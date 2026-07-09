@@ -1,0 +1,64 @@
+@media (max-width: 1180px) {
+  .topbar {
+    grid-template-columns: 1fr auto;
+  }
+
+  .top-stats {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-pane {
+    order: -1;
+  }
+}
+
+@media (max-width: 760px) {
+  .shell {
+    padding: 10px;
+  }
+
+  .topbar,
+  .section-head,
+  .instance-main {
+    align-items: stretch;
+  }
+
+  .section-head,
+  .instance-main {
+    flex-direction: column;
+  }
+
+  .topbar {
+    grid-template-columns: 1fr;
+  }
+
+  .top-actions,
+  .instance-actions,
+  .top-stats {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .summary-band,
+  .meta-grid,
+  .instance-list.rows .instance-card {
+    grid-template-columns: 1fr;
+  }
+
+  .background-control {
+    grid-template-columns: 1fr;
+  }
+
+  .brand h1 {
+    font-size: 18px;
+  }
+
+  .terminal-input {
+    grid-template-columns: 1fr;
+  }
+}

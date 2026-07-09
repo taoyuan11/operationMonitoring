@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      lucide-vue-next:
+        specifier: ^0.562.0
+        version: 0.562.0(vue@3.5.39(typescript@6.0.3))
       vue:
         specifier: ^3.5.39
         version: 3.5.39(typescript@6.0.3)
@@ -338,6 +341,11 @@ packages:
   lightningcss@1.32.0:
     resolution: {integrity: sha512-NXYBzinNrblfraPGyrbPoD19C1h9lfI/1mzgWYvXUTe414Gz/X1FD2XBZSZM7rRTrMA8JL3OtAaGifrIKhQ5yQ==}
     engines: {node: '>= 12.0.0'}
+
+  lucide-vue-next@0.562.0:
+    resolution: {integrity: sha512-LN0BLGKMFulv0lnfK29r14DcngRUhIqdcaL0zXTt2o0oS9odlrjCGaU3/X9hIihOjjN8l8e+Y9G/famcNYaI7Q==}
+    peerDependencies:
+      vue: '>=3.0.1'
 
   magic-string@0.30.21:
     resolution: {integrity: sha512-vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ==}
@@ -702,6 +710,10 @@ snapshots:
       lightningcss-linux-x64-musl: 1.32.0
       lightningcss-win32-arm64-msvc: 1.32.0
       lightningcss-win32-x64-msvc: 1.32.0
+
+  lucide-vue-next@0.562.0(vue@3.5.39(typescript@6.0.3)):
+    dependencies:
+      vue: 3.5.39(typescript@6.0.3)
 
   magic-string@0.30.21:
     dependencies:

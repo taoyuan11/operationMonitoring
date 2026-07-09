@@ -1,0 +1,153 @@
+.login-panel,
+.admin-panel {
+  padding: 14px;
+}
+
+.login-panel,
+.stack-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.admin-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.tabs {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  width: 100%;
+}
+
+.tabs button {
+  font-size: 12px;
+}
+
+.admin-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.list-item,
+.job-row,
+.log-row {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  border-radius: 7px;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  min-width: 0;
+  padding: 10px;
+}
+
+.list-item > div,
+.job-row,
+.log-row {
+  min-width: 0;
+}
+
+.list-item strong,
+.job-row strong,
+.log-row strong,
+.list-item code {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-item code {
+  color: var(--accent-strong);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.job-row,
+.log-row {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.job-status {
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 11px;
+  font-weight: 800;
+  padding: 2px 8px;
+  text-transform: uppercase;
+}
+
+.job-status.completed {
+  background: #dff3ea;
+  color: var(--success);
+}
+
+.job-status.failed {
+  background: #ffe8e6;
+  color: var(--danger);
+}
+
+.job-status.running,
+.job-status.queued {
+  background: #e8f2ff;
+  color: var(--accent);
+}
+
+.admin-section h3 {
+  font-size: 14px;
+  margin-top: 4px;
+}
+
+.background-control {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 104px minmax(0, 1fr);
+}
+
+.background-preview {
+  align-items: center;
+  aspect-ratio: 16 / 10;
+  background: rgba(255, 255, 255, 0.26);
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  border-radius: 7px;
+  color: var(--muted);
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.background-preview img {
+  height: 100%;
+  object-fit: cover;
+  width: 100%;
+}
+
+.background-preview.empty {
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.36), rgba(255, 255, 255, 0.14));
+}
+
+.background-actions {
+  align-content: start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.background-actions small {
+  color: var(--muted);
+  flex: 1 0 100%;
+  font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -24,6 +24,7 @@ import {
   Zap,
 } from 'lucide-vue-next'
 import CountryFlag from './CountryFlag.vue'
+import OperatingSystemLogo from './OperatingSystemLogo.vue'
 import { getCountryOption } from '../data/countries'
 import type { CommandRecord, Instance, ViewMode } from '../types/domain'
 import { formatBytes, formatDuration, formatPercent, formatTime, metricPercent } from '../utils/format'
@@ -174,100 +175,105 @@ function deleteInstance(instance: Instance) {
       </div>
     </div>
 
-    <div v-if="instances.length" class="board-toolbar">
-      <div class="instance-search" role="search">
-        <Search :size="16" aria-hidden="true" />
-        <input
-          v-model="searchQuery"
-          type="search"
-          aria-label="搜索节点名称、主机名、地区或备注"
-          placeholder="搜索名称、主机名、地区或备注"
-        />
+    <Transition name="content">
+      <div v-if="instances.length" class="board-toolbar">
+        <div class="instance-search" role="search">
+          <Search :size="16" aria-hidden="true" />
+          <input
+            v-model="searchQuery"
+            type="search"
+            aria-label="搜索节点名称、主机名、地区或备注"
+            placeholder="搜索名称、主机名、地区或备注"
+          />
+          <Transition name="fade-scale">
+            <button
+              v-if="searchQuery"
+              class="clear-search"
+              type="button"
+              title="清除搜索"
+              aria-label="清除节点搜索"
+              @click="searchQuery = ''"
+            >
+              <X :size="14" />
+            </button>
+          </Transition>
+        </div>
+
+        <div class="toolbar-group status-filter">
+          <span class="toolbar-label"><ListFilter :size="14" aria-hidden="true" />状态</span>
+          <div class="segmented filter-segmented" aria-label="按节点状态筛选">
+            <button
+              :class="{ active: statusFilter === 'all' }"
+              type="button"
+              title="显示全部节点"
+              aria-label="显示全部节点"
+              :aria-pressed="statusFilter === 'all'"
+              @click="statusFilter = 'all'"
+            >
+              全部
+            </button>
+            <button
+              :class="{ active: statusFilter === 'online' }"
+              type="button"
+              title="只显示在线节点"
+              aria-label="只显示在线节点"
+              :aria-pressed="statusFilter === 'online'"
+              @click="statusFilter = 'online'"
+            >
+              <Wifi :size="13" aria-hidden="true" />在线
+            </button>
+            <button
+              :class="{ active: statusFilter === 'offline' }"
+              type="button"
+              title="只显示离线节点"
+              aria-label="只显示离线节点"
+              :aria-pressed="statusFilter === 'offline'"
+              @click="statusFilter = 'offline'"
+            >
+              <WifiOff :size="13" aria-hidden="true" />离线
+            </button>
+          </div>
+        </div>
+
+        <label class="sort-control">
+          <span><ArrowDownWideNarrow :size="14" aria-hidden="true" />排序</span>
+          <select v-model="sortMode" aria-label="节点排序方式">
+            <option value="default">默认顺序</option>
+            <option value="cpu">CPU 占用</option>
+            <option value="memory">内存占用</option>
+            <option value="name">节点名称</option>
+          </select>
+        </label>
+
+        <output class="result-count" aria-live="polite">
+          显示 {{ filteredInstances.length }} / {{ instances.length }} 个节点
+        </output>
+      </div>
+    </Transition>
+
+    <Transition name="content" mode="out-in">
+      <div v-if="instances.length === 0" key="empty" class="empty-state">
+        <span class="empty-icon"><Server :size="28" /></span>
+        <strong>暂无已接入节点</strong>
+        <span>{{ isAdmin ? '请前往“接入审核”页面处理新节点申请。' : '节点通过管理员审核并完成接入后会显示在这里。' }}</span>
+      </div>
+
+      <div v-else-if="filteredInstances.length === 0" key="filtered-empty" class="empty-state filtered-empty">
+        <span class="empty-icon"><Search :size="28" /></span>
+        <strong>没有符合条件的节点</strong>
+        <span>尝试更换关键词或状态筛选条件。</span>
         <button
-          v-if="searchQuery"
-          class="clear-search"
+          class="text-button"
           type="button"
-          title="清除搜索"
-          aria-label="清除节点搜索"
-          @click="searchQuery = ''"
+          title="重置筛选条件"
+          aria-label="重置节点筛选条件"
+          @click="resetFilters"
         >
-          <X :size="14" />
+          <RotateCcw :size="14" />重置筛选
         </button>
       </div>
 
-      <div class="toolbar-group status-filter">
-        <span class="toolbar-label"><ListFilter :size="14" aria-hidden="true" />状态</span>
-        <div class="segmented filter-segmented" aria-label="按节点状态筛选">
-          <button
-            :class="{ active: statusFilter === 'all' }"
-            type="button"
-            title="显示全部节点"
-            aria-label="显示全部节点"
-            :aria-pressed="statusFilter === 'all'"
-            @click="statusFilter = 'all'"
-          >
-            全部
-          </button>
-          <button
-            :class="{ active: statusFilter === 'online' }"
-            type="button"
-            title="只显示在线节点"
-            aria-label="只显示在线节点"
-            :aria-pressed="statusFilter === 'online'"
-            @click="statusFilter = 'online'"
-          >
-            <Wifi :size="13" aria-hidden="true" />在线
-          </button>
-          <button
-            :class="{ active: statusFilter === 'offline' }"
-            type="button"
-            title="只显示离线节点"
-            aria-label="只显示离线节点"
-            :aria-pressed="statusFilter === 'offline'"
-            @click="statusFilter = 'offline'"
-          >
-            <WifiOff :size="13" aria-hidden="true" />离线
-          </button>
-        </div>
-      </div>
-
-      <label class="sort-control">
-        <span><ArrowDownWideNarrow :size="14" aria-hidden="true" />排序</span>
-        <select v-model="sortMode" aria-label="节点排序方式">
-          <option value="default">默认顺序</option>
-          <option value="cpu">CPU 占用</option>
-          <option value="memory">内存占用</option>
-          <option value="name">节点名称</option>
-        </select>
-      </label>
-
-      <output class="result-count" aria-live="polite">
-        显示 {{ filteredInstances.length }} / {{ instances.length }} 个节点
-      </output>
-    </div>
-
-    <div v-if="instances.length === 0" class="empty-state">
-      <span class="empty-icon"><Server :size="28" /></span>
-      <strong>暂无已接入节点</strong>
-      <span>{{ isAdmin ? '请前往“接入审核”页面处理新节点申请。' : '节点通过管理员审核并完成接入后会显示在这里。' }}</span>
-    </div>
-
-    <div v-else-if="filteredInstances.length === 0" class="empty-state filtered-empty">
-      <span class="empty-icon"><Search :size="28" /></span>
-      <strong>没有符合条件的节点</strong>
-      <span>尝试更换关键词或状态筛选条件。</span>
-      <button
-        class="text-button"
-        type="button"
-        title="重置筛选条件"
-        aria-label="重置节点筛选条件"
-        @click="resetFilters"
-      >
-        <RotateCcw :size="14" />重置筛选
-      </button>
-    </div>
-
-    <div v-else :class="['instance-list', viewMode]">
+      <TransitionGroup v-else key="instances" name="instance" tag="div" :class="['instance-list', viewMode]">
       <article
         v-for="instance in filteredInstances"
         :key="instance.id"
@@ -275,7 +281,7 @@ function deleteInstance(instance: Instance) {
       >
         <header class="instance-main">
           <div class="instance-identity">
-            <span class="server-icon"><Server :size="19" /></span>
+            <OperatingSystemLogo class="server-icon" :os="instance.os" />
             <div>
               <div class="title-line">
                 <h3 :title="instanceName(instance)">{{ instanceName(instance) }}</h3>
@@ -323,33 +329,35 @@ function deleteInstance(instance: Instance) {
               >
                 <MoreHorizontal :size="16" />
               </button>
-              <div
-                v-if="openMenuId === instance.id"
-                class="more-menu"
-                role="menu"
-                style="display: flex; flex-direction: column"
-                @click.stop
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  title="停用节点"
-                  :aria-label="`停用节点 ${instanceName(instance)}`"
-                  @click="disableInstance(instance)"
+              <Transition name="menu">
+                <div
+                  v-if="openMenuId === instance.id"
+                  class="more-menu"
+                  role="menu"
+                  style="display: flex; flex-direction: column"
+                  @click.stop
                 >
-                  <Pause :size="14" />停用节点
-                </button>
-                <button
-                  class="danger"
-                  type="button"
-                  role="menuitem"
-                  title="删除节点"
-                  :aria-label="`删除节点 ${instanceName(instance)}`"
-                  @click="deleteInstance(instance)"
-                >
-                  <Trash2 :size="14" />删除节点
-                </button>
-              </div>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    title="停用节点"
+                    :aria-label="`停用节点 ${instanceName(instance)}`"
+                    @click="disableInstance(instance)"
+                  >
+                    <Pause :size="14" />停用节点
+                  </button>
+                  <button
+                    class="danger"
+                    type="button"
+                    role="menuitem"
+                    title="删除节点"
+                    :aria-label="`删除节点 ${instanceName(instance)}`"
+                    @click="deleteInstance(instance)"
+                  >
+                    <Trash2 :size="14" />删除节点
+                  </button>
+                </div>
+              </Transition>
             </div>
           </div>
         </header>
@@ -403,6 +411,7 @@ function deleteInstance(instance: Instance) {
           </button>
         </div>
       </article>
-    </div>
+      </TransitionGroup>
+    </Transition>
   </section>
 </template>

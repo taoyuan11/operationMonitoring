@@ -1,0 +1,125 @@
+.page-stage,
+.dashboard-content {
+  min-width: 0;
+}
+
+.page-enter-active,
+.page-leave-active {
+  transition: opacity .18s ease, transform .2s cubic-bezier(.22, 1, .36, 1);
+}
+
+.page-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.page-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.content-enter-active,
+.content-leave-active {
+  transition: opacity .16s ease, transform .18s ease;
+}
+
+.content-enter-from,
+.content-leave-to {
+  opacity: 0;
+  transform: translateY(5px);
+}
+
+.navigation-enter-active,
+.navigation-leave-active {
+  transition: opacity .16s ease, transform .18s ease;
+}
+
+.navigation-enter-from,
+.navigation-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+.notice-enter-active,
+.notice-leave-active,
+.fade-enter-active,
+.fade-leave-active,
+.fade-scale-enter-active,
+.fade-scale-leave-active {
+  transition: opacity .16s ease, transform .16s ease;
+}
+
+.notice-enter-from,
+.notice-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.fade-scale-enter-from,
+.fade-scale-leave-to {
+  opacity: 0;
+  transform: scale(.94);
+}
+
+.menu-enter-active,
+.menu-leave-active {
+  transform-origin: top right;
+  transition: opacity .14s ease, transform .16s cubic-bezier(.22, 1, .36, 1);
+}
+
+.menu-enter-from,
+.menu-leave-to {
+  opacity: 0;
+  transform: translateY(-5px) scale(.98);
+}
+
+.modal-enter-active,
+.modal-leave-active {
+  transition: opacity .2s ease;
+}
+
+.modal-enter-active .modal,
+.modal-leave-active .modal {
+  transition: opacity .2s ease, transform .22s cubic-bezier(.22, 1, .36, 1);
+}
+
+.modal-enter-from,
+.modal-leave-to,
+.modal-enter-from .modal,
+.modal-leave-to .modal {
+  opacity: 0;
+}
+
+.modal-enter-from .modal,
+.modal-leave-to .modal {
+  transform: translateY(10px) scale(.985);
+}
+
+.instance-enter-active,
+.instance-leave-active,
+.row-enter-active,
+.row-leave-active {
+  transition: opacity .18s ease, transform .22s cubic-bezier(.22, 1, .36, 1);
+}
+
+.instance-enter-from,
+.instance-leave-to {
+  opacity: 0;
+  transform: translateY(8px) scale(.99);
+}
+
+.row-enter-from,
+.row-leave-to {
+  opacity: 0;
+  transform: translateX(8px);
+}
+
+.instance-move,
+.row-move {
+  transition: transform .24s cubic-bezier(.22, 1, .36, 1);
+}

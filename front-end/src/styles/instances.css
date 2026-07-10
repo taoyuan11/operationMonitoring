@@ -34,8 +34,10 @@
 
 .instance-main { display: flex; align-items: flex-start; justify-content: space-between; gap: 11px; min-width: 0; }
 .instance-identity { display: flex; align-items: flex-start; gap: 11px; min-width: 0; }
-.server-icon { display: inline-flex; width: 38px; height: 38px; flex: 0 0 38px; align-items: center; justify-content: center; color: #76d4b7; background: var(--accent-soft); border: 1px solid rgba(59, 191, 155, .16); border-radius: 6px; }
-.offline .server-icon { color: #e88996; background: rgba(236, 113, 130, .08); border-color: rgba(236, 113, 130, .16); }
+.server-icon { display: inline-flex; width: 38px; height: 38px; flex: 0 0 38px; align-items: center; justify-content: center; color: #76d4b7; background: color-mix(in srgb, currentColor 11%, transparent); border: 1px solid color-mix(in srgb, currentColor 19%, transparent); border-radius: 6px; }
+.server-icon svg { width: 20px; height: 20px; }
+.server-icon .brand-logo { fill: currentColor; stroke: none; }
+.offline .server-icon { opacity: .7; filter: saturate(.6); }
 .instance-identity > div { min-width: 0; }
 .title-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .title-line h3 { max-width: 230px; overflow: hidden; color: #edf1ef; font-size: 15px; font-weight: 670; text-overflow: ellipsis; white-space: nowrap; }
@@ -66,7 +68,7 @@
 .metric-label span svg { color: var(--metric-color); }
 .metric-label strong { color: #dce2df; font-size: 12px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .metric > i { display: block; height: 5px; overflow: hidden; background: rgba(255, 255, 255, .075); border-radius: 3px; }
-.metric > i b { display: block; height: 100%; max-width: 100%; background: var(--metric-color); border-radius: inherit; }
+.metric > i b { display: block; height: 100%; max-width: 100%; background: var(--metric-color); border-radius: inherit; transition: width .35s cubic-bezier(.22, 1, .36, 1), background .18s ease; }
 .metric small { min-height: 15px; color: #77827d; font-size: 10px; text-align: right; }
 .metric-unavailable { padding-top: 1px; text-align: left !important; }
 

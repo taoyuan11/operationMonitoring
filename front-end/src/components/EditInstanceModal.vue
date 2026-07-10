@@ -125,46 +125,50 @@ function submit() {
               <ChevronDown :class="{ open: countryPickerOpen }" :size="16" aria-hidden="true" />
             </button>
 
-            <div v-if="countryPickerOpen" class="country-picker-menu">
-              <div class="country-search-box">
-                <Search :size="15" aria-hidden="true" />
-                <input
-                  ref="countrySearchInput"
-                  v-model="countrySearch"
-                  type="search"
-                  autocomplete="off"
-                  aria-label="搜索国家"
-                  placeholder="搜索国家或代码"
-                  @keydown.esc.stop.prevent="dismissCountryPicker"
-                />
-              </div>
-              <div id="country-option-list" class="country-option-list" role="listbox" aria-label="国家">
-                <button
-                  v-for="country in filteredCountries"
-                  :key="country.code"
-                  :class="['country-option', { selected: country.code === form.country_code }]"
-                  type="button"
-                  role="option"
-                  :aria-selected="country.code === form.country_code"
-                  @click="selectCountry(country)"
-                >
-                  <img
-                    class="country-flag"
-                    :src="getCountryFlagUrl(country.code)"
-                    alt=""
-                    aria-hidden="true"
-                    loading="lazy"
-                    decoding="async"
+            <Transition name="menu">
+              <div v-if="countryPickerOpen" class="country-picker-menu">
+                <div class="country-search-box">
+                  <Search :size="15" aria-hidden="true" />
+                  <input
+                    ref="countrySearchInput"
+                    v-model="countrySearch"
+                    type="search"
+                    autocomplete="off"
+                    aria-label="搜索国家"
+                    placeholder="搜索国家或代码"
+                    @keydown.esc.stop.prevent="dismissCountryPicker"
                   />
-                  <span>{{ country.name }}</span>
-                  <small>{{ country.code }}</small>
-                  <Check v-if="country.code === form.country_code" :size="15" aria-hidden="true" />
-                </button>
-                <p v-if="filteredCountries.length === 0" class="country-empty">没有匹配的国家</p>
+                </div>
+                <div id="country-option-list" class="country-option-list" role="listbox" aria-label="国家">
+                  <button
+                    v-for="country in filteredCountries"
+                    :key="country.code"
+                    :class="['country-option', { selected: country.code === form.country_code }]"
+                    type="button"
+                    role="option"
+                    :aria-selected="country.code === form.country_code"
+                    @click="selectCountry(country)"
+                  >
+                    <img
+                      class="country-flag"
+                      :src="getCountryFlagUrl(country.code)"
+                      alt=""
+                      aria-hidden="true"
+                      loading="lazy"
+                      decoding="async"
+                    />
+                    <span>{{ country.name }}</span>
+                    <small>{{ country.code }}</small>
+                    <Check v-if="country.code === form.country_code" :size="15" aria-hidden="true" />
+                  </button>
+                  <p v-if="filteredCountries.length === 0" class="country-empty">没有匹配的国家</p>
+                </div>
               </div>
-            </div>
+            </Transition>
           </div>
-          <p v-if="countryError" class="field-error" role="alert">请选择国家</p>
+          <Transition name="notice">
+            <p v-if="countryError" class="field-error" role="alert">请选择国家</p>
+          </Transition>
         </div>
       </fieldset>
       <label><span>节点备注</span><textarea v-model="form.remark" placeholder="补充说明"></textarea></label>

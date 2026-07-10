@@ -27,7 +27,9 @@ defineEmits<{
         <h2 id="login-title">管理员登录</h2>
         <p>输入管理密码后即可进入控制台。</p>
       </div>
-      <p v-if="errorMessage" class="login-error">{{ errorMessage }}</p>
+      <Transition name="notice">
+        <p v-if="errorMessage" class="login-error">{{ errorMessage }}</p>
+      </Transition>
       <label class="password-field">
         <span>管理密码</span>
         <div class="input-shell">

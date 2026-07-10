@@ -24,4 +24,9 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_System_Performance",
+] }
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

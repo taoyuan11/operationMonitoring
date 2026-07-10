@@ -62,32 +62,34 @@ defineEmits<{
         <div class="card-heading">
           <div><h3>待审批节点</h3><p>节点在获得批准之前不会出现在公开实例列表中。</p></div>
         </div>
-        <div v-if="pendingInstances.length === 0" class="page-empty">
-          <span><Check :size="24" /></span>
-          <strong>所有申请均已处理</strong>
-          <p>目前没有等待审核的新节点。</p>
-        </div>
-        <div v-else class="approval-list">
-          <article v-for="item in pendingInstances" :key="item.id" class="approval-row">
-            <span class="list-icon"><Terminal :size="17" /></span>
-            <div class="approval-identity">
-              <strong>{{ item.hostname }}</strong>
-              <span>{{ item.os }}/{{ item.arch }} · Agent {{ item.agent_version }}</span>
-            </div>
-            <div class="approval-time">
-              <span>最后请求</span>
-              <strong>{{ formatTime(item.last_seen) }}</strong>
-            </div>
-            <div class="row-actions">
-              <button class="approve-button" type="button" @click="$emit('approve', item.id)">
-                <Check :size="15" />批准
-              </button>
-              <button class="reject-button" type="button" @click="$emit('reject', item.id)">
-                <X :size="15" />拒绝
-              </button>
-            </div>
-          </article>
-        </div>
+        <Transition name="content" mode="out-in">
+          <div v-if="pendingInstances.length === 0" key="empty" class="page-empty">
+            <span><Check :size="24" /></span>
+            <strong>所有申请均已处理</strong>
+            <p>目前没有等待审核的新节点。</p>
+          </div>
+          <TransitionGroup v-else key="approvals" name="row" tag="div" class="approval-list">
+            <article v-for="item in pendingInstances" :key="item.id" class="approval-row">
+              <span class="list-icon"><Terminal :size="17" /></span>
+              <div class="approval-identity">
+                <strong>{{ item.hostname }}</strong>
+                <span>{{ item.os }}/{{ item.arch }} · Agent {{ item.agent_version }}</span>
+              </div>
+              <div class="approval-time">
+                <span>最后请求</span>
+                <strong>{{ formatTime(item.last_seen) }}</strong>
+              </div>
+              <div class="row-actions">
+                <button class="approve-button" type="button" @click="$emit('approve', item.id)">
+                  <Check :size="15" />批准
+                </button>
+                <button class="reject-button" type="button" @click="$emit('reject', item.id)">
+                  <X :size="15" />拒绝
+                </button>
+              </div>
+            </article>
+          </TransitionGroup>
+        </Transition>
       </div>
     </template>
 
@@ -115,29 +117,33 @@ defineEmits<{
 
         <div class="admin-content-card">
           <div class="card-heading"><div><h3>已启用命令</h3><p>当前允许执行的命令白名单。</p></div></div>
-          <div v-if="commands.length === 0" class="compact-empty">暂无快捷命令</div>
-          <div class="command-list">
-            <article v-for="command in commands" :key="command.id" class="command-row">
-              <span class="list-icon"><Terminal :size="16" /></span>
-              <div><strong>{{ command.name }}</strong><code>{{ command.command }}</code></div>
-              <button class="icon-button danger" type="button" title="停用" @click="$emit('removeCommand', command)">
-                <Trash2 :size="15" />
-              </button>
-            </article>
-          </div>
+          <Transition name="content" mode="out-in">
+            <div v-if="commands.length === 0" key="empty" class="compact-empty">暂无快捷命令</div>
+            <TransitionGroup v-else key="commands" name="row" tag="div" class="command-list">
+              <article v-for="command in commands" :key="command.id" class="command-row">
+                <span class="list-icon"><Terminal :size="16" /></span>
+                <div><strong>{{ command.name }}</strong><code>{{ command.command }}</code></div>
+                <button class="icon-button danger" type="button" title="停用" @click="$emit('removeCommand', command)">
+                  <Trash2 :size="15" />
+                </button>
+              </article>
+            </TransitionGroup>
+          </Transition>
         </div>
 
         <div class="admin-content-card recent-jobs-card">
           <div class="card-heading"><div><h3>最近执行记录</h3><p>最近提交到节点的命令任务。</p></div></div>
-          <div v-if="jobs.length === 0" class="compact-empty">暂无执行记录</div>
-          <div class="jobs-table" v-else>
-            <article v-for="job in jobs.slice(0, 10)" :key="job.id" class="job-table-row">
-              <span :class="['job-status', job.status]">{{ job.status }}</span>
-              <strong>{{ job.command }}</strong>
-              <small>节点 {{ job.instance_id.slice(0, 8) }}</small>
-              <time>{{ formatTime(job.created_at) }}</time>
-            </article>
-          </div>
+          <Transition name="content" mode="out-in">
+            <div v-if="jobs.length === 0" key="empty" class="compact-empty">暂无执行记录</div>
+            <TransitionGroup v-else key="jobs" name="row" tag="div" class="jobs-table">
+              <article v-for="job in jobs.slice(0, 10)" :key="job.id" class="job-table-row">
+                <span :class="['job-status', job.status]">{{ job.status }}</span>
+                <strong>{{ job.command }}</strong>
+                <small>节点 {{ job.instance_id.slice(0, 8) }}</small>
+                <time>{{ formatTime(job.created_at) }}</time>
+              </article>
+            </TransitionGroup>
+          </Transition>
         </div>
       </div>
     </template>
@@ -168,8 +174,15 @@ defineEmits<{
         <div class="admin-content-card background-card">
           <div class="card-heading"><div><h3>页面背景</h3><p>自定义监控页面背景，系统会自动添加深色遮罩。</p></div></div>
           <div :class="['large-background-preview', { empty: !settingsForm.background_image_url }]">
-            <img v-if="settingsForm.background_image_url" :src="settingsForm.background_image_url" alt="当前背景" />
-            <div v-else><Image :size="28" /><span>当前使用默认渐变背景</span></div>
+            <Transition name="fade" mode="out-in">
+              <img
+                v-if="settingsForm.background_image_url"
+                key="image"
+                :src="settingsForm.background_image_url"
+                alt="当前背景"
+              />
+              <div v-else key="empty"><Image :size="28" /><span>当前使用默认渐变背景</span></div>
+            </Transition>
           </div>
           <div class="background-toolbar">
             <label :class="['file-button', { disabled: backgroundOperation }]">
@@ -183,17 +196,19 @@ defineEmits<{
                 @change="$emit('selectBackgroundImage', $event)"
               />
             </label>
-            <button
-              v-if="settingsForm.background_image_url"
-              class="text-button danger"
-              type="button"
-              :disabled="Boolean(backgroundOperation)"
-              @click="$emit('clearBackgroundImage')"
-            >
-              <LoaderCircle v-if="backgroundOperation === 'removing'" class="spin" :size="14" />
-              <Trash2 v-else :size="14" />
-              {{ backgroundOperation === 'removing' ? '正在移除' : '移除背景' }}
-            </button>
+            <Transition name="fade-scale">
+              <button
+                v-if="settingsForm.background_image_url"
+                class="text-button danger"
+                type="button"
+                :disabled="Boolean(backgroundOperation)"
+                @click="$emit('clearBackgroundImage')"
+              >
+                <LoaderCircle v-if="backgroundOperation === 'removing'" class="spin" :size="14" />
+                <Trash2 v-else :size="14" />
+                {{ backgroundOperation === 'removing' ? '正在移除' : '移除背景' }}
+              </button>
+            </Transition>
             <small :class="{ success: backgroundMessage }">{{ backgroundMessage || backgroundFileName || '支持 PNG、JPEG、WebP，最大 5MB' }}</small>
           </div>
         </div>
@@ -213,18 +228,20 @@ defineEmits<{
 
       <div class="admin-content-card wide-card">
         <div class="card-heading"><div><h3>管理操作记录</h3><p>按操作时间倒序显示。</p></div></div>
-        <div v-if="logs.length === 0" class="page-empty">
-          <span><ClipboardList :size="24" /></span><strong>暂无操作记录</strong>
-        </div>
-        <div v-else class="logs-table">
-          <div class="logs-table-head"><span>操作</span><span>详细信息</span><span>目标</span><span>时间</span></div>
-          <article v-for="log in logs.slice(0, 20)" :key="log.id" class="logs-table-row">
-            <strong>{{ log.action }}</strong>
-            <p>{{ log.detail }}</p>
-            <span>{{ log.target }}</span>
-            <time>{{ formatTime(log.created_at) }}</time>
-          </article>
-        </div>
+        <Transition name="content" mode="out-in">
+          <div v-if="logs.length === 0" key="empty" class="page-empty">
+            <span><ClipboardList :size="24" /></span><strong>暂无操作记录</strong>
+          </div>
+          <TransitionGroup v-else key="logs" name="row" tag="div" class="logs-table">
+            <div key="header" class="logs-table-head"><span>操作</span><span>详细信息</span><span>目标</span><span>时间</span></div>
+            <article v-for="log in logs.slice(0, 20)" :key="log.id" class="logs-table-row">
+              <strong>{{ log.action }}</strong>
+              <p>{{ log.detail }}</p>
+              <span>{{ log.target }}</span>
+              <time>{{ formatTime(log.created_at) }}</time>
+            </article>
+          </TransitionGroup>
+        </Transition>
       </div>
     </template>
   </section>

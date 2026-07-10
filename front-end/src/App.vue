@@ -168,103 +168,128 @@ function confirmAction() {
       @logout="logout"
     />
 
-    <AdminNavigation
-      v-if="consoleState.isAdmin.value"
-      :current-page="currentPage"
-      :pending-count="consoleState.pendingInstances.value.length"
-      @navigate="navigate"
-    />
-
-    <template v-if="currentPage === 'home'">
-      <div v-if="!consoleState.publicReady.value" class="dashboard-skeleton" aria-label="正在加载监控数据">
-        <div class="skeleton-summary"><i v-for="index in 4" :key="index"></i></div>
-        <div class="skeleton-heading"></div>
-        <div class="skeleton-board"><i v-for="index in 3" :key="index"></i></div>
-      </div>
-
-      <template v-else>
-        <SummaryBand
-          :total="consoleState.instances.value.length"
-          :online="consoleState.onlineCount.value"
-          :avg-cpu="consoleState.avgCpu.value"
-          :avg-memory="consoleState.avgMemory.value"
-        />
-
-        <p v-if="consoleState.errorMessage.value" class="notice">
-          {{ consoleState.errorMessage.value }}
-        </p>
-
-        <InstanceBoard
-          :instances="consoleState.instances.value"
-          :commands="consoleState.commands.value"
-          :is-admin="consoleState.isAdmin.value"
-          :view-mode="consoleState.viewMode.value"
-          @update:view-mode="consoleState.viewMode.value = $event"
-          @edit="consoleState.openEdit"
-          @terminal="consoleState.openTerminal"
-          @disable="requestDisable"
-          @delete="requestDelete"
-          @run-command="requestRunCommand"
-        />
-      </template>
-    </template>
-
-    <template v-else>
-      <p v-if="consoleState.errorMessage.value" class="notice page-notice">
-        {{ consoleState.errorMessage.value }}
-      </p>
-
-      <AdminPanel
-        :admin-tab="activeAdminTab"
-        :pending-instances="consoleState.pendingInstances.value"
-        :commands="consoleState.commands.value"
-        :jobs="consoleState.jobs.value"
-        :logs="consoleState.logs.value"
-        :settings-form="consoleState.settingsForm"
-        :background-file-name="consoleState.backgroundFileName.value"
-        :background-operation="consoleState.backgroundOperation.value"
-        :background-message="consoleState.backgroundMessage.value"
-        :command-form="consoleState.commandForm"
-        @approve="consoleState.approveInstance"
-        @reject="consoleState.rejectInstance"
-        @create-command="consoleState.createCommand"
-        @remove-command="requestRemoveCommand"
-        @save-settings="consoleState.saveSettings"
-        @select-background-image="consoleState.selectBackgroundImage"
-        @clear-background-image="consoleState.clearBackgroundImage"
+    <Transition name="navigation">
+      <AdminNavigation
+        v-if="consoleState.isAdmin.value"
+        :current-page="currentPage"
+        :pending-count="consoleState.pendingInstances.value.length"
+        @navigate="navigate"
       />
-    </template>
+    </Transition>
 
-    <LoginModal
-      v-if="loginOpen && !consoleState.isAdmin.value"
-      :loading="consoleState.loading.value"
-      :error-message="consoleState.errorMessage.value"
-      :form="consoleState.loginForm"
-      @close="loginOpen = false"
-      @login="consoleState.login"
-    />
+    <Transition name="page" mode="out-in">
+      <section :key="currentPage" class="page-stage">
+        <template v-if="currentPage === 'home'">
+          <Transition name="content" mode="out-in">
+            <div
+              v-if="!consoleState.publicReady.value"
+              key="skeleton"
+              class="dashboard-skeleton"
+              aria-label="正在加载监控数据"
+            >
+              <div class="skeleton-summary"><i v-for="index in 4" :key="index"></i></div>
+              <div class="skeleton-heading"></div>
+              <div class="skeleton-board"><i v-for="index in 3" :key="index"></i></div>
+            </div>
 
-    <EditInstanceModal
-      v-if="consoleState.editInstance.value"
-      :form="consoleState.editForm"
-      @close="consoleState.closeEdit"
-      @save="consoleState.saveEdit"
-    />
+            <div v-else key="dashboard" class="dashboard-content">
+              <SummaryBand
+                :total="consoleState.instances.value.length"
+                :online="consoleState.onlineCount.value"
+                :avg-cpu="consoleState.avgCpu.value"
+                :avg-memory="consoleState.avgMemory.value"
+              />
 
-    <TerminalModal
-      v-if="consoleState.terminalState.instance"
-      :instance="consoleState.terminalState.instance"
-      @close="consoleState.closeTerminal"
-    />
+              <Transition name="notice">
+                <p v-if="consoleState.errorMessage.value" class="notice">
+                  {{ consoleState.errorMessage.value }}
+                </p>
+              </Transition>
 
-    <ConfirmModal
-      v-if="confirmation"
-      :title="confirmation.title"
-      :message="confirmation.message"
-      :confirm-label="confirmation.confirmLabel"
-      :tone="confirmation.tone"
-      @close="confirmation = null"
-      @confirm="confirmAction"
-    />
+              <InstanceBoard
+                :instances="consoleState.instances.value"
+                :commands="consoleState.commands.value"
+                :is-admin="consoleState.isAdmin.value"
+                :view-mode="consoleState.viewMode.value"
+                @update:view-mode="consoleState.viewMode.value = $event"
+                @edit="consoleState.openEdit"
+                @terminal="consoleState.openTerminal"
+                @disable="requestDisable"
+                @delete="requestDelete"
+                @run-command="requestRunCommand"
+              />
+            </div>
+          </Transition>
+        </template>
+
+        <template v-else>
+          <Transition name="notice">
+            <p v-if="consoleState.errorMessage.value" class="notice page-notice">
+              {{ consoleState.errorMessage.value }}
+            </p>
+          </Transition>
+
+          <AdminPanel
+            :admin-tab="activeAdminTab"
+            :pending-instances="consoleState.pendingInstances.value"
+            :commands="consoleState.commands.value"
+            :jobs="consoleState.jobs.value"
+            :logs="consoleState.logs.value"
+            :settings-form="consoleState.settingsForm"
+            :background-file-name="consoleState.backgroundFileName.value"
+            :background-operation="consoleState.backgroundOperation.value"
+            :background-message="consoleState.backgroundMessage.value"
+            :command-form="consoleState.commandForm"
+            @approve="consoleState.approveInstance"
+            @reject="consoleState.rejectInstance"
+            @create-command="consoleState.createCommand"
+            @remove-command="requestRemoveCommand"
+            @save-settings="consoleState.saveSettings"
+            @select-background-image="consoleState.selectBackgroundImage"
+            @clear-background-image="consoleState.clearBackgroundImage"
+          />
+        </template>
+      </section>
+    </Transition>
+
+    <Transition name="modal" appear>
+      <LoginModal
+        v-if="loginOpen && !consoleState.isAdmin.value"
+        :loading="consoleState.loading.value"
+        :error-message="consoleState.errorMessage.value"
+        :form="consoleState.loginForm"
+        @close="loginOpen = false"
+        @login="consoleState.login"
+      />
+    </Transition>
+
+    <Transition name="modal" appear>
+      <EditInstanceModal
+        v-if="consoleState.editInstance.value"
+        :form="consoleState.editForm"
+        @close="consoleState.closeEdit"
+        @save="consoleState.saveEdit"
+      />
+    </Transition>
+
+    <Transition name="modal" appear>
+      <TerminalModal
+        v-if="consoleState.terminalState.instance"
+        :instance="consoleState.terminalState.instance"
+        @close="consoleState.closeTerminal"
+      />
+    </Transition>
+
+    <Transition name="modal" appear>
+      <ConfirmModal
+        v-if="confirmation"
+        :title="confirmation.title"
+        :message="confirmation.message"
+        :confirm-label="confirmation.confirmLabel"
+        :tone="confirmation.tone"
+        @close="confirmation = null"
+        @confirm="confirmAction"
+      />
+    </Transition>
   </main>
 </template>

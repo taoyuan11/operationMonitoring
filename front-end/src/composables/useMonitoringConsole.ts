@@ -63,16 +63,8 @@ export function useMonitoringConsole() {
 
   const terminalState = reactive<{
     instance: Instance | null
-    socket: WebSocket | null
-    output: string
-    input: string
-    connected: boolean
   }>({
     instance: null,
-    socket: null,
-    output: '',
-    input: '',
-    connected: false,
   })
 
   const onlineCount = computed(() => instances.value.filter((item) => item.online).length)
@@ -320,48 +312,11 @@ export function useMonitoringConsole() {
   }
 
   function openTerminal(instance: Instance) {
-    closeTerminal()
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const socket = new WebSocket(
-      `${protocol}//${window.location.host}/api/admin/instances/${instance.id}/terminal/ws`,
-    )
     terminalState.instance = instance
-    terminalState.socket = socket
-    terminalState.output = ''
-    terminalState.input = ''
-    terminalState.connected = false
-
-    socket.onopen = () => {
-      terminalState.connected = true
-    }
-    socket.onmessage = (event) => {
-      terminalState.output += String(event.data)
-    }
-    socket.onerror = () => {
-      terminalState.output += '\n连接发生错误。\n'
-    }
-    socket.onclose = () => {
-      terminalState.connected = false
-    }
   }
 
   function closeTerminal() {
-    terminalState.socket?.close()
     terminalState.instance = null
-    terminalState.socket = null
-    terminalState.output = ''
-    terminalState.input = ''
-    terminalState.connected = false
-  }
-
-  function sendTerminalCommand() {
-    const command = terminalState.input.trim()
-    if (!command || !terminalState.socket || terminalState.socket.readyState !== WebSocket.OPEN) {
-      return
-    }
-    terminalState.output += `> ${command}\n`
-    terminalState.socket.send(command)
-    terminalState.input = ''
   }
 
   function applyAppearance(url: string | null) {
@@ -433,6 +388,5 @@ export function useMonitoringConsole() {
     clearBackgroundImage,
     openTerminal,
     closeTerminal,
-    sendTerminalCommand,
   }
 }

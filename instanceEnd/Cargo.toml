@@ -2,13 +2,16 @@
 name = "instanceEnd"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 directories = "6.0"
 futures-util = "0.3"
 hostname = "0.4"
+portable-pty = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -16,3 +19,9 @@ sysinfo = "0.30"
 tokio = { version = "1.48", features = ["full"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

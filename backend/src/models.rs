@@ -233,8 +233,30 @@ pub struct AgentWsQuery {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentOutbound {
-    RunCommand { job_id: String, command: String },
-    Ping { now: i64 },
+    RunCommand {
+        job_id: String,
+        command: String,
+    },
+    Ping {
+        now: i64,
+    },
+    TerminalOpen {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    TerminalInput {
+        session_id: String,
+        data: String,
+    },
+    TerminalResize {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    TerminalClose {
+        session_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -243,16 +265,52 @@ pub enum AgentInbound {
     Pong {
         now: i64,
     },
+    Metrics {
+        hostname: String,
+        os: String,
+        arch: String,
+        agent_version: String,
+        metrics: MetricPayload,
+    },
     CommandResult {
         job_id: String,
         exit_code: i64,
         output: String,
     },
+    TerminalOpened {
+        session_id: String,
+    },
+    TerminalOutput {
+        session_id: String,
+        data: String,
+    },
+    TerminalClosed {
+        session_id: String,
+        exit_code: Option<i64>,
+        reason: Option<String>,
+    },
 }
 
-#[derive(Debug, Clone)]
-pub struct CommandOutcome {
-    pub job_id: String,
-    pub exit_code: i64,
-    pub output: String,
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TerminalClientMessage {
+    Input { data: String },
+    Resize { cols: u16, rows: u16 },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TerminalServerMessage {
+    Opening,
+    Ready,
+    Output {
+        data: String,
+    },
+    Closed {
+        exit_code: Option<i64>,
+        reason: Option<String>,
+    },
+    Error {
+        message: String,
+    },
 }

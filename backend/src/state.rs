@@ -1,11 +1,12 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc};
+use uuid::Uuid;
 
 use crate::{
     config::Cli,
-    models::{AgentOutbound, CommandOutcome},
+    models::{AgentOutbound, TerminalServerMessage},
 };
 
 #[derive(Clone)]
@@ -16,7 +17,7 @@ pub struct AppState {
     pub upload_dir: PathBuf,
     pub sessions: Arc<RwLock<HashMap<String, i64>>>,
     pub agents: Arc<RwLock<HashMap<String, AgentHandle>>>,
-    pub command_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<CommandOutcome>>>>,
+    pub terminal_sessions: Arc<RwLock<HashMap<String, TerminalSessionHandle>>>,
 }
 
 impl AppState {
@@ -28,12 +29,20 @@ impl AppState {
             upload_dir: cli.upload_dir,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             agents: Arc::new(RwLock::new(HashMap::new())),
-            command_waiters: Arc::new(Mutex::new(HashMap::new())),
+            terminal_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
 
 #[derive(Clone)]
 pub struct AgentHandle {
+    pub connection_id: Uuid,
     pub tx: mpsc::UnboundedSender<AgentOutbound>,
+}
+
+#[derive(Clone)]
+pub struct TerminalSessionHandle {
+    pub instance_id: String,
+    pub agent_connection_id: Uuid,
+    pub tx: mpsc::UnboundedSender<TerminalServerMessage>,
 }

@@ -2,36 +2,32 @@ mod command;
 mod config;
 mod http;
 mod identity;
+mod lifecycle;
 mod metrics;
 mod models;
 mod profile;
+mod terminal;
 mod time;
 mod ws;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
-use config::Cli;
-use http::report_loop;
-use identity::load_or_create_identity;
-use ws::agent_ws_loop;
+use config::{AgentCommand, Cli};
+use lifecycle::{run_agent, start, status, stop};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    let identity = load_or_create_identity(cli.identity_file.clone())?;
-    println!("agent instance_id: {}", identity.instance_id);
-    println!("server: {}", cli.server);
+    if cli.daemon_child {
+        if cli.command != AgentCommand::Start {
+            bail!("invalid internal agent invocation");
+        }
+        return tokio::runtime::Runtime::new()?.block_on(run_agent(cli.agent));
+    }
 
-    let http_client = reqwest::Client::new();
-    let report_task = tokio::spawn(report_loop(
-        cli.clone(),
-        identity.clone(),
-        http_client.clone(),
-    ));
-    let ws_task = tokio::spawn(agent_ws_loop(cli, identity));
-
-    let (report_result, ws_result) = tokio::join!(report_task, ws_task);
-    report_result??;
-    ws_result??;
-    Ok(())
+    match cli.command {
+        AgentCommand::Start => start(&cli.agent),
+        AgentCommand::Stop { timeout } => stop(&cli.agent, timeout),
+        AgentCommand::Status => status(&cli.agent),
+        AgentCommand::Log => tokio::runtime::Runtime::new()?.block_on(run_agent(cli.agent)),
+    }
 }

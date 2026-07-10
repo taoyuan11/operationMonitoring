@@ -35,22 +35,19 @@
   justify-content: space-between;
 }
 
-.terminal-output {
-  background: #101820;
+.terminal-screen {
+  background: #0d141c;
   border-radius: 7px;
-  color: #e6edf3;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 13px;
-  line-height: 1.5;
-  margin: 0;
+  height: min(64vh, 620px);
   min-height: 360px;
-  overflow: auto;
-  padding: 12px;
-  white-space: pre-wrap;
+  overflow: hidden;
+  padding: 8px;
 }
 
-.terminal-input {
-  display: grid;
-  gap: 8px;
-  grid-template-columns: minmax(0, 1fr) auto;
+.terminal-screen .xterm {
+  height: 100%;
+}
+
+.terminal-screen .xterm-viewport {
+  border-radius: 4px;
 }

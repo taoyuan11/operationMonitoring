@@ -58,7 +58,4 @@
     font-size: 18px;
   }
 
-  .terminal-input {
-    grid-template-columns: 1fr;
-  }
 }

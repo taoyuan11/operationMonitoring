@@ -256,11 +256,11 @@ pub async fn latest_metric(db: &SqlitePool, instance_id: &str) -> AppResult<Opti
     Ok(metric)
 }
 
-pub fn instance_summary(record: InstanceRecord, metrics: Option<MetricRecord>) -> InstanceSummary {
-    let online = record
-        .last_seen
-        .map(|last_seen| now_ts() - last_seen <= 20)
-        .unwrap_or(false);
+pub fn instance_summary(
+    record: InstanceRecord,
+    metrics: Option<MetricRecord>,
+    online: bool,
+) -> InstanceSummary {
     InstanceSummary {
         id: record.id,
         name: record.name,

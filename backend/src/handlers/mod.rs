@@ -66,7 +66,8 @@ pub async fn public_instances(
     let mut summaries = Vec::with_capacity(records.len());
     for record in records {
         let metrics = latest_metric(&state.db, &record.id).await?;
-        summaries.push(instance_summary(record, metrics));
+        let online = state.agents.read().await.contains_key(&record.id);
+        summaries.push(instance_summary(record, metrics, online));
     }
 
     Ok(Json(summaries))
@@ -288,7 +289,8 @@ pub async fn admin_update_instance(
 
     let updated = get_instance(&state.db, &id).await?;
     let metrics = latest_metric(&state.db, &updated.id).await?;
-    Ok(Json(instance_summary(updated, metrics)))
+    let online = state.agents.read().await.contains_key(&updated.id);
+    Ok(Json(instance_summary(updated, metrics, online)))
 }
 
 pub async fn admin_disable_instance(
@@ -414,7 +416,10 @@ pub async fn admin_upload_background_image(
             return Err(AppError::new(StatusCode::BAD_REQUEST, "图片不能为空"));
         }
         if bytes.len() > MAX_BACKGROUND_BYTES {
-            return Err(AppError::new(StatusCode::PAYLOAD_TOO_LARGE, "图片不能超过 5 MB"));
+            return Err(AppError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "图片不能超过 5 MB",
+            ));
         }
         if !background_signature_matches(extension, &bytes) {
             return Err(AppError::new(StatusCode::BAD_REQUEST, "图片文件格式不正确"));

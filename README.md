@@ -49,13 +49,15 @@ backend/src/
 instanceEnd/src/
   command.rs      系统命令执行与超时截断
   config.rs       Agent 启动参数
-  http.rs         注册与指标上报
+  http.rs         审批前注册请求
   identity.rs     本地实例身份生成和读取
+  lifecycle.rs    实例进程启动、停止与状态管理
   metrics.rs      CPU、内存、磁盘、网络采集
   models.rs       Agent 与后端通信模型
   profile.rs      主机基础信息
+  terminal.rs     跨平台 PTY/ConPTY 交互式 Shell
   time.rs         时间戳工具
-  ws.rs           Agent 持久连接和命令回传
+  ws.rs           Agent WebSocket、指标上报、命令与终端复用通道
 ```
 
 ## 本地启动
@@ -75,14 +77,48 @@ pnpm install
 pnpm dev
 ```
 
-启动实例端：
+构建并在后台启动实例端：
 
 ```bash
 cd instanceEnd
-cargo run -- --server http://127.0.0.1:13500
+cargo build --release
+./target/release/instanceEnd start --server http://127.0.0.1:13500
+```
+
+`start` 会在后台启动实例端并立即释放命令行，标准输出和错误输出会写入命令返回的日志路径。Windows 使用同目录下的 `instanceEnd.exe`，后台子进程不会创建控制台窗口。
+
+查询状态或停止实例端：
+
+```bash
+./target/release/instanceEnd status
+./target/release/instanceEnd stop
+```
+
+需要在前台运行实例端并直接向终端打印日志时，使用 `log`：
+
+```bash
+./target/release/instanceEnd log --server http://127.0.0.1:13500
+```
+
+实例端不提供 `run` 命令。`log` 会持续运行，按 `Ctrl+C` 退出；同一状态目录下不能同时运行前台和后台实例端。
+
+开发时也可以通过 Cargo 执行相同命令：
+
+```bash
+cargo run -- start --server http://127.0.0.1:13500
+cargo run -- status
+cargo run -- log
+cargo run -- stop
 ```
 
 前端开发服务器已在 `front-end/vite.config.ts` 中代理 `/api` 到 `http://127.0.0.1:13500`，WebSocket 也会透传。
+
+## 连接与终端说明
+
+- 实例审批完成后，指标、快捷命令和交互式终端都复用同一条 Agent WebSocket 长连接。
+- 后端以内存中的 WebSocket 连接状态判断实例在线；连接关闭或心跳超时后立即判定离线，不再依赖“最后上报时间 + 固定阈值”。
+- Web 终端使用系统 PTY/ConPTY，支持持续 Shell 上下文、`cd`、环境变量、交互程序、方向键、Tab、`Ctrl+C` 和窗口尺寸变化。
+- 浏览器与 Agent 之间的终端数据按原始字节进行 Base64 封装，Shell 统一按 UTF-8 工作；Windows `cmd.exe` 会切换到代码页 65001，避免中文经 JSON 转发时损坏。
 
 ## 常用环境变量
 
@@ -101,7 +137,11 @@ OM_ADMIN_PASSWORD=admin123
 OM_SERVER=http://127.0.0.1:13500
 OM_AGENT_ID_FILE=/path/to/identity.json
 OM_REPORT_INTERVAL=5
+OM_AGENT_STATE_DIR=/path/to/runtime
+OM_AGENT_LOG_FILE=/path/to/agent.log
 ```
+
+同一状态目录只允许一个实例端进程运行。若要在一台机器上运行多个实例端，请为每个进程设置不同的 `OM_AGENT_STATE_DIR` 和 `OM_AGENT_ID_FILE`。
 
 ## 验证命令
 
@@ -115,6 +155,5 @@ cd instanceEnd && cargo check
 
 - 增加历史趋势图和指标明细页。
 - 增加告警规则、通知渠道和阈值配置。
-- 增加真实交互式 PTY，替代当前命令式 Web 终端。
 - 增加登录失败限制、密码哈希和更细粒度权限。
 - 增加 Agent 安装脚本、服务注册和自动升级。

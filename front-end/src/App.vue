@@ -83,9 +83,8 @@ const consoleState = useMonitoringConsole()
 
     <TerminalModal
       v-if="consoleState.terminalState.instance"
-      :state="consoleState.terminalState"
+      :instance="consoleState.terminalState.instance"
       @close="consoleState.closeTerminal"
-      @send="consoleState.sendTerminalCommand"
     />
   </main>
 </template>

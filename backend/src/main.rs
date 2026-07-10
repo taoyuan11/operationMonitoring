@@ -18,13 +18,12 @@ use clap::Parser;
 use config::Cli;
 use db::{cleanup_loop, connect_db, init_db};
 use handlers::{
-    admin_approve_instance, admin_commands, admin_create_command, admin_delete_instance,
-    admin_delete_background_image, admin_disable_command, admin_disable_instance,
-    admin_get_settings, admin_jobs, admin_login, admin_logout, admin_logs, admin_me,
-    admin_pending_instances, admin_put_settings, admin_reject_instance,
-    admin_run_whitelist_command, admin_terminal_ws, admin_update_instance,
-    admin_upload_background_image, agent_register, agent_report, agent_ws, health,
-    public_appearance, public_instances, public_metrics,
+    admin_approve_instance, admin_commands, admin_create_command, admin_delete_background_image,
+    admin_delete_instance, admin_disable_command, admin_disable_instance, admin_get_settings,
+    admin_jobs, admin_login, admin_logout, admin_logs, admin_me, admin_pending_instances,
+    admin_put_settings, admin_reject_instance, admin_run_whitelist_command, admin_terminal_ws,
+    admin_update_instance, admin_upload_background_image, agent_register, agent_report, agent_ws,
+    health, public_appearance, public_instances, public_metrics,
 };
 use state::AppState;
 use tower_http::{cors::CorsLayer, services::ServeDir};

@@ -10,11 +10,9 @@ pub struct Cli {
     #[arg(
         long,
         env = "OM_DATABASE_URL",
-        default_value = "sqlite://operation-monitoring.db"
+        default_value = "sqlite://db/operation-monitoring.db"
     )]
     pub database_url: String,
-    #[arg(long, env = "OM_ADMIN_USER", default_value = "admin")]
-    pub admin_user: String,
     #[arg(long, env = "OM_ADMIN_PASSWORD", default_value = "admin123")]
     pub admin_password: String,
     #[arg(long, env = "OM_UPLOAD_DIR", default_value = "uploads")]

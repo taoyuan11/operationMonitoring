@@ -18,6 +18,11 @@ export type Instance = {
   id: string
   name: string
   region: string
+  country_code: string
+  country: string
+  province_code: string
+  province: string
+  city: string
   remark: string
   hostname: string
   os: string
@@ -82,3 +87,5 @@ export type AppearanceResponse = {
 export type ViewMode = 'grid' | 'rows'
 
 export type AdminTab = 'pending' | 'commands' | 'settings' | 'logs'
+
+export type AppPage = 'home' | AdminTab

@@ -162,11 +162,11 @@ type TerminalServerMessage =
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="emit('close')">
-    <section class="modal terminal-modal">
+  <div class="modal-backdrop" @click.self="emit('close')" @keydown.esc="emit('close')">
+    <section class="modal terminal-modal" role="dialog" aria-modal="true" aria-labelledby="terminal-title">
       <div class="terminal-head">
         <div>
-          <h2>{{ instance.name }} · Web 终端</h2>
+          <h2 id="terminal-title">{{ instance.name }} · Web 终端</h2>
           <p>{{ status }} · UTF-8</p>
         </div>
         <button class="icon-button" type="button" title="关闭" @click="emit('close')">

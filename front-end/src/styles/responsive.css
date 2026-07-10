@@ -1,61 +1,102 @@
-@media (max-width: 1180px) {
-  .topbar {
-    grid-template-columns: 1fr auto;
-  }
+@media (max-width: 1280px) {
+  .topbar { grid-template-columns: auto auto 1fr; }
+  .top-actions { grid-column: 3; grid-row: 1; justify-self: end; }
+  .top-stats { grid-column: 1 / -1; justify-content: flex-start; padding: 12px 0 2px; border-top: 1px solid var(--line); }
+  .top-stat:first-child { padding-left: 0; }
+  .board-toolbar { grid-template-columns: minmax(250px, 1fr) auto auto; }
+  .result-count { grid-column: 1 / -1; }
+  .instance-list.rows .instance-card { grid-template-columns: 1fr 1.3fr; }
+  .instance-list.rows .meta-grid { grid-column: 1 / -1; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
 
-  .top-stats {
-    grid-column: 1 / -1;
-    justify-content: flex-start;
-  }
-
-  .workspace {
-    grid-template-columns: 1fr;
-  }
-
-  .admin-pane {
-    order: -1;
-  }
+@media (max-width: 980px) {
+  .commands-layout, .settings-layout { grid-template-columns: 1fr; }
+  .recent-jobs-card { grid-column: auto; }
+  .approval-row { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .approval-time { display: none; }
+  .board-toolbar { grid-template-columns: 1fr auto; }
+  .instance-search { grid-column: 1 / -1; }
+  .sort-control { justify-self: end; }
+  .result-count { grid-column: 1 / -1; }
 }
 
 @media (max-width: 760px) {
-  .shell {
-    padding: 10px;
-  }
+  .shell { padding: 0 12px 28px; }
+  .topbar { grid-template-columns: 1fr auto; gap: 12px; min-height: 68px; padding: 10px 0; }
+  .health-pill { display: none; }
+  .top-actions { grid-column: 2; }
+  .top-stats { grid-column: 1 / -1; overflow-x: auto; padding-bottom: 4px; }
+  .top-stat { padding: 0 12px; }
+  .time-stat { padding-left: 0; }
+  .top-stat:nth-child(2) { border-right: 0; }
+  .traffic-rates { display: none; }
+  .session { display: none; }
 
-  .topbar,
-  .section-head,
-  .instance-main {
-    align-items: stretch;
-  }
+  .admin-navigation { gap: 0; margin-top: 6px; margin-bottom: 22px; }
+  .admin-navigation button { flex: 1 0 auto; min-width: max-content; min-height: 44px; padding: 0 12px; }
 
-  .section-head,
-  .instance-main {
-    flex-direction: column;
-  }
+  .summary-band { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 20px; margin-bottom: 24px; }
+  .skeleton-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .skeleton-board { grid-template-columns: 1fr; }
+  .summary-card { min-height: 96px; padding: 14px; border-bottom: 1px solid var(--line); }
+  .summary-card:nth-child(2) { border-right: 0; }
+  .summary-card:nth-child(3), .summary-card:nth-child(4) { border-bottom: 0; }
+  .summary-icon { width: 34px; height: 34px; }
+  .summary-card strong { font-size: 22px; }
+  .summary-card > div span { font-size: 12px; }
 
-  .topbar {
-    grid-template-columns: 1fr;
-  }
+  .section-head { align-items: center; }
+  .section-head p { display: none; }
+  .board-toolbar { grid-template-columns: 1fr; padding: 10px; }
+  .instance-search, .status-filter, .sort-control, .result-count { grid-column: auto; }
+  .status-filter { align-items: flex-start; flex-direction: column; }
+  .sort-control { justify-self: stretch; justify-content: space-between; }
+  .sort-control select { width: min(180px, 55%); }
+  .result-count { padding-top: 4px; }
 
-  .top-actions,
-  .instance-actions,
-  .top-stats {
-    flex-wrap: wrap;
-    justify-content: flex-start;
-  }
+  .instance-list.grid { grid-template-columns: 1fr; }
+  .instance-list.rows .instance-card { display: flex; }
+  .instance-actions { gap: 2px; }
+  .page-header { grid-template-columns: auto minmax(0, 1fr); padding-bottom: 16px; }
+  .page-count { display: none; }
+  .approval-row { grid-template-columns: auto minmax(0, 1fr); }
+  .approval-row .row-actions { grid-column: 1 / -1; padding-left: 50px; }
+  .job-table-row { grid-template-columns: 80px minmax(0, 1fr); min-height: 70px; padding: 8px 10px; }
+  .job-table-row small, .job-table-row time { grid-column: 2; }
+  .job-table-row time { color: #68736e; }
+  .background-toolbar small { flex: 1 0 100%; margin-left: 0; }
+  .terminal-screen { min-height: 320px; }
+}
 
-  .summary-band,
-  .meta-grid,
-  .instance-list.rows .instance-card {
-    grid-template-columns: 1fr;
-  }
+@media (max-width: 520px) {
+  .brand-copy .eyebrow { display: none; }
+  .brand h1 { font-size: 16px; }
+  .brand-mark { width: 38px; height: 38px; flex-basis: 38px; }
+  .top-actions .text-button { width: 36px; padding: 0; font-size: 0; gap: 0; }
+  .admin-login-button { width: 38px; padding: 0; font-size: 0; gap: 0; }
+  .admin-navigation button { min-width: 84px; padding: 0 9px; font-size: 12px; }
+  .admin-navigation button svg { width: 15px; }
+  .admin-navigation button em { position: absolute; top: 3px; right: 3px; }
 
-  .background-control {
-    grid-template-columns: 1fr;
-  }
+  .summary-card { grid-template-columns: auto 1fr; gap: 6px 9px; }
+  .summary-card > div { flex-direction: column; align-items: flex-start; gap: 1px; }
+  .summary-card small { display: none; }
+  .filter-segmented { width: 100%; }
+  .filter-segmented button { flex: 1; min-width: 0; }
+  .instance-card { padding: 14px; }
+  .metrics { grid-template-columns: 1fr; }
+  .title-line h3 { max-width: 145px; }
+  .instance-location { max-width: 210px; }
+  .meta-grid { grid-template-columns: 1fr 1fr; }
+  .page-heading-icon { width: 40px; height: 40px; }
+  .page-header h2 { font-size: 19px; }
+  .page-header p { display: none; }
+  .admin-content-card { padding: 15px; }
+  .large-background-preview, .large-background-preview img { min-height: 190px; height: 190px; }
+  .modal { padding: 18px; }
+  .login-modal { padding: 24px 18px 20px; }
+}
 
-  .brand h1 {
-    font-size: 18px;
-  }
-
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }

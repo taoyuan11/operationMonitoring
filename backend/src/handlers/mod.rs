@@ -53,7 +53,8 @@ pub async fn public_instances(
 ) -> AppResult<Json<Vec<InstanceSummary>>> {
     let records = sqlx::query_as::<_, InstanceRecord>(
         r#"
-        SELECT id, secret, name, region, remark, hostname, os, arch, agent_version,
+        SELECT id, secret, name, region, country_code, country, province_code, province, city,
+               remark, hostname, os, arch, agent_version,
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE approved = 1 AND disabled = 0
@@ -107,8 +108,8 @@ pub async fn admin_login(
     State(state): State<AppState>,
     Json(payload): Json<LoginRequest>,
 ) -> AppResult<Response> {
-    if payload.username != state.admin_user || payload.password != state.admin_password {
-        return Err(AppError::new(StatusCode::UNAUTHORIZED, "账号或密码错误"));
+    if payload.password != state.admin_password {
+        return Err(AppError::new(StatusCode::UNAUTHORIZED, "管理员密码错误"));
     }
 
     let token = Uuid::new_v4().to_string();
@@ -120,11 +121,7 @@ pub async fn admin_login(
         .insert(token.clone(), expires_at);
     write_action_log(&state.db, "admin", "login", "admin", "管理员登录").await?;
 
-    let mut response = Json(LoginResponse {
-        username: state.admin_user.clone(),
-        role: "admin",
-    })
-    .into_response();
+    let mut response = Json(LoginResponse { role: "admin" }).into_response();
     let cookie = format!(
         "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800",
         SESSION_COOKIE, token
@@ -147,7 +144,6 @@ pub async fn admin_logout(
 
     let mut response = Json(MeResponse {
         authenticated: false,
-        username: None,
     })
     .into_response();
     response.headers_mut().insert(
@@ -159,10 +155,7 @@ pub async fn admin_logout(
 
 pub async fn admin_me(State(state): State<AppState>, headers: HeaderMap) -> Json<MeResponse> {
     let authenticated = require_admin(&state, &headers).await.is_ok();
-    Json(MeResponse {
-        authenticated,
-        username: authenticated.then_some(state.admin_user.clone()),
-    })
+    Json(MeResponse { authenticated })
 }
 
 pub async fn admin_pending_instances(
@@ -205,9 +198,10 @@ pub async fn admin_approve_instance(
 
     sqlx::query(
         r#"
-        INSERT INTO instances(id, secret, name, region, remark, hostname, os, arch,
-                              agent_version, approved, disabled, first_seen, last_seen)
-        VALUES(?, ?, ?, '', '', ?, ?, ?, ?, 1, 0, ?, ?)
+        INSERT INTO instances(id, secret, name, region, country_code, country, province_code,
+                              province, city, remark, hostname, os, arch, agent_version,
+                              approved, disabled, first_seen, last_seen)
+        VALUES(?, ?, ?, '', '', '', '', '', '', '', ?, ?, ?, ?, 1, 0, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             secret = excluded.secret,
             hostname = excluded.hostname,
@@ -275,16 +269,58 @@ pub async fn admin_update_instance(
 
     let current = get_instance(&state.db, &id).await?;
     let name = non_empty_or(payload.name, current.name);
-    let region = payload.region.unwrap_or(current.region);
+    let location_changed = payload.country_code.is_some()
+        || payload.country.is_some()
+        || payload.province_code.is_some()
+        || payload.province.is_some()
+        || payload.city.is_some();
+    let country_code = payload.country_code.unwrap_or(current.country_code);
+    let country = payload.country.unwrap_or(current.country);
+    let province_code = payload.province_code.unwrap_or(current.province_code);
+    let province = payload.province.unwrap_or(current.province);
+    let city = payload.city.unwrap_or(current.city);
+    let region = if location_changed {
+        [country.as_str(), province.as_str(), city.as_str()]
+            .into_iter()
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ")
+    } else {
+        payload.region.unwrap_or(current.region)
+    };
     let remark = payload.remark.unwrap_or(current.remark);
 
-    sqlx::query("UPDATE instances SET name = ?, region = ?, remark = ? WHERE id = ?")
-        .bind(&name)
-        .bind(&region)
-        .bind(&remark)
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
+    if country.trim().is_empty() && (!province.trim().is_empty() || !city.trim().is_empty()) {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "省份和城市必须隶属于国家",
+        ));
+    }
+    if province.trim().is_empty() && !city.trim().is_empty() {
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "城市必须隶属于省份"));
+    }
+    if !country_code.is_empty()
+        && (country_code.len() != 2 || !country_code.bytes().all(|byte| byte.is_ascii_alphabetic()))
+    {
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "国家代码格式无效"));
+    }
+
+    sqlx::query(
+        "UPDATE instances SET name = ?, region = ?, country_code = ?, country = ?, \
+         province_code = ?, province = ?, city = ?, remark = ? WHERE id = ?",
+    )
+    .bind(&name)
+    .bind(&region)
+    .bind(country_code.trim().to_ascii_uppercase())
+    .bind(country.trim())
+    .bind(province_code.trim())
+    .bind(province.trim())
+    .bind(city.trim())
+    .bind(&remark)
+    .bind(&id)
+    .execute(&state.db)
+    .await?;
     write_action_log(&state.db, "admin", "update_instance", &id, "编辑实例资料").await?;
 
     let updated = get_instance(&state.db, &id).await?;

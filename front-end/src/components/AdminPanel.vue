@@ -4,7 +4,7 @@ import {
   ClipboardList,
   Image,
   ListChecks,
-  LogIn,
+  LoaderCircle,
   Plus,
   Settings,
   Terminal,
@@ -15,22 +15,18 @@ import type { ActionLog, AdminTab, CommandJob, CommandRecord, PendingInstance } 
 import { formatTime } from '../utils/format'
 
 defineProps<{
-  isAdmin: boolean
-  loading: boolean
   adminTab: AdminTab
   pendingInstances: PendingInstance[]
   commands: CommandRecord[]
   jobs: CommandJob[]
   logs: ActionLog[]
-  loginForm: {
-    username: string
-    password: string
-  }
   settingsForm: {
     retention_days: number
     background_image_url: string | null
   }
   backgroundFileName: string
+  backgroundOperation: 'uploading' | 'removing' | null
+  backgroundMessage: string
   commandForm: {
     name: string
     command: string
@@ -39,8 +35,6 @@ defineProps<{
 }>()
 
 defineEmits<{
-  'update:adminTab': [value: AdminTab]
-  login: []
   approve: [id: string]
   reject: [id: string]
   createCommand: []
@@ -52,123 +46,186 @@ defineEmits<{
 </script>
 
 <template>
-  <aside class="admin-pane">
-    <form v-if="!isAdmin" class="login-panel" @submit.prevent="$emit('login')">
-      <h2>管理员登录</h2>
-      <label>
-        账号
-        <input v-model="loginForm.username" autocomplete="username" />
-      </label>
-      <label>
-        密码
-        <input v-model="loginForm.password" type="password" autocomplete="current-password" />
-      </label>
-      <button class="primary-button" type="submit" :disabled="loading">
-        <LogIn :size="17" />登录
-      </button>
-    </form>
+  <section class="management-page">
+    <template v-if="adminTab === 'pending'">
+      <header class="page-header">
+        <div class="page-heading-icon"><ListChecks :size="22" /></div>
+        <div>
+          <span class="section-kicker">Access review</span>
+          <h2>接入审核</h2>
+          <p>审核新节点的接入请求，仅批准可信设备。</p>
+        </div>
+        <span class="page-count">{{ pendingInstances.length }} 个待处理</span>
+      </header>
 
-    <div v-else class="admin-panel">
-      <div class="tabs">
-        <button :class="{ active: adminTab === 'pending' }" type="button" @click="$emit('update:adminTab', 'pending')">
-          <ListChecks :size="16" />审批
-        </button>
-        <button :class="{ active: adminTab === 'commands' }" type="button" @click="$emit('update:adminTab', 'commands')">
-          <Terminal :size="16" />命令
-        </button>
-        <button :class="{ active: adminTab === 'settings' }" type="button" @click="$emit('update:adminTab', 'settings')">
-          <Settings :size="16" />设置
-        </button>
-        <button :class="{ active: adminTab === 'logs' }" type="button" @click="$emit('update:adminTab', 'logs')">
-          <ClipboardList :size="16" />日志
-        </button>
+      <div class="admin-content-card wide-card">
+        <div class="card-heading">
+          <div><h3>待审批节点</h3><p>节点在获得批准之前不会出现在公开实例列表中。</p></div>
+        </div>
+        <div v-if="pendingInstances.length === 0" class="page-empty">
+          <span><Check :size="24" /></span>
+          <strong>所有申请均已处理</strong>
+          <p>目前没有等待审核的新节点。</p>
+        </div>
+        <div v-else class="approval-list">
+          <article v-for="item in pendingInstances" :key="item.id" class="approval-row">
+            <span class="list-icon"><Terminal :size="17" /></span>
+            <div class="approval-identity">
+              <strong>{{ item.hostname }}</strong>
+              <span>{{ item.os }}/{{ item.arch }} · Agent {{ item.agent_version }}</span>
+            </div>
+            <div class="approval-time">
+              <span>最后请求</span>
+              <strong>{{ formatTime(item.last_seen) }}</strong>
+            </div>
+            <div class="row-actions">
+              <button class="approve-button" type="button" @click="$emit('approve', item.id)">
+                <Check :size="15" />批准
+              </button>
+              <button class="reject-button" type="button" @click="$emit('reject', item.id)">
+                <X :size="15" />拒绝
+              </button>
+            </div>
+          </article>
+        </div>
       </div>
+    </template>
 
-      <section v-if="adminTab === 'pending'" class="admin-section">
-        <h2>待审批实例</h2>
-        <p v-if="pendingInstances.length === 0" class="muted">暂无待审批实例。</p>
-        <article v-for="item in pendingInstances" :key="item.id" class="list-item">
-          <div>
-            <strong>{{ item.hostname }}</strong>
-            <span>{{ item.os }}/{{ item.arch }} · {{ formatTime(item.last_seen) }}</span>
-          </div>
-          <div class="row-actions">
-            <button class="icon-button success" type="button" title="批准" @click="$emit('approve', item.id)">
-              <Check :size="16" />
-            </button>
-            <button class="icon-button danger" type="button" title="拒绝" @click="$emit('reject', item.id)">
-              <X :size="16" />
-            </button>
-          </div>
-        </article>
-      </section>
+    <template v-if="adminTab === 'commands'">
+      <header class="page-header">
+        <div class="page-heading-icon purple"><Terminal :size="22" /></div>
+        <div>
+          <span class="section-kicker">Remote actions</span>
+          <h2>快捷命令</h2>
+          <p>维护可在实例节点上安全执行的预设操作。</p>
+        </div>
+        <span class="page-count">{{ commands.length }} 个已启用</span>
+      </header>
 
-      <section v-if="adminTab === 'commands'" class="admin-section">
-        <h2>快捷操作</h2>
-        <form class="stack-form" @submit.prevent="$emit('createCommand')">
-          <input v-model="commandForm.name" placeholder="名称，例如 重启 Nginx" />
-          <input v-model="commandForm.command" placeholder="命令，例如 systemctl restart nginx" />
-          <input v-model="commandForm.confirm_text" placeholder="确认提示，可选" />
-          <button class="primary-button" type="submit"><Plus :size="16" />添加</button>
-        </form>
-        <article v-for="command in commands" :key="command.id" class="list-item">
-          <div>
-            <strong>{{ command.name }}</strong>
-            <code>{{ command.command }}</code>
-          </div>
-          <button class="icon-button danger" type="button" title="停用" @click="$emit('removeCommand', command)">
-            <Trash2 :size="15" />
-          </button>
-        </article>
-        <h3>最近命令</h3>
-        <article v-for="job in jobs.slice(0, 5)" :key="job.id" class="job-row">
-          <span :class="['job-status', job.status]">{{ job.status }}</span>
-          <strong>{{ job.command }}</strong>
-          <small>{{ job.instance_id.slice(0, 8) }} · {{ formatTime(job.created_at) }}</small>
-        </article>
-      </section>
+      <div class="admin-page-grid commands-layout">
+        <div class="admin-content-card">
+          <div class="card-heading"><div><h3>创建快捷命令</h3><p>添加后可直接在主页节点卡片中执行。</p></div></div>
+          <form class="stack-form page-form" @submit.prevent="$emit('createCommand')">
+            <label><span>显示名称</span><input v-model="commandForm.name" required placeholder="例如：重启 Nginx" /></label>
+            <label><span>执行命令</span><input v-model="commandForm.command" required placeholder="systemctl restart nginx" /></label>
+            <label><span>确认提示 <i>可选</i></span><input v-model="commandForm.confirm_text" placeholder="执行前显示的二次确认提示" /></label>
+            <button class="primary-button" type="submit"><Plus :size="16" />添加快捷命令</button>
+          </form>
+        </div>
 
-      <section v-if="adminTab === 'settings'" class="admin-section">
-        <h2>系统设置</h2>
-        <form class="stack-form" @submit.prevent="$emit('saveSettings')">
-          <label>
-            指标保留天数
-            <input v-model.number="settingsForm.retention_days" min="1" max="365" type="number" />
-          </label>
-          <button class="primary-button" type="submit"><Settings :size="16" />保存设置</button>
-        </form>
-        <div class="background-control">
-          <div class="background-preview" :class="{ empty: !settingsForm.background_image_url }">
-            <img v-if="settingsForm.background_image_url" :src="settingsForm.background_image_url" alt="" />
-            <Image v-else :size="28" />
-          </div>
-          <div class="background-actions">
-            <label class="file-button">
-              <Image :size="16" />
-              上传背景
-              <input accept="image/png,image/jpeg,image/webp" type="file" @change="$emit('selectBackgroundImage', $event)" />
-            </label>
-            <button
-              class="text-button compact"
-              type="button"
-              :disabled="!settingsForm.background_image_url"
-              @click="$emit('clearBackgroundImage')"
-            >
-              <X :size="15" />清除背景
-            </button>
-            <small>{{ backgroundFileName || 'PNG / JPEG / WebP，最大 5 MB' }}</small>
+        <div class="admin-content-card">
+          <div class="card-heading"><div><h3>已启用命令</h3><p>当前允许执行的命令白名单。</p></div></div>
+          <div v-if="commands.length === 0" class="compact-empty">暂无快捷命令</div>
+          <div class="command-list">
+            <article v-for="command in commands" :key="command.id" class="command-row">
+              <span class="list-icon"><Terminal :size="16" /></span>
+              <div><strong>{{ command.name }}</strong><code>{{ command.command }}</code></div>
+              <button class="icon-button danger" type="button" title="停用" @click="$emit('removeCommand', command)">
+                <Trash2 :size="15" />
+              </button>
+            </article>
           </div>
         </div>
-      </section>
 
-      <section v-if="adminTab === 'logs'" class="admin-section">
-        <h2>操作日志</h2>
-        <article v-for="log in logs" :key="log.id" class="log-row">
-          <strong>{{ log.action }}</strong>
-          <span>{{ log.detail }}</span>
-          <small>{{ log.actor }} · {{ formatTime(log.created_at) }}</small>
-        </article>
-      </section>
-    </div>
-  </aside>
+        <div class="admin-content-card recent-jobs-card">
+          <div class="card-heading"><div><h3>最近执行记录</h3><p>最近提交到节点的命令任务。</p></div></div>
+          <div v-if="jobs.length === 0" class="compact-empty">暂无执行记录</div>
+          <div class="jobs-table" v-else>
+            <article v-for="job in jobs.slice(0, 10)" :key="job.id" class="job-table-row">
+              <span :class="['job-status', job.status]">{{ job.status }}</span>
+              <strong>{{ job.command }}</strong>
+              <small>节点 {{ job.instance_id.slice(0, 8) }}</small>
+              <time>{{ formatTime(job.created_at) }}</time>
+            </article>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template v-if="adminTab === 'settings'">
+      <header class="page-header">
+        <div class="page-heading-icon amber"><Settings :size="22" /></div>
+        <div>
+          <span class="section-kicker">System preferences</span>
+          <h2>系统设置</h2>
+          <p>管理数据生命周期与监控页面的视觉外观。</p>
+        </div>
+      </header>
+
+      <div class="admin-page-grid settings-layout">
+        <div class="admin-content-card">
+          <div class="card-heading"><div><h3>数据保留</h3><p>超过保留期限的历史指标会被自动清理。</p></div></div>
+          <form class="stack-form page-form" @submit.prevent="$emit('saveSettings')">
+            <label>
+              <span>指标保留天数</span>
+              <input v-model.number="settingsForm.retention_days" min="1" max="365" type="number" />
+            </label>
+            <small class="form-help">可设置 1 至 365 天，不影响节点基础信息。</small>
+            <button class="primary-button" type="submit"><Settings :size="16" />保存设置</button>
+          </form>
+        </div>
+
+        <div class="admin-content-card background-card">
+          <div class="card-heading"><div><h3>页面背景</h3><p>自定义监控页面背景，系统会自动添加深色遮罩。</p></div></div>
+          <div :class="['large-background-preview', { empty: !settingsForm.background_image_url }]">
+            <img v-if="settingsForm.background_image_url" :src="settingsForm.background_image_url" alt="当前背景" />
+            <div v-else><Image :size="28" /><span>当前使用默认渐变背景</span></div>
+          </div>
+          <div class="background-toolbar">
+            <label :class="['file-button', { disabled: backgroundOperation }]">
+              <LoaderCircle v-if="backgroundOperation === 'uploading'" class="spin" :size="15" />
+              <Image v-else :size="15" />
+              {{ backgroundOperation === 'uploading' ? '正在上传' : '选择图片' }}
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                :disabled="Boolean(backgroundOperation)"
+                @change="$emit('selectBackgroundImage', $event)"
+              />
+            </label>
+            <button
+              v-if="settingsForm.background_image_url"
+              class="text-button danger"
+              type="button"
+              :disabled="Boolean(backgroundOperation)"
+              @click="$emit('clearBackgroundImage')"
+            >
+              <LoaderCircle v-if="backgroundOperation === 'removing'" class="spin" :size="14" />
+              <Trash2 v-else :size="14" />
+              {{ backgroundOperation === 'removing' ? '正在移除' : '移除背景' }}
+            </button>
+            <small :class="{ success: backgroundMessage }">{{ backgroundMessage || backgroundFileName || '支持 PNG、JPEG、WebP，最大 5MB' }}</small>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template v-if="adminTab === 'logs'">
+      <header class="page-header">
+        <div class="page-heading-icon cyan"><ClipboardList :size="22" /></div>
+        <div>
+          <span class="section-kicker">Audit trail</span>
+          <h2>操作日志</h2>
+          <p>查看管理员最近执行的审批、配置和节点操作。</p>
+        </div>
+        <span class="page-count">最近 {{ Math.min(logs.length, 20) }} 条</span>
+      </header>
+
+      <div class="admin-content-card wide-card">
+        <div class="card-heading"><div><h3>管理操作记录</h3><p>按操作时间倒序显示。</p></div></div>
+        <div v-if="logs.length === 0" class="page-empty">
+          <span><ClipboardList :size="24" /></span><strong>暂无操作记录</strong>
+        </div>
+        <div v-else class="logs-table">
+          <div class="logs-table-head"><span>操作</span><span>详细信息</span><span>目标</span><span>时间</span></div>
+          <article v-for="log in logs.slice(0, 20)" :key="log.id" class="logs-table-row">
+            <strong>{{ log.action }}</strong>
+            <p>{{ log.detail }}</p>
+            <span>{{ log.target }}</span>
+            <time>{{ formatTime(log.created_at) }}</time>
+          </article>
+        </div>
+      </div>
+    </template>
+  </section>
 </template>

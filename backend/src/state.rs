@@ -12,7 +12,6 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
-    pub admin_user: String,
     pub admin_password: String,
     pub upload_dir: PathBuf,
     pub sessions: Arc<RwLock<HashMap<String, i64>>>,
@@ -24,7 +23,6 @@ impl AppState {
     pub fn new(db: SqlitePool, cli: Cli) -> Self {
         Self {
             db,
-            admin_user: cli.admin_user,
             admin_password: cli.admin_password,
             upload_dir: cli.upload_dir,
             sessions: Arc::new(RwLock::new(HashMap::new())),

@@ -66,7 +66,7 @@ instanceEnd/src/
 
 ```bash
 cd backend
-OM_ADMIN_USER=admin OM_ADMIN_PASSWORD=admin123 cargo run
+OM_ADMIN_PASSWORD=admin123 cargo run
 ```
 
 启动前端：
@@ -126,10 +126,13 @@ cargo run -- stop
 
 ```bash
 OM_BIND=127.0.0.1:13500
-OM_DATABASE_URL=sqlite://operation-monitoring.db
-OM_ADMIN_USER=admin
+OM_DATABASE_URL=sqlite://db/operation-monitoring.db
 OM_ADMIN_PASSWORD=admin123
 ```
+
+未设置 `OM_DATABASE_URL` 时，后端会在启动进程的当前工作目录下自动创建
+`db/operation-monitoring.db`；SQLite 产生的 WAL、SHM 等运行时文件也位于该目录，
+不会作为项目文件提交。
 
 实例端：
 

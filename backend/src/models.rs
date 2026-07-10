@@ -9,20 +9,17 @@ pub struct HealthResponse {
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
-    pub username: String,
     pub password: String,
 }
 
 #[derive(Serialize)]
 pub struct LoginResponse {
-    pub username: String,
     pub role: &'static str,
 }
 
 #[derive(Serialize)]
 pub struct MeResponse {
     pub authenticated: bool,
-    pub username: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +73,11 @@ pub struct InstanceRecord {
     pub secret: String,
     pub name: String,
     pub region: String,
+    pub country_code: String,
+    pub country: String,
+    pub province_code: String,
+    pub province: String,
+    pub city: String,
     pub remark: String,
     pub hostname: String,
     pub os: String,
@@ -132,6 +134,11 @@ pub struct InstanceSummary {
     pub id: String,
     pub name: String,
     pub region: String,
+    pub country_code: String,
+    pub country: String,
+    pub province_code: String,
+    pub province: String,
+    pub city: String,
     pub remark: String,
     pub hostname: String,
     pub os: String,
@@ -154,6 +161,11 @@ pub struct MetricsQuery {
 pub struct UpdateInstanceRequest {
     pub name: Option<String>,
     pub region: Option<String>,
+    pub country_code: Option<String>,
+    pub country: Option<String>,
+    pub province_code: Option<String>,
+    pub province: Option<String>,
+    pub city: Option<String>,
     pub remark: Option<String>,
 }
 

@@ -1,5 +1,6 @@
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from '../api/http'
+import { getCountryOption } from '../data/countries'
 import type {
   ActionLog,
   AdminTab,
@@ -26,20 +27,26 @@ export function useMonitoringConsole() {
   const jobs = ref<CommandJob[]>([])
   const logs = ref<ActionLog[]>([])
   const isAdmin = ref(false)
-  const username = ref<string | null>(null)
+  const sessionReady = ref(false)
+  const publicReady = ref(false)
   const loading = ref(false)
+  const refreshing = ref(false)
   const errorMessage = ref('')
   const viewMode = ref<ViewMode>('grid')
   const adminTab = ref<AdminTab>('pending')
   const backgroundImageUrl = ref<string | null>(null)
   const currentTime = ref(new Date())
   const backgroundFileName = ref('')
+  const backgroundOperation = ref<'uploading' | 'removing' | null>(null)
+  const backgroundMessage = ref('')
   const trafficSnapshot = ref<TrafficSnapshot | null>(null)
   const networkRxRate = ref(0)
   const networkTxRate = ref(0)
+  let publicPollTimer: number | null = null
+  let clockTimer: number | null = null
+  let publicRequestInFlight = false
 
   const loginForm = reactive({
-    username: 'admin',
     password: '',
   })
 
@@ -57,7 +64,8 @@ export function useMonitoringConsole() {
   const editInstance = ref<Instance | null>(null)
   const editForm = reactive({
     name: '',
-    region: '',
+    country_code: '',
+    country: '',
     remark: '',
   })
 
@@ -68,10 +76,12 @@ export function useMonitoringConsole() {
   })
 
   const onlineCount = computed(() => instances.value.filter((item) => item.online).length)
-  const avgCpu = computed(() => average(instances.value.map((item) => item.metrics?.cpu_percent)))
+  const avgCpu = computed(() =>
+    average(instances.value.filter((item) => item.online).map((item) => item.metrics?.cpu_percent)),
+  )
   const avgMemory = computed(() =>
     average(
-      instances.value.map((item) =>
+      instances.value.filter((item) => item.online).map((item) =>
         item.metrics && item.metrics.memory_total > 0
           ? (item.metrics.memory_used / item.metrics.memory_total) * 100
           : null,
@@ -93,20 +103,36 @@ export function useMonitoringConsole() {
   })
 
   onMounted(async () => {
-    await Promise.all([loadAppearance(), loadPublic(), checkSession()])
-    window.setInterval(loadPublic, 5000)
-    window.setInterval(() => {
+    const initialResults = await Promise.allSettled([loadAppearance(), loadPublic(), checkSession()])
+    const publicResult = initialResults[1]
+    if (publicResult.status === 'rejected') {
+      errorMessage.value = publicResult.reason instanceof Error
+        ? publicResult.reason.message
+        : '暂时无法加载监控数据'
+    }
+    sessionReady.value = true
+    publicReady.value = true
+
+    publicPollTimer = window.setInterval(pollPublic, 5000)
+    clockTimer = window.setInterval(() => {
       currentTime.value = new Date()
     }, 1000)
   })
 
-  async function guarded(task: () => Promise<void>) {
+  onBeforeUnmount(() => {
+    if (publicPollTimer !== null) window.clearInterval(publicPollTimer)
+    if (clockTimer !== null) window.clearInterval(clockTimer)
+  })
+
+  async function guarded(task: () => Promise<void>): Promise<boolean> {
     loading.value = true
     errorMessage.value = ''
     try {
       await task()
+      return true
     } catch (error) {
       errorMessage.value = error instanceof Error ? error.message : '操作失败'
+      return false
     } finally {
       loading.value = false
     }
@@ -118,15 +144,26 @@ export function useMonitoringConsole() {
     instances.value = nextInstances
   }
 
+  async function pollPublic() {
+    if (publicRequestInFlight) return
+    publicRequestInFlight = true
+    try {
+      await loadPublic()
+    } catch {
+      // Keep the last valid snapshot during transient network failures.
+    } finally {
+      publicRequestInFlight = false
+    }
+  }
+
   async function loadAppearance() {
     const appearance = await api<AppearanceResponse>('/api/public/appearance')
     applyAppearance(appearance.background_image_url)
   }
 
   async function checkSession() {
-    const me = await api<{ authenticated: boolean; username: string | null }>('/api/admin/me')
+    const me = await api<{ authenticated: boolean }>('/api/admin/me')
     isAdmin.value = me.authenticated
-    username.value = me.username
     if (me.authenticated) {
       await loadAdminData()
     }
@@ -150,22 +187,25 @@ export function useMonitoringConsole() {
   }
 
   function refreshAll() {
-    guarded(async () => {
+    if (refreshing.value) return
+    refreshing.value = true
+    void guarded(async () => {
       await Promise.all([loadPublic(), loadAppearance()])
       if (isAdmin.value) {
         await loadAdminData()
       }
+    }).finally(() => {
+      refreshing.value = false
     })
   }
 
   function login() {
     guarded(async () => {
-      const me = await api<{ username: string }>('/api/admin/login', {
+      await api<{ role: 'admin' }>('/api/admin/login', {
         method: 'POST',
         body: JSON.stringify(loginForm),
       })
       isAdmin.value = true
-      username.value = me.username
       loginForm.password = ''
       await loadAdminData()
     })
@@ -175,7 +215,6 @@ export function useMonitoringConsole() {
     guarded(async () => {
       await api('/api/admin/logout', { method: 'POST' })
       isAdmin.value = false
-      username.value = null
       pendingInstances.value = []
       commands.value = []
       jobs.value = []
@@ -198,9 +237,11 @@ export function useMonitoringConsole() {
   }
 
   function openEdit(instance: Instance) {
+    const country = getCountryOption(instance.country_code)
     editInstance.value = instance
     editForm.name = instance.name
-    editForm.region = instance.region
+    editForm.country_code = country?.code || ''
+    editForm.country = country?.name || ''
     editForm.remark = instance.remark
   }
 
@@ -214,7 +255,12 @@ export function useMonitoringConsole() {
     guarded(async () => {
       await api(`/api/admin/instances/${id}`, {
         method: 'PATCH',
-        body: JSON.stringify(editForm),
+        body: JSON.stringify({
+          ...editForm,
+          province_code: '',
+          province: '',
+          city: '',
+        }),
       })
       editInstance.value = null
       await loadPublic()
@@ -222,7 +268,6 @@ export function useMonitoringConsole() {
   }
 
   function disableInstance(instance: Instance) {
-    if (!window.confirm(`停用实例 ${instance.name}？停用后将不再接受上报。`)) return
     guarded(async () => {
       await api(`/api/admin/instances/${instance.id}/disable`, { method: 'POST' })
       await loadPublic()
@@ -230,7 +275,6 @@ export function useMonitoringConsole() {
   }
 
   function deleteInstance(instance: Instance) {
-    if (!window.confirm(`删除实例 ${instance.name} 及历史指标？此操作不可恢复。`)) return
     guarded(async () => {
       await api(`/api/admin/instances/${instance.id}`, { method: 'DELETE' })
       await Promise.all([loadPublic(), loadAdminData()])
@@ -251,7 +295,6 @@ export function useMonitoringConsole() {
   }
 
   function removeCommand(command: CommandRecord) {
-    if (!window.confirm(`停用快捷操作 ${command.name}？`)) return
     guarded(async () => {
       await api(`/api/admin/commands/${command.id}`, { method: 'DELETE' })
       await loadAdminData()
@@ -259,8 +302,6 @@ export function useMonitoringConsole() {
   }
 
   function runCommand(instance: Instance, command: CommandRecord) {
-    const prompt = command.confirm_text || `确认在 ${instance.name} 上执行：${command.command}`
-    if (!window.confirm(prompt)) return
     guarded(async () => {
       await api(`/api/admin/instances/${instance.id}/commands/${command.id}/run`, {
         method: 'POST',
@@ -279,12 +320,27 @@ export function useMonitoringConsole() {
     })
   }
 
-  function selectBackgroundImage(event: Event) {
+  async function selectBackgroundImage(event: Event) {
     const input = event.target as HTMLInputElement
     const file = input.files?.[0]
     if (!file) return
+
+    backgroundMessage.value = ''
+    errorMessage.value = ''
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+      errorMessage.value = '仅支持 PNG、JPEG、WebP 图片'
+      input.value = ''
+      return
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      errorMessage.value = '图片不能超过 5 MB'
+      input.value = ''
+      return
+    }
+
     backgroundFileName.value = file.name
-    guarded(async () => {
+    backgroundOperation.value = 'uploading'
+    const success = await guarded(async () => {
       const body = new FormData()
       body.append('image', file)
       const settings = await api<SettingsResponse>('/api/admin/settings/background-image', {
@@ -292,23 +348,27 @@ export function useMonitoringConsole() {
         body,
       })
       applyAppearance(settings.background_image_url)
-      settingsForm.background_image_url = settings.background_image_url
-      input.value = ''
-      backgroundFileName.value = ''
       await loadAdminData()
     })
+    input.value = ''
+    backgroundFileName.value = ''
+    backgroundOperation.value = null
+    if (success) backgroundMessage.value = '背景图片已更新并立即生效'
   }
 
-  function clearBackgroundImage() {
-    guarded(async () => {
+  async function clearBackgroundImage() {
+    backgroundMessage.value = ''
+    backgroundOperation.value = 'removing'
+    const success = await guarded(async () => {
       const settings = await api<SettingsResponse>('/api/admin/settings/background-image', {
         method: 'DELETE',
       })
       applyAppearance(settings.background_image_url)
-      settingsForm.background_image_url = settings.background_image_url
-      backgroundFileName.value = ''
       await loadAdminData()
     })
+    backgroundOperation.value = null
+    backgroundFileName.value = ''
+    if (success) backgroundMessage.value = '已恢复默认背景'
   }
 
   function openTerminal(instance: Instance) {
@@ -347,13 +407,17 @@ export function useMonitoringConsole() {
     jobs,
     logs,
     isAdmin,
-    username,
+    sessionReady,
+    publicReady,
     loading,
+    refreshing,
     errorMessage,
     viewMode,
     adminTab,
     backgroundImageUrl,
     backgroundFileName,
+    backgroundOperation,
+    backgroundMessage,
     currentTime,
     loginForm,
     settingsForm,

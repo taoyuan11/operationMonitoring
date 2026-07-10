@@ -1,5 +1,6 @@
-use std::{str::FromStr, time::Duration};
+use std::{fs, str::FromStr, time::Duration};
 
+use anyhow::Context;
 use axum::http::StatusCode;
 use sqlx::{
     SqlitePool,
@@ -21,6 +22,15 @@ pub async fn connect_db(database_url: &str) -> anyhow::Result<SqlitePool> {
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true);
 
+    if let Some(parent) = options
+        .get_filename()
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create database directory {}", parent.display()))?;
+    }
+
     Ok(SqlitePoolOptions::new()
         .max_connections(8)
         .connect_with(options)
@@ -35,6 +45,11 @@ pub async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             secret TEXT NOT NULL,
             name TEXT NOT NULL,
             region TEXT NOT NULL DEFAULT '',
+            country_code TEXT NOT NULL DEFAULT '',
+            country TEXT NOT NULL DEFAULT '',
+            province_code TEXT NOT NULL DEFAULT '',
+            province TEXT NOT NULL DEFAULT '',
+            city TEXT NOT NULL DEFAULT '',
             remark TEXT NOT NULL DEFAULT '',
             hostname TEXT NOT NULL DEFAULT '',
             os TEXT NOT NULL DEFAULT '',
@@ -49,6 +64,8 @@ pub async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(db)
     .await?;
+
+    ensure_instance_location_columns(db).await?;
 
     sqlx::query(
         r#"
@@ -178,6 +195,31 @@ pub async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn ensure_instance_location_columns(db: &SqlitePool) -> anyhow::Result<()> {
+    let columns =
+        sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('instances')")
+            .fetch_all(db)
+            .await?;
+
+    for (name, definition) in [
+        ("country_code", "TEXT NOT NULL DEFAULT ''"),
+        ("country", "TEXT NOT NULL DEFAULT ''"),
+        ("province_code", "TEXT NOT NULL DEFAULT ''"),
+        ("province", "TEXT NOT NULL DEFAULT ''"),
+        ("city", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            sqlx::query(&format!(
+                "ALTER TABLE instances ADD COLUMN {name} {definition}"
+            ))
+            .execute(db)
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn register_or_touch_pending(
     db: &SqlitePool,
     payload: &AgentRegisterRequest,
@@ -226,7 +268,8 @@ pub async fn get_instance(db: &SqlitePool, id: &str) -> AppResult<InstanceRecord
 pub async fn get_instance_optional(db: &SqlitePool, id: &str) -> AppResult<Option<InstanceRecord>> {
     let record = sqlx::query_as::<_, InstanceRecord>(
         r#"
-        SELECT id, secret, name, region, remark, hostname, os, arch, agent_version,
+        SELECT id, secret, name, region, country_code, country, province_code, province, city,
+               remark, hostname, os, arch, agent_version,
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE id = ?
@@ -265,6 +308,11 @@ pub fn instance_summary(
         id: record.id,
         name: record.name,
         region: record.region,
+        country_code: record.country_code,
+        country: record.country,
+        province_code: record.province_code,
+        province: record.province,
+        city: record.city,
         remark: record.remark,
         hostname: record.hostname,
         os: record.os,
@@ -335,4 +383,59 @@ pub async fn write_action_log(
     .execute(db)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn init_db_migrates_existing_instance_locations() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory database");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE instances (
+                id TEXT PRIMARY KEY,
+                secret TEXT NOT NULL,
+                name TEXT NOT NULL,
+                region TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                hostname TEXT NOT NULL DEFAULT '',
+                os TEXT NOT NULL DEFAULT '',
+                arch TEXT NOT NULL DEFAULT '',
+                agent_version TEXT NOT NULL DEFAULT '',
+                approved INTEGER NOT NULL DEFAULT 1,
+                disabled INTEGER NOT NULL DEFAULT 0,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("create legacy instances table");
+        sqlx::query(
+            "INSERT INTO instances(id, secret, name, region, first_seen) VALUES('old', 'secret', 'Old', '上海', 1)",
+        )
+        .execute(&db)
+        .await
+        .expect("insert legacy instance");
+
+        init_db(&db).await.expect("migrate database");
+
+        let record = get_instance(&db, "old")
+            .await
+            .expect("load migrated instance");
+        assert_eq!(record.region, "上海");
+        assert_eq!(record.country_code, "");
+        assert_eq!(record.country, "");
+        assert_eq!(record.province_code, "");
+        assert_eq!(record.province, "");
+        assert_eq!(record.city, "");
+    }
 }

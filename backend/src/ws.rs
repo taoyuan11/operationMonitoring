@@ -13,6 +13,7 @@ use crate::{
         AgentInbound, AgentOutbound, MetricPayload, TerminalClientMessage, TerminalServerMessage,
     },
     state::{AgentHandle, AppState, TerminalSessionHandle},
+    updates::{confirm_update_version, offer_update_on_connect, record_update_status},
     utils::now_ts,
 };
 
@@ -34,6 +35,7 @@ pub async fn agent_socket(state: AppState, instance_id: String, socket: WebSocke
         .bind(&instance_id)
         .execute(&state.db)
         .await;
+    offer_update_on_connect(&state, &instance_id).await;
 
     info!(%instance_id, %connection_id, "agent websocket connected");
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -123,6 +125,9 @@ async fn handle_agent_message(
             os,
             arch,
             agent_version,
+            package_type,
+            native_arch,
+            update_privileged,
             metrics,
         } => {
             store_metrics(
@@ -132,6 +137,9 @@ async fn handle_agent_message(
                 &os,
                 &arch,
                 &agent_version,
+                package_type.as_deref(),
+                native_arch.as_deref(),
+                update_privileged,
                 metrics,
             )
             .await?;
@@ -180,6 +188,26 @@ async fn handle_agent_message(
             )
             .await;
         }
+        AgentInbound::UpdateStatus {
+            release_id,
+            artifact_id,
+            version,
+            retry_count,
+            status,
+            message,
+        } => {
+            record_update_status(
+                state,
+                instance_id,
+                &release_id,
+                &artifact_id,
+                &version,
+                retry_count,
+                &status,
+                message.as_deref(),
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -191,12 +219,18 @@ async fn store_metrics(
     os: &str,
     arch: &str,
     agent_version: &str,
+    package_type: Option<&str>,
+    native_arch: Option<&str>,
+    update_privileged: Option<bool>,
     metrics: MetricPayload,
 ) -> AppResult<()> {
     sqlx::query(
         r#"
         UPDATE instances
-        SET hostname = ?, os = ?, arch = ?, agent_version = ?, last_seen = ?
+        SET hostname = ?, os = ?, arch = ?, agent_version = ?,
+            package_type = COALESCE(?, package_type),
+            native_arch = COALESCE(?, native_arch),
+            update_privileged = COALESCE(?, update_privileged), last_seen = ?
         WHERE id = ?
         "#,
     )
@@ -204,10 +238,15 @@ async fn store_metrics(
     .bind(os)
     .bind(arch)
     .bind(agent_version)
+    .bind(package_type)
+    .bind(native_arch)
+    .bind(update_privileged.map(i64::from))
     .bind(now_ts())
     .bind(instance_id)
     .execute(&state.db)
     .await?;
+
+    confirm_update_version(state, instance_id, agent_version).await?;
 
     sqlx::query(
         r#"

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Operation Monitoring agent")]
+#[command(name = "om-agent", version, about = "Operation Monitoring agent")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: AgentCommand,
@@ -13,8 +13,23 @@ pub struct Cli {
     pub daemon_child: bool,
 }
 
-#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum AgentCommand {
+    /// Install the agent as a system service
+    Install {
+        /// Run without prompts; --server is required
+        #[arg(long)]
+        non_interactive: bool,
+        /// Accept destructive or system-wide changes without confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Remove the system service, executable, configuration, and data
+    Uninstall {
+        /// Confirm removal without prompting
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Start the agent in the background
     Start,
     /// Stop the background agent
@@ -27,6 +42,13 @@ pub enum AgentCommand {
     Status,
     /// Run the agent in the foreground and print logs
     Log,
+    #[command(name = "service-run", hide = true)]
+    ServiceRun,
+    #[command(name = "apply-update", hide = true)]
+    ApplyUpdate {
+        #[arg(long)]
+        plan_file: PathBuf,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -48,6 +70,9 @@ pub struct AgentConfig {
     /// File that receives background process output
     #[arg(long, env = "OM_AGENT_LOG_FILE", global = true)]
     pub log_file: Option<PathBuf>,
+    /// Persistent directory used for downloaded packages and update state
+    #[arg(long, env = "OM_AGENT_UPDATE_DIR", global = true)]
+    pub update_dir: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -66,12 +91,21 @@ impl AgentConfig {
         if let Some(path) = &self.log_file {
             command.arg("--log-file").arg(path);
         }
+        if let Some(path) = &self.update_dir {
+            command.arg("--update-dir").arg(path);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn exposes_the_short_command_name() {
+        assert_eq!(Cli::command().get_name(), "om-agent");
+    }
 
     #[test]
     fn accepts_global_options_after_subcommand() {
@@ -91,6 +125,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_unattended_install_options() {
+        let cli = Cli::try_parse_from([
+            "agent",
+            "install",
+            "--non-interactive",
+            "--yes",
+            "--server",
+            "https://monitor.example",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.command,
+            AgentCommand::Install {
+                non_interactive: true,
+                yes: true,
+            }
+        );
+        assert_eq!(cli.agent.server, "https://monitor.example");
+    }
+
+    #[test]
     fn stop_timeout_defaults_to_ten_seconds() {
         let cli = Cli::try_parse_from(["agent", "stop"]).unwrap();
 
@@ -107,5 +163,17 @@ mod tests {
     #[test]
     fn run_is_not_a_supported_command() {
         assert!(Cli::try_parse_from(["agent", "run"]).is_err());
+    }
+
+    #[test]
+    fn accepts_a_persistent_update_directory() {
+        let cli =
+            Cli::try_parse_from(["agent", "log", "--update-dir", "/var/lib/om-agent/updates"])
+                .unwrap();
+
+        assert_eq!(
+            cli.agent.update_dir,
+            Some(PathBuf::from("/var/lib/om-agent/updates"))
+        );
     }
 }

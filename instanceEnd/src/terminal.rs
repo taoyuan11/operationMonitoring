@@ -10,7 +10,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::models::AgentInbound;
+use crate::{activity::ActivityTracker, models::AgentInbound};
 
 enum TerminalControl {
     Input(Vec<u8>),
@@ -21,22 +21,38 @@ enum TerminalControl {
 pub struct TerminalManager {
     sessions: HashMap<String, mpsc::Sender<TerminalControl>>,
     outbound: tokio_mpsc::UnboundedSender<AgentInbound>,
+    activity: ActivityTracker,
 }
 
 impl TerminalManager {
-    pub fn new(outbound: tokio_mpsc::UnboundedSender<AgentInbound>) -> Self {
+    pub fn new(
+        outbound: tokio_mpsc::UnboundedSender<AgentInbound>,
+        activity: ActivityTracker,
+    ) -> Self {
         Self {
             sessions: HashMap::new(),
             outbound,
+            activity,
         }
     }
 
     pub fn open(&mut self, session_id: String, cols: u16, rows: u16) {
         self.close(&session_id);
+        let Some(activity_guard) = self.activity.try_enter() else {
+            let _ = self.outbound.send(AgentInbound::TerminalClosed {
+                session_id,
+                exit_code: None,
+                reason: Some("agent update is waiting to install".to_string()),
+            });
+            return;
+        };
         let (control_tx, control_rx) = mpsc::channel();
         self.sessions.insert(session_id.clone(), control_tx);
         let outbound = self.outbound.clone();
-        thread::spawn(move || run_terminal(session_id, cols, rows, control_rx, outbound));
+        thread::spawn(move || {
+            let _activity_guard = activity_guard;
+            run_terminal(session_id, cols, rows, control_rx, outbound);
+        });
     }
 
     pub fn input(&self, session_id: &str, encoded_data: &str) {
@@ -220,7 +236,7 @@ mod tests {
     #[test]
     fn interactive_terminal_keeps_context_and_utf8_bytes() {
         let (outbound, mut inbound) = tokio_mpsc::unbounded_channel();
-        let mut manager = TerminalManager::new(outbound);
+        let mut manager = TerminalManager::new(outbound, ActivityTracker::default());
         let session_id = "terminal-test".to_string();
         manager.open(session_id.clone(), 80, 24);
 

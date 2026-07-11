@@ -117,12 +117,34 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
             println!("stop requested; agent is shutting down");
             Ok(())
         },
-        result = tokio::signal::ctrl_c() => {
-            result.context("failed to listen for Ctrl+C")?;
-            println!("interrupt received; agent is shutting down");
+        result = wait_for_shutdown_signal() => {
+            result?;
+            println!("shutdown signal received; agent is shutting down");
             Ok(())
         },
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt =
+        signal(SignalKind::interrupt()).context("failed to listen for the interrupt signal")?;
+    let mut terminate =
+        signal(SignalKind::terminate()).context("failed to listen for the terminate signal")?;
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for Ctrl+C")
 }
 
 fn wait_until_ready(child: &mut Child, pid: u32, paths: &RuntimePaths) -> Result<()> {
@@ -291,7 +313,7 @@ impl RuntimePaths {
             Some(path) => path.clone(),
             None => ProjectDirs::from("com", "operation-monitoring", "agent")
                 .map(|dirs| dirs.data_local_dir().join("runtime"))
-                .unwrap_or(std::env::current_dir()?.join(".operation-monitoring-agent")),
+                .unwrap_or(std::env::current_dir()?.join(".om-agent")),
         };
         let log_file = config
             .log_file
@@ -384,6 +406,7 @@ mod tests {
             report_interval: 5,
             state_dir: Some(state_dir),
             log_file: None,
+            update_dir: None,
         }
     }
 

@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use tokio::{process::Command, time::timeout};
 
+use crate::activity::ActivityTracker;
+
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 pub async fn execute_command(command: &str) -> (i64, String) {
@@ -17,6 +19,16 @@ pub async fn execute_command(command: &str) -> (i64, String) {
         Ok(Err(error)) => (-1, format!("failed to execute command: {error}")),
         Err(_) => (-1, "command timed out after 120 seconds".to_string()),
     }
+}
+
+pub async fn execute_tracked_command(command: &str, activity: &ActivityTracker) -> (i64, String) {
+    let Some(_guard) = activity.try_enter() else {
+        return (
+            -1,
+            "command rejected because an agent update is waiting to install".to_string(),
+        );
+    };
+    execute_command(command).await
 }
 
 fn truncate_utf8(output: &mut String, max_bytes: usize) {

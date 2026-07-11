@@ -82,22 +82,22 @@ pnpm dev
 ```bash
 cd instanceEnd
 cargo build --release
-./target/release/instanceEnd start --server http://127.0.0.1:13500
+./target/release/om-agent start --server http://127.0.0.1:13500
 ```
 
-`start` 会在后台启动实例端并立即释放命令行，标准输出和错误输出会写入命令返回的日志路径。Windows 使用同目录下的 `instanceEnd.exe`，后台子进程不会创建控制台窗口。
+`start` 会在后台启动实例端并立即释放命令行，标准输出和错误输出会写入命令返回的日志路径。Windows 使用同目录下的 `om-agent.exe`，后台子进程不会创建控制台窗口。
 
 查询状态或停止实例端：
 
 ```bash
-./target/release/instanceEnd status
-./target/release/instanceEnd stop
+./target/release/om-agent status
+./target/release/om-agent stop
 ```
 
 需要在前台运行实例端并直接向终端打印日志时，使用 `log`：
 
 ```bash
-./target/release/instanceEnd log --server http://127.0.0.1:13500
+./target/release/om-agent log --server http://127.0.0.1:13500
 ```
 
 实例端不提供 `run` 命令。`log` 会持续运行，按 `Ctrl+C` 退出；同一状态目录下不能同时运行前台和后台实例端。
@@ -111,7 +111,144 @@ cargo run -- log
 cargo run -- stop
 ```
 
-前端开发服务器已在 `front-end/vite.config.ts` 中代理 `/api` 到 `http://127.0.0.1:13500`，WebSocket 也会透传。
+## 实例端一键安装
+
+实例端二进制支持显式的系统级安装命令。安装过程会询问并校验后端地址，自动通过 `sudo` 或 Windows UAC 请求管理员权限，将程序复制到系统命令目录、注册开机自启并立即启动：
+
+```bash
+./om-agent install
+```
+
+批量部署可使用无人值守模式；该模式必须显式指定后端地址：
+
+```bash
+./om-agent install --non-interactive --yes --server https://monitor.example.com
+```
+
+- Linux：安装到 `/usr/local/bin` 并注册 systemd。
+- OpenWrt：安装到 `/usr/bin` 并注册 procd。
+- macOS：安装到 `/usr/local/bin` 并注册 LaunchDaemon。
+- Windows：安装到 `%ProgramFiles%\OM Agent`，注册 Windows Service，并加入机器级 `PATH`。
+
+重复执行 `install` 会修复程序、配置和服务定义，同时保留已有实例身份。旧版 `operation-monitoring-agent` 的命令、安装路径和显示名会迁移为 `om-agent`，已有身份和更新状态保持不变；内部兼容标识会继续供旧 updater 和回滚版本使用。`uninstall` 默认删除新旧服务、PATH 项、程序、身份、配置、日志和更新缓存：
+
+```bash
+om-agent uninstall
+om-agent uninstall --yes # 无人值守
+```
+
+这种方式安装的实例会上报 `standalone` 更新类型。发布更新时 Windows 上传 `.exe`，Linux/macOS 上传 `.bin`；Agent 通过独立 updater 替换自身，并在健康检查失败时恢复旧二进制。项目不再生成、分发或接受 DEB、RPM、IPK、MSI、PKG；所有平台统一使用 standalone 可执行文件。
+
+## 打包与分发实例端 standalone 可执行文件
+
+项目只发布独立可执行文件，不再生成或分发 DEB、RPM、IPK、MSI、PKG。控制台的程序更新接口也只接受 `package_type=standalone`。首次安装、开机自启、系统命令注册和后续卸载均由可执行文件自身的 `install` / `uninstall` 命令完成，因此不再需要原生安装包。
+
+### 构建产物
+
+先修改 `instanceEnd/Cargo.toml` 中的版本号，再为每个目标系统和 CPU 架构单独构建。Cargo 二进制名称固定为 `om-agent`。
+
+Linux 和 macOS 使用：
+
+```bash
+cd instanceEnd
+./scripts/build-standalone.sh <rust-target> <linux|macos> <native-architecture>
+```
+
+常用示例：
+
+```bash
+# Linux x86_64（glibc）
+./scripts/build-standalone.sh x86_64-unknown-linux-gnu linux x86_64
+
+# Linux / OpenWrt aarch64（musl）
+./scripts/build-standalone.sh aarch64-unknown-linux-musl linux aarch64
+
+# macOS Apple Silicon
+./scripts/build-standalone.sh aarch64-apple-darwin macos arm64
+
+# macOS Intel
+./scripts/build-standalone.sh x86_64-apple-darwin macos x86_64
+```
+
+Windows 在 PowerShell 中使用：
+
+```powershell
+cd instanceEnd
+.\scripts\build-standalone.ps1 -RustTarget x86_64-pc-windows-msvc -NativeArchitecture x64
+```
+
+脚本执行 `cargo build --locked --release --target ... --bin om-agent`，将产物复制到 `instanceEnd/dist/standalone/`，并生成同名 `.sha256` 文件：
+
+```text
+om-agent_0.1.0_linux_x86_64.bin
+om-agent_0.1.0_linux_x86_64.bin.sha256
+om-agent_0.1.0_macos_arm64.bin
+om-agent_0.1.0_windows_x64.exe
+om-agent_0.1.0_windows_x64.exe.sha256
+```
+
+交叉编译前需要安装相应 Rust target 和工具链。例如：
+
+```bash
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-musl
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+部分目标不能仅靠 `rustup target add` 完成：从 macOS 构建 Linux glibc 目标通常需要 Zig/`cargo-zigbuild`；OpenWrt MIPS/MIPSel 需要使用与固件版本、CPU 和 libc ABI 匹配的 OpenWrt SDK 编译。分发给 OpenWrt 的文件仍选择 `linux + standalone`，但二进制必须与设备 ABI 完全兼容。
+
+### 首次分发和安装
+
+将对应平台的 `.bin` 或 `.exe` 直接提供给目标机器。Unix 平台下载后添加执行权限，再运行安装命令：
+
+```bash
+chmod +x om-agent_0.1.0_linux_x86_64.bin
+./om-agent_0.1.0_linux_x86_64.bin install
+```
+
+无人值守部署：
+
+```bash
+./om-agent_0.1.0_linux_x86_64.bin install \
+  --non-interactive --yes \
+  --server https://monitor.example.com
+```
+
+Windows 请在 PowerShell 或命令提示符中运行下载的 `.exe`：
+
+```powershell
+.\om-agent_0.1.0_windows_x64.exe install
+```
+
+安装命令会自动请求管理员权限、复制到系统目录、注册开机自启并让 `om-agent` 在命令行全局可用：
+
+- Linux：`/usr/local/bin/om-agent` + systemd。
+- OpenWrt：`/usr/bin/om-agent` + procd。
+- macOS：`/usr/local/bin/om-agent` + LaunchDaemon。
+- Windows：`%ProgramFiles%\OM Agent` + Windows Service + 机器级 `PATH`。
+
+安装完成后可直接执行：
+
+```bash
+om-agent status
+om-agent uninstall
+```
+
+### 发布实例端更新
+
+1. 在控制台“程序更新”页面创建 SemVer 版本草稿。
+2. 为需要覆盖的每个系统和架构上传对应 standalone 可执行文件。
+3. 目标系统选择 `linux`、`windows` 或 `macos`；分发格式固定为 `standalone`。
+4. Windows 文件扩展名必须为 `.exe`；Linux 和 macOS 必须为 `.bin`。
+5. 原生架构必须与 Agent 上报值一致，例如 Linux `x86_64`/`aarch64`、Windows `x64`/`arm64`、macOS `arm64`/`x86_64`。
+6. 检查覆盖率后发布版本；后端不会构建、转换或重命名上传内容。
+
+Agent 会流式下载文件，校验大小、平台文件签名和 SHA-256，等待快捷命令与终端会话结束，再通过独立 updater 替换已安装程序并重启服务。新版本未能在健康检查期限内连接后端时，updater 会恢复上一版本可执行文件。自动更新要求 Agent 由 `install` 命令以系统服务方式安装并以管理员权限运行；直接通过 `start` 或 `log` 启动的开发实例不会声明自动更新能力。
+
+生产分发应使用 HTTPS/WSS，并对 standalone 产物执行平台代码签名：Windows 对 `.exe` 使用 Authenticode，macOS 对二进制进行 Developer ID 签名和公证。后端的 SHA-256 校验用于传输完整性，不能替代平台代码签名。
+
+### 从旧原生安装迁移
+
+旧的 DEB、RPM、IPK、MSI、PKG 安装不会再获得匹配更新。迁移前应停止旧服务并备份实例身份与配置，然后移除旧包，下载匹配平台和架构的 standalone 文件并运行 `install`。为避免在控制台产生新实例，迁移时应保留原身份文件和原 `OM_SERVER` 配置；确认新服务上线后再清理旧包管理器残留。
 
 ## 连接与终端说明
 
@@ -128,6 +265,9 @@ cargo run -- stop
 OM_BIND=127.0.0.1:13500
 OM_DATABASE_URL=sqlite://db/operation-monitoring.db
 OM_ADMIN_PASSWORD=admin123
+OM_UPLOAD_DIR=uploads
+OM_UPDATE_DIR=updates
+OM_AGENT_PACKAGE_MAX_BYTES=268435456
 ```
 
 未设置 `OM_DATABASE_URL` 时，后端会在启动进程的当前工作目录下自动创建
@@ -142,9 +282,10 @@ OM_AGENT_ID_FILE=/path/to/identity.json
 OM_REPORT_INTERVAL=5
 OM_AGENT_STATE_DIR=/path/to/runtime
 OM_AGENT_LOG_FILE=/path/to/agent.log
+OM_AGENT_UPDATE_DIR=/path/to/persistent/updates
 ```
 
-同一状态目录只允许一个实例端进程运行。若要在一台机器上运行多个实例端，请为每个进程设置不同的 `OM_AGENT_STATE_DIR` 和 `OM_AGENT_ID_FILE`。
+同一状态目录只允许一个实例端进程运行。若要在一台机器上运行多个实例端，请为每个进程设置不同的 `OM_AGENT_STATE_DIR`、`OM_AGENT_ID_FILE` 和 `OM_AGENT_UPDATE_DIR`。更新目录保存可执行文件、回滚基线、状态和 updater 日志，不能放在重启后会清空的临时目录中。OpenWrt standalone 安装默认使用 `/var/lib/om-agent/updates`。
 
 ## 验证命令
 
@@ -159,4 +300,4 @@ cd instanceEnd && cargo check
 - 增加历史趋势图和指标明细页。
 - 增加告警规则、通知渠道和阈值配置。
 - 增加登录失败限制、密码哈希和更细粒度权限。
-- 增加 Agent 安装脚本、服务注册和自动升级。
+- 增加 CI 中的多平台 standalone 可执行文件构建、签名和发布流水线。

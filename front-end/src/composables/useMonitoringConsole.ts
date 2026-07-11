@@ -3,6 +3,10 @@ import { api } from '../api/http'
 import { getCountryOption } from '../data/countries'
 import type {
   ActionLog,
+  AgentArtifactTarget,
+  AgentRelease,
+  AgentReleaseForm,
+  AgentUpdateAttempt,
   AdminTab,
   AppearanceResponse,
   CommandJob,
@@ -20,12 +24,16 @@ type TrafficSnapshot = {
   capturedAt: number
 }
 
+type AgentUpdateOperation = 'creating' | 'saving' | 'uploading' | 'publishing' | 'deleting' | 'retrying' | null
+
 export function useMonitoringConsole() {
   const instances = ref<Instance[]>([])
   const pendingInstances = ref<PendingInstance[]>([])
   const commands = ref<CommandRecord[]>([])
   const jobs = ref<CommandJob[]>([])
   const logs = ref<ActionLog[]>([])
+  const agentReleases = ref<AgentRelease[]>([])
+  const agentUpdateAttempts = ref<AgentUpdateAttempt[]>([])
   const isAdmin = ref(false)
   const sessionReady = ref(false)
   const publicReady = ref(false)
@@ -39,6 +47,9 @@ export function useMonitoringConsole() {
   const backgroundFileName = ref('')
   const backgroundOperation = ref<'uploading' | 'removing' | null>(null)
   const backgroundMessage = ref('')
+  const agentUpdateOperation = ref<AgentUpdateOperation>(null)
+  const agentUpdateBusyId = ref('')
+  const agentUpdateMessage = ref('')
   const trafficSnapshot = ref<TrafficSnapshot | null>(null)
   const networkRxRate = ref(0)
   const networkTxRate = ref(0)
@@ -59,6 +70,11 @@ export function useMonitoringConsole() {
     name: '',
     command: '',
     confirm_text: '',
+  })
+
+  const agentReleaseForm = reactive<AgentReleaseForm>({
+    version: '',
+    notes: '',
   })
 
   const editInstance = ref<Instance | null>(null)
@@ -148,7 +164,10 @@ export function useMonitoringConsole() {
     if (publicRequestInFlight) return
     publicRequestInFlight = true
     try {
-      await loadPublic()
+      await Promise.all([
+        loadPublic(),
+        isAdmin.value && !agentUpdateOperation.value ? loadAgentUpdates() : Promise.resolve(),
+      ])
     } catch {
       // Keep the last valid snapshot during transient network failures.
     } finally {
@@ -176,6 +195,7 @@ export function useMonitoringConsole() {
       api<CommandJob[]>('/api/admin/jobs'),
       api<ActionLog[]>('/api/admin/logs'),
       api<SettingsResponse>('/api/admin/settings'),
+      loadAgentUpdates(),
     ])
     pendingInstances.value = pending
     commands.value = commandList
@@ -184,6 +204,27 @@ export function useMonitoringConsole() {
     settingsForm.retention_days = settings.retention_days
     applyAppearance(settings.background_image_url)
     settingsForm.background_image_url = settings.background_image_url
+  }
+
+  async function loadAgentUpdates() {
+    const [releases, attempts] = await Promise.all([
+      api<AgentRelease[]>('/api/admin/agent-releases'),
+      api<AgentUpdateAttempt[]>('/api/admin/agent-update-attempts'),
+    ])
+    agentUpdateAttempts.value = attempts
+    agentReleases.value = releases.map((release) => ({
+      ...release,
+      artifacts: release.artifacts || [],
+      attempts: release.attempts?.length
+        ? release.attempts
+        : attempts.filter((attempt) => attempt.release_id === release.id),
+      coverage: release.coverage || {
+        eligible_instances: 0,
+        covered_instances: 0,
+        missing_artifact_instances: 0,
+        unprivileged_instances: 0,
+      },
+    }))
   }
 
   function refreshAll() {
@@ -219,6 +260,9 @@ export function useMonitoringConsole() {
       commands.value = []
       jobs.value = []
       logs.value = []
+      agentReleases.value = []
+      agentUpdateAttempts.value = []
+      agentUpdateMessage.value = ''
     })
   }
 
@@ -320,6 +364,118 @@ export function useMonitoringConsole() {
     })
   }
 
+  function createAgentRelease() {
+    const form = {
+      version: agentReleaseForm.version.trim(),
+      notes: agentReleaseForm.notes.trim(),
+    }
+    if (!form.version) {
+      errorMessage.value = '请输入 Agent 版本号'
+      return Promise.resolve(false)
+    }
+
+    return runAgentUpdateTask('creating', 'new-release', async () => {
+      await api<AgentRelease>('/api/admin/agent-releases', {
+        method: 'POST',
+        body: JSON.stringify(form),
+      })
+      agentReleaseForm.version = ''
+      agentReleaseForm.notes = ''
+      await loadAgentUpdates()
+    }, '已创建更新草稿')
+  }
+
+  function saveAgentRelease(releaseId: string, form: AgentReleaseForm) {
+    const payload = {
+      version: form.version.trim(),
+      notes: form.notes.trim(),
+    }
+    if (!payload.version) {
+      errorMessage.value = '请输入 Agent 版本号'
+      return Promise.resolve(false)
+    }
+
+    return runAgentUpdateTask('saving', releaseId, async () => {
+      await api<AgentRelease>(`/api/admin/agent-releases/${releaseId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      })
+      await loadAgentUpdates()
+    }, '草稿已保存')
+  }
+
+  function uploadAgentArtifact(releaseId: string, target: AgentArtifactTarget, file: File) {
+    const normalizedTarget = {
+      ...target,
+      os: target.os.trim(),
+      native_arch: target.native_arch.trim(),
+    }
+    if (!normalizedTarget.os || !normalizedTarget.native_arch) {
+      errorMessage.value = '请选择目标系统和原生架构'
+      return Promise.resolve(false)
+    }
+    if (file.size === 0) {
+      errorMessage.value = '可执行文件不能为空'
+      return Promise.resolve(false)
+    }
+    if (normalizedTarget.package_type !== 'standalone') {
+      errorMessage.value = '仅支持 standalone 可执行文件'
+      return Promise.resolve(false)
+    }
+    const expectedExtension = normalizedTarget.os === 'windows' ? 'exe' : 'bin'
+    if (!file.name.toLowerCase().endsWith(`.${expectedExtension}`)) {
+      errorMessage.value = `请选择 .${expectedExtension} 可执行文件`
+      return Promise.resolve(false)
+    }
+
+    return runAgentUpdateTask('uploading', releaseId, async () => {
+      const body = new FormData()
+      body.append('os', normalizedTarget.os)
+      body.append('package_type', normalizedTarget.package_type)
+      body.append('native_arch', normalizedTarget.native_arch)
+      body.append('file', file)
+      await api(`/api/admin/agent-releases/${releaseId}/artifacts`, {
+        method: 'POST',
+        body,
+      })
+      await loadAgentUpdates()
+    }, '可执行文件已添加到草稿')
+  }
+
+  function deleteAgentArtifact(releaseId: string, artifactId: string) {
+    return runAgentUpdateTask('deleting', artifactId, async () => {
+      await api(`/api/admin/agent-releases/${releaseId}/artifacts/${artifactId}`, {
+        method: 'DELETE',
+      })
+      await loadAgentUpdates()
+    }, '可执行文件已移除')
+  }
+
+  function publishAgentRelease(release: AgentRelease) {
+    return runAgentUpdateTask('publishing', release.id, async () => {
+      await api<AgentRelease>(`/api/admin/agent-releases/${release.id}/publish`, {
+        method: 'POST',
+      })
+      await loadAgentUpdates()
+    }, `${release.version} 已发布`)
+  }
+
+  function deleteAgentRelease(release: AgentRelease) {
+    return runAgentUpdateTask('deleting', release.id, async () => {
+      await api(`/api/admin/agent-releases/${release.id}`, { method: 'DELETE' })
+      await loadAgentUpdates()
+    }, '更新草稿已删除')
+  }
+
+  function retryAgentUpdateAttempt(attempt: AgentUpdateAttempt) {
+    return runAgentUpdateTask('retrying', attempt.id, async () => {
+      await api<AgentUpdateAttempt>(`/api/admin/agent-update-attempts/${attempt.id}/retry`, {
+        method: 'POST',
+      })
+      await loadAgentUpdates()
+    }, '已安排重新尝试更新')
+  }
+
   async function selectBackgroundImage(event: Event) {
     const input = event.target as HTMLInputElement
     const file = input.files?.[0]
@@ -379,6 +535,22 @@ export function useMonitoringConsole() {
     terminalState.instance = null
   }
 
+  async function runAgentUpdateTask(
+    operation: Exclude<AgentUpdateOperation, null>,
+    targetId: string,
+    task: () => Promise<void>,
+    successMessage: string,
+  ) {
+    agentUpdateMessage.value = ''
+    agentUpdateOperation.value = operation
+    agentUpdateBusyId.value = targetId
+    const success = await guarded(task)
+    if (success) agentUpdateMessage.value = successMessage
+    agentUpdateOperation.value = null
+    agentUpdateBusyId.value = ''
+    return success
+  }
+
   function applyAppearance(url: string | null) {
     backgroundImageUrl.value = url
     settingsForm.background_image_url = url
@@ -406,6 +578,8 @@ export function useMonitoringConsole() {
     commands,
     jobs,
     logs,
+    agentReleases,
+    agentUpdateAttempts,
     isAdmin,
     sessionReady,
     publicReady,
@@ -418,10 +592,14 @@ export function useMonitoringConsole() {
     backgroundFileName,
     backgroundOperation,
     backgroundMessage,
+    agentUpdateOperation,
+    agentUpdateBusyId,
+    agentUpdateMessage,
     currentTime,
     loginForm,
     settingsForm,
     commandForm,
+    agentReleaseForm,
     editInstance,
     editForm,
     terminalState,
@@ -448,6 +626,14 @@ export function useMonitoringConsole() {
     removeCommand,
     runCommand,
     saveSettings,
+    loadAgentUpdates,
+    createAgentRelease,
+    saveAgentRelease,
+    uploadAgentArtifact,
+    deleteAgentArtifact,
+    publishAgentRelease,
+    deleteAgentRelease,
+    retryAgentUpdateAttempt,
     selectBackgroundImage,
     clearBackgroundImage,
     openTerminal,

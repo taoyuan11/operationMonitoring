@@ -28,6 +28,9 @@ export type Instance = {
   os: string
   arch: string
   agent_version: string
+  package_type?: string
+  native_arch?: string
+  update_privileged?: boolean
   online: boolean
   first_seen: number
   last_seen: number | null
@@ -40,6 +43,9 @@ export type PendingInstance = {
   os: string
   arch: string
   agent_version: string
+  package_type?: string
+  native_arch?: string
+  update_privileged?: boolean
   first_seen: number
   last_seen: number
 }
@@ -84,8 +90,78 @@ export type AppearanceResponse = {
   background_image_url: string | null
 }
 
+export type AgentReleaseStatus = 'draft' | 'published'
+
+export type AgentPackageType = 'standalone'
+
+export type AgentArtifactTarget = {
+  os: string
+  package_type: AgentPackageType
+  native_arch: string
+}
+
+export type AgentArtifact = AgentArtifactTarget & {
+  id: string
+  release_id: string
+  file_name: string
+  size_bytes: number
+  sha256: string
+  created_at: number
+}
+
+export type AgentUpdateAttemptStatus =
+  | 'pending'
+  | 'waiting'
+  | 'downloading'
+  | 'verifying'
+  | 'waiting_idle'
+  | 'installing'
+  | 'awaiting_restart'
+  | 'succeeded'
+  | 'rollback_succeeded'
+  | 'failed'
+
+export type AgentUpdateAttempt = {
+  id: string
+  release_id: string
+  artifact_id: string
+  instance_id: string
+  from_version: string
+  target_version: string
+  status: AgentUpdateAttemptStatus
+  message: string
+  retry_count: number
+  created_at: number
+  updated_at: number
+  completed_at: number | null
+}
+
+export type AgentReleaseCoverage = {
+  eligible_instances: number
+  covered_instances: number
+  missing_artifact_instances: number
+  unprivileged_instances: number
+}
+
+export type AgentRelease = {
+  id: string
+  version: string
+  notes: string
+  status: AgentReleaseStatus
+  created_at: number
+  published_at: number | null
+  artifacts: AgentArtifact[]
+  attempts: AgentUpdateAttempt[]
+  coverage: AgentReleaseCoverage
+}
+
+export type AgentReleaseForm = {
+  version: string
+  notes: string
+}
+
 export type ViewMode = 'grid' | 'rows'
 
-export type AdminTab = 'pending' | 'commands' | 'settings' | 'logs'
+export type AdminTab = 'pending' | 'commands' | 'updates' | 'settings' | 'logs'
 
 export type AppPage = 'home' | AdminTab

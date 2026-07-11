@@ -2,13 +2,14 @@
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AdminNavigation from './components/AdminNavigation.vue'
 import AdminPanel from './components/AdminPanel.vue'
+import AgentUpdatesPanel from './components/AgentUpdatesPanel.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import InstanceBoard from './components/InstanceBoard.vue'
 import LoginModal from './components/LoginModal.vue'
 import SummaryBand from './components/SummaryBand.vue'
 import TopBar from './components/TopBar.vue'
 import { useMonitoringConsole } from './composables/useMonitoringConsole'
-import type { AdminTab, AppPage, CommandRecord, Instance } from './types/domain'
+import type { AdminTab, AgentRelease, AppPage, CommandRecord, Instance } from './types/domain'
 
 const TerminalModal = defineAsyncComponent(() => import('./components/TerminalModal.vue'))
 const EditInstanceModal = defineAsyncComponent(() => import('./components/EditInstanceModal.vue'))
@@ -33,6 +34,7 @@ const pageFromHash: Record<string, AppPage> = {
   '#/instances': 'home',
   '#/approval': 'pending',
   '#/commands': 'commands',
+  '#/updates': 'updates',
   '#/logs': 'logs',
   '#/settings': 'settings',
 }
@@ -41,6 +43,7 @@ const hashFromPage: Record<AppPage, string> = {
   home: '#/',
   pending: '#/approval',
   commands: '#/commands',
+  updates: '#/updates',
   logs: '#/logs',
   settings: '#/settings',
 }
@@ -141,6 +144,26 @@ function requestRunCommand(instance: Instance, command: CommandRecord) {
   }
 }
 
+function requestPublishAgentRelease(release: AgentRelease) {
+  confirmation.value = {
+    title: '发布 Agent 更新',
+    message: `发布 ${release.version} 后，符合条件的实例会自动安装对应更新包。尚未完成过受管更新的实例可能没有可用的回滚包。`,
+    confirmLabel: '确认发布',
+    tone: 'warning',
+    action: () => consoleState.publishAgentRelease(release),
+  }
+}
+
+function requestDeleteAgentRelease(release: AgentRelease) {
+  confirmation.value = {
+    title: '删除更新草稿',
+    message: `将删除 ${release.version} 及其已上传的可执行文件，此操作无法恢复。`,
+    confirmLabel: '删除草稿',
+    tone: 'danger',
+    action: () => consoleState.deleteAgentRelease(release),
+  }
+}
+
 function confirmAction() {
   const action = confirmation.value?.action
   confirmation.value = null
@@ -229,7 +252,25 @@ function confirmAction() {
             </p>
           </Transition>
 
+          <AgentUpdatesPanel
+            v-if="currentPage === 'updates'"
+            :instances="consoleState.instances.value"
+            :releases="consoleState.agentReleases.value"
+            :attempts="consoleState.agentUpdateAttempts.value"
+            :form="consoleState.agentReleaseForm"
+            :operation="consoleState.agentUpdateOperation.value"
+            :busy-id="consoleState.agentUpdateBusyId.value"
+            :message="consoleState.agentUpdateMessage.value"
+            @create-release="consoleState.createAgentRelease"
+            @save-release="consoleState.saveAgentRelease"
+            @upload-artifact="consoleState.uploadAgentArtifact"
+            @delete-artifact="consoleState.deleteAgentArtifact"
+            @publish-release="requestPublishAgentRelease"
+            @delete-release="requestDeleteAgentRelease"
+            @retry-attempt="consoleState.retryAgentUpdateAttempt"
+          />
           <AdminPanel
+            v-else
             :admin-tab="activeAdminTab"
             :pending-instances="consoleState.pendingInstances.value"
             :commands="consoleState.commands.value"

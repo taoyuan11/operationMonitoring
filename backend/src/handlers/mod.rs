@@ -25,6 +25,7 @@ use crate::{
         SettingsRequest, SettingsResponse, UpdateInstanceRequest,
     },
     state::AppState,
+    updates::confirm_update_version,
     utils::{non_empty_or, now_ts},
     ws::{agent_socket, terminal_socket},
 };
@@ -55,6 +56,7 @@ pub async fn public_instances(
         r#"
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version,
+               package_type, native_arch, update_privileged,
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE approved = 1 AND disabled = 0
@@ -166,7 +168,8 @@ pub async fn admin_pending_instances(
 
     let rows = sqlx::query_as::<_, PendingInstance>(
         r#"
-        SELECT id, hostname, os, arch, agent_version, first_seen, last_seen
+        SELECT id, hostname, os, arch, agent_version, package_type, native_arch,
+               update_privileged, first_seen, last_seen
         FROM pending_instances
         ORDER BY last_seen DESC
         "#,
@@ -186,7 +189,8 @@ pub async fn admin_approve_instance(
 
     let pending = sqlx::query_as::<_, PendingInstanceSecret>(
         r#"
-        SELECT id, secret, hostname, os, arch, agent_version, first_seen, last_seen
+        SELECT id, secret, hostname, os, arch, agent_version, package_type, native_arch,
+               update_privileged, first_seen, last_seen
         FROM pending_instances
         WHERE id = ?
         "#,
@@ -200,14 +204,18 @@ pub async fn admin_approve_instance(
         r#"
         INSERT INTO instances(id, secret, name, region, country_code, country, province_code,
                               province, city, remark, hostname, os, arch, agent_version,
-                              approved, disabled, first_seen, last_seen)
-        VALUES(?, ?, ?, '', '', '', '', '', '', '', ?, ?, ?, ?, 1, 0, ?, ?)
+                              package_type, native_arch, update_privileged, approved, disabled,
+                              first_seen, last_seen)
+        VALUES(?, ?, ?, '', '', '', '', '', '', '', ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             secret = excluded.secret,
             hostname = excluded.hostname,
             os = excluded.os,
             arch = excluded.arch,
             agent_version = excluded.agent_version,
+            package_type = excluded.package_type,
+            native_arch = excluded.native_arch,
+            update_privileged = excluded.update_privileged,
             approved = 1,
             disabled = 0,
             last_seen = excluded.last_seen
@@ -220,6 +228,9 @@ pub async fn admin_approve_instance(
     .bind(&pending.os)
     .bind(&pending.arch)
     .bind(&pending.agent_version)
+    .bind(&pending.package_type)
+    .bind(&pending.native_arch)
+    .bind(pending.update_privileged)
     .bind(pending.first_seen)
     .bind(pending.last_seen)
     .execute(&state.db)
@@ -772,6 +783,9 @@ pub async fn agent_report(
         os: payload.os.clone(),
         arch: payload.arch.clone(),
         agent_version: payload.agent_version.clone(),
+        package_type: payload.package_type.clone(),
+        native_arch: payload.native_arch.clone(),
+        update_privileged: payload.update_privileged,
     };
     register_or_touch_pending(&state.db, &register_payload).await?;
 
@@ -797,7 +811,10 @@ pub async fn agent_report(
     sqlx::query(
         r#"
         UPDATE instances
-        SET hostname = ?, os = ?, arch = ?, agent_version = ?, last_seen = ?
+        SET hostname = ?, os = ?, arch = ?, agent_version = ?,
+            package_type = COALESCE(?, package_type),
+            native_arch = COALESCE(?, native_arch),
+            update_privileged = COALESCE(?, update_privileged), last_seen = ?
         WHERE id = ?
         "#,
     )
@@ -805,10 +822,15 @@ pub async fn agent_report(
     .bind(&payload.os)
     .bind(&payload.arch)
     .bind(&payload.agent_version)
+    .bind(payload.package_type.as_deref())
+    .bind(payload.native_arch.as_deref())
+    .bind(payload.update_privileged.map(i64::from))
     .bind(now_ts())
     .bind(&payload.instance_id)
     .execute(&state.db)
     .await?;
+
+    confirm_update_version(&state, &payload.instance_id, &payload.agent_version).await?;
 
     sqlx::query(
         r#"

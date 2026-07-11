@@ -30,6 +30,12 @@ pub struct AgentRegisterRequest {
     pub os: String,
     pub arch: String,
     pub agent_version: String,
+    #[serde(default)]
+    pub package_type: Option<String>,
+    #[serde(default)]
+    pub native_arch: Option<String>,
+    #[serde(default)]
+    pub update_privileged: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -47,6 +53,12 @@ pub struct AgentReportRequest {
     pub os: String,
     pub arch: String,
     pub agent_version: String,
+    #[serde(default)]
+    pub package_type: Option<String>,
+    #[serde(default)]
+    pub native_arch: Option<String>,
+    #[serde(default)]
+    pub update_privileged: Option<bool>,
     pub metrics: MetricPayload,
 }
 
@@ -83,6 +95,9 @@ pub struct InstanceRecord {
     pub os: String,
     pub arch: String,
     pub agent_version: String,
+    pub package_type: String,
+    pub native_arch: String,
+    pub update_privileged: i64,
     pub approved: i64,
     pub disabled: i64,
     pub first_seen: i64,
@@ -96,6 +111,9 @@ pub struct PendingInstance {
     pub os: String,
     pub arch: String,
     pub agent_version: String,
+    pub package_type: String,
+    pub native_arch: String,
+    pub update_privileged: bool,
     pub first_seen: i64,
     pub last_seen: i64,
 }
@@ -108,6 +126,9 @@ pub struct PendingInstanceSecret {
     pub os: String,
     pub arch: String,
     pub agent_version: String,
+    pub package_type: String,
+    pub native_arch: String,
+    pub update_privileged: bool,
     pub first_seen: i64,
     pub last_seen: i64,
 }
@@ -242,6 +263,95 @@ pub struct AgentWsQuery {
     pub secret: String,
 }
 
+#[derive(Deserialize)]
+pub struct CreateAgentReleaseRequest {
+    pub version: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Serialize, FromRow, Clone)]
+pub struct AgentReleaseRecord {
+    pub id: String,
+    pub version: String,
+    pub notes: String,
+    pub status: String,
+    pub created_at: i64,
+    pub published_at: Option<i64>,
+}
+
+#[derive(Serialize, FromRow, Clone)]
+pub struct AgentArtifactRecord {
+    pub id: String,
+    pub release_id: String,
+    pub os: String,
+    pub package_type: String,
+    pub native_arch: String,
+    pub file_name: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    #[serde(skip_serializing)]
+    pub storage_path: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, FromRow, Clone)]
+pub struct AgentUpdateAttemptRecord {
+    pub id: String,
+    pub release_id: String,
+    pub artifact_id: String,
+    pub instance_id: String,
+    pub from_version: String,
+    pub target_version: String,
+    pub status: String,
+    pub message: String,
+    pub retry_count: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+pub struct AgentReleaseCoverage {
+    pub eligible_instances: i64,
+    pub covered_instances: i64,
+    pub missing_artifact_instances: i64,
+    pub unprivileged_instances: i64,
+}
+
+#[derive(Serialize)]
+pub struct AgentReleaseDetail {
+    #[serde(flatten)]
+    pub release: AgentReleaseRecord,
+    pub artifacts: Vec<AgentArtifactRecord>,
+    pub attempts: Vec<AgentUpdateAttemptRecord>,
+    pub coverage: AgentReleaseCoverage,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAttemptsQuery {
+    pub release_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentUpdateOffer {
+    pub release_id: String,
+    pub version: String,
+    pub artifact_id: String,
+    pub download_url: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub package_type: String,
+    pub native_arch: String,
+    #[serde(default)]
+    pub retry_count: i64,
+}
+
+#[derive(Serialize)]
+pub struct AgentUpdateManifest {
+    pub update: Option<AgentUpdateOffer>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentOutbound {
@@ -269,6 +379,18 @@ pub enum AgentOutbound {
     TerminalClose {
         session_id: String,
     },
+    UpdateAvailable {
+        release_id: String,
+        version: String,
+        artifact_id: String,
+        download_url: String,
+        sha256: String,
+        size_bytes: i64,
+        package_type: String,
+        native_arch: String,
+        #[serde(default)]
+        retry_count: i64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -282,6 +404,12 @@ pub enum AgentInbound {
         os: String,
         arch: String,
         agent_version: String,
+        #[serde(default)]
+        package_type: Option<String>,
+        #[serde(default)]
+        native_arch: Option<String>,
+        #[serde(default)]
+        update_privileged: Option<bool>,
         metrics: MetricPayload,
     },
     CommandResult {
@@ -300,6 +428,15 @@ pub enum AgentInbound {
         session_id: String,
         exit_code: Option<i64>,
         reason: Option<String>,
+    },
+    UpdateStatus {
+        release_id: String,
+        artifact_id: String,
+        version: String,
+        #[serde(default)]
+        retry_count: i64,
+        status: String,
+        message: Option<String>,
     },
 }
 

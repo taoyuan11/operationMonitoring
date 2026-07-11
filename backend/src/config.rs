@@ -5,7 +5,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(version, about = "Operation Monitoring backend")]
 pub struct Cli {
-    #[arg(long, env = "OM_BIND", default_value = "127.0.0.1:13500")]
+    #[arg(long, env = "OM_BIND", default_value = "0.0.0.0:13500")]
     pub bind: SocketAddr,
     #[arg(
         long,
@@ -17,4 +17,12 @@ pub struct Cli {
     pub admin_password: String,
     #[arg(long, env = "OM_UPLOAD_DIR", default_value = "uploads")]
     pub upload_dir: PathBuf,
+    #[arg(long, env = "OM_UPDATE_DIR", default_value = "updates")]
+    pub update_dir: PathBuf,
+    #[arg(
+        long,
+        env = "OM_AGENT_PACKAGE_MAX_BYTES",
+        default_value_t = 256 * 1024 * 1024
+    )]
+    pub agent_package_max_bytes: usize,
 }

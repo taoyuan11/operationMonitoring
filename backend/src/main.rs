@@ -6,6 +6,7 @@ mod handlers;
 mod jobs;
 mod models;
 mod state;
+mod updates;
 mod utils;
 mod ws;
 
@@ -26,8 +27,15 @@ use handlers::{
     health, public_appearance, public_instances, public_metrics,
 };
 use state::AppState;
+use std::{io::ErrorKind, path::Path};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing::{info, warn};
+use updates::{
+    admin_agent_releases, admin_agent_update_attempts, admin_create_agent_release,
+    admin_delete_agent_artifact, admin_delete_agent_release, admin_publish_agent_release,
+    admin_retry_agent_update, admin_update_agent_release, admin_upload_agent_artifact,
+    agent_download_artifact, agent_update_manifest, update_timeout_loop,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -38,12 +46,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     if cli.admin_password == "admin123" {
         warn!("using default admin password; set OM_ADMIN_PASSWORD in production");
     }
 
     let bind = cli.bind;
+    let package_body_limit = cli.agent_package_max_bytes.saturating_add(1024 * 1024);
+    prepare_storage_directories(&mut cli).await?;
     let db = connect_db(&cli.database_url).await?;
     init_db(&db).await?;
 
@@ -97,9 +107,42 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/admin/jobs", get(admin_jobs))
         .route("/api/admin/logs", get(admin_logs))
+        .route(
+            "/api/admin/agent-releases",
+            get(admin_agent_releases).post(admin_create_agent_release),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}",
+            patch(admin_update_agent_release).delete(admin_delete_agent_release),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/artifacts",
+            post(admin_upload_agent_artifact).layer(DefaultBodyLimit::max(package_body_limit)),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/artifacts/{artifact_id}",
+            delete(admin_delete_agent_artifact),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/publish",
+            post(admin_publish_agent_release),
+        )
+        .route(
+            "/api/admin/agent-update-attempts",
+            get(admin_agent_update_attempts),
+        )
+        .route(
+            "/api/admin/agent-update-attempts/{attempt_id}/retry",
+            post(admin_retry_agent_update),
+        )
         .route("/api/agent/register", post(agent_register))
         .route("/api/agent/report", post(agent_report))
         .route("/api/agent/ws", get(agent_ws))
+        .route("/api/agent/update/manifest", get(agent_update_manifest))
+        .route(
+            "/api/agent/update/artifacts/{artifact_id}/download",
+            get(agent_download_artifact),
+        )
         .nest_service("/uploads", ServeDir::new(upload_dir))
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(6 * 1024 * 1024))
@@ -109,9 +152,72 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         cleanup_loop(cleanup_state).await;
     });
+    let update_timeout_state = state.clone();
+    tokio::spawn(async move {
+        update_timeout_loop(update_timeout_state).await;
+    });
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("backend listening on http://{}", bind);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn prepare_storage_directories(cli: &mut Cli) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(&cli.upload_dir).await?;
+    tokio::fs::create_dir_all(&cli.update_dir).await?;
+
+    let upload_dir = tokio::fs::canonicalize(&cli.upload_dir).await?;
+    let update_dir = tokio::fs::canonicalize(&cli.update_dir).await?;
+    if paths_overlap(&upload_dir, &update_dir) {
+        anyhow::bail!(
+            "OM_UPDATE_DIR must not equal, contain, or be contained by the public OM_UPLOAD_DIR"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&update_dir, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+
+    match tokio::fs::remove_dir_all(update_dir.join(".tmp")).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    cli.upload_dir = upload_dir;
+    cli.update_dir = update_dir;
+    Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paths_overlap;
+    use std::path::Path;
+
+    #[test]
+    fn private_update_storage_must_not_overlap_public_uploads() {
+        assert!(paths_overlap(
+            Path::new("/srv/uploads"),
+            Path::new("/srv/uploads")
+        ));
+        assert!(paths_overlap(
+            Path::new("/srv/uploads"),
+            Path::new("/srv/uploads/updates")
+        ));
+        assert!(paths_overlap(
+            Path::new("/srv/private"),
+            Path::new("/srv/private/uploads")
+        ));
+        assert!(!paths_overlap(
+            Path::new("/srv/uploads"),
+            Path::new("/srv/updates")
+        ));
+    }
 }

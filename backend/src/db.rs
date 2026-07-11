@@ -55,6 +55,9 @@ pub async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             os TEXT NOT NULL DEFAULT '',
             arch TEXT NOT NULL DEFAULT '',
             agent_version TEXT NOT NULL DEFAULT '',
+            package_type TEXT NOT NULL DEFAULT '',
+            native_arch TEXT NOT NULL DEFAULT '',
+            update_privileged INTEGER NOT NULL DEFAULT 0,
             approved INTEGER NOT NULL DEFAULT 1,
             disabled INTEGER NOT NULL DEFAULT 0,
             first_seen INTEGER NOT NULL,
@@ -66,6 +69,7 @@ pub async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     ensure_instance_location_columns(db).await?;
+    ensure_capability_columns(db, "instances").await?;
 
     sqlx::query(
         r#"
@@ -76,6 +80,9 @@ pub async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             os TEXT NOT NULL,
             arch TEXT NOT NULL,
             agent_version TEXT NOT NULL,
+            package_type TEXT NOT NULL DEFAULT '',
+            native_arch TEXT NOT NULL DEFAULT '',
+            update_privileged INTEGER NOT NULL DEFAULT 0,
             first_seen INTEGER NOT NULL,
             last_seen INTEGER NOT NULL
         );
@@ -83,6 +90,8 @@ pub async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(db)
     .await?;
+
+    ensure_capability_columns(db, "pending_instances").await?;
 
     sqlx::query(
         r#"
@@ -188,6 +197,69 @@ pub async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS agent_releases (
+            id TEXT PRIMARY KEY,
+            version TEXT NOT NULL UNIQUE,
+            notes TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'published')),
+            created_at INTEGER NOT NULL,
+            published_at INTEGER
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS agent_artifacts (
+            id TEXT PRIMARY KEY,
+            release_id TEXT NOT NULL REFERENCES agent_releases(id) ON DELETE CASCADE,
+            os TEXT NOT NULL,
+            package_type TEXT NOT NULL,
+            native_arch TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            storage_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(release_id, os, package_type, native_arch)
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS agent_update_attempts (
+            id TEXT PRIMARY KEY,
+            release_id TEXT NOT NULL REFERENCES agent_releases(id) ON DELETE CASCADE,
+            artifact_id TEXT NOT NULL REFERENCES agent_artifacts(id) ON DELETE CASCADE,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            from_version TEXT NOT NULL,
+            target_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            message TEXT NOT NULL DEFAULT '',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            UNIQUE(release_id, instance_id)
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_agent_attempts_instance_updated ON agent_update_attempts(instance_id, updated_at DESC);",
+    )
+    .execute(db)
+    .await?;
+
     sqlx::query("INSERT OR IGNORE INTO settings(key, value) VALUES('retention_days', '30');")
         .execute(db)
         .await?;
@@ -220,6 +292,29 @@ async fn ensure_instance_location_columns(db: &SqlitePool) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn ensure_capability_columns(db: &SqlitePool, table: &str) -> anyhow::Result<()> {
+    let columns =
+        sqlx::query_scalar::<_, String>(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .fetch_all(db)
+            .await?;
+
+    for (name, definition) in [
+        ("package_type", "TEXT NOT NULL DEFAULT ''"),
+        ("native_arch", "TEXT NOT NULL DEFAULT ''"),
+        ("update_privileged", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN {name} {definition}"
+            ))
+            .execute(db)
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn register_or_touch_pending(
     db: &SqlitePool,
     payload: &AgentRegisterRequest,
@@ -228,20 +323,46 @@ pub async fn register_or_touch_pending(
         if instance.secret != payload.secret {
             return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
         }
+        sqlx::query(
+            r#"
+            UPDATE instances
+            SET hostname = ?, os = ?, arch = ?, agent_version = ?,
+                package_type = COALESCE(?, package_type),
+                native_arch = COALESCE(?, native_arch),
+                update_privileged = COALESCE(?, update_privileged),
+                last_seen = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&payload.hostname)
+        .bind(&payload.os)
+        .bind(&payload.arch)
+        .bind(&payload.agent_version)
+        .bind(payload.package_type.as_deref())
+        .bind(payload.native_arch.as_deref())
+        .bind(payload.update_privileged.map(i64::from))
+        .bind(now_ts())
+        .bind(&payload.instance_id)
+        .execute(db)
+        .await?;
         return Ok(());
     }
 
     let now = now_ts();
     sqlx::query(
         r#"
-        INSERT INTO pending_instances(id, secret, hostname, os, arch, agent_version, first_seen, last_seen)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO pending_instances(id, secret, hostname, os, arch, agent_version, package_type,
+                                      native_arch, update_privileged, first_seen, last_seen)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             secret = excluded.secret,
             hostname = excluded.hostname,
             os = excluded.os,
             arch = excluded.arch,
             agent_version = excluded.agent_version,
+            package_type = excluded.package_type,
+            native_arch = excluded.native_arch,
+            update_privileged = excluded.update_privileged,
             last_seen = excluded.last_seen
         "#,
     )
@@ -251,6 +372,9 @@ pub async fn register_or_touch_pending(
     .bind(&payload.os)
     .bind(&payload.arch)
     .bind(&payload.agent_version)
+    .bind(payload.package_type.as_deref().unwrap_or_default())
+    .bind(payload.native_arch.as_deref().unwrap_or_default())
+    .bind(i64::from(payload.update_privileged.unwrap_or(false)))
     .bind(now)
     .bind(now)
     .execute(db)
@@ -270,6 +394,7 @@ pub async fn get_instance_optional(db: &SqlitePool, id: &str) -> AppResult<Optio
         r#"
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version,
+               package_type, native_arch, update_privileged,
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE id = ?

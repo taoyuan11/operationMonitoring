@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::{
     auth::{SESSION_COOKIE, require_admin, session_token},
     db::{
-        get_instance, get_instance_optional, instance_summary, latest_metric,
-        register_or_touch_pending, retention_days, setting_value, write_action_log,
+        approve_pending_instance, get_instance, get_instance_optional, instance_summary,
+        latest_metric, register_or_touch_pending, retention_days, setting_value, write_action_log,
     },
     error::{AppError, AppResult},
     jobs::{create_command_job, dispatch_command},
@@ -21,8 +21,8 @@ use crate::{
         ActionLogRecord, AgentRegisterRequest, AgentRegisterResponse, AgentReportRequest,
         AgentWsQuery, AppearanceResponse, CommandJobRecord, CommandRecord, CreateCommandRequest,
         HealthResponse, InstanceRecord, InstanceSummary, ListQuery, LoginRequest, LoginResponse,
-        MeResponse, MetricRecord, MetricsQuery, PendingInstance, PendingInstanceSecret,
-        SettingsRequest, SettingsResponse, UpdateInstanceRequest,
+        MeResponse, MetricRecord, MetricsQuery, PendingInstance, SettingsRequest, SettingsResponse,
+        UpdateInstanceRequest,
     },
     state::AppState,
     updates::confirm_update_version,
@@ -187,59 +187,9 @@ pub async fn admin_approve_instance(
 ) -> AppResult<Json<AgentRegisterResponse>> {
     require_admin(&state, &headers).await?;
 
-    let pending = sqlx::query_as::<_, PendingInstanceSecret>(
-        r#"
-        SELECT id, secret, hostname, os, arch, agent_version, package_type, native_arch,
-               update_privileged, first_seen, last_seen
-        FROM pending_instances
-        WHERE id = ?
-        "#,
-    )
-    .bind(&id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "待审批实例不存在"))?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO instances(id, secret, name, region, country_code, country, province_code,
-                              province, city, remark, hostname, os, arch, agent_version,
-                              package_type, native_arch, update_privileged, approved, disabled,
-                              first_seen, last_seen)
-        VALUES(?, ?, ?, '', '', '', '', '', '', '', ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            secret = excluded.secret,
-            hostname = excluded.hostname,
-            os = excluded.os,
-            arch = excluded.arch,
-            agent_version = excluded.agent_version,
-            package_type = excluded.package_type,
-            native_arch = excluded.native_arch,
-            update_privileged = excluded.update_privileged,
-            approved = 1,
-            disabled = 0,
-            last_seen = excluded.last_seen
-        "#,
-    )
-    .bind(&pending.id)
-    .bind(&pending.secret)
-    .bind(&pending.hostname)
-    .bind(&pending.hostname)
-    .bind(&pending.os)
-    .bind(&pending.arch)
-    .bind(&pending.agent_version)
-    .bind(&pending.package_type)
-    .bind(&pending.native_arch)
-    .bind(pending.update_privileged)
-    .bind(pending.first_seen)
-    .bind(pending.last_seen)
-    .execute(&state.db)
-    .await?;
-
-    sqlx::query("DELETE FROM pending_instances WHERE id = ?")
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
+    approve_pending_instance(&state.db, &id)
+        .await?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "待审批实例不存在"))?;
 
     write_action_log(&state.db, "admin", "approve_instance", &id, "批准实例接入").await?;
 

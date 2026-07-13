@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.*
+.DS_Store
+Dockerfile*
+npm-debug.log*
+pnpm-debug.log*

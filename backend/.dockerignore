@@ -1,0 +1,14 @@
+target/
+db/
+uploads/
+updates/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+.DS_Store
+Dockerfile*

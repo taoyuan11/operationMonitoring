@@ -1,0 +1,36 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      OM_BIND: 0.0.0.0:13500
+      OM_DATABASE_URL: sqlite:///app/db/operation-monitoring.db
+      OM_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:-admin123}
+      OM_UPLOAD_DIR: /app/uploads
+      OM_UPDATE_DIR: /app/updates
+      OM_AGENT_PACKAGE_MAX_BYTES: ${OM_AGENT_PACKAGE_MAX_BYTES:-268435456}
+      RUST_LOG: ${RUST_LOG:-backend=info,tower_http=info}
+    ports:
+      - "${BACKEND_PORT:-13500}:13500"
+    volumes:
+      - backend-db:/app/db
+      - backend-uploads:/app/uploads
+      - backend-updates:/app/updates
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./front-end
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-300m}
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    restart: unless-stopped
+
+volumes:
+  backend-db:
+  backend-uploads:
+  backend-updates:

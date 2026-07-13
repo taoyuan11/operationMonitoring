@@ -111,6 +111,51 @@ cargo run -- log
 cargo run -- stop
 ```
 
+## Docker Compose 部署
+
+安装 Docker 和 Docker Compose 后，在项目根目录构建并启动前端与后端：
+
+```bash
+docker compose up -d --build
+```
+
+默认可通过以下地址访问：
+
+- 前端控制台：`http://localhost`
+- 后端 API：`http://localhost:13500`
+- 健康检查：`http://localhost:13500/api/health`
+
+默认管理员密码为仅供本地开发使用的 `admin123`。生产环境必须通过
+`OM_ADMIN_PASSWORD` 设置强密码；也可以覆盖前后端端口：
+
+```bash
+OM_ADMIN_PASSWORD='replace-with-a-strong-password' \
+FRONTEND_PORT=8080 \
+BACKEND_PORT=13500 \
+docker compose up -d --build
+```
+
+Agent 可以连接前端代理地址（例如 `http://服务器地址:8080`）或后端直连地址
+（例如 `http://服务器地址:13500`）。前端代理支持 API、上传资源和 WebSocket。
+
+SQLite 数据、背景图片和 Agent 更新包分别保存在 `backend-db`、
+`backend-uploads` 和 `backend-updates` 命名卷中，重新创建容器不会删除这些数据。
+删除命名卷前请先备份。常用管理命令：
+
+```bash
+docker compose ps
+docker compose logs -f
+docker compose down
+```
+
+默认允许上传 256 MiB 的 Agent 包。修改后端限制时，应同时调整 Nginx 请求体限制：
+
+```bash
+OM_AGENT_PACKAGE_MAX_BYTES=536870912 \
+NGINX_CLIENT_MAX_BODY_SIZE=600m \
+docker compose up -d --build
+```
+
 ## 实例端一键安装
 
 实例端二进制支持显式的系统级安装命令。安装过程会询问并校验后端地址，自动通过 `sudo` 或 Windows UAC 请求管理员权限，将程序复制到系统命令目录、注册开机自启并立即启动：
@@ -177,7 +222,7 @@ cd instanceEnd
 .\scripts\build-standalone.ps1 -RustTarget x86_64-pc-windows-msvc -NativeArchitecture x64
 ```
 
-脚本执行 `cargo build --locked --release --target ... --bin om-agent`，将产物复制到 `instanceEnd/dist/standalone/`，并生成同名 `.sha256` 文件：
+脚本在原生目标上执行 `cargo build --locked --release --target ... --bin om-agent`。从当前主机交叉编译 Linux 目标时，如果系统已安装 Zig 和 `cargo-zigbuild`，脚本会自动改用 `cargo zigbuild`，避免 `ring` 等含 C/汇编代码的依赖因缺少目标链接器而失败。随后脚本将产物复制到 `instanceEnd/dist/standalone/`，并生成同名 `.sha256` 文件：
 
 ```text
 om-agent_0.1.0_linux_x86_64.bin
@@ -192,9 +237,11 @@ om-agent_0.1.0_windows_x64.exe.sha256
 ```bash
 rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-musl
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo install cargo-zigbuild
+# macOS: brew install zig
 ```
 
-部分目标不能仅靠 `rustup target add` 完成：从 macOS 构建 Linux glibc 目标通常需要 Zig/`cargo-zigbuild`；OpenWrt MIPS/MIPSel 需要使用与固件版本、CPU 和 libc ABI 匹配的 OpenWrt SDK 编译。分发给 OpenWrt 的文件仍选择 `linux + standalone`，但二进制必须与设备 ABI 完全兼容。
+部分目标不能仅靠 `rustup target add` 完成：从 macOS 构建 Linux glibc 或 musl 目标通常需要 Zig/`cargo-zigbuild`；OpenWrt MIPS/MIPSel 需要使用与固件版本、CPU 和 libc ABI 匹配的 OpenWrt SDK 编译。使用 SDK 已配置好的 Cargo 链接器时，设置 `OM_STANDALONE_BUILDER=cargo` 可关闭 Zig 自动选择。也可以设置 `OM_STANDALONE_BUILDER=zigbuild` 强制使用 Zig。分发给 OpenWrt 的文件仍选择 `linux + standalone`，但二进制必须与设备 ABI 完全兼容。
 
 ### 首次分发和安装
 

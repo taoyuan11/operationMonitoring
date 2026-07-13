@@ -11,7 +11,10 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{AgentRegisterRequest, InstanceRecord, InstanceSummary, MetricRecord, SettingsRow},
+    models::{
+        AgentRegisterRequest, InstanceRecord, InstanceSummary, MetricRecord, PendingInstanceSecret,
+        SettingsRow,
+    },
     state::AppState,
     utils::now_ts,
 };
@@ -319,7 +322,22 @@ pub async fn register_or_touch_pending(
     db: &SqlitePool,
     payload: &AgentRegisterRequest,
 ) -> AppResult<()> {
-    if let Some(instance) = get_instance_optional(db, &payload.instance_id).await? {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let instance = sqlx::query_as::<_, InstanceRecord>(
+        r#"
+        SELECT id, secret, name, region, country_code, country, province_code, province, city,
+               remark, hostname, os, arch, agent_version,
+               package_type, native_arch, update_privileged,
+               approved, disabled, first_seen, last_seen
+        FROM instances
+        WHERE id = ?
+        "#,
+    )
+    .bind(&payload.instance_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some(instance) = instance {
         if instance.secret != payload.secret {
             return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
         }
@@ -343,8 +361,13 @@ pub async fn register_or_touch_pending(
         .bind(payload.update_privileged.map(i64::from))
         .bind(now_ts())
         .bind(&payload.instance_id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM pending_instances WHERE id = ?")
+            .bind(&payload.instance_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         return Ok(());
     }
 
@@ -377,10 +400,79 @@ pub async fn register_or_touch_pending(
     .bind(i64::from(payload.update_privileged.unwrap_or(false)))
     .bind(now)
     .bind(now)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
+
     Ok(())
+}
+
+pub async fn approve_pending_instance(
+    db: &SqlitePool,
+    id: &str,
+) -> AppResult<Option<PendingInstanceSecret>> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let pending = sqlx::query_as::<_, PendingInstanceSecret>(
+        r#"
+        SELECT id, secret, hostname, os, arch, agent_version, package_type, native_arch,
+               update_privileged, first_seen, last_seen
+        FROM pending_instances
+        WHERE id = ?
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(pending) = pending else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO instances(id, secret, name, region, country_code, country, province_code,
+                              province, city, remark, hostname, os, arch, agent_version,
+                              package_type, native_arch, update_privileged, approved, disabled,
+                              first_seen, last_seen)
+        VALUES(?, ?, ?, '', '', '', '', '', '', '', ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            secret = excluded.secret,
+            hostname = excluded.hostname,
+            os = excluded.os,
+            arch = excluded.arch,
+            agent_version = excluded.agent_version,
+            package_type = excluded.package_type,
+            native_arch = excluded.native_arch,
+            update_privileged = excluded.update_privileged,
+            approved = 1,
+            disabled = 0,
+            last_seen = excluded.last_seen
+        "#,
+    )
+    .bind(&pending.id)
+    .bind(&pending.secret)
+    .bind(&pending.hostname)
+    .bind(&pending.hostname)
+    .bind(&pending.os)
+    .bind(&pending.arch)
+    .bind(&pending.agent_version)
+    .bind(&pending.package_type)
+    .bind(&pending.native_arch)
+    .bind(pending.update_privileged)
+    .bind(pending.first_seen)
+    .bind(pending.last_seen)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query("DELETE FROM pending_instances WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(Some(pending))
 }
 
 pub async fn get_instance(db: &SqlitePool, id: &str) -> AppResult<InstanceRecord> {
@@ -562,5 +654,50 @@ mod tests {
         assert_eq!(record.province_code, "");
         assert_eq!(record.province, "");
         assert_eq!(record.city, "");
+    }
+
+    #[tokio::test]
+    async fn approved_instance_is_not_recreated_as_pending_by_concurrent_registration() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("connect in-memory database");
+        init_db(&db).await.expect("initialize database");
+        let payload = AgentRegisterRequest {
+            instance_id: "agent-1".to_string(),
+            secret: "secret-1".to_string(),
+            hostname: "host-1".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            agent_version: "0.1.0".to_string(),
+            package_type: Some("standalone".to_string()),
+            native_arch: Some("x86_64".to_string()),
+            update_privileged: Some(true),
+        };
+
+        register_or_touch_pending(&db, &payload)
+            .await
+            .expect("create pending instance");
+        let (approved, registered) = tokio::join!(
+            approve_pending_instance(&db, &payload.instance_id),
+            register_or_touch_pending(&db, &payload),
+        );
+        approved.expect("approve instance");
+        registered.expect("register instance");
+
+        assert!(
+            get_instance_optional(&db, &payload.instance_id)
+                .await
+                .expect("load instance")
+                .is_some()
+        );
+        let pending_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_instances WHERE id = ?")
+                .bind(&payload.instance_id)
+                .fetch_one(&db)
+                .await
+                .expect("count pending instances");
+        assert_eq!(pending_count, 0);
     }
 }

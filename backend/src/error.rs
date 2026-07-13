@@ -25,6 +25,10 @@ impl AppError {
     pub fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "需要管理员登录")
     }
+
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+    }
 }
 
 impl IntoResponse for AppError {

@@ -8,6 +8,7 @@ import InstanceBoard from './components/InstanceBoard.vue'
 import LoginModal from './components/LoginModal.vue'
 import SummaryBand from './components/SummaryBand.vue'
 import TopBar from './components/TopBar.vue'
+import UserManagementPanel from './components/UserManagementPanel.vue'
 import { useMonitoringConsole } from './composables/useMonitoringConsole'
 import type { AdminTab, AgentRelease, AppPage, CommandRecord, Instance } from './types/domain'
 
@@ -35,6 +36,7 @@ const pageFromHash: Record<string, AppPage> = {
   '#/approval': 'pending',
   '#/commands': 'commands',
   '#/updates': 'updates',
+  '#/users': 'users',
   '#/logs': 'logs',
   '#/settings': 'settings',
 }
@@ -44,6 +46,7 @@ const hashFromPage: Record<AppPage, string> = {
   pending: '#/approval',
   commands: '#/commands',
   updates: '#/updates',
+  users: '#/users',
   logs: '#/logs',
   settings: '#/settings',
 }
@@ -269,6 +272,22 @@ function confirmAction() {
             @delete-release="requestDeleteAgentRelease"
             @retry-attempt="consoleState.retryAgentUpdateAttempt"
           />
+          <UserManagementPanel
+            v-else-if="currentPage === 'users'"
+            :users="consoleState.adminUsers.value"
+            :enrollments="consoleState.authEnrollments.value"
+            :active-enrollment="consoleState.activeAuthEnrollment.value"
+            :current-user="consoleState.currentUser.value"
+            :loading="consoleState.loading.value"
+            :form="consoleState.userAuthForm"
+            @create-user="consoleState.createUserEnrollment"
+            @add-device="consoleState.createDeviceEnrollment"
+            @confirm-enrollment="consoleState.confirmAuthEnrollment"
+            @cancel-enrollment="consoleState.cancelAuthEnrollment"
+            @set-enabled="consoleState.setAdminUserEnabled"
+            @delete-user="consoleState.deleteAdminUser"
+            @revoke-device="consoleState.revokeAuthenticatorDevice($event.id)"
+          />
           <AdminPanel
             v-else
             :admin-tab="activeAdminTab"
@@ -298,9 +317,12 @@ function confirmAction() {
         v-if="loginOpen && !consoleState.isAdmin.value"
         :loading="consoleState.loading.value"
         :error-message="consoleState.errorMessage.value"
+        :mode="consoleState.authMode.value"
+        :enrollment="consoleState.activeAuthEnrollment.value"
         :form="consoleState.loginForm"
         @close="loginOpen = false"
         @login="consoleState.login"
+        @restart="consoleState.restartBootstrap"
       />
     </Transition>
 

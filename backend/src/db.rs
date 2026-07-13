@@ -202,6 +202,65 @@ pub async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS admin_users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            username_normalized TEXT NOT NULL UNIQUE,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS authenticator_devices (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            secret_ciphertext TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_authenticator_devices_user ON authenticator_devices(user_id);",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS admin_enrollments (
+            id TEXT PRIMARY KEY,
+            target_user_id TEXT REFERENCES admin_users(id) ON DELETE CASCADE,
+            username TEXT NOT NULL,
+            username_normalized TEXT NOT NULL,
+            device_name TEXT NOT NULL,
+            secret_ciphertext TEXT NOT NULL,
+            created_by_user_id TEXT REFERENCES admin_users(id) ON DELETE SET NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_admin_enrollments_expiry ON admin_enrollments(expires_at);",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS agent_releases (
             id TEXT PRIMARY KEY,
             version TEXT NOT NULL UNIQUE,

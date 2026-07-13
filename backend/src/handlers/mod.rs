@@ -3,14 +3,14 @@ use std::path::{Path as FsPath, PathBuf};
 use axum::{
     Json,
     extract::{Multipart, Path, Query, State, ws::WebSocketUpgrade},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
+    response::Response,
 };
 use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
-    auth::{SESSION_COOKIE, require_admin, session_token},
+    auth::require_admin,
     db::{
         approve_pending_instance, get_instance, get_instance_optional, instance_summary,
         latest_metric, register_or_touch_pending, retention_days, setting_value, write_action_log,
@@ -20,9 +20,8 @@ use crate::{
     models::{
         ActionLogRecord, AgentRegisterRequest, AgentRegisterResponse, AgentReportRequest,
         AgentWsQuery, AppearanceResponse, CommandJobRecord, CommandRecord, CreateCommandRequest,
-        HealthResponse, InstanceRecord, InstanceSummary, ListQuery, LoginRequest, LoginResponse,
-        MeResponse, MetricRecord, MetricsQuery, PendingInstance, SettingsRequest, SettingsResponse,
-        UpdateInstanceRequest,
+        HealthResponse, InstanceRecord, InstanceSummary, ListQuery, MetricRecord, MetricsQuery,
+        PendingInstance, SettingsRequest, SettingsResponse, UpdateInstanceRequest,
     },
     state::AppState,
     updates::confirm_update_version,
@@ -106,60 +105,6 @@ pub async fn public_metrics(
     Ok(Json(metrics))
 }
 
-pub async fn admin_login(
-    State(state): State<AppState>,
-    Json(payload): Json<LoginRequest>,
-) -> AppResult<Response> {
-    if payload.password != state.admin_password {
-        return Err(AppError::new(StatusCode::UNAUTHORIZED, "管理员密码错误"));
-    }
-
-    let token = Uuid::new_v4().to_string();
-    let expires_at = now_ts() + 7 * 24 * 3600;
-    state
-        .sessions
-        .write()
-        .await
-        .insert(token.clone(), expires_at);
-    write_action_log(&state.db, "admin", "login", "admin", "管理员登录").await?;
-
-    let mut response = Json(LoginResponse { role: "admin" }).into_response();
-    let cookie = format!(
-        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800",
-        SESSION_COOKIE, token
-    );
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&cookie)
-            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "Cookie 生成失败"))?,
-    );
-    Ok(response)
-}
-
-pub async fn admin_logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AppResult<Response> {
-    if let Some(token) = session_token(&headers) {
-        state.sessions.write().await.remove(&token);
-    }
-
-    let mut response = Json(MeResponse {
-        authenticated: false,
-    })
-    .into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_static("om_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"),
-    );
-    Ok(response)
-}
-
-pub async fn admin_me(State(state): State<AppState>, headers: HeaderMap) -> Json<MeResponse> {
-    let authenticated = require_admin(&state, &headers).await.is_ok();
-    Json(MeResponse { authenticated })
-}
-
 pub async fn admin_pending_instances(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -185,13 +130,20 @@ pub async fn admin_approve_instance(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
 
     approve_pending_instance(&state.db, &id)
         .await?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "待审批实例不存在"))?;
 
-    write_action_log(&state.db, "admin", "approve_instance", &id, "批准实例接入").await?;
+    write_action_log(
+        &state.db,
+        &admin.username,
+        "approve_instance",
+        &id,
+        "批准实例接入",
+    )
+    .await?;
 
     Ok(Json(AgentRegisterResponse {
         approved: true,
@@ -205,13 +157,20 @@ pub async fn admin_reject_instance(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
 
     sqlx::query("DELETE FROM pending_instances WHERE id = ?")
         .bind(&id)
         .execute(&state.db)
         .await?;
-    write_action_log(&state.db, "admin", "reject_instance", &id, "拒绝实例接入").await?;
+    write_action_log(
+        &state.db,
+        &admin.username,
+        "reject_instance",
+        &id,
+        "拒绝实例接入",
+    )
+    .await?;
 
     Ok(Json(AgentRegisterResponse {
         approved: false,
@@ -226,7 +185,7 @@ pub async fn admin_update_instance(
     Path(id): Path<String>,
     Json(payload): Json<UpdateInstanceRequest>,
 ) -> AppResult<Json<InstanceSummary>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
 
     let current = get_instance(&state.db, &id).await?;
     let name = non_empty_or(payload.name, current.name);
@@ -282,7 +241,14 @@ pub async fn admin_update_instance(
     .bind(&id)
     .execute(&state.db)
     .await?;
-    write_action_log(&state.db, "admin", "update_instance", &id, "编辑实例资料").await?;
+    write_action_log(
+        &state.db,
+        &admin.username,
+        "update_instance",
+        &id,
+        "编辑实例资料",
+    )
+    .await?;
 
     let updated = get_instance(&state.db, &id).await?;
     let metrics = latest_metric(&state.db, &updated.id).await?;
@@ -295,14 +261,21 @@ pub async fn admin_disable_instance(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
 
     sqlx::query("UPDATE instances SET disabled = 1 WHERE id = ?")
         .bind(&id)
         .execute(&state.db)
         .await?;
     state.agents.write().await.remove(&id);
-    write_action_log(&state.db, "admin", "disable_instance", &id, "停用实例").await?;
+    write_action_log(
+        &state.db,
+        &admin.username,
+        "disable_instance",
+        &id,
+        "停用实例",
+    )
+    .await?;
 
     Ok(Json(AgentRegisterResponse {
         approved: true,
@@ -316,7 +289,7 @@ pub async fn admin_delete_instance(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
 
     sqlx::query("DELETE FROM metrics WHERE instance_id = ?")
         .bind(&id)
@@ -333,7 +306,7 @@ pub async fn admin_delete_instance(
     state.agents.write().await.remove(&id);
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "delete_instance",
         &id,
         "删除实例和历史指标",
@@ -363,7 +336,7 @@ pub async fn admin_put_settings(
     headers: HeaderMap,
     Json(payload): Json<SettingsRequest>,
 ) -> AppResult<Json<SettingsResponse>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let days = payload.retention_days.clamp(1, 365);
     sqlx::query(
         "INSERT INTO settings(key, value) VALUES('retention_days', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -373,7 +346,7 @@ pub async fn admin_put_settings(
     .await?;
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "update_settings",
         "retention_days",
         &format!("指标保留天数设置为 {}", days),
@@ -390,7 +363,7 @@ pub async fn admin_upload_background_image(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> AppResult<Json<SettingsResponse>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
 
     let mut image: Option<(String, Vec<u8>)> = None;
     while let Some(field) = multipart
@@ -453,7 +426,7 @@ pub async fn admin_upload_background_image(
 
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "update_background",
         "appearance",
         "更新站点背景图",
@@ -470,7 +443,7 @@ pub async fn admin_delete_background_image(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<SettingsResponse>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let old_relative_path = setting_value(&state.db, BACKGROUND_SETTING_KEY).await?;
     sqlx::query("DELETE FROM settings WHERE key = ?")
         .bind(BACKGROUND_SETTING_KEY)
@@ -481,7 +454,7 @@ pub async fn admin_delete_background_image(
     }
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "clear_background",
         "appearance",
         "清除站点背景图",
@@ -556,7 +529,7 @@ pub async fn admin_create_command(
     headers: HeaderMap,
     Json(payload): Json<CreateCommandRequest>,
 ) -> AppResult<Json<CommandRecord>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let name = payload.name.trim();
     let command = payload.command.trim();
     if name.is_empty() || command.is_empty() {
@@ -588,7 +561,7 @@ pub async fn admin_create_command(
 
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "create_command",
         &record.id,
         &record.name,
@@ -602,12 +575,19 @@ pub async fn admin_disable_command(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     sqlx::query("UPDATE commands SET enabled = 0 WHERE id = ?")
         .bind(&id)
         .execute(&state.db)
         .await?;
-    write_action_log(&state.db, "admin", "disable_command", &id, "停用快捷操作").await?;
+    write_action_log(
+        &state.db,
+        &admin.username,
+        "disable_command",
+        &id,
+        "停用快捷操作",
+    )
+    .await?;
     Ok(Json(AgentRegisterResponse {
         approved: true,
         disabled: true,
@@ -620,7 +600,7 @@ pub async fn admin_run_whitelist_command(
     headers: HeaderMap,
     Path((instance_id, command_id)): Path<(String, String)>,
 ) -> AppResult<Json<CommandJobRecord>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
 
     let command = sqlx::query_as::<_, CommandRecord>(
         "SELECT id, name, command, confirm_text, enabled, created_at FROM commands WHERE id = ? AND enabled = 1",
@@ -635,13 +615,13 @@ pub async fn admin_run_whitelist_command(
         Some(command.id),
         &instance_id,
         &command.command,
-        "admin",
+        &admin.username,
     )
     .await?;
     dispatch_command(&state, &job.id, &instance_id, &command.command).await?;
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "run_command",
         &instance_id,
         &format!("执行快捷操作：{}", command.name),
@@ -836,7 +816,7 @@ pub async fn admin_terminal_ws(
     Path(instance_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     get_instance(&state.db, &instance_id).await?;
-    Ok(ws.on_upgrade(move |socket| terminal_socket(state, instance_id, socket)))
+    Ok(ws.on_upgrade(move |socket| terminal_socket(state, instance_id, admin.username, socket)))
 }

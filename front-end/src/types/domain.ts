@@ -90,6 +90,48 @@ export type AppearanceResponse = {
   background_image_url: string | null
 }
 
+export type AuthMode = 'bootstrap' | 'totp'
+
+export type SessionUser = {
+  id: string
+  username: string
+}
+
+export type AuthEnrollment = {
+  id: string
+  username: string
+  device_name: string
+  otpauth_uri: string
+  expires_at: number
+}
+
+export type AuthenticatorDevice = {
+  id: string
+  name: string
+  created_at: number
+  last_used_at: number | null
+}
+
+export type AdminUser = SessionUser & {
+  enabled: boolean
+  created_at: number
+  devices: AuthenticatorDevice[]
+}
+
+export type PendingAuthEnrollment = {
+  id: string
+  target_user_id: string | null
+  username: string
+  device_name: string
+  created_at: number
+  expires_at: number
+}
+
+export type AdminUsersResponse = {
+  users: AdminUser[]
+  enrollments: PendingAuthEnrollment[]
+}
+
 export type AgentReleaseStatus = 'draft' | 'published'
 
 export type AgentPackageType = 'standalone'
@@ -182,6 +224,6 @@ export type AgentReleaseForm = {
 
 export type ViewMode = 'grid' | 'rows'
 
-export type AdminTab = 'pending' | 'commands' | 'updates' | 'settings' | 'logs'
+export type AdminTab = 'pending' | 'commands' | 'updates' | 'users' | 'settings' | 'logs'
 
 export type AppPage = 'home' | AdminTab

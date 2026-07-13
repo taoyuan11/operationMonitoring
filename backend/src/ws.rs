@@ -325,7 +325,12 @@ async fn close_connection_terminals(state: &AppState, instance_id: &str, connect
     });
 }
 
-pub async fn terminal_socket(state: AppState, instance_id: String, socket: WebSocket) {
+pub async fn terminal_socket(
+    state: AppState,
+    instance_id: String,
+    actor: String,
+    socket: WebSocket,
+) {
     let session_id = Uuid::new_v4().to_string();
     let started_at = now_ts();
     let Some(agent) = state.agents.read().await.get(&instance_id).cloned() else {
@@ -340,10 +345,11 @@ pub async fn terminal_socket(state: AppState, instance_id: String, socket: WebSo
     };
 
     if let Err(error) = sqlx::query(
-        "INSERT INTO ssh_sessions(id, instance_id, actor, started_at) VALUES(?, ?, 'admin', ?)",
+        "INSERT INTO ssh_sessions(id, instance_id, actor, started_at) VALUES(?, ?, ?, ?)",
     )
     .bind(&session_id)
     .bind(&instance_id)
+    .bind(&actor)
     .bind(started_at)
     .execute(&state.db)
     .await

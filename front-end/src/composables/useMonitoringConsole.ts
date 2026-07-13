@@ -9,12 +9,18 @@ import type {
   AgentRelease,
   AgentReleaseForm,
   AgentUpdateAttempt,
+  AdminUser,
+  AdminUsersResponse,
   AdminTab,
   AppearanceResponse,
+  AuthEnrollment,
+  AuthMode,
   CommandJob,
   CommandRecord,
   Instance,
   PendingInstance,
+  PendingAuthEnrollment,
+  SessionUser,
   SettingsResponse,
   ViewMode,
 } from '../types/domain'
@@ -36,6 +42,11 @@ export function useMonitoringConsole() {
   const logs = ref<ActionLog[]>([])
   const agentReleases = ref<AgentRelease[]>([])
   const agentUpdateAttempts = ref<AgentUpdateAttempt[]>([])
+  const adminUsers = ref<AdminUser[]>([])
+  const authEnrollments = ref<PendingAuthEnrollment[]>([])
+  const activeAuthEnrollment = ref<AuthEnrollment | null>(null)
+  const authMode = ref<AuthMode>('totp')
+  const currentUser = ref<SessionUser | null>(null)
   const isAdmin = ref(false)
   const sessionReady = ref(false)
   const publicReady = ref(false)
@@ -60,7 +71,15 @@ export function useMonitoringConsole() {
   let publicRequestInFlight = false
 
   const loginForm = reactive({
+    username: '',
     password: '',
+    code: '',
+  })
+
+  const userAuthForm = reactive({
+    username: '',
+    current_code: '',
+    confirmation_code: '',
   })
 
   const settingsForm = reactive({
@@ -183,20 +202,26 @@ export function useMonitoringConsole() {
   }
 
   async function checkSession() {
-    const me = await api<{ authenticated: boolean }>('/api/admin/me')
+    const [status, me] = await Promise.all([
+      api<{ mode: AuthMode }>('/api/admin/auth/status'),
+      api<{ authenticated: boolean; user: SessionUser | null }>('/api/admin/me'),
+    ])
+    authMode.value = status.mode
     isAdmin.value = me.authenticated
+    currentUser.value = me.user
     if (me.authenticated) {
       await loadAdminData()
     }
   }
 
   async function loadAdminData() {
-    const [pending, commandList, jobList, logList, settings] = await Promise.all([
+    const [pending, commandList, jobList, logList, settings, users] = await Promise.all([
       api<PendingInstance[]>('/api/admin/pending-instances'),
       api<CommandRecord[]>('/api/admin/commands'),
       api<CommandJob[]>('/api/admin/jobs'),
       api<ActionLog[]>('/api/admin/logs'),
       api<SettingsResponse>('/api/admin/settings'),
+      api<AdminUsersResponse>('/api/admin/users'),
       loadAgentUpdates(),
     ])
     pendingInstances.value = pending
@@ -206,6 +231,7 @@ export function useMonitoringConsole() {
     settingsForm.retention_days = settings.retention_days
     applyAppearance(settings.background_image_url)
     settingsForm.background_image_url = settings.background_image_url
+    applyUsers(users)
   }
 
   async function loadAgentUpdates() {
@@ -244,26 +270,61 @@ export function useMonitoringConsole() {
 
   function login() {
     guarded(async () => {
-      await api<{ role: 'admin' }>('/api/admin/login', {
-        method: 'POST',
-        body: JSON.stringify(loginForm),
-      })
+      if (authMode.value === 'bootstrap' && !activeAuthEnrollment.value) {
+        activeAuthEnrollment.value = await api<AuthEnrollment>('/api/admin/bootstrap/start', {
+          method: 'POST',
+          body: JSON.stringify({
+            username: loginForm.username,
+            password: loginForm.password,
+          }),
+        })
+        loginForm.password = ''
+        loginForm.code = ''
+        return
+      }
+
+      const response = authMode.value === 'bootstrap' && activeAuthEnrollment.value
+        ? await api<{ role: 'admin'; user: SessionUser }>(
+            `/api/admin/bootstrap/enrollments/${activeAuthEnrollment.value.id}/confirm`,
+            {
+              method: 'POST',
+              body: JSON.stringify({ code: loginForm.code }),
+            },
+          )
+        : await api<{ role: 'admin'; user: SessionUser }>('/api/admin/login', {
+            method: 'POST',
+            body: JSON.stringify({ username: loginForm.username, code: loginForm.code }),
+          })
       isAdmin.value = true
+      currentUser.value = response.user
+      authMode.value = 'totp'
+      activeAuthEnrollment.value = null
       loginForm.password = ''
+      loginForm.code = ''
       await loadAdminData()
     })
+  }
+
+  function restartBootstrap() {
+    activeAuthEnrollment.value = null
+    loginForm.code = ''
+    errorMessage.value = ''
   }
 
   function logout() {
     guarded(async () => {
       await api('/api/admin/logout', { method: 'POST' })
       isAdmin.value = false
+      currentUser.value = null
       pendingInstances.value = []
       commands.value = []
       jobs.value = []
       logs.value = []
       agentReleases.value = []
       agentUpdateAttempts.value = []
+      adminUsers.value = []
+      authEnrollments.value = []
+      activeAuthEnrollment.value = null
       agentUpdateMessage.value = ''
     })
   }
@@ -364,6 +425,108 @@ export function useMonitoringConsole() {
       })
       await loadAdminData()
     })
+  }
+
+  function createUserEnrollment() {
+    return runUserAuthTask(async () => {
+      activeAuthEnrollment.value = await api<AuthEnrollment>('/api/admin/users/enrollments', {
+        method: 'POST',
+        body: JSON.stringify({
+          username: userAuthForm.username,
+          current_code: userAuthForm.current_code,
+        }),
+      })
+      userAuthForm.username = ''
+      userAuthForm.confirmation_code = ''
+      await loadUsers()
+    })
+  }
+
+  function createDeviceEnrollment(user: AdminUser) {
+    return runUserAuthTask(async () => {
+      activeAuthEnrollment.value = await api<AuthEnrollment>(
+        `/api/admin/users/${user.id}/device-enrollments`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ current_code: userAuthForm.current_code }),
+        },
+      )
+      userAuthForm.confirmation_code = ''
+      await loadUsers()
+    })
+  }
+
+  function confirmAuthEnrollment() {
+    if (!activeAuthEnrollment.value) return Promise.resolve(false)
+    const enrollmentId = activeAuthEnrollment.value.id
+    return runUserAuthTask(async () => {
+      const users = await api<AdminUsersResponse>(
+        `/api/admin/auth/enrollments/${enrollmentId}/confirm`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ code: userAuthForm.confirmation_code }),
+        },
+      )
+      activeAuthEnrollment.value = null
+      userAuthForm.confirmation_code = ''
+      applyUsers(users)
+    }, false)
+  }
+
+  function cancelAuthEnrollment(enrollmentId: string) {
+    return runUserAuthTask(async () => {
+      await api(`/api/admin/auth/enrollments/${enrollmentId}`, {
+        method: 'DELETE',
+        body: JSON.stringify({ current_code: userAuthForm.current_code }),
+      })
+      if (activeAuthEnrollment.value?.id === enrollmentId) activeAuthEnrollment.value = null
+      await loadUsers()
+    })
+  }
+
+  function setAdminUserEnabled(user: AdminUser, enabled: boolean) {
+    return runUserAuthTask(async () => {
+      await api(`/api/admin/users/${user.id}/enabled`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled, current_code: userAuthForm.current_code }),
+      })
+      await loadUsers()
+    })
+  }
+
+  function deleteAdminUser(user: AdminUser) {
+    return runUserAuthTask(async () => {
+      await api(`/api/admin/users/${user.id}`, {
+        method: 'DELETE',
+        body: JSON.stringify({ current_code: userAuthForm.current_code }),
+      })
+      await loadUsers()
+    })
+  }
+
+  function revokeAuthenticatorDevice(deviceId: string) {
+    return runUserAuthTask(async () => {
+      await api(`/api/admin/auth/devices/${deviceId}`, {
+        method: 'DELETE',
+        body: JSON.stringify({ current_code: userAuthForm.current_code }),
+      })
+      await checkSession()
+    })
+  }
+
+  async function runUserAuthTask(task: () => Promise<void>, clearCurrentCode = true) {
+    const success = await guarded(task)
+    if (clearCurrentCode) userAuthForm.current_code = ''
+    return success
+  }
+
+  async function loadUsers() {
+    applyUsers(await api<AdminUsersResponse>('/api/admin/users'))
+  }
+
+  function applyUsers(response: AdminUsersResponse) {
+    adminUsers.value = response.users
+    authEnrollments.value = response.enrollments
   }
 
   function createAgentRelease() {
@@ -623,6 +786,11 @@ export function useMonitoringConsole() {
     logs,
     agentReleases,
     agentUpdateAttempts,
+    adminUsers,
+    authEnrollments,
+    activeAuthEnrollment,
+    authMode,
+    currentUser,
     isAdmin,
     sessionReady,
     publicReady,
@@ -640,6 +808,7 @@ export function useMonitoringConsole() {
     agentUpdateMessage,
     currentTime,
     loginForm,
+    userAuthForm,
     settingsForm,
     commandForm,
     agentReleaseForm,
@@ -657,6 +826,7 @@ export function useMonitoringConsole() {
     appearanceStyle,
     refreshAll,
     login,
+    restartBootstrap,
     logout,
     approveInstance,
     rejectInstance,
@@ -669,6 +839,13 @@ export function useMonitoringConsole() {
     removeCommand,
     runCommand,
     saveSettings,
+    createUserEnrollment,
+    createDeviceEnrollment,
+    confirmAuthEnrollment,
+    cancelAuthEnrollment,
+    setAdminUserEnabled,
+    deleteAdminUser,
+    revokeAuthenticatorDevice,
     loadAgentUpdates,
     createAgentRelease,
     saveAgentRelease,

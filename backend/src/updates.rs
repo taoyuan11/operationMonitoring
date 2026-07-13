@@ -114,7 +114,7 @@ pub async fn admin_create_agent_release(
     headers: HeaderMap,
     Json(payload): Json<CreateAgentReleaseRequest>,
 ) -> AppResult<(StatusCode, Json<AgentReleaseDetail>)> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let version = validate_version(&payload.version)?;
     let id = Uuid::new_v4().to_string();
     let created_at = now_ts();
@@ -131,7 +131,7 @@ pub async fn admin_create_agent_release(
 
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "create_agent_release",
         &id,
         &format!("创建 Agent 版本 {version}"),
@@ -150,7 +150,7 @@ pub async fn admin_update_agent_release(
     Path(release_id): Path<String>,
     Json(payload): Json<CreateAgentReleaseRequest>,
 ) -> AppResult<Json<AgentReleaseDetail>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     require_draft_release(&state, &release_id).await?;
     let version = validate_version(&payload.version)?;
     let result = sqlx::query(
@@ -171,7 +171,7 @@ pub async fn admin_update_agent_release(
 
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "update_agent_release",
         &release_id,
         &format!("更新 Agent 草稿 {version}"),
@@ -186,7 +186,7 @@ pub async fn admin_delete_agent_release(
     headers: HeaderMap,
     Path(release_id): Path<String>,
 ) -> AppResult<StatusCode> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     require_draft_release(&state, &release_id).await?;
     let deleted = sqlx::query("DELETE FROM agent_releases WHERE id = ? AND status = 'draft'")
         .bind(&release_id)
@@ -201,7 +201,7 @@ pub async fn admin_delete_agent_release(
     let _ = fs::remove_dir_all(state.update_dir.join(&release_id)).await;
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "delete_agent_release",
         &release_id,
         "删除 Agent 更新草稿",
@@ -216,7 +216,7 @@ pub async fn admin_upload_agent_artifact(
     Path(release_id): Path<String>,
     multipart: Multipart,
 ) -> AppResult<(StatusCode, Json<AgentArtifactRecord>)> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     require_draft_release(&state, &release_id).await?;
     let received = receive_artifact(&state, multipart).await?;
     let result = store_artifact(&state, &release_id, received).await;
@@ -224,7 +224,7 @@ pub async fn admin_upload_agent_artifact(
 
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "upload_agent_artifact",
         &artifact.id,
         &format!(
@@ -241,7 +241,7 @@ pub async fn admin_delete_agent_artifact(
     headers: HeaderMap,
     Path((release_id, artifact_id)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     require_draft_release(&state, &release_id).await?;
     let artifact = get_artifact(&state, &artifact_id)
         .await?
@@ -273,7 +273,7 @@ pub async fn admin_delete_agent_artifact(
     remove_stored_file(&state, &format!("{}.sha256", artifact.storage_path)).await;
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "delete_agent_artifact",
         &artifact_id,
         "删除 Agent 可执行文件及 SHA-256 校验文件",
@@ -287,7 +287,7 @@ pub async fn admin_publish_agent_release(
     headers: HeaderMap,
     Path(release_id): Path<String>,
 ) -> AppResult<Json<AgentReleaseDetail>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let release = require_draft_release(&state, &release_id).await?;
     let target = Version::parse(&release.version)
         .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "版本号不是有效的 SemVer"))?;
@@ -358,7 +358,7 @@ pub async fn admin_publish_agent_release(
 
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "publish_agent_release",
         &release_id,
         &format!("发布 Agent 版本 {}", release.version),
@@ -405,7 +405,7 @@ pub async fn admin_retry_agent_update(
     headers: HeaderMap,
     Path(attempt_id): Path<String>,
 ) -> AppResult<Json<AgentUpdateAttemptRecord>> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let attempt = get_attempt(&state, &attempt_id).await?;
     if !matches!(attempt.status.as_str(), "failed" | "rollback_succeeded") {
         return Err(AppError::new(
@@ -437,7 +437,7 @@ pub async fn admin_retry_agent_update(
     }
     write_action_log(
         &state.db,
-        "admin",
+        &admin.username,
         "retry_agent_update",
         &attempt_id,
         &format!("重试实例 {} 的 Agent 更新", attempt.instance_id),
@@ -1590,7 +1590,7 @@ mod tests {
 
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use crate::{config::Cli, db::init_db};
+    use crate::{auth::AuthCipher, config::Cli, db::init_db};
 
     async fn test_state() -> AppState {
         let db = SqlitePoolOptions::new()
@@ -1609,10 +1609,16 @@ mod tests {
                 bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
                 database_url: "sqlite::memory:".to_string(),
                 admin_password: "test".to_string(),
+                auth_secret_key: None,
+                auth_key_file: root.join("auth-secret.key"),
+                secure_cookies: false,
+                reset_admin_auth: false,
+                confirm_reset_admin_auth: None,
                 upload_dir: root.join("uploads"),
                 update_dir: root.join("updates"),
                 agent_package_max_bytes: 1024 * 1024,
             },
+            AuthCipher::from_key(&[7_u8; 32]).expect("create test auth cipher"),
         )
     }
 

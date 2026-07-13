@@ -8,21 +8,6 @@ pub struct HealthResponse {
 }
 
 #[derive(Deserialize)]
-pub struct LoginRequest {
-    pub password: String,
-}
-
-#[derive(Serialize)]
-pub struct LoginResponse {
-    pub role: &'static str,
-}
-
-#[derive(Serialize)]
-pub struct MeResponse {
-    pub authenticated: bool,
-}
-
-#[derive(Deserialize)]
 pub struct AgentRegisterRequest {
     pub instance_id: String,
     pub secret: String,

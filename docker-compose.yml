@@ -6,6 +6,8 @@ services:
       OM_BIND: 0.0.0.0:13500
       OM_DATABASE_URL: sqlite:///app/db/operation-monitoring.db
       OM_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:-admin123}
+      OM_AUTH_KEY_FILE: /app/db/auth-secret.key
+      OM_SECURE_COOKIES: ${OM_SECURE_COOKIES:-false}
       OM_UPLOAD_DIR: /app/uploads
       OM_UPDATE_DIR: /app/updates
       OM_AGENT_PACKAGE_MAX_BYTES: ${OM_AGENT_PACKAGE_MAX_BYTES:-268435456}

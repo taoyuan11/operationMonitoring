@@ -5,6 +5,7 @@ use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::{
+    auth::AuthCipher,
     config::Cli,
     models::{AgentOutbound, TerminalServerMessage},
 };
@@ -13,27 +14,48 @@ use crate::{
 pub struct AppState {
     pub db: SqlitePool,
     pub admin_password: String,
+    pub auth_cipher: Arc<AuthCipher>,
+    pub secure_cookies: bool,
     pub upload_dir: PathBuf,
     pub update_dir: PathBuf,
     pub agent_package_max_bytes: usize,
-    pub sessions: Arc<RwLock<HashMap<String, i64>>>,
+    pub sessions: Arc<RwLock<HashMap<String, AdminSession>>>,
+    pub auth_attempts: Arc<RwLock<HashMap<String, AuthAttempt>>>,
     pub agents: Arc<RwLock<HashMap<String, AgentHandle>>>,
     pub terminal_sessions: Arc<RwLock<HashMap<String, TerminalSessionHandle>>>,
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool, cli: Cli) -> Self {
+    pub fn new(db: SqlitePool, cli: Cli, auth_cipher: AuthCipher) -> Self {
         Self {
             db,
             admin_password: cli.admin_password,
+            auth_cipher: Arc::new(auth_cipher),
+            secure_cookies: cli.secure_cookies,
             upload_dir: cli.upload_dir,
             update_dir: cli.update_dir,
             agent_package_max_bytes: cli.agent_package_max_bytes,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            auth_attempts: Arc::new(RwLock::new(HashMap::new())),
             agents: Arc::new(RwLock::new(HashMap::new())),
             terminal_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+}
+
+#[derive(Clone)]
+pub struct AdminSession {
+    pub user_id: String,
+    pub username: String,
+    pub device_id: String,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Default)]
+pub struct AuthAttempt {
+    pub failures: u32,
+    pub window_started_at: i64,
+    pub blocked_until: i64,
 }
 
 #[derive(Clone)]

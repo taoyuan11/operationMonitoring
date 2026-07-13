@@ -15,6 +15,16 @@ pub struct Cli {
     pub database_url: String,
     #[arg(long, env = "OM_ADMIN_PASSWORD", default_value = "admin123")]
     pub admin_password: String,
+    #[arg(long, env = "OM_AUTH_SECRET_KEY")]
+    pub auth_secret_key: Option<String>,
+    #[arg(long, env = "OM_AUTH_KEY_FILE", default_value = "db/auth-secret.key")]
+    pub auth_key_file: PathBuf,
+    #[arg(long, env = "OM_SECURE_COOKIES", default_value_t = false)]
+    pub secure_cookies: bool,
+    #[arg(long, default_value_t = false)]
+    pub reset_admin_auth: bool,
+    #[arg(long)]
+    pub confirm_reset_admin_auth: Option<String>,
     #[arg(long, env = "OM_UPLOAD_DIR", default_value = "uploads")]
     pub upload_dir: PathBuf,
     #[arg(long, env = "OM_UPDATE_DIR", default_value = "updates")]

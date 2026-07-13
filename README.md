@@ -31,7 +31,8 @@ front-end/src/
 
 ```text
 backend/src/
-  auth.rs         管理员 session 校验
+  auth.rs         TOTP、密钥加密和管理员 session 校验
+  admin_auth.rs   管理员初始化、登录、用户与认证设备 API
   config.rs       启动参数和环境变量
   db.rs           SQLite 连接、建表、查询辅助、清理任务
   error.rs        统一错误响应
@@ -125,8 +126,12 @@ docker compose up -d --build
 - 后端 API：`http://localhost:13500`
 - 健康检查：`http://localhost:13500/api/health`
 
-默认管理员密码为仅供本地开发使用的 `admin123`。生产环境必须通过
-`OM_ADMIN_PASSWORD` 设置强密码；也可以覆盖前后端端口：
+默认密码 `admin123` 仅用于第一次启动时创建首位管理员。首次登录后必须填写
+用户名、使用手机 Authenticator 扫描二维码并输入 6 位代码；确认成功后密码入口会
+永久关闭，之后统一使用“用户名 + Authenticator 代码”登录。兼容 Google
+Authenticator、Microsoft Authenticator、1Password 等标准 TOTP 应用。
+
+生产环境必须在首次初始化前通过 `OM_ADMIN_PASSWORD` 设置强密码；也可以覆盖前后端端口：
 
 ```bash
 OM_ADMIN_PASSWORD='replace-with-a-strong-password' \
@@ -147,6 +152,35 @@ docker compose ps
 docker compose logs -f
 docker compose down
 ```
+
+后台“用户管理”页面可以现场添加管理员和多台 Authenticator。创建、停用、删除、
+撤销设备等敏感操作都需要当前管理员再次输入自己的 6 位代码。二维码只在创建页面
+临时显示，刷新后不能恢复；未确认的注册可取消后重新生成。
+
+TOTP 密钥使用 AES-256-GCM 加密。默认加密主密钥保存在 SQLite 同一命名卷内的
+`/app/db/auth-secret.key`，备份数据库时必须同时备份该文件；丢失后现有
+Authenticator 无法恢复。也可以通过 `OM_AUTH_SECRET_KEY` 提供 Base64 编码的
+32 字节主密钥，此时应由外部 Secret 管理系统保存。
+
+若唯一管理员遗失全部设备，只能在后端主机上停止正常服务后执行显式恢复：
+
+```bash
+cd backend
+cargo run -- --reset-admin-auth \
+  --confirm-reset-admin-auth RESET-ADMIN-AUTH
+```
+
+Docker 部署使用挂载了同一数据库卷的一次性后端容器：
+
+```bash
+docker compose stop backend
+docker compose run --rm backend --reset-admin-auth \
+  --confirm-reset-admin-auth RESET-ADMIN-AUTH
+docker compose up -d backend
+```
+
+恢复命令会删除所有管理员与认证设备并立即退出；下一次正常启动重新开放一次性
+密码初始化。操作日志和业务数据不会删除。
 
 默认允许上传 256 MiB 的 Agent 包。修改后端限制时，应同时调整 Nginx 请求体限制：
 
@@ -319,6 +353,9 @@ Agent 会流式下载文件，校验大小、平台文件签名和 SHA-256，等
 OM_BIND=127.0.0.1:13500
 OM_DATABASE_URL=sqlite://db/operation-monitoring.db
 OM_ADMIN_PASSWORD=admin123
+OM_AUTH_KEY_FILE=db/auth-secret.key
+# OM_AUTH_SECRET_KEY=<Base64 编码的 32 字节主密钥>
+OM_SECURE_COOKIES=false
 OM_UPLOAD_DIR=uploads
 OM_UPDATE_DIR=updates
 OM_AGENT_PACKAGE_MAX_BYTES=268435456
@@ -327,6 +364,10 @@ OM_AGENT_PACKAGE_MAX_BYTES=268435456
 未设置 `OM_DATABASE_URL` 时，后端会在启动进程的当前工作目录下自动创建
 `db/operation-monitoring.db`；SQLite 产生的 WAL、SHM 等运行时文件也位于该目录，
 不会作为项目文件提交。
+
+`OM_ADMIN_PASSWORD` 仅在管理员表为空时有效，完成首位管理员绑定后即使仍保留该
+变量也会被忽略。`OM_SECURE_COOKIES` 在 HTTPS/WSS 生产部署中应设为 `true`；
+直接使用 HTTP 本地开发时保持 `false`。会话固定有效 7 天，后端重启会要求重新登录。
 
 实例端：
 

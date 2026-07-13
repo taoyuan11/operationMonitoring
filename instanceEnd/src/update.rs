@@ -5,7 +5,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Output, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
     sync::OnceLock,
     thread,
@@ -45,6 +45,7 @@ const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVICE_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DISK_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CHECKSUM_FILE_BYTES: usize = 4096;
 
 static UPDATE_CAPABILITY: OnceLock<UpdateCapability> = OnceLock::new();
 
@@ -454,10 +455,11 @@ impl UpdateManager {
         tokio::time::sleep(Duration::from_secs(delay)).await;
 
         self.send_status(offer, UpdateStatus::Downloading, None, outbound)?;
+        let checksum_sha256 = self.download_checksum(offer).await?;
         let downloaded = self.download_to_temporary(offer, package_type).await?;
 
         self.send_status(offer, UpdateStatus::Verifying, None, outbound)?;
-        verify_download(offer, package_type, &downloaded)?;
+        verify_download(offer, package_type, &downloaded, &checksum_sha256)?;
         replace_file(&downloaded.temporary_path, &downloaded.final_path)?;
         self.set_package_path(offer, downloaded.final_path.clone())?;
 
@@ -551,9 +553,9 @@ impl UpdateManager {
         if offer.sha256.len() != 64 || !offer.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("update package SHA-256 is invalid");
         }
-        if !offer.download_url.starts_with("/api/agent/update/")
-            || offer.download_url.starts_with("//")
-        {
+        let expected_download_url =
+            format!("/api/agent/update/artifacts/{}/download", offer.artifact_id);
+        if offer.download_url != expected_download_url {
             bail!("update download URL must be an agent update API path");
         }
         offer.package_type.parse()
@@ -633,6 +635,46 @@ impl UpdateManager {
             size_bytes: received,
             sha256: format!("{:x}", hasher.finalize()),
         })
+    }
+
+    async fn download_checksum(&self, offer: &UpdateOffer) -> Result<String> {
+        let checksum_path = offer
+            .download_url
+            .strip_suffix("/download")
+            .context("update download URL has no download suffix")?;
+        let checksum_url = format!(
+            "{}{checksum_path}/checksum",
+            self.config.server.trim_end_matches('/'),
+        );
+        let response = self
+            .client
+            .get(checksum_url)
+            .header(AGENT_ID_HEADER, &self.identity.instance_id)
+            .header(AGENT_SECRET_HEADER, &self.identity.secret)
+            .send()
+            .await?
+            .error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|length| length == 0 || length > MAX_CHECKSUM_FILE_BYTES as u64)
+        {
+            bail!("update SHA-256 sidecar size is invalid");
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len() + chunk.len() > MAX_CHECKSUM_FILE_BYTES {
+                bail!("update SHA-256 sidecar size is invalid");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            bail!("update SHA-256 sidecar size is invalid");
+        }
+        let contents = std::str::from_utf8(&bytes)
+            .context("update SHA-256 sidecar is not valid UTF-8 text")?;
+        parse_checksum_sidecar(contents)
     }
 
     fn begin_attempt(&self, offer: &UpdateOffer) -> Result<()> {
@@ -1449,11 +1491,12 @@ fn run_command_with_timeout(
     wait_for_command(&mut child, spec, timeout, description)
 }
 
+#[cfg(any(windows, test))]
 fn run_command_output_with_timeout(
     spec: &CommandSpec,
     timeout: Duration,
     description: &str,
-) -> Result<Output> {
+) -> Result<std::process::Output> {
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -1584,6 +1627,7 @@ fn restart_agent_service(_package_type: PackageType) -> Result<()> {
     bail!("{}", errors.join("; "))
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScServiceState {
     Stopped,
@@ -1591,6 +1635,7 @@ enum ScServiceState {
     Other,
 }
 
+#[cfg(any(windows, test))]
 fn parse_sc_query_state(output: &str) -> Option<ScServiceState> {
     for line in output.lines() {
         let Some((_, fields)) = line.split_once(':') else {
@@ -1614,6 +1659,7 @@ fn parse_sc_query_state(output: &str) -> Option<ScServiceState> {
     None
 }
 
+#[cfg(windows)]
 fn query_windows_agent_service(service_name: &str) -> Result<ScServiceState> {
     let spec = CommandSpec {
         program: "sc.exe".into(),
@@ -1632,6 +1678,7 @@ fn query_windows_agent_service(service_name: &str) -> Result<ScServiceState> {
         .ok_or_else(|| anyhow!("sc query did not report a service state"))
 }
 
+#[cfg(windows)]
 fn stop_windows_agent_service(service_name: &str) -> Result<()> {
     if query_windows_agent_service(service_name)? == ScServiceState::Stopped {
         return Ok(());
@@ -1657,6 +1704,7 @@ fn stop_windows_agent_service(service_name: &str) -> Result<()> {
     }
 }
 
+#[cfg(windows)]
 fn restart_windows_agent_service(service_name: &str) -> Result<()> {
     stop_windows_agent_service(service_name)?;
 
@@ -1753,6 +1801,7 @@ fn verify_download(
     offer: &UpdateOffer,
     package_type: PackageType,
     downloaded: &DownloadedPackage,
+    checksum_sha256: &str,
 ) -> Result<()> {
     let expected_size = u64::try_from(offer.size_bytes).context("invalid package size")?;
     if downloaded.size_bytes != expected_size {
@@ -1761,14 +1810,34 @@ fn verify_download(
             downloaded.size_bytes
         );
     }
-    if !downloaded.sha256.eq_ignore_ascii_case(&offer.sha256) {
+    if !checksum_sha256.eq_ignore_ascii_case(&offer.sha256) {
+        bail!(
+            "SHA-256 sidecar mismatch: offer expected {}, sidecar declared {}",
+            offer.sha256,
+            checksum_sha256
+        );
+    }
+    if !downloaded.sha256.eq_ignore_ascii_case(checksum_sha256) {
         bail!(
             "download SHA-256 mismatch: expected {}, got {}",
-            offer.sha256,
+            checksum_sha256,
             downloaded.sha256
         );
     }
     validate_package_magic(package_type, &downloaded.temporary_path)
+}
+
+fn parse_checksum_sidecar(contents: &str) -> Result<String> {
+    let mut fields = contents.split_whitespace();
+    let sha256 = fields.next().unwrap_or_default();
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("update SHA-256 sidecar contains an invalid digest");
+    }
+    let _file_name = fields.next();
+    if fields.next().is_some() {
+        bail!("update SHA-256 sidecar contains unexpected fields");
+    }
+    Ok(sha256.to_ascii_lowercase())
 }
 
 fn verify_package_at_rest(
@@ -2068,6 +2137,67 @@ fn is_update_privileged() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_sha256_sidecar_and_rejects_invalid_content() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            parse_checksum_sidecar(&format!("{digest}  om-agent.bin\n")).unwrap(),
+            digest
+        );
+        assert_eq!(
+            parse_checksum_sidecar(&format!("{}\n", "B".repeat(64))).unwrap(),
+            "b".repeat(64)
+        );
+        assert!(parse_checksum_sidecar("not-a-digest om-agent.bin").is_err());
+        assert!(
+            parse_checksum_sidecar(&format!("{} om-agent.bin extra\n", "a".repeat(64))).is_err()
+        );
+    }
+
+    #[test]
+    fn downloaded_package_must_match_offer_and_sidecar() {
+        #[cfg(windows)]
+        let package: &[u8] = b"MZtrusted-executable";
+        #[cfg(target_os = "macos")]
+        let package: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, b't', b'r', b'u', b's', b't'];
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let package: &[u8] = b"\x7fELFtrusted-executable";
+        let directory = std::env::temp_dir().join(format!("om-update-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("download.part");
+        fs::write(&path, package).unwrap();
+        let digest = format!("{:x}", Sha256::digest(package));
+        let offer = UpdateOffer {
+            release_id: "release-checksum".to_string(),
+            version: "9.9.9".to_string(),
+            artifact_id: "artifact-checksum".to_string(),
+            download_url: "/api/agent/update/artifacts/artifact-checksum/download".to_string(),
+            sha256: digest.clone(),
+            size_bytes: package.len() as i64,
+            package_type: "standalone".to_string(),
+            native_arch: standalone_native_arch(),
+            retry_count: 0,
+        };
+        let downloaded = DownloadedPackage {
+            temporary_path: path,
+            final_path: directory.join("final.standalone"),
+            size_bytes: package.len() as u64,
+            sha256: digest.clone(),
+        };
+
+        assert!(verify_download(&offer, PackageType::Standalone, &downloaded, &digest).is_ok());
+        assert!(
+            verify_download(
+                &offer,
+                PackageType::Standalone,
+                &downloaded,
+                &"b".repeat(64),
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn update_spread_is_stable_and_bounded() {

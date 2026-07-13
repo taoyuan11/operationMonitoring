@@ -34,7 +34,8 @@ use updates::{
     admin_agent_releases, admin_agent_update_attempts, admin_create_agent_release,
     admin_delete_agent_artifact, admin_delete_agent_release, admin_publish_agent_release,
     admin_retry_agent_update, admin_update_agent_release, admin_upload_agent_artifact,
-    agent_download_artifact, agent_update_manifest, update_timeout_loop,
+    agent_download_artifact, agent_download_artifact_checksum, agent_update_manifest,
+    update_timeout_loop,
 };
 
 #[tokio::main]
@@ -142,6 +143,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/agent/update/artifacts/{artifact_id}/download",
             get(agent_download_artifact),
+        )
+        .route(
+            "/api/agent/update/artifacts/{artifact_id}/checksum",
+            get(agent_download_artifact_checksum),
         )
         .nest_service("/uploads", ServeDir::new(upload_dir))
         .with_state(state.clone())

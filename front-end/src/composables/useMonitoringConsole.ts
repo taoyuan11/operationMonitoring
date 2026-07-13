@@ -4,6 +4,8 @@ import { getCountryOption } from '../data/countries'
 import type {
   ActionLog,
   AgentArtifactTarget,
+  AgentArtifactUploadItem,
+  AgentArtifactUploadResult,
   AgentRelease,
   AgentReleaseForm,
   AgentUpdateAttempt,
@@ -404,42 +406,83 @@ export function useMonitoringConsole() {
     }, '草稿已保存')
   }
 
-  function uploadAgentArtifact(releaseId: string, target: AgentArtifactTarget, file: File) {
-    const normalizedTarget = {
-      ...target,
-      os: target.os.trim(),
-      native_arch: target.native_arch.trim(),
-    }
-    if (!normalizedTarget.os || !normalizedTarget.native_arch) {
-      errorMessage.value = '请选择目标系统和原生架构'
-      return Promise.resolve(false)
-    }
-    if (file.size === 0) {
-      errorMessage.value = '可执行文件不能为空'
-      return Promise.resolve(false)
-    }
-    if (normalizedTarget.package_type !== 'standalone') {
-      errorMessage.value = '仅支持 standalone 可执行文件'
-      return Promise.resolve(false)
-    }
-    const expectedExtension = normalizedTarget.os === 'windows' ? 'exe' : 'bin'
-    if (!file.name.toLowerCase().endsWith(`.${expectedExtension}`)) {
-      errorMessage.value = `请选择 .${expectedExtension} 可执行文件`
-      return Promise.resolve(false)
-    }
+  async function uploadAgentArtifact(
+    releaseId: string,
+    uploads: AgentArtifactUploadItem[],
+    onComplete: (result: AgentArtifactUploadResult) => void,
+  ) {
+    if (!uploads.length || agentUpdateOperation.value) return false
 
-    return runAgentUpdateTask('uploading', releaseId, async () => {
-      const body = new FormData()
-      body.append('os', normalizedTarget.os)
-      body.append('package_type', normalizedTarget.package_type)
-      body.append('native_arch', normalizedTarget.native_arch)
-      body.append('file', file)
-      await api(`/api/admin/agent-releases/${releaseId}/artifacts`, {
-        method: 'POST',
-        body,
-      })
+    const result: AgentArtifactUploadResult = {
+      succeeded_row_ids: [],
+      failures: [],
+    }
+    agentUpdateMessage.value = ''
+    agentUpdateOperation.value = 'uploading'
+    agentUpdateBusyId.value = releaseId
+
+    const completed = await guarded(async () => {
+      for (const upload of uploads) {
+        const normalizedTarget: AgentArtifactTarget = {
+          ...upload.target,
+          os: upload.target.os.trim(),
+          native_arch: upload.target.native_arch.trim(),
+        }
+        let validationError = ''
+        if (!normalizedTarget.os || !normalizedTarget.native_arch) {
+          validationError = '请选择目标系统和原生架构'
+        } else if (upload.file.size === 0) {
+          validationError = '可执行文件不能为空'
+        } else if (upload.checksum_file.size === 0) {
+          validationError = 'SHA-256 校验文件不能为空'
+        } else if (normalizedTarget.package_type !== 'standalone') {
+          validationError = '仅支持 standalone 可执行文件'
+        } else {
+          const expectedExtension = normalizedTarget.os === 'windows' ? 'exe' : 'bin'
+          if (!upload.file.name.toLowerCase().endsWith(`.${expectedExtension}`)) {
+            validationError = `请选择 .${expectedExtension} 可执行文件`
+          } else if (upload.checksum_file.name.toLowerCase() !== `${upload.file.name.toLowerCase()}.sha256`) {
+            validationError = 'SHA-256 校验文件名必须与可执行文件匹配'
+          }
+        }
+
+        if (validationError) {
+          result.failures.push({ row_id: upload.row_id, message: validationError })
+          continue
+        }
+
+        const body = new FormData()
+        body.append('os', normalizedTarget.os)
+        body.append('package_type', normalizedTarget.package_type)
+        body.append('native_arch', normalizedTarget.native_arch)
+        body.append('file', upload.file)
+        body.append('checksum_file', upload.checksum_file)
+        try {
+          await api(`/api/admin/agent-releases/${releaseId}/artifacts`, {
+            method: 'POST',
+            body,
+          })
+          result.succeeded_row_ids.push(upload.row_id)
+        } catch (error) {
+          result.failures.push({
+            row_id: upload.row_id,
+            message: error instanceof Error ? error.message : '上传失败',
+          })
+        }
+      }
       await loadAgentUpdates()
-    }, '可执行文件已添加到草稿')
+    })
+
+    onComplete(result)
+    if (completed && result.succeeded_row_ids.length) {
+      agentUpdateMessage.value = `已上传 ${result.succeeded_row_ids.length} 个更新包`
+    }
+    if (completed && result.failures.length) {
+      errorMessage.value = `${result.failures.length} 个更新包上传失败：${result.failures[0].message}`
+    }
+    agentUpdateOperation.value = null
+    agentUpdateBusyId.value = ''
+    return completed && result.failures.length === 0
   }
 
   function deleteAgentArtifact(releaseId: string, artifactId: string) {

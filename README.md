@@ -182,7 +182,7 @@ om-agent uninstall
 om-agent uninstall --yes # 无人值守
 ```
 
-这种方式安装的实例会上报 `standalone` 更新类型。发布更新时 Windows 上传 `.exe`，Linux/macOS 上传 `.bin`；Agent 通过独立 updater 替换自身，并在健康检查失败时恢复旧二进制。项目不再生成、分发或接受 DEB、RPM、IPK、MSI、PKG；所有平台统一使用 standalone 可执行文件。
+这种方式安装的实例会上报 `standalone` 更新类型。发布更新时 Windows 必须同时上传 `.exe` 及其同名 `.exe.sha256`，Linux/macOS 必须同时上传 `.bin` 及其同名 `.bin.sha256`；后端会在保存前核对校验文件内容。更新时 Agent 会先下载受认证保护的 `.sha256` 文件，再校验发布记录、校验文件和实际下载文件中的摘要完全一致，校验通过后才交给独立 updater 替换自身，并在健康检查失败时恢复旧二进制。项目不再生成、分发或接受 DEB、RPM、IPK、MSI、PKG；所有平台统一使用 standalone 可执行文件。
 
 ## 打包与分发实例端 standalone 可执行文件
 
@@ -192,11 +192,12 @@ om-agent uninstall --yes # 无人值守
 
 先修改 `instanceEnd/Cargo.toml` 中的版本号，再为每个目标系统和 CPU 架构单独构建。Cargo 二进制名称固定为 `om-agent`。
 
-Linux 和 macOS 使用：
+在 Bash 环境中使用：
 
 ```bash
 cd instanceEnd
-./scripts/build-standalone.sh <rust-target> <linux|macos> <native-architecture>
+./scripts/build-standalone.sh <rust-target> <linux|windows|macos> <native-architecture>
+./scripts/build-standalone.sh all
 ```
 
 常用示例：
@@ -220,7 +221,10 @@ Windows 在 PowerShell 中使用：
 ```powershell
 cd instanceEnd
 .\scripts\build-standalone.ps1 -RustTarget x86_64-pc-windows-msvc -NativeArchitecture x64
+.\scripts\build-standalone.ps1 all
 ```
+
+`all` 会依次尝试控制台支持的全部 9 个系统/架构组合，并允许在任意目标失败后继续构建：Linux `x86_64`、`aarch64`、`arm`、`x86`，Windows `x64`、`arm64`、`x86`，以及 macOS `arm64`、`x86_64`。Bash 和 PowerShell 脚本使用相同的目标矩阵。全部尝试结束后，脚本会汇总每个失败项的系统、架构、Rust target 和首条构建错误；只要存在失败，最终退出状态即为非零。
 
 脚本在原生目标上执行 `cargo build --locked --release --target ... --bin om-agent`。从当前主机交叉编译 Linux 目标时，如果系统已安装 Zig 和 `cargo-zigbuild`，脚本会自动改用 `cargo zigbuild`，避免 `ring` 等含 C/汇编代码的依赖因缺少目标链接器而失败。随后脚本将产物复制到 `instanceEnd/dist/standalone/`，并生成同名 `.sha256` 文件：
 
@@ -228,6 +232,7 @@ cd instanceEnd
 om-agent_0.1.0_linux_x86_64.bin
 om-agent_0.1.0_linux_x86_64.bin.sha256
 om-agent_0.1.0_macos_arm64.bin
+om-agent_0.1.0_macos_arm64.bin.sha256
 om-agent_0.1.0_windows_x64.exe
 om-agent_0.1.0_windows_x64.exe.sha256
 ```
@@ -236,7 +241,9 @@ om-agent_0.1.0_windows_x64.exe.sha256
 
 ```bash
 rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-musl
+rustup target add armv7-unknown-linux-gnueabihf i686-unknown-linux-gnu
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
+rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc i686-pc-windows-msvc
 cargo install cargo-zigbuild
 # macOS: brew install zig
 ```

@@ -100,6 +100,26 @@ export type AgentArtifactTarget = {
   native_arch: string
 }
 
+export type AgentArtifactUploadRow = AgentArtifactTarget & {
+  id: string
+  file: File | null
+  checksum_file: File | null
+  error: string
+  inference: 'manual' | 'matched' | 'needs_target' | 'needs_architecture'
+}
+
+export type AgentArtifactUploadItem = {
+  row_id: string
+  target: AgentArtifactTarget
+  file: File
+  checksum_file: File
+}
+
+export type AgentArtifactUploadResult = {
+  succeeded_row_ids: string[]
+  failures: Array<{ row_id: string; message: string }>
+}
+
 export type AgentArtifact = AgentArtifactTarget & {
   id: string
   release_id: string

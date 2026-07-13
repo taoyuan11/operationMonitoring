@@ -157,10 +157,10 @@ fn collect_nvidia_samples() -> Vec<GpuSample> {
         "--query-gpu=utilization.gpu,memory.used,memory.total",
         "--format=csv,noheader,nounits",
     ];
-    let mut commands = vec![std::path::PathBuf::from("nvidia-smi")];
 
     #[cfg(target_os = "windows")]
-    {
+    let commands = {
+        let mut commands = vec![std::path::PathBuf::from("nvidia-smi")];
         for root in [
             std::env::var_os("ProgramW6432"),
             std::env::var_os("ProgramFiles"),
@@ -175,7 +175,11 @@ fn collect_nvidia_samples() -> Vec<GpuSample> {
                     .join("nvidia-smi.exe"),
             );
         }
-    }
+        commands
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let commands = vec![std::path::PathBuf::from("nvidia-smi")];
 
     let Some(output) = commands.into_iter().find_map(|command| {
         Command::new(command)

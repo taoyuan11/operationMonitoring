@@ -33,6 +33,7 @@ use crate::{
 };
 
 const MAX_METADATA_BYTES: usize = 1024;
+const MAX_CHECKSUM_FILE_BYTES: usize = 4096;
 const MAX_STATUS_MESSAGE_BYTES: usize = 4096;
 // Covers parent exit, target/rollback install and service-restart timeouts, health checks, and I/O.
 const UPDATE_HANDOFF_TIMEOUT_SECONDS: i64 = 60 * 60;
@@ -80,6 +81,8 @@ struct ReceivedArtifact {
     file_name: String,
     size_bytes: i64,
     sha256: String,
+    checksum_file_name: String,
+    checksum_contents: String,
     first_bytes: Vec<u8>,
     temp_path: std::path::PathBuf,
 }
@@ -225,7 +228,7 @@ pub async fn admin_upload_agent_artifact(
         "upload_agent_artifact",
         &artifact.id,
         &format!(
-            "上传 {} {} {} Agent 可执行文件",
+            "上传 {} {} {} Agent 可执行文件及 SHA-256 校验文件",
             artifact.os, artifact.package_type, artifact.native_arch
         ),
     )
@@ -267,12 +270,13 @@ pub async fn admin_delete_agent_artifact(
         ));
     }
     remove_stored_file(&state, &artifact.storage_path).await;
+    remove_stored_file(&state, &format!("{}.sha256", artifact.storage_path)).await;
     write_action_log(
         &state.db,
         "admin",
         "delete_agent_artifact",
         &artifact_id,
-        "删除 Agent 可执行文件",
+        "删除 Agent 可执行文件及 SHA-256 校验文件",
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -457,43 +461,7 @@ pub async fn agent_download_artifact(
     headers: HeaderMap,
     Path(artifact_id): Path<String>,
 ) -> AppResult<Response> {
-    let instance = authenticate_agent_headers(&state, &headers).await?;
-    let artifact = sqlx::query_as::<_, AgentArtifactRecord>(
-        r#"
-        SELECT a.id, a.release_id, a.os, a.package_type, a.native_arch, a.file_name,
-               a.size_bytes, a.sha256, a.storage_path, a.created_at
-        FROM agent_artifacts a
-        JOIN agent_releases r ON r.id = a.release_id
-        WHERE a.id = ? AND r.status = 'published'
-        "#,
-    )
-    .bind(&artifact_id)
-    .fetch_optional(&state.db)
-    .await?
-    .filter(|artifact| {
-        instance.update_privileged == 1
-            && target_matches(
-                &instance.os,
-                &instance.package_type,
-                &instance.native_arch,
-                artifact,
-            )
-    })
-    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "没有适用于该实例的可执行文件"))?;
-
-    let attempt_exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_update_attempts WHERE artifact_id = ? AND instance_id = ?",
-    )
-    .bind(&artifact_id)
-    .bind(&instance.id)
-    .fetch_one(&state.db)
-    .await?;
-    if attempt_exists == 0 {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "该实例没有待执行的更新",
-        ));
-    }
+    let artifact = authorized_artifact_download(&state, &headers, &artifact_id).await?;
 
     let path = safe_storage_path(&state, &artifact.storage_path)?;
     let file = File::open(&path).await.map_err(|error| {
@@ -523,6 +491,90 @@ pub async fn agent_download_artifact(
         .header(header::CONTENT_DISPOSITION, disposition)
         .body(body)
         .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "下载响应生成失败"))
+}
+
+pub async fn agent_download_artifact_checksum(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(artifact_id): Path<String>,
+) -> AppResult<Response> {
+    let artifact = authorized_artifact_download(&state, &headers, &artifact_id).await?;
+    let checksum_storage_path = format!("{}.sha256", artifact.storage_path);
+    let path = safe_storage_path(&state, &checksum_storage_path)?;
+    let file = File::open(&path).await.map_err(|error| {
+        warn!(?error, path = %path.display(), "agent artifact checksum file is missing");
+        AppError::new(StatusCode::NOT_FOUND, "Agent SHA-256 校验文件不存在")
+    })?;
+    let size = file.metadata().await?.len();
+    if size == 0 || size > MAX_CHECKSUM_FILE_BYTES as u64 {
+        return Err(AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Agent SHA-256 校验文件大小无效",
+        ));
+    }
+    let disposition = format!(
+        "attachment; filename=\"agent-update-{}.sha256\"",
+        artifact.id
+    );
+    let body = Body::from_stream(ReaderStream::new(file));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, size)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(body)
+        .map_err(|_| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SHA-256 下载响应生成失败",
+            )
+        })
+}
+
+async fn authorized_artifact_download(
+    state: &AppState,
+    headers: &HeaderMap,
+    artifact_id: &str,
+) -> AppResult<AgentArtifactRecord> {
+    let instance = authenticate_agent_headers(state, headers).await?;
+    let artifact = sqlx::query_as::<_, AgentArtifactRecord>(
+        r#"
+        SELECT a.id, a.release_id, a.os, a.package_type, a.native_arch, a.file_name,
+               a.size_bytes, a.sha256, a.storage_path, a.created_at
+        FROM agent_artifacts a
+        JOIN agent_releases r ON r.id = a.release_id
+        WHERE a.id = ? AND r.status = 'published'
+        "#,
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.db)
+    .await?
+    .filter(|artifact| {
+        instance.update_privileged == 1
+            && target_matches(
+                &instance.os,
+                &instance.package_type,
+                &instance.native_arch,
+                artifact,
+            )
+    })
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "没有适用于该实例的可执行文件"))?;
+
+    let attempt_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_update_attempts WHERE artifact_id = ? AND instance_id = ?",
+    )
+    .bind(artifact_id)
+    .bind(&instance.id)
+    .fetch_one(&state.db)
+    .await?;
+    if attempt_exists == 0 {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "该实例没有待执行的更新",
+        ));
+    }
+
+    Ok(artifact)
 }
 
 pub async fn offer_update_on_connect(state: &AppState, instance_id: &str) {
@@ -648,111 +700,156 @@ async fn receive_artifact(
     let temp_dir = state.update_dir.join(".tmp");
     fs::create_dir_all(&temp_dir).await?;
     let temp_path = temp_dir.join(format!("{}.upload", Uuid::new_v4()));
-    let result =
-        async {
-            let mut os = None;
-            let mut package_type = None;
-            let mut native_arch = None;
-            let mut file_name = None;
-            let mut size_bytes = 0_i64;
-            let mut first_bytes = Vec::with_capacity(16);
-            let mut digest = Sha256::new();
-            let mut received_file = false;
+    let result = async {
+        let mut os = None;
+        let mut package_type = None;
+        let mut native_arch = None;
+        let mut file_name = None;
+        let mut checksum_file_name = None;
+        let mut checksum_contents = None;
+        let mut size_bytes = 0_i64;
+        let mut first_bytes = Vec::with_capacity(16);
+        let mut digest = Sha256::new();
+        let mut received_file = false;
 
-            while let Some(mut field) = multipart
-                .next_field()
-                .await
-                .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "无法读取上传表单"))?
-            {
-                let name = field.name().unwrap_or_default().to_string();
-                match name.as_str() {
-                    "os" | "package_type" | "native_arch" => {
-                        let value = field.text().await.map_err(|_| {
-                            AppError::new(StatusCode::BAD_REQUEST, "无法读取可执行文件元数据")
-                        })?;
-                        if value.len() > MAX_METADATA_BYTES {
-                            return Err(AppError::new(
-                                StatusCode::BAD_REQUEST,
-                                "可执行文件元数据过长",
-                            ));
-                        }
-                        match name.as_str() {
-                            "os" => os = Some(value),
-                            "package_type" => package_type = Some(value),
-                            "native_arch" => native_arch = Some(value),
-                            _ => unreachable!(),
-                        }
-                    }
-                    "file" => {
-                        if received_file {
-                            return Err(AppError::new(
-                                StatusCode::BAD_REQUEST,
-                                "只能上传一个可执行文件",
-                            ));
-                        }
-                        let supplied_name = field
-                            .file_name()
-                            .and_then(|name| FsPath::new(name).file_name())
-                            .and_then(|name| name.to_str())
-                            .filter(|name| !name.is_empty())
-                            .ok_or_else(|| {
-                                AppError::new(StatusCode::BAD_REQUEST, "可执行文件文件名无效")
-                            })?
-                            .to_string();
-                        let mut file = File::create(&temp_path).await?;
-                        while let Some(chunk) = field.chunk().await.map_err(|_| {
-                            AppError::new(StatusCode::BAD_REQUEST, "可执行文件上传中断")
-                        })? {
-                            size_bytes =
-                                size_bytes.checked_add(chunk.len() as i64).ok_or_else(|| {
-                                    AppError::new(StatusCode::PAYLOAD_TOO_LARGE, "可执行文件过大")
-                                })?;
-                            if size_bytes as usize > state.agent_package_max_bytes {
-                                return Err(AppError::new(
-                                    StatusCode::PAYLOAD_TOO_LARGE,
-                                    "可执行文件超过大小限制",
-                                ));
-                            }
-                            if first_bytes.len() < 16 {
-                                let take = (16 - first_bytes.len()).min(chunk.len());
-                                first_bytes.extend_from_slice(&chunk[..take]);
-                            }
-                            digest.update(&chunk);
-                            file.write_all(&chunk).await?;
-                        }
-                        file.flush().await?;
-                        file.sync_all().await?;
-                        file_name = Some(supplied_name);
-                        received_file = true;
-                    }
-                    _ => {
+        while let Some(mut field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "无法读取上传表单"))?
+        {
+            let name = field.name().unwrap_or_default().to_string();
+            match name.as_str() {
+                "os" | "package_type" | "native_arch" => {
+                    let value = field.text().await.map_err(|_| {
+                        AppError::new(StatusCode::BAD_REQUEST, "无法读取可执行文件元数据")
+                    })?;
+                    if value.len() > MAX_METADATA_BYTES {
                         return Err(AppError::new(
                             StatusCode::BAD_REQUEST,
-                            "上传表单包含未知字段",
+                            "可执行文件元数据过长",
                         ));
                     }
+                    match name.as_str() {
+                        "os" => os = Some(value),
+                        "package_type" => package_type = Some(value),
+                        "native_arch" => native_arch = Some(value),
+                        _ => unreachable!(),
+                    }
+                }
+                "file" => {
+                    if received_file {
+                        return Err(AppError::new(
+                            StatusCode::BAD_REQUEST,
+                            "只能上传一个可执行文件",
+                        ));
+                    }
+                    let supplied_name = field
+                        .file_name()
+                        .and_then(|name| FsPath::new(name).file_name())
+                        .and_then(|name| name.to_str())
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| {
+                            AppError::new(StatusCode::BAD_REQUEST, "可执行文件文件名无效")
+                        })?
+                        .to_string();
+                    let mut file = File::create(&temp_path).await?;
+                    while let Some(chunk) = field
+                        .chunk()
+                        .await
+                        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "可执行文件上传中断"))?
+                    {
+                        size_bytes =
+                            size_bytes.checked_add(chunk.len() as i64).ok_or_else(|| {
+                                AppError::new(StatusCode::PAYLOAD_TOO_LARGE, "可执行文件过大")
+                            })?;
+                        if size_bytes as usize > state.agent_package_max_bytes {
+                            return Err(AppError::new(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "可执行文件超过大小限制",
+                            ));
+                        }
+                        if first_bytes.len() < 16 {
+                            let take = (16 - first_bytes.len()).min(chunk.len());
+                            first_bytes.extend_from_slice(&chunk[..take]);
+                        }
+                        digest.update(&chunk);
+                        file.write_all(&chunk).await?;
+                    }
+                    file.flush().await?;
+                    file.sync_all().await?;
+                    file_name = Some(supplied_name);
+                    received_file = true;
+                }
+                "checksum_file" => {
+                    if checksum_file_name.is_some() {
+                        return Err(AppError::new(
+                            StatusCode::BAD_REQUEST,
+                            "只能上传一个 SHA-256 校验文件",
+                        ));
+                    }
+                    let supplied_name = field
+                        .file_name()
+                        .and_then(|name| FsPath::new(name).file_name())
+                        .and_then(|name| name.to_str())
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| {
+                            AppError::new(StatusCode::BAD_REQUEST, "SHA-256 校验文件名无效")
+                        })?
+                        .to_string();
+                    let mut contents = Vec::new();
+                    while let Some(chunk) = field.chunk().await.map_err(|_| {
+                        AppError::new(StatusCode::BAD_REQUEST, "无法读取 SHA-256 校验文件")
+                    })? {
+                        if contents.len() + chunk.len() > MAX_CHECKSUM_FILE_BYTES {
+                            return Err(AppError::new(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "SHA-256 校验文件过大",
+                            ));
+                        }
+                        contents.extend_from_slice(&chunk);
+                    }
+                    let contents = String::from_utf8(contents).map_err(|_| {
+                        AppError::new(StatusCode::BAD_REQUEST, "SHA-256 校验文件必须是文本文件")
+                    })?;
+                    checksum_file_name = Some(supplied_name);
+                    checksum_contents = Some(contents);
+                }
+                _ => {
+                    return Err(AppError::new(
+                        StatusCode::BAD_REQUEST,
+                        "上传表单包含未知字段",
+                    ));
                 }
             }
-            if !received_file || size_bytes == 0 {
-                return Err(AppError::new(
-                    StatusCode::BAD_REQUEST,
-                    "可执行文件文件不能为空",
-                ));
-            }
-            Ok(ReceivedArtifact {
-                os: os.ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "缺少目标系统"))?,
-                package_type: package_type
-                    .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "缺少可执行文件类型"))?,
-                native_arch: native_arch
-                    .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "缺少原生架构"))?,
-                file_name: file_name.expect("file name exists after received_file check"),
-                size_bytes,
-                sha256: format!("{:x}", digest.finalize()),
-                first_bytes,
-                temp_path: temp_path.clone(),
-            })
         }
-        .await;
+        if !received_file || size_bytes == 0 {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "可执行文件文件不能为空",
+            ));
+        }
+        if checksum_file_name.is_none() {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "缺少 .sha256 校验文件",
+            ));
+        }
+        Ok(ReceivedArtifact {
+            os: os.ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "缺少目标系统"))?,
+            package_type: package_type
+                .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "缺少可执行文件类型"))?,
+            native_arch: native_arch
+                .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "缺少原生架构"))?,
+            file_name: file_name.expect("file name exists after received_file check"),
+            size_bytes,
+            sha256: format!("{:x}", digest.finalize()),
+            checksum_file_name: checksum_file_name.expect("checksum file name exists after check"),
+            checksum_contents: checksum_contents.expect("checksum contents exists after check"),
+            first_bytes,
+            temp_path: temp_path.clone(),
+        })
+    }
+    .await;
     if result.is_err() {
         let _ = fs::remove_file(&temp_path).await;
     }
@@ -792,10 +889,16 @@ async fn store_artifact(
     let id = Uuid::new_v4().to_string();
     let extension = expected_extension(&received.os);
     let relative_path = format!("{release_id}/{id}.{extension}");
+    let checksum_relative_path = format!("{relative_path}.sha256");
     let final_dir = state.update_dir.join(release_id);
     let final_path = state.update_dir.join(&relative_path);
+    let checksum_final_path = state.update_dir.join(&checksum_relative_path);
     fs::create_dir_all(&final_dir).await?;
     fs::rename(&received.temp_path, &final_path).await?;
+    if let Err(error) = fs::write(&checksum_final_path, &received.checksum_contents).await {
+        let _ = fs::remove_file(&final_path).await;
+        return Err(error.into());
+    }
 
     let artifact = AgentArtifactRecord {
         id,
@@ -835,6 +938,7 @@ async fn store_artifact(
         Ok(inserted) => inserted,
         Err(error) => {
             let _ = fs::remove_file(&final_path).await;
+            let _ = fs::remove_file(&checksum_final_path).await;
             if error
                 .as_database_error()
                 .is_some_and(|error| error.is_unique_violation())
@@ -849,6 +953,7 @@ async fn store_artifact(
     };
     if inserted.rows_affected() != 1 {
         let _ = fs::remove_file(&final_path).await;
+        let _ = fs::remove_file(&checksum_final_path).await;
         require_draft_release(state, release_id).await?;
         return Err(AppError::new(
             StatusCode::CONFLICT,
@@ -896,6 +1001,53 @@ fn validate_artifact_metadata(received: &mut ReceivedArtifact) -> AppResult<()> 
             StatusCode::BAD_REQUEST,
             "可执行文件签名与目标系统不匹配",
         ));
+    }
+    validate_checksum_file(
+        &received.file_name,
+        &received.checksum_file_name,
+        &received.checksum_contents,
+        &received.sha256,
+    )?;
+    Ok(())
+}
+
+fn validate_checksum_file(
+    file_name: &str,
+    checksum_file_name: &str,
+    checksum_contents: &str,
+    actual_sha256: &str,
+) -> AppResult<()> {
+    let expected_file_name = format!("{file_name}.sha256");
+    if !checksum_file_name.eq_ignore_ascii_case(&expected_file_name) {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "SHA-256 校验文件名必须与可执行文件匹配",
+        ));
+    }
+    let mut fields = checksum_contents.split_whitespace();
+    let supplied_sha256 = fields.next().unwrap_or_default();
+    if supplied_sha256.len() != 64
+        || !supplied_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !supplied_sha256.eq_ignore_ascii_case(actual_sha256)
+    {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "SHA-256 校验文件内容与可执行文件不匹配",
+        ));
+    }
+    if let Some(supplied_name) = fields.next() {
+        if supplied_name.trim_start_matches('*') != file_name {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "SHA-256 校验文件中的文件名不匹配",
+            ));
+        }
+        if fields.next().is_some() {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "SHA-256 校验文件格式无效",
+            ));
+        }
     }
     Ok(())
 }
@@ -1945,6 +2097,8 @@ mod tests {
             file_name: "agent.bin".to_string(),
             size_bytes: 15,
             sha256: "0".repeat(64),
+            checksum_file_name: "agent.bin.sha256".to_string(),
+            checksum_contents: format!("{}  agent.bin\n", "0".repeat(64)),
             first_bytes: b"\x7fELFpayload".to_vec(),
             temp_path: temporary,
         };
@@ -1961,5 +2115,69 @@ mod tests {
         .await
         .expect("count artifacts");
         assert_eq!(count, 1, "the pre-existing published artifact is unchanged");
+    }
+
+    #[test]
+    fn accepts_matching_sha256_sidecar_formats() {
+        let digest = "a".repeat(64);
+        assert!(
+            validate_checksum_file(
+                "om-agent.bin",
+                "om-agent.bin.sha256",
+                &format!("{digest}  om-agent.bin\n"),
+                &digest,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_checksum_file(
+                "om-agent.exe",
+                "OM-AGENT.EXE.SHA256",
+                &format!("{digest} *om-agent.exe\r\n"),
+                &digest,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_sha256_sidecars() {
+        let digest = "a".repeat(64);
+        assert!(
+            validate_checksum_file(
+                "om-agent.bin",
+                "other.bin.sha256",
+                &format!("{digest}  om-agent.bin\n"),
+                &digest,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_checksum_file(
+                "om-agent.bin",
+                "om-agent.bin.sha256",
+                &format!("{}  om-agent.bin\n", "b".repeat(64)),
+                &digest,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_checksum_file(
+                "om-agent.bin",
+                "om-agent.bin.sha256",
+                &format!("{digest}  other.bin\n"),
+                &digest,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_checksum_file(
+                "om-agent.bin",
+                "om-agent.bin.sha256",
+                &format!("{digest}  om-agent.bin unexpected\n"),
+                &digest,
+            )
+            .is_err()
+        );
     }
 }

@@ -254,13 +254,22 @@ cd instanceEnd
 ./scripts/build-standalone.sh x86_64-apple-darwin macos x86_64
 ```
 
-Windows 在 PowerShell 中使用：
+Windows 推荐直接使用 `.cmd` 入口。无参数时会依次构建 Windows x64、x86 和 ARM64，不受 PowerShell 脚本执行策略影响：
 
 ```powershell
 cd instanceEnd
-.\scripts\build-standalone.ps1 -RustTarget x86_64-pc-windows-msvc -NativeArchitecture x64
-.\scripts\build-standalone.ps1 all
+.\scripts\build-standalone.cmd
 ```
+
+也可以只构建一个 Windows Rust target；架构会从目标矩阵自动推导：
+
+```powershell
+.\scripts\build-standalone.cmd x86_64-pc-windows-msvc
+.\scripts\build-standalone.cmd aarch64-pc-windows-msvc
+.\scripts\build-standalone.cmd i686-pc-windows-msvc
+```
+
+脚本会通过 `rustup` 自动安装缺失的 Windows Rust targets。x64 和 x86 使用已安装的 MSVC 工具链；ARM64 需要 Visual Studio 的“MSVC ARM64 生成工具”，或者预先安装 LLVM 与 `cargo-xwin`（`cargo install --locked cargo-xwin`）。脚本检测到 `cargo-xwin` 后会自动用于 ARM64，并在 Windows 普通用户环境下选择不需要符号链接权限的 Clang sysroot 后端；首次构建会下载并缓存数 GB 的 MSVC sysroot。直接调用 `.ps1` 时，如果系统执行策略禁止脚本运行，可使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-standalone.ps1`；该设置仅作用于本次子进程，不会修改系统或用户级执行策略。
 
 `all` 会依次尝试控制台支持的全部 10 个系统/架构组合，并允许在任意目标失败后继续构建：Linux glibc `x86_64`、Linux/OpenWrt musl `x86_64-musl`、Linux `aarch64`、`arm`、`x86`，Windows `x64`、`arm64`、`x86`，以及 macOS `arm64`、`x86_64`。Bash 和 PowerShell 脚本使用相同的目标矩阵。全部尝试结束后，脚本会汇总每个失败项的系统、架构、Rust target 和首条构建错误；只要存在失败，最终退出状态即为非零。
 
@@ -275,6 +284,10 @@ om-agent_0.1.0_macos_arm64.bin
 om-agent_0.1.0_macos_arm64.bin.sha256
 om-agent_0.1.0_windows_x64.exe
 om-agent_0.1.0_windows_x64.exe.sha256
+om-agent_0.1.0_windows_x86.exe
+om-agent_0.1.0_windows_x86.exe.sha256
+om-agent_0.1.0_windows_arm64.exe
+om-agent_0.1.0_windows_arm64.exe.sha256
 ```
 
 交叉编译前需要安装相应 Rust target 和工具链。例如：
@@ -285,6 +298,8 @@ rustup target add armv7-unknown-linux-gnueabihf i686-unknown-linux-gnu
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc i686-pc-windows-msvc
 cargo install cargo-zigbuild
+# Windows ARM64（未安装 Visual Studio ARM64 生成工具时）
+cargo install --locked cargo-xwin
 # macOS: brew install zig
 ```
 

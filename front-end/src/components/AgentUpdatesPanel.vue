@@ -66,7 +66,7 @@ const createReleaseInputKey = ref(0)
 let uploadRowSequence = 0
 
 const nativeArchitecturesByOs: Record<string, string[]> = {
-  linux: ['x86_64', 'aarch64', 'arm', 'x86'],
+  linux: ['x86_64', 'x86_64-musl', 'aarch64', 'arm', 'x86'],
   windows: ['x64', 'arm64', 'x86'],
   macos: ['arm64', 'x86_64'],
 }
@@ -247,7 +247,9 @@ function inferTargetFromName(fileName: string) {
       : /linux/.test(name)
         ? 'linux'
         : ''
-  const detectedArchitecture = /aarch64|arm64/.test(name)
+  const detectedArchitecture = /x86_64[-_]musl/.test(name)
+    ? 'x86_64-musl'
+    : /aarch64|arm64/.test(name)
     ? os === 'windows' || os === 'macos' ? 'arm64' : 'aarch64'
     : /x86_64|amd64|x64/.test(name)
       ? os === 'windows' ? 'x64' : 'x86_64'
@@ -272,7 +274,7 @@ function inferVersionFromName(fileName: string) {
   const baseName = fileName
     .replace(/\.sha256$/i, '')
     .replace(/\.(?:bin|exe)$/i, '')
-    .replace(/(?:[_-](?:linux|windows|win|macos|darwin|osx))?(?:[_-](?:x86_64|amd64|x64|aarch64|arm64|armv?7|arm|i[3-6]86|x86))$/i, '')
+    .replace(/(?:[_-](?:linux|windows|win|macos|darwin|osx))?(?:[_-](?:x86_64[-_]musl|x86_64|amd64|x64|aarch64|arm64|armv?7|arm|i[3-6]86|x86))$/i, '')
   const match = baseName.match(
     /(?:^|[_-])v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/,
   )

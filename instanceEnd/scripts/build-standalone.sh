@@ -23,6 +23,7 @@ USAGE
 
 SUPPORTED_TARGETS=(
   'x86_64-unknown-linux-gnu|linux|x86_64'
+  'x86_64-unknown-linux-musl|linux|x86_64-musl'
   'aarch64-unknown-linux-musl|linux|aarch64'
   'armv7-unknown-linux-gnueabihf|linux|arm'
   'i686-unknown-linux-gnu|linux|x86'

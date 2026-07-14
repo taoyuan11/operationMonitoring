@@ -1950,7 +1950,16 @@ fn standalone_native_arch() -> String {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::env::consts::ARCH.to_string()
+        linux_standalone_native_arch(std::env::consts::ARCH, Path::new("/etc/openwrt_release"))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_standalone_native_arch(arch: &str, openwrt_release: &Path) -> String {
+    if arch == "x86_64" && openwrt_release.exists() {
+        "x86_64-musl".to_string()
+    } else {
+        arch.to_string()
     }
 }
 
@@ -2137,6 +2146,24 @@ fn is_update_privileged() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn distinguishes_openwrt_x86_64_musl_updates() {
+        let directory = std::env::temp_dir().join(format!("om-openwrt-{}", uuid::Uuid::new_v4()));
+        let marker = directory.join("openwrt_release");
+
+        assert_eq!(linux_standalone_native_arch("x86_64", &marker), "x86_64");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&marker, "DISTRIB_ID='OpenWrt'\n").unwrap();
+        assert_eq!(
+            linux_standalone_native_arch("x86_64", &marker),
+            "x86_64-musl"
+        );
+        assert_eq!(linux_standalone_native_arch("aarch64", &marker), "aarch64");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn parses_sha256_sidecar_and_rejects_invalid_content() {

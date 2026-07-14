@@ -241,6 +241,9 @@ cd instanceEnd
 # Linux x86_64（glibc）
 ./scripts/build-standalone.sh x86_64-unknown-linux-gnu linux x86_64
 
+# OpenWrt x86_64（musl）
+./scripts/build-standalone.sh x86_64-unknown-linux-musl linux x86_64-musl
+
 # Linux / OpenWrt aarch64（musl）
 ./scripts/build-standalone.sh aarch64-unknown-linux-musl linux aarch64
 
@@ -259,13 +262,15 @@ cd instanceEnd
 .\scripts\build-standalone.ps1 all
 ```
 
-`all` 会依次尝试控制台支持的全部 9 个系统/架构组合，并允许在任意目标失败后继续构建：Linux `x86_64`、`aarch64`、`arm`、`x86`，Windows `x64`、`arm64`、`x86`，以及 macOS `arm64`、`x86_64`。Bash 和 PowerShell 脚本使用相同的目标矩阵。全部尝试结束后，脚本会汇总每个失败项的系统、架构、Rust target 和首条构建错误；只要存在失败，最终退出状态即为非零。
+`all` 会依次尝试控制台支持的全部 10 个系统/架构组合，并允许在任意目标失败后继续构建：Linux glibc `x86_64`、Linux/OpenWrt musl `x86_64-musl`、Linux `aarch64`、`arm`、`x86`，Windows `x64`、`arm64`、`x86`，以及 macOS `arm64`、`x86_64`。Bash 和 PowerShell 脚本使用相同的目标矩阵。全部尝试结束后，脚本会汇总每个失败项的系统、架构、Rust target 和首条构建错误；只要存在失败，最终退出状态即为非零。
 
 脚本在原生目标上执行 `cargo build --locked --release --target ... --bin om-agent`。从当前主机交叉编译 Linux 目标时，如果系统已安装 Zig 和 `cargo-zigbuild`，脚本会自动改用 `cargo zigbuild`，避免 `ring` 等含 C/汇编代码的依赖因缺少目标链接器而失败。随后脚本将产物复制到 `instanceEnd/dist/standalone/`，并生成同名 `.sha256` 文件：
 
 ```text
 om-agent_0.1.0_linux_x86_64.bin
 om-agent_0.1.0_linux_x86_64.bin.sha256
+om-agent_0.1.0_linux_x86_64-musl.bin
+om-agent_0.1.0_linux_x86_64-musl.bin.sha256
 om-agent_0.1.0_macos_arm64.bin
 om-agent_0.1.0_macos_arm64.bin.sha256
 om-agent_0.1.0_windows_x64.exe
@@ -275,7 +280,7 @@ om-agent_0.1.0_windows_x64.exe.sha256
 交叉编译前需要安装相应 Rust target 和工具链。例如：
 
 ```bash
-rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 rustup target add armv7-unknown-linux-gnueabihf i686-unknown-linux-gnu
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc i686-pc-windows-msvc
@@ -283,7 +288,7 @@ cargo install cargo-zigbuild
 # macOS: brew install zig
 ```
 
-部分目标不能仅靠 `rustup target add` 完成：从 macOS 构建 Linux glibc 或 musl 目标通常需要 Zig/`cargo-zigbuild`；OpenWrt MIPS/MIPSel 需要使用与固件版本、CPU 和 libc ABI 匹配的 OpenWrt SDK 编译。使用 SDK 已配置好的 Cargo 链接器时，设置 `OM_STANDALONE_BUILDER=cargo` 可关闭 Zig 自动选择。也可以设置 `OM_STANDALONE_BUILDER=zigbuild` 强制使用 Zig。分发给 OpenWrt 的文件仍选择 `linux + standalone`，但二进制必须与设备 ABI 完全兼容。
+部分目标不能仅靠 `rustup target add` 完成：从 macOS 构建 Linux glibc 或 musl 目标通常需要 Zig/`cargo-zigbuild`；OpenWrt MIPS/MIPSel 需要使用与固件版本、CPU 和 libc ABI 匹配的 OpenWrt SDK 编译。使用 SDK 已配置好的 Cargo 链接器时，设置 `OM_STANDALONE_BUILDER=cargo` 可关闭 Zig 自动选择。也可以设置 `OM_STANDALONE_BUILDER=zigbuild` 强制使用 Zig。OpenWrt x86_64 使用 `linux / x86_64-musl / standalone`，普通 glibc Linux x86_64 使用 `linux / x86_64 / standalone`；Agent 会按该原生架构标识精确匹配更新，避免两种 libc 的产物互相覆盖或误发。其他 OpenWrt 架构仍必须确保二进制与设备 ABI 完全兼容。
 
 ### 首次分发和安装
 

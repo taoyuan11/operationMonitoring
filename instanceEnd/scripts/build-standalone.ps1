@@ -9,6 +9,7 @@ if (Test-Path Variable:PSNativeCommandUseErrorActionPreference) {
 }
 $SupportedTargets = @(
     [pscustomobject]@{ RustTarget = 'x86_64-unknown-linux-gnu'; OS = 'linux'; NativeArchitecture = 'x86_64' }
+    [pscustomobject]@{ RustTarget = 'x86_64-unknown-linux-musl'; OS = 'linux'; NativeArchitecture = 'x86_64-musl' }
     [pscustomobject]@{ RustTarget = 'aarch64-unknown-linux-musl'; OS = 'linux'; NativeArchitecture = 'aarch64' }
     [pscustomobject]@{ RustTarget = 'armv7-unknown-linux-gnueabihf'; OS = 'linux'; NativeArchitecture = 'arm' }
     [pscustomobject]@{ RustTarget = 'i686-unknown-linux-gnu'; OS = 'linux'; NativeArchitecture = 'x86' }

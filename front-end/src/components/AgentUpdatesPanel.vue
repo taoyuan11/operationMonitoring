@@ -90,6 +90,7 @@ const attemptStatusText: Record<AgentUpdateAttemptStatus, string> = {
 }
 
 const publishedCount = computed(() => props.releases.filter((release) => release.status === 'published').length)
+const instancesById = computed(() => new Map(props.instances.map((instance) => [instance.id, instance])))
 const createReleaseFileSummary = computed(() => {
   const packageCount = createReleaseFiles.value.filter((file) => !file.name.toLowerCase().endsWith('.sha256')).length
   const checksumCount = createReleaseFiles.value.length - packageCount
@@ -499,6 +500,11 @@ function attemptsFor(release: AgentRelease) {
     : props.attempts.filter((attempt) => attempt.release_id === release.id)
 }
 
+function attemptInstanceName(attempt: AgentUpdateAttempt) {
+  const instance = instancesById.value.get(attempt.instance_id)
+  return instance?.name || instance?.hostname || attempt.instance_id
+}
+
 function isBusy(id: string) {
   return Boolean(props.operation) && props.busyId === id
 }
@@ -850,14 +856,18 @@ function isBusy(id: string) {
           </div>
           <div v-else class="update-attempts-table">
             <div class="update-attempts-head">
-              <span>实例</span><span>版本</span><span>状态</span><span>更新时间</span><span></span>
+              <span>实例</span><span>版本</span><span>状态</span><span>说明</span><span>更新时间</span><span></span>
             </div>
             <article v-for="attempt in attemptsFor(release)" :key="attempt.id" class="update-attempt-row">
-              <strong :title="attempt.instance_id">{{ attempt.instance_id.slice(0, 12) }}</strong>
+              <div class="attempt-instance">
+                <strong :title="attemptInstanceName(attempt)">{{ attemptInstanceName(attempt) }}</strong>
+                <small :title="attempt.instance_id">{{ attempt.instance_id.slice(0, 12) }}</small>
+              </div>
               <span class="attempt-versions">{{ attempt.from_version }} -&gt; {{ attempt.target_version }}</span>
-              <span :class="['attempt-status', attempt.status]" :title="attempt.message || attemptStatusText[attempt.status]">
+              <span :class="['attempt-status', attempt.status]" :title="attemptStatusText[attempt.status]">
                 {{ attemptStatusText[attempt.status] }}
               </span>
+              <span class="attempt-message" :title="attempt.message || '暂无补充说明'">{{ attempt.message || '—' }}</span>
               <time>{{ formatTime(attempt.updated_at) }}</time>
               <button
                 v-if="attempt.status === 'failed' || attempt.status === 'rollback_succeeded'"

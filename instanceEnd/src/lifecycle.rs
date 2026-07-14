@@ -25,14 +25,13 @@ pub fn start(config: &AgentConfig) -> Result<()> {
     }
     paths.remove_stale_files();
 
-    let (stdout, stderr) = open_log_files(&paths.log_file)?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("start")
         .arg("--daemon-child")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     config.append_cli_args(&mut command);
     detach(&mut command);
 
@@ -106,20 +105,20 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
     let guard = RuntimeGuard::acquire(paths)?;
     let identity = load_or_create_identity(config.identity_file.clone())?;
 
-    println!("agent instance_id: {}", identity.instance_id);
-    println!("server: {}", config.server);
+    crate::logging::info(format_args!("agent instance_id: {}", identity.instance_id));
+    crate::logging::info(format_args!("server: {}", config.server));
     guard.mark_ready()?;
 
     tokio::select! {
         result = agent_ws_loop(config, identity) => result,
         result = wait_for_stop(guard.stop_file(), guard.pid()) => {
             result?;
-            println!("stop requested; agent is shutting down");
+            crate::logging::info(format_args!("stop requested; agent is shutting down"));
             Ok(())
         },
         result = wait_for_shutdown_signal() => {
             result?;
-            println!("shutdown signal received; agent is shutting down");
+            crate::logging::info(format_args!("shutdown signal received; agent is shutting down"));
             Ok(())
         },
     }
@@ -189,26 +188,16 @@ async fn wait_for_stop(path: &Path, pid: u32) -> Result<()> {
     }
 }
 
-fn open_log_files(path: &Path) -> Result<(File, File)> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
-    }
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open log file {}", path.display()))?;
-    let stderr = stdout.try_clone()?;
-    Ok((stdout, stderr))
-}
-
 fn print_running(prefix: &str, pid: Option<u32>, log_file: &Path) {
     match pid {
         Some(pid) => println!("{prefix} (pid {pid})"),
         None => println!("{prefix}"),
     }
     println!("log: {}", log_file.display());
+}
+
+pub fn log_file(config: &AgentConfig) -> Result<PathBuf> {
+    Ok(RuntimePaths::from_config(config)?.log_file)
 }
 
 #[cfg(unix)]
@@ -406,6 +395,8 @@ mod tests {
             report_interval: 5,
             state_dir: Some(state_dir),
             log_file: None,
+            log_max_bytes: 10 * 1024 * 1024,
+            log_history: 3,
             update_dir: None,
         }
     }

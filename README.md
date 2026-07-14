@@ -101,7 +101,7 @@ cargo build --release
 ./target/release/om-agent log --server http://127.0.0.1:13500
 ```
 
-实例端不提供 `run` 命令。`log` 会持续运行，按 `Ctrl+C` 退出；同一状态目录下不能同时运行前台和后台实例端。
+实例端不提供 `run` 命令。`log` 会持续运行，按 `Ctrl+C` 退出；同一状态目录下不能同时运行前台和后台实例端。未配置 `OM_AGENT_LOG_FILE` 时日志直接打印到终端，配置后则写入对应的滚动日志文件。
 
 开发时也可以通过 Cargo 执行相同命令：
 
@@ -386,8 +386,14 @@ OM_AGENT_ID_FILE=/path/to/identity.json
 OM_REPORT_INTERVAL=5
 OM_AGENT_STATE_DIR=/path/to/runtime
 OM_AGENT_LOG_FILE=/path/to/agent.log
+OM_AGENT_LOG_MAX_BYTES=10485760
+OM_AGENT_LOG_HISTORY=3
 OM_AGENT_UPDATE_DIR=/path/to/persistent/updates
 ```
+
+实例端日志默认在单个文件达到 10 MiB 时滚动，保留 `agent.log.1` 至
+`agent.log.3` 三个历史文件，超过保留数量的旧日志会直接删除。updater 日志使用相同的
+大小和保留策略。将 `OM_AGENT_LOG_HISTORY` 设为 `0` 可在滚动时直接丢弃旧日志。
 
 同一状态目录只允许一个实例端进程运行。若要在一台机器上运行多个实例端，请为每个进程设置不同的 `OM_AGENT_STATE_DIR`、`OM_AGENT_ID_FILE` 和 `OM_AGENT_UPDATE_DIR`。更新目录保存可执行文件、回滚基线、状态和 updater 日志，不能放在重启后会清空的临时目录中。OpenWrt standalone 安装默认使用 `/var/lib/om-agent/updates`。
 

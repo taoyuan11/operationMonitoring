@@ -70,6 +70,18 @@ pub struct AgentConfig {
     /// File that receives background process output
     #[arg(long, env = "OM_AGENT_LOG_FILE", global = true)]
     pub log_file: Option<PathBuf>,
+    /// Maximum size of one log file before rotation
+    #[arg(
+        long,
+        env = "OM_AGENT_LOG_MAX_BYTES",
+        default_value_t = 10 * 1024 * 1024,
+        value_parser = clap::value_parser!(u64).range(1..),
+        global = true
+    )]
+    pub log_max_bytes: u64,
+    /// Number of rotated log files to retain
+    #[arg(long, env = "OM_AGENT_LOG_HISTORY", default_value_t = 3, global = true)]
+    pub log_history: usize,
     /// Persistent directory used for downloaded packages and update state
     #[arg(long, env = "OM_AGENT_UPDATE_DIR", global = true)]
     pub update_dir: Option<PathBuf>,
@@ -91,6 +103,11 @@ impl AgentConfig {
         if let Some(path) = &self.log_file {
             command.arg("--log-file").arg(path);
         }
+        command
+            .arg("--log-max-bytes")
+            .arg(self.log_max_bytes.to_string())
+            .arg("--log-history")
+            .arg(self.log_history.to_string());
         if let Some(path) = &self.update_dir {
             command.arg("--update-dir").arg(path);
         }
@@ -158,6 +175,27 @@ mod tests {
         let cli = Cli::try_parse_from(["agent", "log"]).unwrap();
 
         assert_eq!(cli.command, AgentCommand::Log);
+    }
+
+    #[test]
+    fn parses_log_rotation_options() {
+        let cli = Cli::try_parse_from([
+            "agent",
+            "start",
+            "--log-max-bytes",
+            "2048",
+            "--log-history",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.agent.log_max_bytes, 2048);
+        assert_eq!(cli.agent.log_history, 0);
+    }
+
+    #[test]
+    fn rejects_zero_log_size() {
+        assert!(Cli::try_parse_from(["agent", "start", "--log-max-bytes", "0"]).is_err());
     }
 
     #[test]

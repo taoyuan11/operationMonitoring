@@ -57,35 +57,38 @@ pub async fn agent_ws_loop(config: AgentConfig, identity: Identity) -> Result<()
     ) {
         Ok(manager) => Some(manager),
         Err(error) => {
-            eprintln!("agent updates are unavailable: {error:#}");
+            crate::logging::error(format_args!("agent updates are unavailable: {error:#}"));
             None
         }
     };
     loop {
         match register_once(&config, &identity, &http_client).await {
             Ok(response) if response.disabled => {
-                println!("websocket paused: instance disabled");
+                crate::logging::info(format_args!("websocket paused: instance disabled"));
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
             Ok(response) if !response.approved => {
-                println!("websocket waiting for approval: {}", response.message);
+                crate::logging::info(format_args!(
+                    "websocket waiting for approval: {}",
+                    response.message
+                ));
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
             Ok(_) => {}
             Err(error) => {
-                eprintln!("register before websocket failed: {error:#}");
+                crate::logging::error(format_args!("register before websocket failed: {error:#}"));
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
         }
 
         let url = websocket_url(&config.server, &identity);
-        println!("connecting websocket: {url}");
+        crate::logging::info(format_args!("connecting websocket: {url}"));
         match connect_async(&url).await {
             Ok((stream, _)) => {
-                println!("websocket connected");
+                crate::logging::info(format_args!("websocket connected"));
                 match handle_agent_socket(
                     stream,
                     &config,
@@ -97,10 +100,12 @@ pub async fn agent_ws_loop(config: AgentConfig, identity: Identity) -> Result<()
                 {
                     Ok(SocketOutcome::ApplyUpdate) => return Ok(()),
                     Ok(SocketOutcome::Disconnected) => {}
-                    Err(error) => eprintln!("websocket error: {error:#}"),
+                    Err(error) => crate::logging::error(format_args!("websocket error: {error:#}")),
                 }
             }
-            Err(error) => eprintln!("websocket connect failed: {error:#}"),
+            Err(error) => {
+                crate::logging::error(format_args!("websocket connect failed: {error:#}"))
+            }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -134,7 +139,9 @@ async fn handle_agent_socket(
                 let _ = outbound_tx.send(status);
             }
             Ok(None) => {}
-            Err(error) => eprintln!("failed to restore update status: {error:#}"),
+            Err(error) => {
+                crate::logging::error(format_args!("failed to restore update status: {error:#}"))
+            }
         }
     }
     let outcome = loop {
@@ -166,13 +173,15 @@ async fn handle_agent_socket(
                                 ));
                             }
                             Ok(false) => {}
-                            Err(error) => eprintln!(
+                            Err(error) => crate::logging::error(format_args!(
                                 "failed to inspect local update state before manifest offer: {error:#}"
-                            ),
+                            )),
                         }
                     }
                     Ok(None) => {}
-                    Err(error) => eprintln!("failed to check for an agent update: {error:#}"),
+                    Err(error) => crate::logging::error(format_args!(
+                        "failed to check for an agent update: {error:#}"
+                    )),
                 }
             }
             event = update_event_rx.recv(), if active_update.is_some() => {
@@ -209,12 +218,12 @@ async fn handle_agent_socket(
                             .await;
                             match flush_result {
                                 Ok(Ok(())) => {}
-                                Ok(Err(error)) => eprintln!(
+                                Ok(Err(error)) => crate::logging::error(format_args!(
                                     "failed to flush final update status before exiting: {error:#}"
-                                ),
-                                Err(_) => eprintln!(
+                                )),
+                                Err(_) => crate::logging::error(format_args!(
                                     "timed out flushing final update status before exiting"
-                                ),
+                                )),
                             }
                             break SocketOutcome::ApplyUpdate;
                         }
@@ -248,7 +257,9 @@ async fn handle_agent_socket(
                                 outbound_tx.send(AgentInbound::Pong { now })?;
                             }
                             AgentOutbound::RunCommand { job_id, command } => {
-                                println!("running command job {job_id}: {command}");
+                                crate::logging::info(format_args!(
+                                    "running command job {job_id}: {command}"
+                                ));
                                 let command_outbound = outbound_tx.clone();
                                 let command_activity = activity.clone();
                                 tokio::spawn(async move {
@@ -306,13 +317,13 @@ async fn handle_agent_socket(
                                                     update_event_tx.clone(),
                                                 ));
                                             }
-                                            Ok(false) => println!(
+                                            Ok(false) => crate::logging::info(format_args!(
                                                 "ignored duplicate update offer for active handoff {}",
                                                 offer.artifact_id
-                                            ),
-                                            Err(error) => eprintln!(
+                                            )),
+                                            Err(error) => crate::logging::error(format_args!(
                                                 "failed to inspect local update state before websocket offer: {error:#}"
-                                            ),
+                                            )),
                                         }
                                     } else {
                                         let _ = outbound_tx.send(AgentInbound::UpdateStatus {

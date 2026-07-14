@@ -322,7 +322,7 @@ pub async fn admin_publish_agent_release(
     }
 
     for instance in instances {
-        if instance.update_privileged != 1 || !version_is_newer(&target, &instance.agent_version) {
+        if !version_is_newer(&target, &instance.agent_version) {
             continue;
         }
         let Some(artifact) = artifacts.iter().find(|artifact| {
@@ -335,12 +335,13 @@ pub async fn admin_publish_agent_release(
         }) else {
             continue;
         };
+        let (status, message, completed_at) = publish_attempt_state(&instance, now);
         sqlx::query(
             r#"
             INSERT INTO agent_update_attempts(
                 id, release_id, artifact_id, instance_id, from_version, target_version,
-                status, message, retry_count, created_at, updated_at
-            ) VALUES($1, $2, $3, $4, $5, $6, 'pending', '', 0, $7, $8)
+                status, message, retry_count, created_at, updated_at, completed_at
+            ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10, $11)
             ON CONFLICT(release_id, instance_id) DO NOTHING
             "#,
         )
@@ -350,8 +351,11 @@ pub async fn admin_publish_agent_release(
         .bind(&instance.id)
         .bind(&instance.agent_version)
         .bind(&release.version)
+        .bind(status)
+        .bind(message)
         .bind(now)
         .bind(now)
+        .bind(completed_at)
         .execute(&mut *transaction)
         .await?;
     }
@@ -1166,6 +1170,10 @@ async fn load_release_detail(
     release: AgentReleaseRecord,
 ) -> AppResult<AgentReleaseDetail> {
     let artifacts = release_artifacts(state, &release.id).await?;
+    let instances = capability_instances(state).await?;
+    if release.status == "published" {
+        backfill_unprivileged_attempts(state, &release, &artifacts, &instances).await?;
+    }
     let attempts = sqlx::query_as::<_, AgentUpdateAttemptRecord>(
         r#"
         SELECT id, release_id, artifact_id, instance_id, from_version, target_version,
@@ -1176,7 +1184,6 @@ async fn load_release_detail(
     .bind(&release.id)
     .fetch_all(&state.db)
     .await?;
-    let instances = capability_instances(state).await?;
     let mut eligible_instances = 0;
     let mut covered_instances = 0;
     let mut missing_artifact_instances = 0;
@@ -1217,6 +1224,57 @@ async fn load_release_detail(
     })
 }
 
+async fn backfill_unprivileged_attempts(
+    state: &AppState,
+    release: &AgentReleaseRecord,
+    artifacts: &[AgentArtifactRecord],
+    instances: &[InstanceCapabilityRow],
+) -> AppResult<()> {
+    let Ok(target) = Version::parse(&release.version) else {
+        return Ok(());
+    };
+    let recorded_at = release.published_at.unwrap_or_else(now_ts);
+    for instance in instances {
+        if instance.update_privileged == 1 || !version_is_newer(&target, &instance.agent_version) {
+            continue;
+        }
+        let Some(artifact) = artifacts.iter().find(|artifact| {
+            target_matches(
+                &instance.os,
+                &instance.package_type,
+                &instance.native_arch,
+                artifact,
+            )
+        }) else {
+            continue;
+        };
+        let (status, message, completed_at) = publish_attempt_state(instance, recorded_at);
+        sqlx::query(
+            r#"
+            INSERT INTO agent_update_attempts(
+                id, release_id, artifact_id, instance_id, from_version, target_version,
+                status, message, retry_count, created_at, updated_at, completed_at
+            ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10, $11)
+            ON CONFLICT(release_id, instance_id) DO NOTHING
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&release.id)
+        .bind(&artifact.id)
+        .bind(&instance.id)
+        .bind(&instance.agent_version)
+        .bind(&release.version)
+        .bind(status)
+        .bind(message)
+        .bind(recorded_at)
+        .bind(recorded_at)
+        .bind(completed_at)
+        .execute(&state.db)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn capability_instances(state: &AppState) -> AppResult<Vec<InstanceCapabilityRow>> {
     Ok(sqlx::query_as::<_, InstanceCapabilityRow>(
         r#"
@@ -1247,6 +1305,21 @@ fn update_target_os<'a>(package_type: &str, reported_os: &'a str) -> Option<&'a 
         "windows" => Some("windows"),
         "macos" => Some("macos"),
         _ => Some("linux"),
+    }
+}
+
+fn publish_attempt_state(
+    instance: &InstanceCapabilityRow,
+    now: i64,
+) -> (&'static str, &'static str, Option<i64>) {
+    if instance.update_privileged == 1 {
+        ("pending", "", None)
+    } else {
+        (
+            "failed",
+            "Agent 进程没有替换当前可执行文件所需的权限",
+            Some(now),
+        )
     }
 }
 
@@ -1721,6 +1794,27 @@ mod tests {
         assert!(!version_is_newer(&release, "1.10.0"));
         assert!(!version_is_newer(&release, "2.0.0"));
         assert!(version_is_newer(&release, "legacy"));
+    }
+
+    #[test]
+    fn records_an_unprivileged_release_target_as_failed() {
+        let instance = InstanceCapabilityRow {
+            id: "unprivileged-agent".to_string(),
+            os: "linux".to_string(),
+            agent_version: "1.0.0".to_string(),
+            package_type: "standalone".to_string(),
+            native_arch: "x86_64".to_string(),
+            update_privileged: 0,
+        };
+
+        assert_eq!(
+            publish_attempt_state(&instance, 123),
+            (
+                "failed",
+                "Agent 进程没有替换当前可执行文件所需的权限",
+                Some(123),
+            )
+        );
     }
 
     #[test]

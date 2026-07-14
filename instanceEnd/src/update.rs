@@ -111,7 +111,6 @@ struct UpdatePaths {
     packages: PathBuf,
     state_file: PathBuf,
     health_file: PathBuf,
-    update_log: PathBuf,
     lock_file: PathBuf,
     lock_owner_file: PathBuf,
 }
@@ -412,7 +411,9 @@ impl UpdateManager {
                 if let Err(persist_error) =
                     self.send_status(&offer, UpdateStatus::Failed, Some(message), &outbound)
                 {
-                    eprintln!("failed to persist update failure: {persist_error:#}");
+                    crate::logging::error(format_args!(
+                        "failed to persist update failure: {persist_error:#}"
+                    ));
                 }
                 PrepareResult::Finished
             }
@@ -505,7 +506,9 @@ impl UpdateManager {
             if let Err(persist_error) =
                 self.send_status(offer, UpdateStatus::Failed, Some(message), outbound)
             {
-                eprintln!("failed to persist updater launch failure: {persist_error:#}");
+                crate::logging::error(format_args!(
+                    "failed to persist updater launch failure: {persist_error:#}"
+                ));
             }
             return false;
         }
@@ -517,7 +520,9 @@ impl UpdateManager {
         ) {
             // The updater is already independent of this process. The parent must still
             // exit so that the standalone updater can replace the executable.
-            eprintln!("failed to persist updater handoff status: {error:#}");
+            crate::logging::error(format_args!(
+                "failed to persist updater handoff status: {error:#}"
+            ));
         }
         true
     }
@@ -837,19 +842,26 @@ impl UpdateManager {
         })?;
         set_owner_only_executable(&updater_path)?;
 
-        let spawned_with_systemd =
-            try_spawn_systemd_updater(&updater_path, &plan_path, &component)?;
+        let spawned_with_systemd = try_spawn_systemd_updater(
+            &updater_path,
+            &plan_path,
+            &component,
+            self.config.log_max_bytes,
+            self.config.log_history,
+        )?;
         if !spawned_with_systemd {
-            let stdout = open_update_log(&self.paths.update_log)?;
-            let stderr = stdout.try_clone()?;
             let mut command = Command::new(&updater_path);
             command
                 .arg("apply-update")
                 .arg("--plan-file")
                 .arg(&plan_path)
+                .arg("--log-max-bytes")
+                .arg(self.config.log_max_bytes.to_string())
+                .arg("--log-history")
+                .arg(self.config.log_history.to_string())
                 .stdin(Stdio::null())
-                .stdout(Stdio::from(stdout))
-                .stderr(Stdio::from(stderr));
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             detach(&mut command);
             command
                 .spawn()
@@ -990,19 +1002,6 @@ fn mutate_attempt(
     write_update_state(state_file, &state)
 }
 
-fn open_update_log(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))
-}
-
 #[cfg(unix)]
 fn set_owner_only_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -1066,6 +1065,8 @@ fn try_spawn_systemd_updater(
     updater_path: &Path,
     plan_path: &Path,
     component: &str,
+    log_max_bytes: u64,
+    log_history: usize,
 ) -> Result<bool> {
     if !Path::new("/run/systemd/system").is_dir() {
         return Ok(false);
@@ -1085,6 +1086,10 @@ fn try_spawn_systemd_updater(
             "apply-update".into(),
             "--plan-file".into(),
             plan_path.as_os_str().to_owned(),
+            "--log-max-bytes".into(),
+            log_max_bytes.to_string().into(),
+            "--log-history".into(),
+            log_history.to_string().into(),
         ],
     };
     match run_command_with_timeout(&spec, SERVICE_RESTART_TIMEOUT, "systemd updater launch") {
@@ -1168,7 +1173,6 @@ impl UpdatePaths {
             packages: root.join("packages"),
             state_file: root.join("state.json"),
             health_file: root.join("health.json"),
-            update_log: root.join("updater.log"),
             lock_file: root.join("updater.lock"),
             lock_owner_file: root.join("updater-owner.json"),
             root,
@@ -1199,11 +1203,11 @@ pub fn apply_update(plan_file: &Path) -> Result<()> {
         .with_context(|| format!("failed to read update plan {}", plan_file.display()))?;
     let plan: ApplyPlan = serde_json::from_str(&content)?;
     let _ownership = acquire_worker_ownership(&plan)?;
-    println!(
+    crate::logging::info(format_args!(
         "applying agent update {} from {}",
         plan.offer.version,
         plan.package_path.display()
-    );
+    ));
 
     let result = apply_update_inner(&plan);
     if let Err(error) = &result {
@@ -1253,7 +1257,9 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
         None,
     )?;
     if let Err(error) = restart_agent_service(package_type) {
-        eprintln!("failed to request agent service restart: {error:#}");
+        crate::logging::error(format_args!(
+            "failed to request agent service restart: {error:#}"
+        ));
     }
 
     if wait_for_health(
@@ -1264,7 +1270,10 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
         HEALTH_TIMEOUT,
     ) {
         complete_target_update(plan, package_type)?;
-        println!("agent update {} is healthy", plan.offer.version);
+        crate::logging::info(format_args!(
+            "agent update {} is healthy",
+            plan.offer.version
+        ));
         return Ok(());
     }
 
@@ -1328,11 +1337,11 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
         bail!("{reason}; no cached rollback package is available");
     };
 
-    eprintln!(
+    crate::logging::error(format_args!(
         "{reason}; rolling back to agent {} from {}",
         previous.version,
         previous.path.display()
-    );
+    ));
     let _ = fs::remove_file(&plan.health_file);
     persist_apply_status(
         plan,
@@ -1356,7 +1365,9 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
         Some(reason.clone()),
     )?;
     if let Err(error) = restart_agent_service(previous.package_type) {
-        eprintln!("failed to request rolled-back service restart: {error:#}");
+        crate::logging::error(format_args!(
+            "failed to request rolled-back service restart: {error:#}"
+        ));
     }
 
     if !wait_for_health(
@@ -1385,7 +1396,10 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
         AttemptPhase::Completed,
         Some(reason),
     )?;
-    println!("agent rollback to {} succeeded", previous.version);
+    crate::logging::info(format_args!(
+        "agent rollback to {} succeeded",
+        previous.version
+    ));
     Ok(())
 }
 
@@ -2243,6 +2257,8 @@ mod tests {
             report_interval: 5,
             state_dir: None,
             log_file: None,
+            log_max_bytes: 10 * 1024 * 1024,
+            log_history: 3,
             update_dir: Some(directory.clone()),
         };
         let paths = UpdatePaths::from_config(&config).unwrap();
@@ -2579,6 +2595,8 @@ mod tests {
             report_interval: 5,
             state_dir: None,
             log_file: None,
+            log_max_bytes: 10 * 1024 * 1024,
+            log_history: 3,
             update_dir: Some(directory.clone()),
         };
         let paths = UpdatePaths::from_config(&config).unwrap();

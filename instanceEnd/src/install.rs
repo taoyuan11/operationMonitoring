@@ -332,9 +332,11 @@ fn env_file(c: &AgentConfig, mac: bool) -> String {
         )
     };
     format!(
-        "OM_SERVER='{}'\nOM_REPORT_INTERVAL='{}'\nOM_AGENT_ID_FILE='{id}'\nOM_AGENT_STATE_DIR='{state}'\nOM_AGENT_LOG_FILE='{log}'\nOM_AGENT_UPDATE_DIR='{update}'\n",
+        "OM_SERVER='{}'\nOM_REPORT_INTERVAL='{}'\nOM_AGENT_ID_FILE='{id}'\nOM_AGENT_STATE_DIR='{state}'\nOM_AGENT_LOG_FILE='{log}'\nOM_AGENT_LOG_MAX_BYTES='{}'\nOM_AGENT_LOG_HISTORY='{}'\nOM_AGENT_UPDATE_DIR='{update}'\n",
         quoted(&c.server),
-        c.report_interval
+        c.report_interval,
+        c.log_max_bytes,
+        c.log_history
     )
 }
 
@@ -418,9 +420,11 @@ fn install_openwrt(c: &AgentConfig) -> Result<()> {
     fs::write(
         "/etc/config/om-agent",
         format!(
-            "config agent 'main'\n\toption enabled '1'\n\toption server '{}'\n\toption report_interval '{}'\n",
+            "config agent 'main'\n\toption enabled '1'\n\toption server '{}'\n\toption report_interval '{}'\n\toption log_max_bytes '{}'\n\toption log_history '{}'\n",
             quoted(&c.server),
-            c.report_interval
+            c.report_interval,
+            c.log_max_bytes,
+            c.log_history
         ),
     )?;
     fs::write("/etc/init.d/om-agent", OPENWRT)?;
@@ -543,13 +547,15 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
     )?;
     fs::write(data.join("install-type"), "standalone\n")?;
     let image = format!(
-        "\"{}\" service-run --server \"{}\" --report-interval {} --identity-file \"{}\" --state-dir \"{}\" --log-file \"{}\" --update-dir \"{}\"",
+        "\"{}\" service-run --server \"{}\" --report-interval {} --identity-file \"{}\" --state-dir \"{}\" --log-file \"{}\" --log-max-bytes {} --log-history {} --update-dir \"{}\"",
         binary.display(),
         c.server,
         c.report_interval,
         data.join("identity.json").display(),
         data.join("runtime").display(),
         data.join("logs/agent.log").display(),
+        c.log_max_bytes,
+        c.log_history,
         data.join("updates").display()
     );
     success(
@@ -791,7 +797,7 @@ fn windows_runas(action: &str, c: Option<&AgentConfig>) -> Result<()> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-const SYSTEMD: &str = "[Unit]\nDescription=OM Agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironmentFile=-/etc/om-agent/agent.env\nExecStart=/usr/local/bin/om-agent log\nRestart=always\nRestartSec=5\nRuntimeDirectory=om-agent\nStateDirectory=om-agent\nUMask=0077\n[Install]\nWantedBy=multi-user.target\n";
+const SYSTEMD: &str = "[Unit]\nDescription=OM Agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironmentFile=-/etc/om-agent/agent.env\nExecStart=/usr/local/bin/om-agent service-run\nRestart=always\nRestartSec=5\nRuntimeDirectory=om-agent\nStateDirectory=om-agent\nUMask=0077\n[Install]\nWantedBy=multi-user.target\n";
 #[cfg(all(unix, not(target_os = "macos")))]
 const OPENWRT: &str = r#"#!/bin/sh /etc/rc.common
 USE_PROCD=1
@@ -802,8 +808,10 @@ start_service() {
  [ "$enabled" -eq 1 ] || return 0
  config_get server main server 'http://127.0.0.1:13500'
  config_get interval main report_interval '5'
+ config_get log_max_bytes main log_max_bytes '10485760'
+ config_get log_history main log_history '3'
  procd_open_instance
- procd_set_param command /usr/bin/om-agent log --server "$server" --report-interval "$interval" --identity-file /etc/om-agent/identity.json --state-dir /var/run/om-agent --update-dir /var/lib/om-agent/updates
+ procd_set_param command /usr/bin/om-agent service-run --server "$server" --report-interval "$interval" --identity-file /etc/om-agent/identity.json --state-dir /var/run/om-agent --log-file /var/log/om-agent/agent.log --log-max-bytes "$log_max_bytes" --log-history "$log_history" --update-dir /var/lib/om-agent/updates
  procd_set_param respawn 3600 5 5
  procd_set_param stdout 1
  procd_set_param stderr 1
@@ -811,7 +819,7 @@ start_service() {
 }
 "#;
 #[cfg(target_os = "macos")]
-const MACOS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>com.operation-monitoring.agent</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>set -a; . '/Library/Application Support/OperationMonitoring/agent.env'; exec /usr/local/bin/om-agent log</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>/Library/Logs/OperationMonitoring/agent.log</string><key>StandardErrorPath</key><string>/Library/Logs/OperationMonitoring/agent.log</string></dict></plist>"#;
+const MACOS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>com.operation-monitoring.agent</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>set -a; . '/Library/Application Support/OperationMonitoring/agent.env'; exec /usr/local/bin/om-agent service-run</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>/Library/Logs/OperationMonitoring/agent.log</string><key>StandardErrorPath</key><string>/Library/Logs/OperationMonitoring/agent.log</string></dict></plist>"#;
 
 #[cfg(test)]
 mod tests {
@@ -878,8 +886,8 @@ mod macos_tests {
 
     #[test]
     fn launch_daemon_uses_the_short_executable_name() {
-        assert!(MACOS.contains("exec /usr/local/bin/om-agent log"));
-        assert!(!MACOS.contains("exec /usr/local/bin/operation-monitoring-agent log"));
+        assert!(MACOS.contains("exec /usr/local/bin/om-agent service-run"));
+        assert!(!MACOS.contains("exec /usr/local/bin/operation-monitoring-agent service-run"));
     }
 }
 
@@ -914,7 +922,7 @@ mod windows_service_impl {
     }
     fn service_main(_: Vec<OsString>) {
         if let Err(e) = inner() {
-            eprintln!("service failed: {e:#}")
+            crate::logging::error(format_args!("service failed: {e:#}"))
         }
     }
     fn inner() -> Result<()> {

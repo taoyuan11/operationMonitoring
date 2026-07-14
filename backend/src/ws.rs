@@ -30,7 +30,7 @@ pub async fn agent_socket(state: AppState, instance_id: String, socket: WebSocke
         .write()
         .await
         .insert(instance_id.clone(), AgentHandle { connection_id, tx });
-    let _ = sqlx::query("UPDATE instances SET last_seen = ? WHERE id = ?")
+    let _ = sqlx::query("UPDATE instances SET last_seen = $1 WHERE id = $2")
         .bind(now_ts())
         .bind(&instance_id)
         .execute(&state.db)
@@ -227,11 +227,11 @@ async fn store_metrics(
     sqlx::query(
         r#"
         UPDATE instances
-        SET hostname = ?, os = ?, arch = ?, agent_version = ?,
-            package_type = COALESCE(?, package_type),
-            native_arch = COALESCE(?, native_arch),
-            update_privileged = COALESCE(?, update_privileged), last_seen = ?
-        WHERE id = ?
+        SET hostname = $1, os = $2, arch = $3, agent_version = $4,
+            package_type = COALESCE($5, package_type),
+            native_arch = COALESCE($6, native_arch),
+            update_privileged = COALESCE($7, update_privileged), last_seen = $8
+        WHERE id = $9
         "#,
     )
     .bind(hostname)
@@ -253,7 +253,7 @@ async fn store_metrics(
         INSERT INTO metrics(instance_id, ts, cpu_percent, memory_used, memory_total,
                             disk_used, disk_total, network_rx, network_tx, gpu_percent,
                             gpu_memory_used, gpu_memory_total, uptime_seconds, load_average)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         "#,
     )
     .bind(instance_id)
@@ -345,7 +345,7 @@ pub async fn terminal_socket(
     };
 
     if let Err(error) = sqlx::query(
-        "INSERT INTO ssh_sessions(id, instance_id, actor, started_at) VALUES(?, ?, ?, ?)",
+        "INSERT INTO ssh_sessions(id, instance_id, actor, started_at) VALUES($1, $2, $3, $4)",
     )
     .bind(&session_id)
     .bind(&instance_id)
@@ -443,7 +443,7 @@ pub async fn terminal_socket(
     let _ = agent.tx.send(AgentOutbound::TerminalClose {
         session_id: session_id.clone(),
     });
-    let _ = sqlx::query("UPDATE ssh_sessions SET ended_at = ? WHERE id = ?")
+    let _ = sqlx::query("UPDATE ssh_sessions SET ended_at = $1 WHERE id = $2")
         .bind(now_ts())
         .bind(&session_id)
         .execute(&state.db)

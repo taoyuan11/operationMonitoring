@@ -529,25 +529,29 @@ export function useMonitoringConsole() {
     authEnrollments.value = response.enrollments
   }
 
-  function createAgentRelease() {
+  async function createAgentRelease(onCreated?: (releaseId: string) => void) {
     const form = {
       version: agentReleaseForm.version.trim(),
       notes: agentReleaseForm.notes.trim(),
     }
     if (!form.version) {
       errorMessage.value = '请输入 Agent 版本号'
-      return Promise.resolve(false)
+      return false
     }
 
-    return runAgentUpdateTask('creating', 'new-release', async () => {
-      await api<AgentRelease>('/api/admin/agent-releases', {
+    let createdReleaseId = ''
+    const success = await runAgentUpdateTask('creating', 'new-release', async () => {
+      const release = await api<AgentRelease>('/api/admin/agent-releases', {
         method: 'POST',
         body: JSON.stringify(form),
       })
+      createdReleaseId = release.id
       agentReleaseForm.version = ''
       agentReleaseForm.notes = ''
       await loadAgentUpdates()
     }, '已创建更新草稿')
+    if (success && createdReleaseId) onCreated?.(createdReleaseId)
+    return success
   }
 
   function saveAgentRelease(releaseId: string, form: AgentReleaseForm) {

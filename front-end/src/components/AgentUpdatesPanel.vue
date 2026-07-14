@@ -41,7 +41,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  createRelease: []
+  createRelease: [onCreated: (releaseId: string) => void]
   saveRelease: [releaseId: string, form: AgentReleaseForm]
   uploadArtifact: [releaseId: string, uploads: AgentArtifactUploadItem[], onComplete: (result: AgentArtifactUploadResult) => void]
   deleteArtifact: [releaseId: string, artifactId: string]
@@ -59,6 +59,10 @@ const batchInputKeys = reactive<Record<string, number>>({})
 const fileInputKeys = reactive<Record<string, number>>({})
 const checksumInputKeys = reactive<Record<string, number>>({})
 const editingReleaseId = ref<string | null>(null)
+const createReleaseFiles = ref<File[]>([])
+const createReleaseFileError = ref('')
+const createReleaseVersionSource = ref('')
+const createReleaseInputKey = ref(0)
 let uploadRowSequence = 0
 
 const nativeArchitecturesByOs: Record<string, string[]> = {
@@ -86,6 +90,12 @@ const attemptStatusText: Record<AgentUpdateAttemptStatus, string> = {
 }
 
 const publishedCount = computed(() => props.releases.filter((release) => release.status === 'published').length)
+const createReleaseFileSummary = computed(() => {
+  const packageCount = createReleaseFiles.value.filter((file) => !file.name.toLowerCase().endsWith('.sha256')).length
+  const checksumCount = createReleaseFiles.value.length - packageCount
+  if (!createReleaseFiles.value.length) return '选择更新包'
+  return `${packageCount} 个更新包，${checksumCount} 个校验文件`
+})
 
 watch(
   () => props.releases,
@@ -256,6 +266,69 @@ function inferTargetFromName(fileName: string) {
     native_arch: architecture,
     inference: os && architecture ? 'matched' as const : os ? 'needs_architecture' as const : 'needs_target' as const,
   }
+}
+
+function inferVersionFromName(fileName: string) {
+  const baseName = fileName
+    .replace(/\.sha256$/i, '')
+    .replace(/\.(?:bin|exe)$/i, '')
+    .replace(/(?:[_-](?:linux|windows|win|macos|darwin|osx))?(?:[_-](?:x86_64|amd64|x64|aarch64|arm64|armv?7|arm|i[3-6]86|x86))$/i, '')
+  const match = baseName.match(
+    /(?:^|[_-])v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/,
+  )
+  return match?.[1] || ''
+}
+
+function chooseCreateReleaseFiles(event: Event) {
+  const input = event.target as HTMLInputElement
+  const selectedFiles = Array.from(input.files || [])
+  const validFiles = selectedFiles.filter((file) => {
+    const name = file.name.toLowerCase()
+    return name.endsWith('.bin') || name.endsWith('.exe') || name.endsWith('.sha256')
+  })
+  const packageFiles = validFiles.filter((file) => !file.name.toLowerCase().endsWith('.sha256'))
+  const versionSources = packageFiles.length ? packageFiles : validFiles
+  const detectedVersions = new Map<string, string>()
+  for (const file of versionSources) {
+    const version = inferVersionFromName(file.name)
+    if (version && !detectedVersions.has(version)) detectedVersions.set(version, file.name)
+  }
+
+  createReleaseFiles.value = validFiles
+  createReleaseVersionSource.value = ''
+  if (detectedVersions.size === 1) {
+    const [[version, source]] = [...detectedVersions]
+    props.form.version = version
+    createReleaseVersionSource.value = source
+  }
+
+  if (selectedFiles.length !== validFiles.length) {
+    createReleaseFileError.value = `${selectedFiles.length - validFiles.length} 个文件不是支持的更新包或 .sha256 文件`
+  } else if (detectedVersions.size > 1) {
+    createReleaseFileError.value = `检测到多个版本：${[...detectedVersions.keys()].join('、')}，请只选择同一版本的文件`
+  } else if (validFiles.length && detectedVersions.size === 0) {
+    createReleaseFileError.value = '无法从文件名识别版本号，请手动填写后继续'
+  } else {
+    createReleaseFileError.value = ''
+  }
+}
+
+function submitCreateRelease() {
+  emit('createRelease', completeCreateRelease)
+}
+
+function completeCreateRelease(releaseId: string) {
+  const files = createReleaseFiles.value
+  artifactUploadRows[releaseId] = [createUploadRow('linux', 'x86_64')]
+  batchFileErrors[releaseId] = ''
+  batchDragDepths[releaseId] = 0
+  batchDragActive[releaseId] = false
+  batchInputKeys[releaseId] = 0
+  if (files.length) assignBatchFiles(releaseId, files)
+  createReleaseFiles.value = []
+  createReleaseFileError.value = ''
+  createReleaseVersionSource.value = ''
+  createReleaseInputKey.value += 1
 }
 
 function assignBatchFiles(releaseId: string, files: File[]) {
@@ -452,10 +525,34 @@ function isBusy(id: string) {
           <p>为一个版本添加多个系统和架构的可执行文件及同名 .sha256 校验文件。</p>
         </div>
       </div>
-      <form class="release-create-form" @submit.prevent="$emit('createRelease')">
+      <form class="release-create-form" @submit.prevent="submitCreateRelease">
+        <label class="release-create-file-picker">
+          <span>更新文件 <i>用于识别版本</i></span>
+          <span class="file-button" :class="{ disabled: operation }" :title="createReleaseFiles.map((file) => file.name).join('\n')">
+            <Upload :size="17" />
+            <span>
+              <strong>{{ createReleaseFileSummary }}</strong>
+              <small>可同时选择 .bin/.exe 及同名 .sha256</small>
+            </span>
+            <input
+              :key="createReleaseInputKey"
+              type="file"
+              accept=".bin,.exe,.sha256"
+              multiple
+              :disabled="Boolean(operation)"
+              @change="chooseCreateReleaseFiles"
+            />
+          </span>
+          <small v-if="createReleaseFileError" class="artifact-file-error" role="alert">
+            {{ createReleaseFileError }}
+          </small>
+        </label>
         <label>
           <span>版本号</span>
           <input v-model.trim="form.version" required placeholder="例如：1.4.0" autocomplete="off" />
+          <small v-if="createReleaseVersionSource" class="release-version-hint">
+            已从 {{ createReleaseVersionSource }} 识别，可直接修改
+          </small>
         </label>
         <label>
           <span>发布说明 <i>可选</i></span>

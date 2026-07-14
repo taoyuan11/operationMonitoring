@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     let bind = cli.bind;
     let package_body_limit = cli.agent_package_max_bytes.saturating_add(1024 * 1024);
     prepare_storage_directories(&mut cli).await?;
-    let db = connect_db(&cli.database_url).await?;
+    let db = connect_db(&cli.database_url, cli.database_password.as_deref()).await?;
     init_db(&db).await?;
     if cli.reset_admin_auth {
         if cli.confirm_reset_admin_auth.as_deref() != Some("RESET-ADMIN-AUTH") {

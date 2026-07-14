@@ -260,6 +260,7 @@ export const COUNTRY_OPTIONS = [
   { code: 'CF', name: '中非共和国', flag: 'cf' },
   { code: 'CN', name: '中国', flag: 'cn' },
   { code: 'HK', name: '中国香港特别行政区', flag: 'hk' },
+  { code: 'TW', name: '中国台湾', flag: 'tw' },
 ] as const satisfies readonly CountryOption[]
 
 const countryOptionsByCode = new Map<string, CountryOption>(

@@ -67,7 +67,7 @@ instanceEnd/src/
 
 ```bash
 cd backend
-OM_ADMIN_PASSWORD=admin123 cargo run
+OM_DATABASE_PASSWORD='<数据库密码>' OM_ADMIN_PASSWORD=admin123 cargo run
 ```
 
 启动前端：
@@ -135,6 +135,7 @@ Authenticator、Microsoft Authenticator、1Password 等标准 TOTP 应用。
 
 ```bash
 OM_ADMIN_PASSWORD='replace-with-a-strong-password' \
+OM_DATABASE_PASSWORD='<数据库密码>' \
 FRONTEND_PORT=8080 \
 BACKEND_PORT=13500 \
 docker compose up -d --build
@@ -143,8 +144,8 @@ docker compose up -d --build
 Agent 可以连接前端代理地址（例如 `http://服务器地址:8080`）或后端直连地址
 （例如 `http://服务器地址:13500`）。前端代理支持 API、上传资源和 WebSocket。
 
-SQLite 数据、背景图片和 Agent 更新包分别保存在 `backend-db`、
-`backend-uploads` 和 `backend-updates` 命名卷中，重新创建容器不会删除这些数据。
+业务数据保存在外部 PostgreSQL 中。管理员认证密钥、背景图片和 Agent 更新包分别保存在
+`backend-db`、`backend-uploads` 和 `backend-updates` 命名卷中，重新创建容器不会删除这些文件。
 删除命名卷前请先备份。常用管理命令：
 
 ```bash
@@ -351,7 +352,8 @@ Agent 会流式下载文件，校验大小、平台文件签名和 SHA-256，等
 
 ```bash
 OM_BIND=127.0.0.1:13500
-OM_DATABASE_URL=sqlite://db/operation-monitoring.db
+OM_DATABASE_URL=postgresql://root@192.168.100.1:5432/operation_monitoring
+OM_DATABASE_PASSWORD=<数据库密码>
 OM_ADMIN_PASSWORD=admin123
 OM_AUTH_KEY_FILE=db/auth-secret.key
 # OM_AUTH_SECRET_KEY=<Base64 编码的 32 字节主密钥>
@@ -361,9 +363,11 @@ OM_UPDATE_DIR=updates
 OM_AGENT_PACKAGE_MAX_BYTES=268435456
 ```
 
-未设置 `OM_DATABASE_URL` 时，后端会在启动进程的当前工作目录下自动创建
-`db/operation-monitoring.db`；SQLite 产生的 WAL、SHM 等运行时文件也位于该目录，
-不会作为项目文件提交。
+未设置 `OM_DATABASE_URL` 时，后端默认连接
+`postgresql://root@192.168.100.1:5432/operation_monitoring`。如果该数据库不存在且
+连接用户具有 `CREATEDB` 权限，后端会自动创建它。数据库密码必须通过
+`OM_DATABASE_PASSWORD` 注入，不要将密码写入配置文件或提交到仓库。首次启动时，
+后端会在目标 PostgreSQL 数据库中自动创建所需表和索引。
 
 `OM_ADMIN_PASSWORD` 仅在管理员表为空时有效，完成首位管理员绑定后即使仍保留该
 变量也会被忽略。`OM_SECURE_COOKIES` 在 HTTPS/WSS 生产部署中应设为 `true`；

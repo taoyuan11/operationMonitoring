@@ -10,14 +10,16 @@ pub struct Cli {
     #[arg(
         long,
         env = "OM_DATABASE_URL",
-        default_value = "sqlite://db/operation-monitoring.db"
+        default_value = "postgresql://root@127.0.0.1:5432/operation_monitoring"
     )]
     pub database_url: String,
+    #[arg(long, env = "OM_DATABASE_PASSWORD")]
+    pub database_password: Option<String>,
     #[arg(long, env = "OM_ADMIN_PASSWORD", default_value = "admin123")]
     pub admin_password: String,
     #[arg(long, env = "OM_AUTH_SECRET_KEY")]
     pub auth_secret_key: Option<String>,
-    #[arg(long, env = "OM_AUTH_KEY_FILE", default_value = "db/auth-secret.key")]
+    #[arg(long, env = "OM_AUTH_KEY_FILE", default_value = "auth/auth-secret.key")]
     pub auth_key_file: PathBuf,
     #[arg(long, env = "OM_SECURE_COOKIES", default_value_t = false)]
     pub secure_cookies: bool,

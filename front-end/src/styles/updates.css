@@ -2,9 +2,15 @@
 .update-feedback { display: inline-flex; width: fit-content; align-items: center; gap: 7px; margin: -4px 0 2px; padding: 9px 11px; color: #80d9bb; background: rgba(73, 200, 159, .08); border: 1px solid rgba(73, 200, 159, .18); border-radius: 6px; font-size: 12px; }
 
 .release-create-card { padding: 19px 20px; }
-.release-create-form { display: grid; grid-template-columns: minmax(170px, .62fr) minmax(260px, 1.38fr) auto; align-items: end; gap: 14px; }
+.release-create-form { display: grid; grid-template-columns: minmax(240px, .9fr) minmax(160px, .55fr) minmax(240px, 1fr) auto; align-items: end; gap: 14px; }
 .release-create-form textarea { min-height: 72px; }
 .release-create-form .primary-button { min-width: 116px; }
+.release-create-file-picker { min-width: 0; }
+.release-create-file-picker .file-button { width: 100%; min-height: 72px; justify-content: flex-start; overflow: hidden; padding: 9px 11px; border-style: dashed; }
+.release-create-file-picker .file-button > span { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 3px; overflow: hidden; }
+.release-create-file-picker .file-button strong { max-width: 100%; overflow: hidden; color: #cdd6d2; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.release-create-file-picker .file-button small, .release-version-hint { color: #75817b; font-size: 10px; font-weight: 450; }
+.release-version-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .release-list { display: flex; min-width: 0; flex-direction: column; gap: 12px; }
 .release-list-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; padding: 7px 2px 2px; }
@@ -91,7 +97,8 @@
 .attempt-status.failed { color: #ee929f; background: rgba(236, 113, 130, .1); }
 
 @media (max-width: 1120px) {
-  .release-create-form, .release-edit-form { grid-template-columns: minmax(160px, .62fr) minmax(230px, 1.38fr); }
+  .release-create-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .release-edit-form { grid-template-columns: minmax(160px, .62fr) minmax(230px, 1.38fr); }
   .release-create-form .primary-button, .release-edit-actions { grid-column: 1 / -1; justify-self: start; }
   .artifact-upload-row { grid-template-columns: repeat(2, minmax(0, 1fr)) auto; }
   .artifact-upload-row .artifact-file-picker, .artifact-upload-row .artifact-checksum-picker { grid-column: 1 / 3; }

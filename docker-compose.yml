@@ -4,7 +4,8 @@ services:
       context: ./backend
     environment:
       OM_BIND: 0.0.0.0:13500
-      OM_DATABASE_URL: sqlite:///app/db/operation-monitoring.db
+      OM_DATABASE_URL: ${OM_DATABASE_URL:-postgresql://root@127.0.0.1:5432/operation_monitoring}
+      OM_DATABASE_PASSWORD: ${OM_DATABASE_PASSWORD:?set OM_DATABASE_PASSWORD}
       OM_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:-admin123}
       OM_AUTH_KEY_FILE: /app/db/auth-secret.key
       OM_SECURE_COOKIES: ${OM_SECURE_COOKIES:-false}

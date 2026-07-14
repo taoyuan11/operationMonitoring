@@ -34,7 +34,7 @@ pub async fn create_command_job(
         r#"
         INSERT INTO command_jobs(id, command_id, instance_id, command, status, requested_by,
                                  created_at, completed_at, output, exit_code)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(&job.id)
@@ -64,7 +64,7 @@ pub async fn dispatch_command(
         return Err(AppError::new(StatusCode::CONFLICT, "实例不在线"));
     };
 
-    sqlx::query("UPDATE command_jobs SET status = 'running' WHERE id = ?")
+    sqlx::query("UPDATE command_jobs SET status = 'running' WHERE id = $1")
         .bind(job_id)
         .execute(&state.db)
         .await?;
@@ -94,8 +94,8 @@ pub async fn complete_command_job(
     sqlx::query(
         r#"
         UPDATE command_jobs
-        SET status = ?, completed_at = ?, output = ?, exit_code = ?
-        WHERE id = ?
+        SET status = $1, completed_at = $2, output = $3, exit_code = $4
+        WHERE id = $5
         "#,
     )
     .bind(status)

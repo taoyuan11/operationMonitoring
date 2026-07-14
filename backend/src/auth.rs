@@ -221,12 +221,12 @@ pub async fn require_admin(state: &AppState, headers: &HeaderMap) -> AppResult<A
         return Err(AppError::unauthorized());
     };
 
-    let valid: Option<i64> = sqlx::query_scalar(
+    let valid: Option<bool> = sqlx::query_scalar(
         r#"
-        SELECT 1
+        SELECT TRUE
         FROM admin_users u
         JOIN authenticator_devices d ON d.user_id = u.id
-        WHERE u.id = ? AND u.enabled = 1 AND d.id = ?
+        WHERE u.id = $1 AND u.enabled = 1 AND d.id = $2
         "#,
     )
     .bind(&session.user_id)

@@ -59,7 +59,7 @@ pub async fn public_instances(
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE approved = 1 AND disabled = 0
-        ORDER BY name COLLATE NOCASE ASC
+        ORDER BY LOWER(name) ASC
         "#,
     )
     .fetch_all(&state.db)
@@ -90,9 +90,9 @@ pub async fn public_metrics(
                network_rx, network_tx, gpu_percent, gpu_memory_used, gpu_memory_total,
                uptime_seconds, load_average
         FROM metrics
-        WHERE instance_id = ? AND ts BETWEEN ? AND ?
+        WHERE instance_id = $1 AND ts BETWEEN $2 AND $3
         ORDER BY ts ASC
-        LIMIT ?
+        LIMIT $4
         "#,
     )
     .bind(id)
@@ -114,7 +114,7 @@ pub async fn admin_pending_instances(
     let rows = sqlx::query_as::<_, PendingInstance>(
         r#"
         SELECT id, hostname, os, arch, agent_version, package_type, native_arch,
-               update_privileged, first_seen, last_seen
+               (update_privileged = 1) AS update_privileged, first_seen, last_seen
         FROM pending_instances
         ORDER BY last_seen DESC
         "#,
@@ -159,7 +159,7 @@ pub async fn admin_reject_instance(
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
 
-    sqlx::query("DELETE FROM pending_instances WHERE id = ?")
+    sqlx::query("DELETE FROM pending_instances WHERE id = $1")
         .bind(&id)
         .execute(&state.db)
         .await?;
@@ -227,8 +227,8 @@ pub async fn admin_update_instance(
     }
 
     sqlx::query(
-        "UPDATE instances SET name = ?, region = ?, country_code = ?, country = ?, \
-         province_code = ?, province = ?, city = ?, remark = ? WHERE id = ?",
+        "UPDATE instances SET name = $1, region = $2, country_code = $3, country = $4, \
+         province_code = $5, province = $6, city = $7, remark = $8 WHERE id = $9",
     )
     .bind(&name)
     .bind(&region)
@@ -263,7 +263,7 @@ pub async fn admin_disable_instance(
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
 
-    sqlx::query("UPDATE instances SET disabled = 1 WHERE id = ?")
+    sqlx::query("UPDATE instances SET disabled = 1 WHERE id = $1")
         .bind(&id)
         .execute(&state.db)
         .await?;
@@ -291,15 +291,15 @@ pub async fn admin_delete_instance(
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
 
-    sqlx::query("DELETE FROM metrics WHERE instance_id = ?")
+    sqlx::query("DELETE FROM metrics WHERE instance_id = $1")
         .bind(&id)
         .execute(&state.db)
         .await?;
-    sqlx::query("DELETE FROM command_jobs WHERE instance_id = ?")
+    sqlx::query("DELETE FROM command_jobs WHERE instance_id = $1")
         .bind(&id)
         .execute(&state.db)
         .await?;
-    sqlx::query("DELETE FROM instances WHERE id = ?")
+    sqlx::query("DELETE FROM instances WHERE id = $1")
         .bind(&id)
         .execute(&state.db)
         .await?;
@@ -339,7 +339,7 @@ pub async fn admin_put_settings(
     let admin = require_admin(&state, &headers).await?;
     let days = payload.retention_days.clamp(1, 365);
     sqlx::query(
-        "INSERT INTO settings(key, value) VALUES('retention_days', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        "INSERT INTO settings(key, value) VALUES('retention_days', $1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
     .bind(days.to_string())
     .execute(&state.db)
@@ -413,7 +413,7 @@ pub async fn admin_upload_background_image(
 
     let relative_path_text = relative_path.to_string_lossy().replace('\\', "/");
     sqlx::query(
-        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        "INSERT INTO settings(key, value) VALUES($1, $2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
     .bind(BACKGROUND_SETTING_KEY)
     .bind(&relative_path_text)
@@ -445,7 +445,7 @@ pub async fn admin_delete_background_image(
 ) -> AppResult<Json<SettingsResponse>> {
     let admin = require_admin(&state, &headers).await?;
     let old_relative_path = setting_value(&state.db, BACKGROUND_SETTING_KEY).await?;
-    sqlx::query("DELETE FROM settings WHERE key = ?")
+    sqlx::query("DELETE FROM settings WHERE key = $1")
         .bind(BACKGROUND_SETTING_KEY)
         .execute(&state.db)
         .await?;
@@ -549,7 +549,7 @@ pub async fn admin_create_command(
     };
 
     sqlx::query(
-        "INSERT INTO commands(id, name, command, confirm_text, enabled, created_at) VALUES(?, ?, ?, ?, 1, ?)",
+        "INSERT INTO commands(id, name, command, confirm_text, enabled, created_at) VALUES($1, $2, $3, $4, 1, $5)",
     )
     .bind(&record.id)
     .bind(&record.name)
@@ -576,7 +576,7 @@ pub async fn admin_disable_command(
     Path(id): Path<String>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
-    sqlx::query("UPDATE commands SET enabled = 0 WHERE id = ?")
+    sqlx::query("UPDATE commands SET enabled = 0 WHERE id = $1")
         .bind(&id)
         .execute(&state.db)
         .await?;
@@ -603,7 +603,7 @@ pub async fn admin_run_whitelist_command(
     let admin = require_admin(&state, &headers).await?;
 
     let command = sqlx::query_as::<_, CommandRecord>(
-        "SELECT id, name, command, confirm_text, enabled, created_at FROM commands WHERE id = ? AND enabled = 1",
+        "SELECT id, name, command, confirm_text, enabled, created_at FROM commands WHERE id = $1 AND enabled = 1",
     )
     .bind(&command_id)
     .fetch_optional(&state.db)
@@ -643,7 +643,7 @@ pub async fn admin_jobs(
                completed_at, output, exit_code
         FROM command_jobs
         ORDER BY created_at DESC
-        LIMIT ?
+        LIMIT $1
         "#,
     )
     .bind(limit)
@@ -664,7 +664,7 @@ pub async fn admin_logs(
         SELECT id, actor, action, target, detail, created_at
         FROM action_logs
         ORDER BY created_at DESC
-        LIMIT ?
+        LIMIT $1
         "#,
     )
     .bind(limit)
@@ -741,11 +741,11 @@ pub async fn agent_report(
     sqlx::query(
         r#"
         UPDATE instances
-        SET hostname = ?, os = ?, arch = ?, agent_version = ?,
-            package_type = COALESCE(?, package_type),
-            native_arch = COALESCE(?, native_arch),
-            update_privileged = COALESCE(?, update_privileged), last_seen = ?
-        WHERE id = ?
+        SET hostname = $1, os = $2, arch = $3, agent_version = $4,
+            package_type = COALESCE($5, package_type),
+            native_arch = COALESCE($6, native_arch),
+            update_privileged = COALESCE($7, update_privileged), last_seen = $8
+        WHERE id = $9
         "#,
     )
     .bind(&payload.hostname)
@@ -767,7 +767,7 @@ pub async fn agent_report(
         INSERT INTO metrics(instance_id, ts, cpu_percent, memory_used, memory_total,
                             disk_used, disk_total, network_rx, network_tx, gpu_percent,
                             gpu_memory_used, gpu_memory_total, uptime_seconds, load_average)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         "#,
     )
     .bind(&payload.instance_id)

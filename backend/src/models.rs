@@ -113,7 +113,7 @@ pub struct PendingInstanceSecret {
     pub agent_version: String,
     pub package_type: String,
     pub native_arch: String,
-    pub update_privileged: bool,
+    pub update_privileged: i64,
     pub first_seen: i64,
     pub last_seen: i64,
 }

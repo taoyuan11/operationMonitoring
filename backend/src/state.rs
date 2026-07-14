@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
@@ -12,7 +12,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: SqlitePool,
+    pub db: PgPool,
     pub admin_password: String,
     pub auth_cipher: Arc<AuthCipher>,
     pub secure_cookies: bool,
@@ -26,7 +26,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool, cli: Cli, auth_cipher: AuthCipher) -> Self {
+    pub fn new(db: PgPool, cli: Cli, auth_cipher: AuthCipher) -> Self {
         Self {
             db,
             admin_password: cli.admin_password,

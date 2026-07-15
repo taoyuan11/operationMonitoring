@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod db;
 mod error;
+mod files;
 mod handlers;
 mod jobs;
 mod models;
@@ -21,11 +22,15 @@ use auth::load_auth_cipher;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use clap::Parser;
 use config::Cli;
 use db::{cleanup_loop, connect_db, init_db};
+use files::{
+    admin_create_directory, admin_delete_file, admin_download_file, admin_file_roots,
+    admin_list_files, admin_move_file, admin_upload_file,
+};
 use handlers::{
     admin_approve_instance, admin_commands, admin_create_command, admin_delete_background_image,
     admin_delete_instance, admin_disable_command, admin_disable_instance, admin_get_settings,
@@ -58,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
     let bind = cli.bind;
     let package_body_limit = cli.agent_package_max_bytes.saturating_add(1024 * 1024);
+    let file_body_limit = cli.file_transfer_max_bytes;
     prepare_storage_directories(&mut cli).await?;
     let db = connect_db(&cli.database_url, cli.database_password.as_deref()).await?;
     init_db(&db).await?;
@@ -163,6 +169,28 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/instances/{id}/terminal/ws",
             get(admin_terminal_ws),
+        )
+        .route(
+            "/api/admin/instances/{id}/files/roots",
+            get(admin_file_roots),
+        )
+        .route(
+            "/api/admin/instances/{id}/files",
+            get(admin_list_files)
+                .patch(admin_move_file)
+                .delete(admin_delete_file),
+        )
+        .route(
+            "/api/admin/instances/{id}/directories",
+            post(admin_create_directory),
+        )
+        .route(
+            "/api/admin/instances/{id}/files/upload",
+            put(admin_upload_file).layer(DefaultBodyLimit::max(file_body_limit)),
+        )
+        .route(
+            "/api/admin/instances/{id}/files/download",
+            get(admin_download_file),
         )
         .route("/api/admin/jobs", get(admin_jobs))
         .route("/api/admin/logs", get(admin_logs))

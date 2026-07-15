@@ -35,15 +35,16 @@
   .admin-navigation { gap: 0; margin-top: 6px; margin-bottom: 22px; }
   .admin-navigation button { flex: 1 0 auto; min-width: max-content; min-height: 44px; padding: 0 12px; }
 
-  .summary-band { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 20px; margin-bottom: 24px; }
+  .summary-band { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 12px; margin-bottom: 16px; }
   .skeleton-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .skeleton-board { grid-template-columns: 1fr; }
-  .summary-card { min-height: 96px; padding: 14px; border-bottom: 1px solid var(--line); }
+  .summary-card { min-height: 72px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
   .summary-card:nth-child(2) { border-right: 0; }
   .summary-card:nth-child(3), .summary-card:nth-child(4) { border-bottom: 0; }
-  .summary-icon { width: 34px; height: 34px; }
-  .summary-card strong { font-size: 22px; }
-  .summary-card > div span { font-size: 12px; }
+  .summary-icon { width: 26px; height: 26px; }
+  .summary-icon svg { width: 14px; height: 14px; }
+  .summary-card strong { font-size: 18px; }
+  .skeleton-summary i { height: 72px; }
 
   .section-head { align-items: center; }
   .section-head p { display: none; }

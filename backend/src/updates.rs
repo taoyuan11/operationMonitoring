@@ -1692,6 +1692,7 @@ mod tests {
                 upload_dir: root.join("uploads"),
                 update_dir: root.join("updates"),
                 agent_package_max_bytes: 1024 * 1024,
+                file_transfer_max_bytes: 1024 * 1024,
             },
             AuthCipher::from_key(&[7_u8; 32]).expect("create test auth cipher"),
         )

@@ -12,6 +12,7 @@ services:
       OM_UPLOAD_DIR: /app/uploads
       OM_UPDATE_DIR: /app/updates
       OM_AGENT_PACKAGE_MAX_BYTES: ${OM_AGENT_PACKAGE_MAX_BYTES:-268435456}
+      OM_FILE_TRANSFER_MAX_BYTES: ${OM_FILE_TRANSFER_MAX_BYTES:-1073741824}
       RUST_LOG: ${RUST_LOG:-backend=info,tower_http=info}
     ports:
       - "${BACKEND_PORT:-13500}:13500"
@@ -28,7 +29,7 @@ services:
       backend:
         condition: service_healthy
     environment:
-      NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-300m}
+      NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-1g}
     ports:
       - "${FRONTEND_PORT:-13501}:80"
     restart: unless-stopped

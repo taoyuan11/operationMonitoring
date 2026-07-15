@@ -1,4 +1,7 @@
-use crate::{config::AgentConfig, lifecycle::run_agent};
+use crate::{
+    config::AgentConfig,
+    lifecycle::{run_agent, stop_if_running},
+};
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use std::{
@@ -40,7 +43,7 @@ pub fn install(mut config: AgentConfig, non_interactive: bool, yes: bool) -> Res
     install_elevated(&config)
 }
 
-pub fn uninstall(yes: bool) -> Result<()> {
+pub fn uninstall(config: AgentConfig, yes: bool) -> Result<()> {
     if !yes {
         if !io::stdin().is_terminal() {
             bail!("unattended uninstall requires --yes");
@@ -50,6 +53,7 @@ pub fn uninstall(yes: bool) -> Result<()> {
             bail!("uninstall cancelled");
         }
     }
+    stop_if_running(&config, 10).context("failed to stop background agent before uninstall")?;
     if !is_elevated() {
         return elevate("uninstall", None);
     }

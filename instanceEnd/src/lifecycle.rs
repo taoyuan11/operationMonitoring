@@ -46,14 +46,19 @@ pub fn start(config: &AgentConfig) -> Result<()> {
 }
 
 pub fn stop(config: &AgentConfig, timeout_seconds: u64) -> Result<()> {
+    if !stop_if_running(config, timeout_seconds)? {
+        println!("agent is not running");
+    }
+    Ok(())
+}
+
+pub fn stop_if_running(config: &AgentConfig, timeout_seconds: u64) -> Result<bool> {
     let paths = RuntimePaths::from_config(config)?;
-    paths.prepare()?;
 
     let pid = match paths.process_state()? {
         ProcessState::Stopped => {
             paths.remove_stale_files();
-            println!("agent is not running");
-            return Ok(());
+            return Ok(false);
         }
         ProcessState::Running(pid) => pid,
     };
@@ -71,7 +76,7 @@ pub fn stop(config: &AgentConfig, timeout_seconds: u64) -> Result<()> {
                 Some(pid) => println!("agent stopped (pid {pid})"),
                 None => println!("agent stopped"),
             }
-            return Ok(());
+            return Ok(true);
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -436,5 +441,14 @@ mod tests {
             paths.process_state().unwrap(),
             ProcessState::Stopped
         ));
+    }
+
+    #[test]
+    fn stopping_a_missing_agent_does_not_create_runtime_files() {
+        let state_dir =
+            std::env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+
+        assert!(!stop_if_running(&test_config(state_dir.clone()), 0).unwrap());
+        assert!(!state_dir.exists());
     }
 }

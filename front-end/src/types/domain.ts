@@ -28,6 +28,7 @@ export type Instance = {
   os: string
   arch: string
   agent_version: string
+  capabilities: string[]
   package_type?: string
   native_arch?: string
   update_privileged?: boolean
@@ -227,3 +228,37 @@ export type ViewMode = 'grid' | 'rows'
 export type AdminTab = 'pending' | 'commands' | 'updates' | 'users' | 'settings' | 'logs'
 
 export type AppPage = 'home' | AdminTab
+
+export type FileEntryKind = 'file' | 'directory' | 'symlink' | 'other'
+
+export type InstanceFileRoot = {
+  path: string
+  label: string
+}
+
+export type InstanceFileEntry = {
+  name: string
+  path: string
+  kind: FileEntryKind
+  size_bytes: number
+  modified_at: number | null
+  readonly: boolean
+}
+
+export type InstanceFileListing = {
+  path: string
+  parent: string | null
+  entries: InstanceFileEntry[]
+  offset: number
+  limit: number
+  total: number
+}
+
+export type FileRootsResponse = {
+  roots: InstanceFileRoot[]
+  max_file_bytes: number
+}
+
+export type FileOperationResult = {
+  path: string
+}

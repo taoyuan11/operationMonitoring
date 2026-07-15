@@ -672,6 +672,7 @@ pub fn instance_summary(
     record: InstanceRecord,
     metrics: Option<MetricRecord>,
     online: bool,
+    capabilities: Vec<String>,
 ) -> InstanceSummary {
     InstanceSummary {
         id: record.id,
@@ -687,6 +688,7 @@ pub fn instance_summary(
         os: record.os,
         arch: record.arch,
         agent_version: record.agent_version,
+        capabilities,
         online,
         first_seen: record.first_seen,
         last_seen: record.last_seen,

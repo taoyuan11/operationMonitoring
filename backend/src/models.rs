@@ -150,6 +150,7 @@ pub struct InstanceSummary {
     pub os: String,
     pub arch: String,
     pub agent_version: String,
+    pub capabilities: Vec<String>,
     pub online: bool,
     pub first_seen: i64,
     pub last_seen: Option<i64>,
@@ -161,6 +162,7 @@ pub struct MetricsQuery {
     pub from: Option<i64>,
     pub to: Option<i64>,
     pub limit: Option<i64>,
+    pub bucket_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -246,6 +248,8 @@ pub struct ListQuery {
 pub struct AgentWsQuery {
     pub instance_id: String,
     pub secret: String,
+    #[serde(default)]
+    pub capabilities: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -337,6 +341,126 @@ pub struct AgentUpdateManifest {
     pub update: Option<AgentUpdateOffer>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileSystemRoot {
+    pub path: String,
+    pub label: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: FileEntryKind,
+    pub size_bytes: u64,
+    pub modified_at: Option<i64>,
+    pub readonly: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileListing {
+    pub path: String,
+    pub parent: Option<String>,
+    pub entries: Vec<FileEntry>,
+    pub offset: u64,
+    pub limit: u64,
+    pub total: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileErrorCode {
+    InvalidPath,
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    NotDirectory,
+    IsDirectory,
+    Busy,
+    TooLarge,
+    Unsupported,
+    Io,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum FileRequest {
+    Roots,
+    List {
+        path: String,
+        offset: u64,
+        limit: u64,
+    },
+    CreateDirectory {
+        parent: String,
+        name: String,
+    },
+    Move {
+        source: String,
+        destination_parent: String,
+        name: String,
+        overwrite: bool,
+    },
+    Delete {
+        path: String,
+        recursive: bool,
+    },
+    UploadStart {
+        parent: String,
+        name: String,
+        size_bytes: u64,
+        overwrite: bool,
+        max_bytes: u64,
+    },
+    DownloadStart {
+        path: String,
+        max_bytes: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum FileResponse {
+    Roots {
+        roots: Vec<FileSystemRoot>,
+    },
+    Listing {
+        listing: FileListing,
+    },
+    OperationComplete {
+        path: String,
+    },
+    UploadReady {
+        path: String,
+    },
+    DownloadReady {
+        path: String,
+        name: String,
+        size_bytes: u64,
+    },
+    TransferAck {
+        sequence: u64,
+        transferred_bytes: u64,
+    },
+    TransferComplete {
+        path: String,
+        size_bytes: u64,
+    },
+    Error {
+        code: FileErrorCode,
+        message: String,
+    },
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentOutbound {
@@ -363,6 +487,20 @@ pub enum AgentOutbound {
     },
     TerminalClose {
         session_id: String,
+    },
+    FileRequest {
+        request_id: String,
+        request: FileRequest,
+    },
+    FileTransferFinish {
+        request_id: String,
+    },
+    FileTransferAck {
+        request_id: String,
+        sequence: u64,
+    },
+    FileTransferCancel {
+        request_id: String,
     },
     UpdateAvailable {
         release_id: String,
@@ -413,6 +551,10 @@ pub enum AgentInbound {
         session_id: String,
         exit_code: Option<i64>,
         reason: Option<String>,
+    },
+    FileResponse {
+        request_id: String,
+        response: FileResponse,
     },
     UpdateStatus {
         release_id: String,

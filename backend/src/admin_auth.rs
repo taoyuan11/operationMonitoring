@@ -1026,6 +1026,7 @@ mod tests {
                 upload_dir: PathBuf::from("unused-uploads"),
                 update_dir: PathBuf::from("unused-updates"),
                 agent_package_max_bytes: 1024,
+                file_transfer_max_bytes: 1024,
             },
             AuthCipher::from_key(&[9_u8; 32]).expect("create cipher"),
         )

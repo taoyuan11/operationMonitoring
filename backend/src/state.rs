@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     auth::AuthCipher,
     config::Cli,
-    models::{AgentOutbound, TerminalServerMessage},
+    models::{AgentOutbound, FileResponse, TerminalServerMessage},
 };
 
 #[derive(Clone)]
@@ -19,10 +19,13 @@ pub struct AppState {
     pub upload_dir: PathBuf,
     pub update_dir: PathBuf,
     pub agent_package_max_bytes: usize,
+    pub file_transfer_max_bytes: usize,
     pub sessions: Arc<RwLock<HashMap<String, AdminSession>>>,
     pub auth_attempts: Arc<RwLock<HashMap<String, AuthAttempt>>>,
     pub agents: Arc<RwLock<HashMap<String, AgentHandle>>>,
     pub terminal_sessions: Arc<RwLock<HashMap<String, TerminalSessionHandle>>>,
+    pub file_requests: Arc<RwLock<HashMap<String, PendingFileRequest>>>,
+    pub active_file_transfers: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl AppState {
@@ -35,10 +38,13 @@ impl AppState {
             upload_dir: cli.upload_dir,
             update_dir: cli.update_dir,
             agent_package_max_bytes: cli.agent_package_max_bytes,
+            file_transfer_max_bytes: cli.file_transfer_max_bytes,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             auth_attempts: Arc::new(RwLock::new(HashMap::new())),
             agents: Arc::new(RwLock::new(HashMap::new())),
             terminal_sessions: Arc::new(RwLock::new(HashMap::new())),
+            file_requests: Arc::new(RwLock::new(HashMap::new())),
+            active_file_transfers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -62,6 +68,8 @@ pub struct AuthAttempt {
 pub struct AgentHandle {
     pub connection_id: Uuid,
     pub tx: mpsc::UnboundedSender<AgentOutbound>,
+    pub binary_tx: mpsc::Sender<Vec<u8>>,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -69,4 +77,18 @@ pub struct TerminalSessionHandle {
     pub instance_id: String,
     pub agent_connection_id: Uuid,
     pub tx: mpsc::UnboundedSender<TerminalServerMessage>,
+}
+
+#[derive(Debug)]
+pub enum FileRequestEvent {
+    Response(FileResponse),
+    Chunk { sequence: u64, data: Vec<u8> },
+    Disconnected,
+}
+
+#[derive(Clone)]
+pub struct PendingFileRequest {
+    pub instance_id: String,
+    pub agent_connection_id: Uuid,
+    pub tx: mpsc::Sender<FileRequestEvent>,
 }

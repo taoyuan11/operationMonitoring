@@ -1,6 +1,6 @@
 # Operation Monitoring
 
-一个自托管的远程资源监控系统 MVP，用于小规模服务器、电脑实例的资源上报、审批管理、快捷命令和 Web 终端操作。
+一个自托管的远程资源监控系统 MVP，用于小规模服务器、电脑实例的资源上报、审批管理、快捷命令、Web 终端和远程文件管理。
 
 ## 项目结构
 
@@ -183,11 +183,12 @@ docker compose up -d backend
 恢复命令会删除所有管理员与认证设备并立即退出；下一次正常启动重新开放一次性
 密码初始化。操作日志和业务数据不会删除。
 
-默认允许上传 256 MiB 的 Agent 包。修改后端限制时，应同时调整 Nginx 请求体限制：
+默认允许上传 256 MiB 的 Agent 包和传输 1 GiB 的实例文件。修改任一后端限制时，应让 Nginx 请求体限制不小于两者中的较大值：
 
 ```bash
 OM_AGENT_PACKAGE_MAX_BYTES=536870912 \
-NGINX_CLIENT_MAX_BODY_SIZE=600m \
+OM_FILE_TRANSFER_MAX_BYTES=1073741824 \
+NGINX_CLIENT_MAX_BODY_SIZE=1100m \
 docker compose up -d --build
 ```
 
@@ -362,6 +363,7 @@ Agent 会流式下载文件，校验大小、平台文件签名和 SHA-256，等
 ## 连接与终端说明
 
 - 实例审批完成后，指标、快捷命令和交互式终端都复用同一条 Agent WebSocket 长连接。
+- 管理员可从实例详情面板浏览 Agent 权限范围内的整机文件系统，执行流式上传、下载、新建目录、重命名、同盘移动和永久删除。文件内容不会写入后端磁盘。
 - 后端以内存中的 WebSocket 连接状态判断实例在线；连接关闭或心跳超时后立即判定离线，不再依赖“最后上报时间 + 固定阈值”。
 - Web 终端使用系统 PTY/ConPTY，支持持续 Shell 上下文、`cd`、环境变量、交互程序、方向键、Tab、`Ctrl+C` 和窗口尺寸变化。
 - 浏览器与 Agent 之间的终端数据按原始字节进行 Base64 封装，Shell 统一按 UTF-8 工作；Windows `cmd.exe` 会切换到代码页 65001，避免中文经 JSON 转发时损坏。
@@ -381,6 +383,7 @@ OM_SECURE_COOKIES=false
 OM_UPLOAD_DIR=uploads
 OM_UPDATE_DIR=updates
 OM_AGENT_PACKAGE_MAX_BYTES=268435456
+OM_FILE_TRANSFER_MAX_BYTES=1073741824
 ```
 
 未设置 `OM_DATABASE_URL` 时，后端默认连接
@@ -392,6 +395,8 @@ OM_AGENT_PACKAGE_MAX_BYTES=268435456
 `OM_ADMIN_PASSWORD` 仅在管理员表为空时有效，完成首位管理员绑定后即使仍保留该
 变量也会被忽略。`OM_SECURE_COOKIES` 在 HTTPS/WSS 生产部署中应设为 `true`；
 直接使用 HTTP 本地开发时保持 `false`。会话固定有效 7 天，后端重启会要求重新登录。
+
+`OM_FILE_TRANSFER_MAX_BYTES` 限制单个远程上传或下载文件的大小，默认 1 GiB。反向代理的请求体上限必须不小于该值；Docker 前端默认将 `NGINX_CLIENT_MAX_BODY_SIZE` 设置为 `1g`，并关闭 API 请求与响应缓冲以保持流式传输。远程文件操作拥有与 Agent 服务进程相同的系统权限，生产环境应严格保护管理员账号和 TOTP 设备。
 
 实例端：
 

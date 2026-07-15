@@ -2,56 +2,42 @@
 import { computed, ref } from 'vue'
 import {
   ArrowDownWideNarrow,
-  Box,
   Cpu,
   Grid3X3,
   HardDrive,
   ListFilter,
   MemoryStick,
-  MoreHorizontal,
-  Pause,
-  Pencil,
-  Play,
   RotateCcw,
   Rows3,
   Search,
   Server,
-  Terminal,
-  Trash2,
   Wifi,
   WifiOff,
   X,
-  Zap,
 } from 'lucide-vue-next'
 import CountryFlag from './CountryFlag.vue'
 import OperatingSystemLogo from './OperatingSystemLogo.vue'
 import { getCountryOption } from '../data/countries'
-import type { CommandRecord, Instance, ViewMode } from '../types/domain'
-import { formatBytes, formatDuration, formatPercent, formatTime, metricPercent } from '../utils/format'
+import type { Instance, ViewMode } from '../types/domain'
+import { formatBytes, formatPercent, metricPercent } from '../utils/format'
 
 type StatusFilter = 'all' | 'online' | 'offline'
 type SortMode = 'default' | 'cpu' | 'memory' | 'name'
 
 const props = defineProps<{
   instances: Instance[]
-  commands: CommandRecord[]
   isAdmin: boolean
   viewMode: ViewMode
 }>()
 
 const emit = defineEmits<{
   'update:viewMode': [value: ViewMode]
-  edit: [instance: Instance]
-  terminal: [instance: Instance]
-  disable: [instance: Instance]
-  delete: [instance: Instance]
-  runCommand: [instance: Instance, command: CommandRecord]
+  open: [instance: Instance]
 }>()
 
 const searchQuery = ref('')
 const statusFilter = ref<StatusFilter>('all')
 const sortMode = ref<SortMode>('default')
-const openMenuId = ref<string | null>(null)
 const nameCollator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' })
 
 const filteredInstances = computed(() => {
@@ -125,26 +111,15 @@ function resetFilters() {
   searchQuery.value = ''
   statusFilter.value = 'all'
   sortMode.value = 'default'
-  openMenuId.value = null
 }
 
-function toggleMenu(instanceId: string) {
-  openMenuId.value = openMenuId.value === instanceId ? null : instanceId
-}
-
-function disableInstance(instance: Instance) {
-  openMenuId.value = null
-  emit('disable', instance)
-}
-
-function deleteInstance(instance: Instance) {
-  openMenuId.value = null
-  emit('delete', instance)
+function openInstance(instance: Instance) {
+  if (props.isAdmin) emit('open', instance)
 }
 </script>
 
 <template>
-  <section class="content-pane" @click="openMenuId = null" @keydown.esc="openMenuId = null">
+  <section class="content-pane">
     <div class="section-head">
       <div>
         <span class="section-kicker">Live nodes</span>
@@ -277,7 +252,13 @@ function deleteInstance(instance: Instance) {
       <article
         v-for="instance in filteredInstances"
         :key="instance.id"
-        :class="['instance-card', { offline: !instance.online }]"
+        :class="['instance-card', { offline: !instance.online, clickable: isAdmin }]"
+        :role="isAdmin ? 'button' : undefined"
+        :tabindex="isAdmin ? 0 : undefined"
+        :aria-label="isAdmin ? `打开节点 ${instanceName(instance)} 的详情与操作面板` : undefined"
+        @click="openInstance(instance)"
+        @keydown.enter="openInstance(instance)"
+        @keydown.space.prevent="openInstance(instance)"
       >
         <header class="instance-main">
           <div class="instance-identity">
@@ -298,71 +279,7 @@ function deleteInstance(instance: Instance) {
               </p>
             </div>
           </div>
-          <div v-if="isAdmin" class="instance-actions">
-            <button
-              class="icon-button subtle"
-              type="button"
-              title="编辑节点"
-              :aria-label="`编辑节点 ${instanceName(instance)}`"
-              @click="$emit('edit', instance)"
-            >
-              <Pencil :size="15" />
-            </button>
-            <button
-              class="icon-button subtle"
-              type="button"
-              title="打开 Web 终端"
-              :aria-label="`打开节点 ${instanceName(instance)} 的 Web 终端`"
-              @click="$emit('terminal', instance)"
-            >
-              <Terminal :size="15" />
-            </button>
-            <div class="more-actions">
-              <button
-                class="icon-button subtle"
-                type="button"
-                title="更多操作"
-                :aria-label="`打开节点 ${instanceName(instance)} 的更多操作`"
-                aria-haspopup="menu"
-                :aria-expanded="openMenuId === instance.id"
-                @click.stop="toggleMenu(instance.id)"
-              >
-                <MoreHorizontal :size="16" />
-              </button>
-              <Transition name="menu">
-                <div
-                  v-if="openMenuId === instance.id"
-                  class="more-menu"
-                  role="menu"
-                  style="display: flex; flex-direction: column"
-                  @click.stop
-                >
-                  <button
-                    type="button"
-                    role="menuitem"
-                    title="停用节点"
-                    :aria-label="`停用节点 ${instanceName(instance)}`"
-                    @click="disableInstance(instance)"
-                  >
-                    <Pause :size="14" />停用节点
-                  </button>
-                  <button
-                    class="danger"
-                    type="button"
-                    role="menuitem"
-                    title="删除节点"
-                    :aria-label="`删除节点 ${instanceName(instance)}`"
-                    @click="deleteInstance(instance)"
-                  >
-                    <Trash2 :size="14" />删除节点
-                  </button>
-                </div>
-              </Transition>
-            </div>
-          </div>
         </header>
-
-        <p v-if="instance.remark" class="instance-remark">{{ instance.remark }}</p>
 
         <div class="metrics">
           <div :class="['metric', metricLevel(instance.metrics?.cpu_percent)]">
@@ -382,33 +299,6 @@ function deleteInstance(instance: Instance) {
             <small v-if="isKnownMetric(diskPercent(instance))">{{ formatBytes(instance.metrics?.disk_used) }} / {{ formatBytes(instance.metrics?.disk_total) }}</small>
             <small v-else class="metric-unavailable">未检测到可用数据</small>
           </div>
-          <div :class="['metric', metricLevel(instance.metrics?.gpu_percent)]">
-            <div class="metric-label"><span><Zap :size="15" />GPU</span><strong>{{ formatPercent(instance.metrics?.gpu_percent) }}</strong></div>
-            <i v-if="isKnownMetric(instance.metrics?.gpu_percent)"><b :style="{ width: `${metricWidth(instance.metrics?.gpu_percent)}%` }"></b></i>
-            <small v-else class="metric-unavailable">未检测到可用数据</small>
-          </div>
-        </div>
-
-        <div class="meta-grid">
-          <span><Box :size="14" /><i>运行时长</i><strong>{{ formatDuration(instance.metrics?.uptime_seconds) }}</strong></span>
-          <span><i>网络接收</i><strong>{{ formatBytes(instance.metrics?.network_rx) }}</strong></span>
-          <span><i>网络发送</i><strong>{{ formatBytes(instance.metrics?.network_tx) }}</strong></span>
-          <span><i>最后上报</i><strong>{{ formatTime(instance.last_seen) }}</strong></span>
-        </div>
-
-        <div v-if="isAdmin && commands.length" class="quick-row">
-          <span>快捷操作</span>
-          <button
-            v-for="command in commands"
-            :key="command.id"
-            class="command-chip"
-            type="button"
-            :title="`运行命令：${command.name}`"
-            :aria-label="`在节点 ${instanceName(instance)} 上运行命令 ${command.name}`"
-            @click="$emit('runCommand', instance, command)"
-          >
-            <Play :size="13" />{{ command.name }}
-          </button>
         </div>
       </article>
       </TransitionGroup>

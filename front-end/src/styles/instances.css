@@ -22,14 +22,17 @@
 .sort-control select { width: 112px; min-height: 38px; padding: 0 28px 0 9px; font-size: 12px; }
 .result-count { color: #7e8984; font-size: 11px; white-space: nowrap; }
 
-.instance-list.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 460px)); gap: 14px; }
+.instance-list.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 14px; }
 .instance-list.rows { display: flex; flex-direction: column; gap: 10px; }
 .instance-card, .empty-state { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 12px 34px rgba(0, 0, 0, .17); }
-.instance-card { position: relative; display: flex; min-width: 0; flex-direction: column; gap: 16px; padding: 18px; overflow: visible; border-left: 3px solid var(--success); transition: border-color .18s ease, background .18s ease; }
+.instance-card { position: relative; display: flex; min-width: 0; flex-direction: column; gap: 14px; padding: 18px; overflow: visible; border-left: 3px solid var(--success); transition: border-color .18s ease, background .18s ease, box-shadow .18s ease; }
+.instance-card.clickable { cursor: pointer; }
+.instance-card.clickable:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 3px; }
+.instance-card.clickable:hover { box-shadow: 0 16px 42px rgba(0, 0, 0, .25); }
 .instance-card:hover { background: rgba(21, 27, 32, .97); border-color: var(--line-strong); border-left-color: var(--success); }
 .instance-card.offline { border-left-color: var(--danger); }
 .instance-card.offline:hover { border-left-color: var(--danger); }
-.instance-list.rows .instance-card { display: grid; grid-template-columns: minmax(260px, .88fr) minmax(420px, 1.45fr) minmax(280px, .85fr); align-items: center; gap: 18px; }
+.instance-list.rows .instance-card { display: grid; grid-template-columns: minmax(260px, .72fr) minmax(480px, 1.28fr); align-items: center; gap: 18px; }
 .instance-list.rows .instance-remark, .instance-list.rows .quick-row { grid-column: 1 / -1; }
 
 .instance-main { display: flex; align-items: flex-start; justify-content: space-between; gap: 11px; min-width: 0; }
@@ -56,7 +59,7 @@
 .more-menu button.danger { color: #ef929f; }
 
 .instance-remark { margin: -4px 0 -2px; padding: 9px 10px; color: #9aa49f; background: rgba(255, 255, 255, .025); border-left: 2px solid #505b56; font-size: 12px; line-height: 1.5; }
-.metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px 20px; padding: 14px; background: #0e1215; border: 1px solid rgba(255, 255, 255, .06); border-radius: 6px; }
+.metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 13px; background: #0e1215; border: 1px solid rgba(255, 255, 255, .06); border-radius: 6px; }
 .metric { display: flex; min-width: 0; flex-direction: column; gap: 7px; --metric-color: #49c89f; }
 .metric:nth-child(2) { --metric-color: #55b8cf; }
 .metric:nth-child(3) { --metric-color: #e5ae54; }

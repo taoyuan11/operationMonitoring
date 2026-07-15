@@ -65,11 +65,23 @@ pub async fn public_instances(
     .fetch_all(&state.db)
     .await?;
 
+    let connected = state
+        .agents
+        .read()
+        .await
+        .iter()
+        .map(|(id, handle)| (id.clone(), handle.capabilities.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut summaries = Vec::with_capacity(records.len());
     for record in records {
         let metrics = latest_metric(&state.db, &record.id).await?;
-        let online = state.agents.read().await.contains_key(&record.id);
-        summaries.push(instance_summary(record, metrics, online));
+        let capabilities = connected.get(&record.id).cloned();
+        summaries.push(instance_summary(
+            record,
+            metrics,
+            capabilities.is_some(),
+            capabilities.unwrap_or_default(),
+        ));
     }
 
     Ok(Json(summaries))
@@ -83,6 +95,41 @@ pub async fn public_metrics(
     let to = query.to.unwrap_or_else(now_ts);
     let from = query.from.unwrap_or(to - 3600);
     let limit = query.limit.unwrap_or(720).clamp(1, 5000);
+
+    if let Some(bucket_seconds) = query.bucket_seconds {
+        let bucket_seconds = bucket_seconds.clamp(60, 24 * 3600);
+        let metrics = sqlx::query_as::<_, MetricRecord>(
+            r#"
+            SELECT (ts / $4) * $4 AS ts,
+                   AVG(cpu_percent)::DOUBLE PRECISION AS cpu_percent,
+                   ROUND(AVG(memory_used))::BIGINT AS memory_used,
+                   ROUND(AVG(memory_total))::BIGINT AS memory_total,
+                   ROUND(AVG(disk_used))::BIGINT AS disk_used,
+                   ROUND(AVG(disk_total))::BIGINT AS disk_total,
+                   ROUND(AVG(network_rx))::BIGINT AS network_rx,
+                   ROUND(AVG(network_tx))::BIGINT AS network_tx,
+                   AVG(gpu_percent)::DOUBLE PRECISION AS gpu_percent,
+                   ROUND(AVG(gpu_memory_used))::BIGINT AS gpu_memory_used,
+                   ROUND(AVG(gpu_memory_total))::BIGINT AS gpu_memory_total,
+                   ROUND(AVG(uptime_seconds))::BIGINT AS uptime_seconds,
+                   AVG(load_average)::DOUBLE PRECISION AS load_average
+            FROM metrics
+            WHERE instance_id = $1 AND ts BETWEEN $2 AND $3
+            GROUP BY (ts / $4)
+            ORDER BY ts ASC
+            LIMIT $5
+            "#,
+        )
+        .bind(id)
+        .bind(from)
+        .bind(to)
+        .bind(bucket_seconds)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await?;
+
+        return Ok(Json(metrics));
+    }
 
     let metrics = sqlx::query_as::<_, MetricRecord>(
         r#"
@@ -252,8 +299,18 @@ pub async fn admin_update_instance(
 
     let updated = get_instance(&state.db, &id).await?;
     let metrics = latest_metric(&state.db, &updated.id).await?;
-    let online = state.agents.read().await.contains_key(&updated.id);
-    Ok(Json(instance_summary(updated, metrics, online)))
+    let capabilities = state
+        .agents
+        .read()
+        .await
+        .get(&updated.id)
+        .map(|handle| handle.capabilities.clone());
+    Ok(Json(instance_summary(
+        updated,
+        metrics,
+        capabilities.is_some(),
+        capabilities.unwrap_or_default(),
+    )))
 }
 
 pub async fn admin_disable_instance(
@@ -807,7 +864,24 @@ pub async fn agent_ws(
         return Err(AppError::new(StatusCode::FORBIDDEN, "实例已停用"));
     }
 
-    Ok(ws.on_upgrade(move |socket| agent_socket(state, query.instance_id, socket)))
+    let capabilities = query
+        .capabilities
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|capability| {
+            !capability.is_empty()
+                && capability.len() <= 64
+                && capability
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+        .take(16)
+        .map(str::to_string)
+        .collect();
+
+    Ok(ws.on_upgrade(move |socket| agent_socket(state, query.instance_id, capabilities, socket)))
 }
 
 pub async fn admin_terminal_ws(

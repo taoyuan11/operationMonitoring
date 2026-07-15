@@ -10,6 +10,7 @@ use crate::{
     activity::ActivityTracker,
     command::execute_tracked_command,
     config::AgentConfig,
+    file_manager::{CAPABILITY as FILE_MANAGER_CAPABILITY, FileManager},
     http::register_once,
     metrics::MetricsCollector,
     models::{AgentInbound, AgentOutbound, Identity, UpdateOffer, UpdateStatus},
@@ -122,7 +123,9 @@ async fn handle_agent_socket(
 ) -> Result<SocketOutcome> {
     let (mut write, mut read) = stream.split();
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<AgentInbound>();
+    let (binary_tx, mut binary_rx) = mpsc::channel(4);
     let mut terminals = TerminalManager::new(outbound_tx.clone(), activity.clone());
+    let mut files = FileManager::new(outbound_tx.clone(), binary_tx, activity.clone());
     let mut collector = MetricsCollector::new();
     let mut report_interval =
         tokio::time::interval(Duration::from_secs(config.report_interval.max(1)));
@@ -245,6 +248,12 @@ async fn handle_agent_socket(
                 let payload = serde_json::to_string(&outbound)?;
                 write.send(Message::Text(payload.into())).await?;
             }
+            binary = binary_rx.recv() => {
+                let Some(binary) = binary else {
+                    break SocketOutcome::Disconnected;
+                };
+                write.send(Message::Binary(binary.into())).await?;
+            }
             incoming = read.next() => {
                 let Some(incoming) = incoming else {
                     break SocketOutcome::Disconnected;
@@ -283,6 +292,18 @@ async fn handle_agent_socket(
                             }
                             AgentOutbound::TerminalClose { session_id } => {
                                 terminals.close(&session_id);
+                            }
+                            AgentOutbound::FileRequest { request_id, request } => {
+                                files.handle_request(request_id, request);
+                            }
+                            AgentOutbound::FileTransferFinish { request_id } => {
+                                files.finish_upload(&request_id);
+                            }
+                            AgentOutbound::FileTransferAck { request_id, sequence } => {
+                                files.acknowledge_download(&request_id, sequence);
+                            }
+                            AgentOutbound::FileTransferCancel { request_id } => {
+                                files.cancel(&request_id);
                             }
                             AgentOutbound::UpdateAvailable {
                                 release_id,
@@ -342,6 +363,7 @@ async fn handle_agent_socket(
                             }
                         }
                     }
+                    Message::Binary(data) => files.handle_binary(&data),
                     Message::Ping(data) => {
                         write.send(Message::Pong(data)).await?;
                     }
@@ -353,6 +375,7 @@ async fn handle_agent_socket(
     };
 
     terminals.close_all();
+    files.close_all();
     drop(active_update);
     Ok(outcome)
 }
@@ -394,7 +417,27 @@ fn websocket_url(server: &str, identity: &Identity) -> String {
         format!("ws://{trimmed}")
     };
     format!(
-        "{base}/api/agent/ws?instance_id={}&secret={}",
-        identity.instance_id, identity.secret
+        "{base}/api/agent/ws?instance_id={}&secret={}&capabilities={FILE_MANAGER_CAPABILITY}",
+        identity.instance_id, identity.secret,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_url_advertises_file_manager_capability() {
+        let url = websocket_url(
+            "https://monitor.example/",
+            &Identity {
+                instance_id: "instance-1".to_string(),
+                secret: "secret-1".to_string(),
+            },
+        );
+        assert_eq!(
+            url,
+            "wss://monitor.example/api/agent/ws?instance_id=instance-1&secret=secret-1&capabilities=file_manager_v1"
+        );
+    }
 }

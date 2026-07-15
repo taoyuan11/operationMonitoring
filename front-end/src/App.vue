@@ -14,10 +14,12 @@ import type { AdminTab, AgentRelease, AppPage, CommandRecord, Instance } from '.
 
 const TerminalModal = defineAsyncComponent(() => import('./components/TerminalModal.vue'))
 const EditInstanceModal = defineAsyncComponent(() => import('./components/EditInstanceModal.vue'))
+const InstanceDetailModal = defineAsyncComponent(() => import('./components/InstanceDetailModal.vue'))
 
 const consoleState = useMonitoringConsole()
 const currentPage = ref<AppPage>('home')
 const loginOpen = ref(false)
+const selectedInstanceId = ref('')
 const confirmation = ref<{
   title: string
   message: string
@@ -28,6 +30,10 @@ const confirmation = ref<{
 
 const activeAdminTab = computed<AdminTab>(() =>
   currentPage.value === 'home' ? consoleState.adminTab.value : currentPage.value,
+)
+
+const selectedInstance = computed(() =>
+  consoleState.instances.value.find((instance) => instance.id === selectedInstanceId.value) || null,
 )
 
 const pageFromHash: Record<string, AppPage> = {
@@ -61,6 +67,7 @@ watch(
       return
     }
     currentPage.value = 'home'
+    selectedInstanceId.value = ''
     if (window.location.hash && window.location.hash !== '#/') {
       window.history.replaceState(null, '', '#/')
     }
@@ -103,11 +110,13 @@ function openLogin() {
 }
 
 function logout() {
+  selectedInstanceId.value = ''
   navigate('home')
   consoleState.logout()
 }
 
 function requestDisable(instance: Instance) {
+  selectedInstanceId.value = ''
   confirmation.value = {
     title: '停用节点',
     message: `停用 ${instance.name || instance.hostname} 后将不再接受该节点上报。`,
@@ -118,6 +127,7 @@ function requestDisable(instance: Instance) {
 }
 
 function requestDelete(instance: Instance) {
+  selectedInstanceId.value = ''
   confirmation.value = {
     title: '删除节点',
     message: `将永久删除 ${instance.name || instance.hostname} 及其历史指标，此操作无法恢复。`,
@@ -130,7 +140,7 @@ function requestDelete(instance: Instance) {
 function requestRemoveCommand(command: CommandRecord) {
   confirmation.value = {
     title: '停用快捷命令',
-    message: `停用“${command.name}”后，节点卡片将不再提供此操作。`,
+    message: `停用“${command.name}”后，实例操作面板将不再提供此命令。`,
     confirmLabel: '确认停用',
     tone: 'warning',
     action: () => consoleState.removeCommand(command),
@@ -138,6 +148,7 @@ function requestRemoveCommand(command: CommandRecord) {
 }
 
 function requestRunCommand(instance: Instance, command: CommandRecord) {
+  selectedInstanceId.value = ''
   confirmation.value = {
     title: '执行快捷命令',
     message: command.confirm_text || `将在 ${instance.name || instance.hostname} 上执行：${command.command}`,
@@ -145,6 +156,21 @@ function requestRunCommand(instance: Instance, command: CommandRecord) {
     tone: 'warning',
     action: () => consoleState.runCommand(instance, command),
   }
+}
+
+function openInstance(instance: Instance) {
+  if (!consoleState.isAdmin.value) return
+  selectedInstanceId.value = instance.id
+}
+
+function editSelectedInstance(instance: Instance) {
+  selectedInstanceId.value = ''
+  consoleState.openEdit(instance)
+}
+
+function openSelectedTerminal(instance: Instance) {
+  selectedInstanceId.value = ''
+  consoleState.openTerminal(instance)
 }
 
 function requestPublishAgentRelease(release: AgentRelease) {
@@ -234,15 +260,10 @@ function confirmAction() {
 
               <InstanceBoard
                 :instances="consoleState.instances.value"
-                :commands="consoleState.commands.value"
                 :is-admin="consoleState.isAdmin.value"
                 :view-mode="consoleState.viewMode.value"
                 @update:view-mode="consoleState.viewMode.value = $event"
-                @edit="consoleState.openEdit"
-                @terminal="consoleState.openTerminal"
-                @disable="requestDisable"
-                @delete="requestDelete"
-                @run-command="requestRunCommand"
+                @open="openInstance"
               />
             </div>
           </Transition>
@@ -310,6 +331,21 @@ function confirmAction() {
           />
         </template>
       </section>
+    </Transition>
+
+    <Transition name="modal" appear>
+      <InstanceDetailModal
+        v-if="selectedInstance && consoleState.isAdmin.value"
+        :instance="selectedInstance"
+        :commands="consoleState.commands.value"
+        :loading="consoleState.loading.value"
+        @close="selectedInstanceId = ''"
+        @edit="editSelectedInstance"
+        @terminal="openSelectedTerminal"
+        @disable="requestDisable"
+        @delete="requestDelete"
+        @run-command="requestRunCommand"
+      />
     </Transition>
 
     <Transition name="modal" appear>

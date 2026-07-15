@@ -37,4 +37,10 @@ pub struct Cli {
         default_value_t = 256 * 1024 * 1024
     )]
     pub agent_package_max_bytes: usize,
+    #[arg(
+        long,
+        env = "OM_FILE_TRANSFER_MAX_BYTES",
+        default_value_t = 1024 * 1024 * 1024
+    )]
+    pub file_transfer_max_bytes: usize,
 }

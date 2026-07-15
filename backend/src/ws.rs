@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppResult,
+    files::{close_connection_file_requests, handle_agent_file_binary, handle_agent_file_response},
     jobs::complete_command_job,
     models::{
         AgentInbound, AgentOutbound, MetricPayload, TerminalClientMessage, TerminalServerMessage,
@@ -20,16 +21,26 @@ use crate::{
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 
-pub async fn agent_socket(state: AppState, instance_id: String, socket: WebSocket) {
+pub async fn agent_socket(
+    state: AppState,
+    instance_id: String,
+    capabilities: Vec<String>,
+    socket: WebSocket,
+) {
     let connection_id = Uuid::new_v4();
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentOutbound>();
+    let (binary_tx, mut binary_rx) = mpsc::channel::<Vec<u8>>(4);
 
-    state
-        .agents
-        .write()
-        .await
-        .insert(instance_id.clone(), AgentHandle { connection_id, tx });
+    state.agents.write().await.insert(
+        instance_id.clone(),
+        AgentHandle {
+            connection_id,
+            tx,
+            binary_tx,
+            capabilities,
+        },
+    );
     let _ = sqlx::query("UPDATE instances SET last_seen = $1 WHERE id = $2")
         .bind(now_ts())
         .bind(&instance_id)
@@ -57,6 +68,14 @@ pub async fn agent_socket(state: AppState, instance_id: String, socket: WebSocke
                     Err(error) => error!(?error, "failed to serialize agent outbound message"),
                 }
             }
+            outbound = binary_rx.recv() => {
+                let Some(outbound) = outbound else {
+                    break;
+                };
+                if sender.send(Message::Binary(outbound.into())).await.is_err() {
+                    break;
+                }
+            }
             incoming = receiver.next() => {
                 let Some(incoming) = incoming else {
                     break;
@@ -79,6 +98,15 @@ pub async fn agent_socket(state: AppState, instance_id: String, socket: WebSocke
                         }
                     }
                     Ok(Message::Pong(_)) => last_inbound = Instant::now(),
+                    Ok(Message::Binary(data)) => {
+                        last_inbound = Instant::now();
+                        handle_agent_file_binary(
+                            &state,
+                            &instance_id,
+                            connection_id,
+                            &data,
+                        ).await;
+                    }
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => {}
                 }
@@ -109,6 +137,7 @@ pub async fn agent_socket(state: AppState, instance_id: String, socket: WebSocke
     drop(agents);
 
     close_connection_terminals(&state, &instance_id, connection_id).await;
+    close_connection_file_requests(&state, &instance_id, connection_id).await;
     info!(%instance_id, %connection_id, "agent websocket disconnected");
 }
 
@@ -187,6 +216,13 @@ async fn handle_agent_message(
                 true,
             )
             .await;
+        }
+        AgentInbound::FileResponse {
+            request_id,
+            response,
+        } => {
+            handle_agent_file_response(state, instance_id, connection_id, &request_id, response)
+                .await;
         }
         AgentInbound::UpdateStatus {
             release_id,

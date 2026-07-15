@@ -81,6 +81,126 @@ pub enum UpdateStatus {
     Failed,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileSystemRoot {
+    pub path: String,
+    pub label: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: FileEntryKind,
+    pub size_bytes: u64,
+    pub modified_at: Option<i64>,
+    pub readonly: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileListing {
+    pub path: String,
+    pub parent: Option<String>,
+    pub entries: Vec<FileEntry>,
+    pub offset: u64,
+    pub limit: u64,
+    pub total: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileErrorCode {
+    InvalidPath,
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    NotDirectory,
+    IsDirectory,
+    Busy,
+    TooLarge,
+    Unsupported,
+    Io,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum FileRequest {
+    Roots,
+    List {
+        path: String,
+        offset: u64,
+        limit: u64,
+    },
+    CreateDirectory {
+        parent: String,
+        name: String,
+    },
+    Move {
+        source: String,
+        destination_parent: String,
+        name: String,
+        overwrite: bool,
+    },
+    Delete {
+        path: String,
+        recursive: bool,
+    },
+    UploadStart {
+        parent: String,
+        name: String,
+        size_bytes: u64,
+        overwrite: bool,
+        max_bytes: u64,
+    },
+    DownloadStart {
+        path: String,
+        max_bytes: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum FileResponse {
+    Roots {
+        roots: Vec<FileSystemRoot>,
+    },
+    Listing {
+        listing: FileListing,
+    },
+    OperationComplete {
+        path: String,
+    },
+    UploadReady {
+        path: String,
+    },
+    DownloadReady {
+        path: String,
+        name: String,
+        size_bytes: u64,
+    },
+    TransferAck {
+        sequence: u64,
+        transferred_bytes: u64,
+    },
+    TransferComplete {
+        path: String,
+        size_bytes: u64,
+    },
+    Error {
+        code: FileErrorCode,
+        message: String,
+    },
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentOutbound {
@@ -107,6 +227,20 @@ pub enum AgentOutbound {
     },
     TerminalClose {
         session_id: String,
+    },
+    FileRequest {
+        request_id: String,
+        request: FileRequest,
+    },
+    FileTransferFinish {
+        request_id: String,
+    },
+    FileTransferAck {
+        request_id: String,
+        sequence: u64,
+    },
+    FileTransferCancel {
+        request_id: String,
     },
     UpdateAvailable {
         release_id: String,
@@ -156,6 +290,10 @@ pub enum AgentInbound {
         session_id: String,
         exit_code: Option<i64>,
         reason: Option<String>,
+    },
+    FileResponse {
+        request_id: String,
+        response: FileResponse,
     },
     UpdateStatus {
         release_id: String,
@@ -227,6 +365,47 @@ mod tests {
                 "version": "1.2.3",
                 "retry_count": 2,
                 "status": "awaiting_restart"
+            })
+        );
+    }
+
+    #[test]
+    fn file_messages_use_stable_tagged_protocol_shapes() {
+        let request = json!({
+            "type": "file_request",
+            "request_id": "request-1",
+            "request": {
+                "operation": "list",
+                "path": "/srv",
+                "offset": 0,
+                "limit": 200
+            }
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentOutbound>(request).unwrap(),
+            AgentOutbound::FileRequest {
+                request: FileRequest::List { path, limit: 200, .. },
+                ..
+            } if path == "/srv"
+        ));
+
+        let response = AgentInbound::FileResponse {
+            request_id: "request-1".to_string(),
+            response: FileResponse::TransferAck {
+                sequence: 3,
+                transferred_bytes: 1024,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "type": "file_response",
+                "request_id": "request-1",
+                "response": {
+                    "result": "transfer_ack",
+                    "sequence": 3,
+                    "transferred_bytes": 1024
+                }
             })
         );
     }

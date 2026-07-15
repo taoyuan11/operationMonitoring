@@ -1,6 +1,7 @@
 mod activity;
 mod command;
 mod config;
+mod file_manager;
 mod http;
 mod identity;
 mod install;
@@ -46,7 +47,7 @@ fn run() -> Result<()> {
             non_interactive,
             yes,
         } => install::install(cli.agent, non_interactive, yes),
-        AgentCommand::Uninstall { yes } => install::uninstall(yes),
+        AgentCommand::Uninstall { yes } => install::uninstall(cli.agent, yes),
         AgentCommand::Start => start(&cli.agent),
         AgentCommand::Stop { timeout } => stop(&cli.agent, timeout),
         AgentCommand::Status => status(&cli.agent),

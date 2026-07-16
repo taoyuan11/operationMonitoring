@@ -670,7 +670,7 @@ fn validate_browser_message(text: &str) -> Result<bool, (&'static str, &'static 
             }
             Ok(true)
         }
-        "release_all" => Ok(true),
+        "release_all" | "secure_attention" => Ok(true),
         "feedback" => {
             if value.get("sequence").and_then(Value::as_u64).is_none() {
                 return Err(("invalid_message", "桌面反馈消息无效"));
@@ -700,7 +700,10 @@ fn validate_agent_message(text: &str) -> Result<(), (&'static str, &'static str)
         .get("type")
         .and_then(Value::as_str)
         .ok_or(("invalid_message", "远程桌面状态消息缺少类型"))?;
-    if matches!(kind, "ready" | "display" | "paused" | "closed" | "error") {
+    if matches!(
+        kind,
+        "ready" | "display" | "desktop_state" | "notice" | "paused" | "closed" | "error"
+    ) {
         Ok(())
     } else {
         Err(("unknown_message", "未知的远程桌面状态消息"))
@@ -829,6 +832,10 @@ mod tests {
                 r#"{"type":"feedback","sequence":7,"fps":10.0,"decode_ms":4.2}"#
             ),
             Ok(false)
+        );
+        assert_eq!(
+            validate_browser_message(r#"{"type":"secure_attention"}"#),
+            Ok(true)
         );
         assert!(validate_browser_message(r#"{"type":"pointer_move","x":2,"y":0}"#).is_err());
         assert!(validate_browser_message(r#"{"type":"unknown"}"#).is_err());

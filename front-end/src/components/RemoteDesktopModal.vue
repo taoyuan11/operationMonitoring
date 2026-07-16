@@ -6,6 +6,7 @@ import {
   Maximize2,
   Monitor,
   RefreshCw,
+  ShieldAlert,
   Shrink,
   X,
 } from 'lucide-vue-next'
@@ -34,6 +35,8 @@ type DesktopServerMessage =
   | { type: 'opening' }
   | { type: 'ready' }
   | { type: 'display'; width: number; height: number }
+  | { type: 'desktop_state'; desktop: 'default' | 'secure' | 'other' }
+  | { type: 'notice'; code: string; message: string }
   | { type: 'paused'; reason: string }
   | { type: 'closed'; reason: string }
   | { type: 'error'; code: string; message: string }
@@ -50,6 +53,7 @@ type DesktopClientMessage =
     modifiers: KeyModifier[]
   }
   | { type: 'release_all' }
+  | { type: 'secure_attention' }
   | {
     type: 'feedback'
     sequence: number
@@ -78,6 +82,7 @@ const isFullscreen = ref(false)
 const isNarrowViewport = ref(false)
 const hasCoarsePointer = ref(false)
 const sessionWarning = ref('')
+const desktopKind = ref<'default' | 'secure' | 'other'>('default')
 
 let socket: WebSocket | null = null
 let socketGeneration = 0
@@ -274,6 +279,18 @@ function handleServerMessage(payload: string) {
         displayHeight.value = message.height
         void nextTick(drawCurrentFrame)
       }
+      break
+    case 'desktop_state':
+      desktopKind.value = message.desktop
+      connectionState.value = 'ready'
+      statusDetail.value = message.desktop === 'secure'
+        ? '正在操作 Windows 登录或 UAC 安全桌面'
+        : message.desktop === 'other'
+          ? '正在操作 Windows 系统桌面'
+          : '键盘和鼠标操作将发送到远程实例'
+      break
+    case 'notice':
+      statusDetail.value = message.message || desktopError(message.code, '')
       break
     case 'paused':
       connectionState.value = 'paused'
@@ -541,6 +558,16 @@ function releaseAllInputs() {
   releaseLocalInputState()
 }
 
+function sendSecureAttention() {
+  if (!canControl.value) return
+  if (!window.confirm('确定向远程 Windows 发送 Ctrl+Alt+Del 吗？')) return
+  releaseAllInputs()
+  if (sendMessage({ type: 'secure_attention' })) {
+    markInputActivity()
+    statusDetail.value = '已请求 Windows 显示安全选项'
+  }
+}
+
 function releaseLocalInputState() {
   pressedMouseButtons.clear()
   pendingPointer = null
@@ -632,6 +659,7 @@ function desktopError(code: string, fallback: string) {
     multiple_active_sessions: 'Windows 存在多个活动用户会话，暂时无法自动选择',
     desktop_locked: 'Windows 桌面已锁定，解锁后可继续操作',
     secure_desktop: 'Windows 正在显示安全桌面，暂不支持远程操作',
+    secure_attention_unavailable: 'Windows 或系统策略未允许发送 Ctrl+Alt+Del',
     unsupported: '当前 Agent 不支持网页远程桌面',
     instance_offline: '实例当前离线，无法建立远程桌面连接',
     unauthorized: '管理员登录已失效，请重新登录',
@@ -645,6 +673,7 @@ function desktopReason(reason: string) {
     multiple_active_sessions: 'Windows 存在多个活动用户会话，暂时无法自动选择',
     desktop_locked: 'Windows 桌面已锁定，解锁后将自动继续',
     secure_desktop: 'Windows 正在显示 UAC 或其他安全桌面，返回普通桌面后将自动继续',
+    secure_desktop_requires_service: '安全桌面控制需要安装并运行 Windows 系统服务',
     logged_out: 'Windows 用户已注销，远程桌面会话已结束',
     idle_timeout: '会话因长时间无键鼠操作而结束',
     session_timeout: '会话已达到最长 2 小时时长',
@@ -684,6 +713,7 @@ function handleVisibilityChange() {
               <i :class="connectionState"></i>{{ statusLabel }}
               <span>{{ resolutionLabel }}</span>
               <span>{{ renderedFps }} FPS</span>
+              <span v-if="desktopKind !== 'default'">{{ desktopKind === 'secure' ? '安全桌面' : '系统桌面' }}</span>
             </p>
           </div>
         </div>
@@ -709,6 +739,15 @@ function handleVisibilityChange() {
               <Maximize2 :size="15" />1:1
             </button>
           </div>
+          <button
+            class="desktop-tool-button desktop-secure-button"
+            type="button"
+            title="向远程 Windows 发送 Ctrl+Alt+Del"
+            :disabled="!canControl"
+            @click="sendSecureAttention"
+          >
+            <ShieldAlert :size="15" /><span>Ctrl+Alt+Del</span>
+          </button>
           <button class="desktop-tool-button" type="button" title="重新连接" @click="connect">
             <RefreshCw :size="15" /><span>重连</span>
           </button>

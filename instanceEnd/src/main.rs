@@ -77,6 +77,7 @@ fn run() -> Result<()> {
             min_fps,
             max_fps,
             jpeg_quality,
+            system_helper,
         } => remote_desktop::run_helper(remote_desktop::DesktopOptions {
             pipe,
             max_width,
@@ -84,6 +85,7 @@ fn run() -> Result<()> {
             min_fps,
             max_fps,
             jpeg_quality,
+            system_helper,
         }),
     }
 }

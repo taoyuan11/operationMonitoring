@@ -24,7 +24,7 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HMODULE, LocalFree},
+        Foundation::{CloseHandle, FreeLibrary, HANDLE, HMODULE, HWND, LocalFree},
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0},
             Direct3D11::{
@@ -42,6 +42,11 @@ use windows::{
                 DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
                 IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
             },
+            Gdi::{
+                BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
+                CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
+                ReleaseDC, SRCCOPY, SelectObject,
+            },
         },
         Security::{
             Authorization::{
@@ -49,25 +54,22 @@ use windows::{
                 SDDL_REVISION_1,
             },
             DuplicateTokenEx, GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-            SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_QUERY, TOKEN_USER, TokenPrimary,
-            TokenUser,
+            SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_QUERY, TOKEN_USER,
+            TokenPrimary, TokenSessionId, TokenUser,
         },
         System::{
             Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
+            LibraryLoader::{GetProcAddress, LoadLibraryW},
             Pipes::GetNamedPipeClientProcessId,
-            RemoteDesktop::{
-                ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive,
-                WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
-                WTSQueryUserToken,
-            },
+            RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
             StationsAndDesktops::{
-                CloseDesktop, DESKTOP_READOBJECTS, GetUserObjectInformationW, OpenInputDesktop,
-                UOI_NAME,
+                CloseDesktop, DESKTOP_READOBJECTS, GetThreadDesktop, GetUserObjectInformationW,
+                HDESK, OpenInputDesktop, SetThreadDesktop, UOI_NAME,
             },
             Threading::{
                 CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-                GetCurrentProcess, GetCurrentProcessId, OpenProcessToken, PROCESS_INFORMATION,
-                STARTUPINFOW, TerminateProcess,
+                GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenProcessToken,
+                PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
             },
         },
         UI::Input::KeyboardAndMouse::{
@@ -77,6 +79,7 @@ use windows::{
             MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
             VIRTUAL_KEY,
         },
+        UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
     },
     core::{ComInterface, PCWSTR, PWSTR},
 };
@@ -140,6 +143,7 @@ async fn establish_session(
         min_fps,
         max_fps: request.max_fps.clamp(min_fps, 12),
         jpeg_quality: request.jpeg_quality.clamp(50, 75),
+        system_helper: matches!(target, HelperTarget::ServiceSession { .. }),
     };
     let mut child = spawn_helper(&options, target)?;
 
@@ -182,8 +186,14 @@ fn create_private_pipe(
     user_sid: &str,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     unsafe {
-        // The protected DACL grants access only to LocalSystem and the selected session user.
-        let sddl = wide(format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})"));
+        // Service helpers run as LocalSystem. Foreground helpers additionally need the current
+        // user's SID so development mode keeps working without weakening the service pipe.
+        let descriptor = if user_sid == "SY" {
+            "D:P(A;;GA;;;SY)".to_string()
+        } else {
+            format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})")
+        };
+        let sddl = wide(descriptor);
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             PCWSTR(sddl.as_ptr()),
@@ -394,8 +404,12 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
         .name("om-desktop-capture".to_string())
         .spawn(move || capture_loop(capture_options, capture_settings, capture_tx))?;
 
-    let mut input = InputState::default();
-    let mut input_desktop_available = default_input_desktop();
+    let mut input = InputState {
+        keys: HashSet::new(),
+        buttons: HashSet::new(),
+        allow_secure_attention: options.system_helper,
+    };
+    let mut input_desktop_available = options.system_helper || default_input_desktop();
     let mut pending_release = false;
     let mut stopping = false;
     let mut desktop_check = tokio::time::interval(Duration::from_millis(100));
@@ -405,13 +419,13 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     loop {
         tokio::select! {
             _ = desktop_check.tick() => {
-                let available = default_input_desktop();
+                let available = options.system_helper || default_input_desktop();
                 if input_desktop_available && !available {
-                    pending_release = !input.release_all();
+                    pending_release = !release_on_input_desktop(&mut input);
                 }
                 input_desktop_available = available;
                 if available && pending_release {
-                    pending_release = !input.release_all();
+                    pending_release = !release_on_input_desktop(&mut input);
                 }
                 if stopping && !pending_release {
                     write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
@@ -428,7 +442,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                         fatal.extend_from_slice(reason.as_bytes());
                         write_packet(&mut write, PIPE_INTERNAL, &fatal).await?;
                         stopping = true;
-                        pending_release = !input.release_all();
+                        pending_release = !release_on_input_desktop(&mut input);
                         if !pending_release {
                             write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
                             break;
@@ -441,7 +455,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                 let (kind, value) = packet?;
                 if kind == PIPE_INTERNAL && value == INTERNAL_STOP {
                     stopping = true;
-                    pending_release = !input.release_all();
+                    pending_release = !release_on_input_desktop(&mut input);
                     if !pending_release {
                         write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
                         break;
@@ -461,29 +475,39 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                         );
                     }
                     DesktopControl::ReleaseAll => {
-                        pending_release = !input.release_all();
+                        pending_release = !release_on_input_desktop(&mut input);
                     }
                     control if !stopping => {
-                        let available = default_input_desktop();
+                        let available = options.system_helper || default_input_desktop();
                         if input_desktop_available && !available {
-                            pending_release = !input.release_all();
+                            pending_release = !release_on_input_desktop(&mut input);
                         }
                         input_desktop_available = available;
                         if available && pending_release {
-                            pending_release = !input.release_all();
+                            pending_release = !release_on_input_desktop(&mut input);
                         }
                         if available && !pending_release {
+                            let secure_attention = matches!(&control, DesktopControl::SecureAttention);
                             let releasing = matches!(
                                 &control,
                                 DesktopControl::Key { down: false, .. }
                                     | DesktopControl::PointerButton { down: false, .. }
                             );
-                            if let Err(error) = input.apply(control) {
+                            if let Err(error) = apply_on_input_desktop(&mut input, control) {
                                 crate::logging::error(format_args!(
                                     "remote desktop input injection failed: {error:#}"
                                 ));
                                 if releasing {
                                     pending_release = true;
+                                }
+                                if secure_attention {
+                                    let notice = serde_json::json!({
+                                        "type":"notice",
+                                        "code":"secure_attention_unavailable",
+                                        "message":"Windows 未允许发送 Ctrl+Alt+Del"
+                                    })
+                                    .to_string();
+                                    write_packet(&mut write, PIPE_CONTROL, notice.as_bytes()).await?;
                                 }
                             }
                         }
@@ -493,7 +517,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
             }
         }
     }
-    let _ = input.release_all();
+    let _ = release_on_input_desktop(&mut input);
     Ok(())
 }
 
@@ -521,8 +545,9 @@ fn capture_loop(
     tx: mpsc::Sender<HelperEvent>,
 ) {
     let mut capture: Option<DxgiCapture> = None;
+    let mut attached_desktop: Option<(HDESK, String)> = None;
     let mut sequence = 0_u64;
-    let mut was_paused = false;
+    let mut foreground_secure_paused = false;
     let mut next_capture = Instant::now();
     loop {
         let now = Instant::now();
@@ -532,38 +557,64 @@ fn capture_loop(
         let adaptive = *settings.lock().unwrap();
         next_capture =
             Instant::now() + Duration::from_millis(1000 / u64::from(adaptive.fps.max(1)));
-        if !default_input_desktop() {
-            if !was_paused {
+        let desktop_name = match attach_input_desktop(&mut attached_desktop) {
+            Ok((name, changed)) => {
+                if changed {
+                    capture = None;
+                    let kind = desktop_kind(&name);
+                    let _ = tx.blocking_send(HelperEvent::Status(
+                        serde_json::json!({"type":"desktop_state","desktop":kind}).to_string(),
+                    ));
+                }
+                name
+            }
+            Err(error) => {
+                crate::logging::error(format_args!("failed to attach input desktop: {error:#}"));
+                capture = None;
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        if !options.system_helper && !desktop_name.eq_ignore_ascii_case("Default") {
+            if !foreground_secure_paused {
                 let _ = tx.blocking_send(HelperEvent::Status(
-                    serde_json::json!({"type":"paused","reason":"secure_desktop"}).to_string(),
+                    serde_json::json!({
+                        "type":"paused",
+                        "reason":"secure_desktop_requires_service"
+                    })
+                    .to_string(),
                 ));
-                was_paused = true;
+                foreground_secure_paused = true;
             }
             capture = None;
             continue;
         }
-        if was_paused {
+        if foreground_secure_paused {
             let _ = tx.blocking_send(HelperEvent::Status(
                 serde_json::json!({"type":"ready"}).to_string(),
             ));
-            was_paused = false;
+            foreground_secure_paused = false;
         }
-        if capture.is_none() {
-            match DxgiCapture::new() {
-                Ok(value) => capture = Some(value),
-                Err(error) => {
-                    let _ = tx.blocking_send(HelperEvent::Fatal(format!(
-                        "failed to initialize DXGI desktop duplication: {error:#}"
-                    )));
-                    return;
+        let result = if desktop_name.eq_ignore_ascii_case("Default") {
+            if capture.is_none() {
+                match DxgiCapture::new() {
+                    Ok(value) => capture = Some(value),
+                    Err(error) => {
+                        crate::logging::error(format_args!(
+                            "failed to initialize DXGI desktop duplication, using GDI: {error:#}"
+                        ));
+                    }
                 }
             }
-        }
-        let result = capture.as_mut().unwrap().capture_jpeg(
-            options.max_width,
-            options.max_height,
-            adaptive.jpeg_quality,
-        );
+            if let Some(capture) = capture.as_mut() {
+                capture.capture_jpeg(options.max_width, options.max_height, adaptive.jpeg_quality)
+            } else {
+                capture_gdi_jpeg(options.max_width, options.max_height, adaptive.jpeg_quality)
+            }
+        } else {
+            capture = None;
+            capture_gdi_jpeg(options.max_width, options.max_height, adaptive.jpeg_quality)
+        };
         match result {
             Ok(Some((jpeg, width, height))) => {
                 sequence += 1;
@@ -594,6 +645,68 @@ fn capture_loop(
             }
         }
     }
+}
+
+fn desktop_kind(name: &str) -> &'static str {
+    if name.eq_ignore_ascii_case("Default") {
+        "default"
+    } else if name.eq_ignore_ascii_case("Winlogon") {
+        "secure"
+    } else {
+        "other"
+    }
+}
+
+fn attach_input_desktop(current: &mut Option<(HDESK, String)>) -> Result<(String, bool)> {
+    unsafe {
+        let desktop = OpenInputDesktop(Default::default(), false, DESKTOP_READOBJECTS)
+            .context("input desktop is unavailable")?;
+        let name = desktop_name(desktop)?;
+        if current.as_ref().is_some_and(|(_, value)| value == &name) {
+            let _ = CloseDesktop(desktop);
+            return Ok((name, false));
+        }
+        SetThreadDesktop(desktop).context("failed to bind capture thread to input desktop")?;
+        if let Some((previous, _)) = current.replace((desktop, name.clone())) {
+            let _ = CloseDesktop(previous);
+        }
+        Ok((name, true))
+    }
+}
+
+fn desktop_name(desktop: HDESK) -> Result<String> {
+    unsafe {
+        let handle = HANDLE(desktop.0);
+        let mut needed = 0_u32;
+        let _ = GetUserObjectInformationW(handle, UOI_NAME, None, 0, Some(&mut needed));
+        let mut value = vec![0_u16; (needed as usize / 2).max(1)];
+        GetUserObjectInformationW(
+            handle,
+            UOI_NAME,
+            Some(value.as_mut_ptr().cast()),
+            needed,
+            Some(&mut needed),
+        )?;
+        let len = value.iter().position(|v| *v == 0).unwrap_or(value.len());
+        Ok(String::from_utf16_lossy(&value[..len]))
+    }
+}
+
+fn apply_on_input_desktop(input: &mut InputState, control: DesktopControl) -> Result<()> {
+    unsafe {
+        let original = GetThreadDesktop(GetCurrentThreadId())?;
+        let desktop = OpenInputDesktop(Default::default(), false, DESKTOP_READOBJECTS)
+            .context("input desktop is unavailable")?;
+        SetThreadDesktop(desktop).context("failed to bind input thread to input desktop")?;
+        let result = input.apply(control);
+        let _ = SetThreadDesktop(original);
+        let _ = CloseDesktop(desktop);
+        result
+    }
+}
+
+fn release_on_input_desktop(input: &mut InputState) -> bool {
+    apply_on_input_desktop(input, DesktopControl::ReleaseAll).is_ok()
 }
 
 struct DxgiCapture {
@@ -774,10 +887,106 @@ unsafe fn copy_bgra_to_rgb(data: *const u8, pitch: u32, width: u32, height: u32)
     rgb
 }
 
+fn capture_gdi_jpeg(
+    max_width: u32,
+    max_height: u32,
+    quality: u8,
+) -> Result<Option<(Vec<u8>, u32, u32)>> {
+    unsafe {
+        let width = GetSystemMetrics(SM_CXSCREEN);
+        let height = GetSystemMetrics(SM_CYSCREEN);
+        if width <= 0 || height <= 0 {
+            bail!("no_active_session: invalid desktop dimensions")
+        }
+        let screen = GetDC(HWND(0));
+        if screen.0 == 0 {
+            bail!("failed to acquire desktop DC")
+        }
+        let memory = CreateCompatibleDC(screen);
+        let bitmap = CreateCompatibleBitmap(screen, width, height);
+        if memory.0 == 0 || bitmap.0 == 0 {
+            if bitmap.0 != 0 {
+                let _ = DeleteObject(bitmap);
+            }
+            if memory.0 != 0 {
+                let _ = DeleteDC(memory);
+            }
+            let _ = ReleaseDC(HWND(0), screen);
+            bail!("failed to create GDI desktop capture objects")
+        }
+        let previous = SelectObject(memory, bitmap);
+        let copied = BitBlt(memory, 0, 0, width, height, screen, 0, 0, SRCCOPY).is_ok();
+        let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = if copied {
+            GetDIBits(
+                memory,
+                bitmap,
+                0,
+                height as u32,
+                Some(pixels.as_mut_ptr().cast()),
+                &mut info,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+        let _ = SelectObject(memory, previous);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(memory);
+        let _ = ReleaseDC(HWND(0), screen);
+        if rows == 0 {
+            bail!("failed to capture input desktop with GDI")
+        }
+        let rgb = copy_bgra_to_rgb(
+            pixels.as_ptr(),
+            width as u32 * 4,
+            width as u32,
+            height as u32,
+        );
+        let source = ImageBuffer::<Rgb<u8>, _>::from_raw(width as u32, height as u32, rgb)
+            .context("invalid GDI desktop image buffer")?;
+        let source = DynamicImage::ImageRgb8(source);
+        let (target_width, target_height) =
+            scaled_dimensions(width as u32, height as u32, max_width, max_height);
+        let image = if target_width != width as u32 || target_height != height as u32 {
+            source.resize_exact(target_width, target_height, FilterType::Triangle)
+        } else {
+            source
+        };
+        let mut quality = quality;
+        loop {
+            let mut jpeg = Vec::new();
+            image.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut jpeg, quality,
+            ))?;
+            if jpeg.len() + 32 <= MAX_FRAME_BYTES || quality <= 50 {
+                if jpeg.len() + 32 > MAX_FRAME_BYTES {
+                    bail!("frame_too_large")
+                }
+                return Ok(Some((jpeg, target_width, target_height)));
+            }
+            quality = quality.saturating_sub(5).max(50);
+        }
+    }
+}
+
 #[derive(Default)]
 struct InputState {
     keys: HashSet<(u16, bool)>,
     buttons: HashSet<u8>,
+    allow_secure_attention: bool,
 }
 
 impl InputState {
@@ -822,6 +1031,12 @@ impl InputState {
                 }
                 Ok(())
             }
+            DesktopControl::SecureAttention => {
+                if !self.allow_secure_attention {
+                    bail!("secure_attention_unavailable")
+                }
+                send_secure_attention()
+            }
             DesktopControl::Feedback { .. } => Ok(()),
         }
     }
@@ -838,6 +1053,23 @@ impl InputState {
             }
         }
         self.keys.is_empty() && self.buttons.is_empty()
+    }
+}
+
+fn send_secure_attention() -> Result<()> {
+    unsafe {
+        let library_name = wide("sas.dll");
+        let library = LoadLibraryW(PCWSTR(library_name.as_ptr()))
+            .context("secure_attention_unavailable: failed to load sas.dll")?;
+        let address = GetProcAddress(library, windows::core::s!("SendSAS"));
+        let Some(address) = address else {
+            let _ = FreeLibrary(library);
+            bail!("secure_attention_unavailable: SendSAS is unavailable")
+        };
+        let send_sas: unsafe extern "system" fn(i32) = std::mem::transmute(address);
+        send_sas(0);
+        let _ = FreeLibrary(library);
+        Ok(())
     }
 }
 
@@ -1044,6 +1276,9 @@ fn append_helper_args(command: &mut Command, options: &DesktopOptions) {
         .arg(options.max_fps.to_string())
         .arg("--jpeg-quality")
         .arg(options.jpeg_quality.to_string());
+    if options.system_helper {
+        command.arg("--system-helper");
+    }
 }
 
 fn current_session_id() -> Result<u32> {
@@ -1058,13 +1293,10 @@ fn helper_target() -> Result<(HelperTarget, String)> {
     let current_session_id = current_session_id()?;
     if current_session_id == 0 {
         let session_id = select_active_session()?;
-        let mut token = HANDLE::default();
-        unsafe { WTSQueryUserToken(session_id, &mut token)? };
-        let sid = token_user_sid(token);
-        unsafe {
-            let _ = CloseHandle(token);
-        }
-        Ok((HelperTarget::ServiceSession { session_id }, sid?))
+        Ok((
+            HelperTarget::ServiceSession { session_id },
+            "SY".to_string(),
+        ))
     } else {
         let mut token = HANDLE::default();
         unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)? };
@@ -1109,27 +1341,11 @@ fn token_user_sid(token: HANDLE) -> Result<String> {
 }
 
 fn select_active_session() -> Result<u32> {
-    unsafe {
-        let console = WTSGetActiveConsoleSessionId();
-        let mut sessions: *mut WTS_SESSION_INFOW = null_mut();
-        let mut count = 0_u32;
-        WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sessions, &mut count)?;
-        let entries = std::slice::from_raw_parts(sessions, count as usize);
-        let active: Vec<u32> = entries
-            .iter()
-            .filter(|v| v.State == WTSActive)
-            .map(|v| v.SessionId)
-            .collect();
-        WTSFreeMemory(sessions.cast());
-        if active.contains(&console) {
-            return Ok(console);
-        }
-        match active.as_slice() {
-            [] => bail!("no_active_session"),
-            [only] => Ok(*only),
-            _ => bail!("multiple_active_sessions"),
-        }
+    let console = unsafe { WTSGetActiveConsoleSessionId() };
+    if console == u32::MAX {
+        bail!("no_active_session")
     }
+    Ok(console)
 }
 
 fn spawn_helper_in_active_session(
@@ -1138,7 +1354,7 @@ fn spawn_helper_in_active_session(
 ) -> Result<HelperProcess> {
     unsafe {
         let mut user_token = HANDLE::default();
-        WTSQueryUserToken(session_id, &mut user_token)?;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut user_token)?;
         let mut primary_token = HANDLE::default();
         let duplicate = DuplicateTokenEx(
             user_token,
@@ -1150,6 +1366,13 @@ fn spawn_helper_in_active_session(
         );
         let _ = CloseHandle(user_token);
         duplicate?;
+        let target_session_id = session_id;
+        SetTokenInformation(
+            primary_token,
+            TokenSessionId,
+            (&target_session_id as *const u32).cast(),
+            size_of::<u32>() as u32,
+        )?;
 
         let executable = std::env::current_exe()?;
         let mut command = Command::new(&executable);

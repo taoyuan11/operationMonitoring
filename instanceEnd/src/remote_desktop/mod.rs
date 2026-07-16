@@ -28,6 +28,7 @@ pub struct DesktopOptions {
     pub min_fps: u8,
     pub max_fps: u8,
     pub jpeg_quality: u8,
+    pub system_helper: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +280,7 @@ pub enum DesktopControl {
         modifiers: Vec<String>,
     },
     ReleaseAll,
+    SecureAttention,
     Feedback {
         sequence: u64,
         fps: f64,
@@ -562,6 +564,10 @@ mod tests {
             serde_json::from_str::<DesktopControl>(r#"{"type":"pointer_move","x":0.25,"y":0.75}"#,)
                 .unwrap(),
             DesktopControl::PointerMove { x: 0.25, y: 0.75 }
+        );
+        assert_eq!(
+            serde_json::from_str::<DesktopControl>(r#"{"type":"secure_attention"}"#).unwrap(),
+            DesktopControl::SecureAttention
         );
     }
 

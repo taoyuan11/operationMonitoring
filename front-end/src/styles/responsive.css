@@ -11,6 +11,8 @@
 
 @media (max-width: 980px) {
   .commands-layout, .settings-layout, .user-management-layout { grid-template-columns: 1fr; }
+  .appearance-settings-card { grid-column: auto; }
+  .appearance-settings-body { grid-template-columns: 1fr; }
   .recent-jobs-card { grid-column: auto; }
   .approval-row { grid-template-columns: auto minmax(0, 1fr) auto; }
   .approval-time { display: none; }
@@ -21,7 +23,8 @@
 }
 
 @media (max-width: 760px) {
-  .shell { padding: 0 12px 28px; }
+  .shell { padding: 0 12px; }
+  .page-stage { padding-bottom: 28px; }
   .topbar { grid-template-columns: 1fr auto; gap: 12px; min-height: 68px; padding: 10px 0; }
   .health-pill { display: none; }
   .top-actions { grid-column: 2; }
@@ -66,6 +69,9 @@
   .job-table-row small, .job-table-row time { grid-column: 2; }
   .job-table-row time { color: #68736e; }
   .background-toolbar small { flex: 1 0 100%; margin-left: 0; }
+  .theme-mode-options { grid-template-columns: 1fr; }
+  .theme-mode-option { min-height: 60px; }
+  .appearance-save-row { align-items: flex-start; flex-direction: column; }
   .terminal-screen { min-height: 320px; }
 }
 
@@ -93,6 +99,10 @@
   .page-header h2 { font-size: 19px; }
   .page-header p { display: none; }
   .admin-content-card { padding: 15px; }
+  .appearance-current { display: none; }
+  .appearance-settings-body { gap: 16px; }
+  .custom-color-picker { width: 100%; grid-template-columns: auto auto 28px 1fr; }
+  .custom-color-picker code { justify-self: end; }
   .administrator-head { grid-template-columns: 32px minmax(0, 1fr) auto; }
   .administrator-head .row-actions { grid-column: 1 / -1; justify-content: flex-end; }
   .auth-device-list { padding-left: 0; }

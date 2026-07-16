@@ -60,7 +60,7 @@ const windowsLogo: LogoIcon = {
 
 const logoMatches: readonly LogoMatch[] = [
   { aliases: ['windows', 'win32', 'win64', 'mingw', 'msys'], icon: windowsLogo },
-  { aliases: ['macos', 'mac os', 'osx', 'os x', 'darwin'], icon: siApple, label: 'macOS', color: '#e8ecef' },
+  { aliases: ['macos', 'mac os', 'osx', 'os x', 'darwin'], icon: siApple, label: 'macOS', color: 'var(--brand-neutral)' },
   { aliases: ['ubuntu', 'kubuntu', 'lubuntu', 'xubuntu', 'ubuntu mate'], icon: siUbuntu },
   { aliases: ['centos'], icon: siCentos, color: '#9b4f96' },
   { aliases: ['debian'], icon: siDebian },
@@ -70,7 +70,7 @@ const logoMatches: readonly LogoMatch[] = [
   { aliases: ['arch', 'arch linux', 'archlinux'], icon: siArchlinux },
   { aliases: ['artix', 'artix linux'], icon: siArtixlinux },
   { aliases: ['rocky', 'rocky linux'], icon: siRockylinux },
-  { aliases: ['alma', 'alma linux', 'almalinux'], icon: siAlmalinux, color: '#e8ecef' },
+  { aliases: ['alma', 'alma linux', 'almalinux'], icon: siAlmalinux, color: 'var(--brand-neutral)' },
   { aliases: ['opensuse', 'opensuse leap', 'opensuse tumbleweed'], icon: siOpensuse },
   { aliases: ['suse', 'sles'], icon: siSuse },
   { aliases: ['kali', 'kali linux'], icon: siKalilinux },
@@ -130,7 +130,7 @@ function brandColor(hex: string | undefined) {
   const red = (numeric >> 16) & 0xff
   const green = (numeric >> 8) & 0xff
   const blue = numeric & 0xff
-  if (Math.max(red, green, blue) < 72) return '#e8ecef'
+  if (Math.max(red, green, blue) < 72) return 'var(--brand-neutral)'
   return `#${hex}`
 }
 </script>

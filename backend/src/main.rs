@@ -34,8 +34,8 @@ use files::{
 use handlers::{
     admin_approve_instance, admin_commands, admin_create_command, admin_delete_background_image,
     admin_delete_instance, admin_disable_command, admin_disable_instance, admin_get_settings,
-    admin_jobs, admin_logs, admin_pending_instances, admin_put_settings, admin_reject_instance,
-    admin_run_whitelist_command, admin_terminal_ws, admin_update_instance,
+    admin_jobs, admin_logs, admin_pending_instances, admin_put_appearance, admin_put_settings,
+    admin_reject_instance, admin_run_whitelist_command, admin_terminal_ws, admin_update_instance,
     admin_upload_background_image, agent_register, agent_report, agent_ws, health,
     public_appearance, public_instances, public_metrics,
 };
@@ -157,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/settings/background-image",
             post(admin_upload_background_image).delete(admin_delete_background_image),
         )
+        .route("/api/admin/settings/appearance", put(admin_put_appearance))
         .route(
             "/api/admin/commands",
             get(admin_commands).post(admin_create_command),

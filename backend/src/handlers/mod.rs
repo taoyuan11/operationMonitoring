@@ -19,9 +19,10 @@ use crate::{
     jobs::{create_command_job, dispatch_command},
     models::{
         ActionLogRecord, AgentRegisterRequest, AgentRegisterResponse, AgentReportRequest,
-        AgentWsQuery, AppearanceResponse, CommandJobRecord, CommandRecord, CreateCommandRequest,
-        HealthResponse, InstanceRecord, InstanceSummary, ListQuery, MetricRecord, MetricsQuery,
-        PendingInstance, SettingsRequest, SettingsResponse, UpdateInstanceRequest,
+        AgentWsQuery, AppearanceResponse, AppearanceSettingsRequest, CommandJobRecord,
+        CommandRecord, CreateCommandRequest, HealthResponse, InstanceRecord, InstanceSummary,
+        ListQuery, MetricRecord, MetricsQuery, PendingInstance, SettingsRequest, SettingsResponse,
+        ThemeMode, UpdateInstanceRequest,
     },
     state::AppState,
     updates::confirm_update_version,
@@ -30,6 +31,9 @@ use crate::{
 };
 
 const BACKGROUND_SETTING_KEY: &str = "background_image_path";
+const THEME_MODE_SETTING_KEY: &str = "theme_mode";
+const ACCENT_COLOR_SETTING_KEY: &str = "accent_color";
+const DEFAULT_ACCENT_COLOR: &str = "#3bbf9b";
 const BACKGROUND_DIR: &str = "backgrounds";
 const MAX_BACKGROUND_BYTES: usize = 5 * 1024 * 1024;
 
@@ -43,9 +47,7 @@ pub async fn health() -> Json<HealthResponse> {
 pub async fn public_appearance(
     State(state): State<AppState>,
 ) -> AppResult<Json<AppearanceResponse>> {
-    Ok(Json(AppearanceResponse {
-        background_image_url: background_image_url(&state).await?,
-    }))
+    Ok(Json(appearance_response(&state).await?))
 }
 
 pub async fn public_instances(
@@ -382,10 +384,7 @@ pub async fn admin_get_settings(
     headers: HeaderMap,
 ) -> AppResult<Json<SettingsResponse>> {
     require_admin(&state, &headers).await?;
-    Ok(Json(SettingsResponse {
-        retention_days: retention_days(&state.db).await?,
-        background_image_url: background_image_url(&state).await?,
-    }))
+    Ok(Json(settings_response(&state).await?))
 }
 
 pub async fn admin_put_settings(
@@ -409,10 +408,45 @@ pub async fn admin_put_settings(
         &format!("指标保留天数设置为 {}", days),
     )
     .await?;
-    Ok(Json(SettingsResponse {
-        retention_days: days,
-        background_image_url: background_image_url(&state).await?,
-    }))
+    let mut response = settings_response(&state).await?;
+    response.retention_days = days;
+    Ok(Json(response))
+}
+
+pub async fn admin_put_appearance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<AppearanceSettingsRequest>,
+) -> AppResult<Json<SettingsResponse>> {
+    let admin = require_admin(&state, &headers).await?;
+    let accent_color = normalize_accent_color(&payload.accent_color)?;
+    let theme_mode = theme_mode_value(payload.theme_mode);
+
+    let mut transaction = state.db.begin().await?;
+    for (key, value) in [
+        (THEME_MODE_SETTING_KEY, theme_mode),
+        (ACCENT_COLOR_SETTING_KEY, accent_color.as_str()),
+    ] {
+        sqlx::query(
+            "INSERT INTO settings(key, value) VALUES($1, $2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+
+    write_action_log(
+        &state.db,
+        &admin.username,
+        "update_appearance",
+        "appearance",
+        &format!("主题模式设置为 {theme_mode}，主题色设置为 {accent_color}"),
+    )
+    .await?;
+
+    Ok(Json(settings_response(&state).await?))
 }
 
 pub async fn admin_upload_background_image(
@@ -490,10 +524,9 @@ pub async fn admin_upload_background_image(
     )
     .await?;
 
-    Ok(Json(SettingsResponse {
-        retention_days: retention_days(&state.db).await?,
-        background_image_url: path_to_upload_url(&relative_path_text),
-    }))
+    let mut response = settings_response(&state).await?;
+    response.background_image_url = path_to_upload_url(&relative_path_text);
+    Ok(Json(response))
 }
 
 pub async fn admin_delete_background_image(
@@ -517,10 +550,73 @@ pub async fn admin_delete_background_image(
         "清除站点背景图",
     )
     .await?;
-    Ok(Json(SettingsResponse {
+    let mut response = settings_response(&state).await?;
+    response.background_image_url = None;
+    Ok(Json(response))
+}
+
+async fn settings_response(state: &AppState) -> AppResult<SettingsResponse> {
+    let appearance = appearance_response(state).await?;
+    Ok(SettingsResponse {
         retention_days: retention_days(&state.db).await?,
-        background_image_url: None,
-    }))
+        background_image_url: appearance.background_image_url,
+        theme_mode: appearance.theme_mode,
+        accent_color: appearance.accent_color,
+    })
+}
+
+async fn appearance_response(state: &AppState) -> AppResult<AppearanceResponse> {
+    Ok(AppearanceResponse {
+        background_image_url: background_image_url(state).await?,
+        theme_mode: load_theme_mode(state).await?,
+        accent_color: load_accent_color(state).await?,
+    })
+}
+
+async fn load_theme_mode(state: &AppState) -> AppResult<ThemeMode> {
+    let value = setting_value(&state.db, THEME_MODE_SETTING_KEY).await?;
+    Ok(parse_theme_mode(value.as_deref()))
+}
+
+fn parse_theme_mode(value: Option<&str>) -> ThemeMode {
+    match value {
+        Some("light") => ThemeMode::Light,
+        Some("dark") => ThemeMode::Dark,
+        _ => ThemeMode::Auto,
+    }
+}
+
+async fn load_accent_color(state: &AppState) -> AppResult<String> {
+    let value = setting_value(&state.db, ACCENT_COLOR_SETTING_KEY).await?;
+    Ok(stored_accent_color(value.as_deref()))
+}
+
+fn stored_accent_color(value: Option<&str>) -> String {
+    value
+        .and_then(|value| normalize_accent_color(value).ok())
+        .unwrap_or_else(|| DEFAULT_ACCENT_COLOR.to_string())
+}
+
+fn normalize_accent_color(value: &str) -> AppResult<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() != 7
+        || !normalized.starts_with('#')
+        || !normalized[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "主题色必须使用 #RRGGBB 格式",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn theme_mode_value(theme_mode: ThemeMode) -> &'static str {
+    match theme_mode {
+        ThemeMode::Auto => "auto",
+        ThemeMode::Light => "light",
+        ThemeMode::Dark => "dark",
+    }
 }
 
 async fn background_image_url(state: &AppState) -> AppResult<Option<String>> {
@@ -893,4 +989,60 @@ pub async fn admin_terminal_ws(
     let admin = require_admin(&state, &headers).await?;
     get_instance(&state.db, &instance_id).await?;
     Ok(ws.on_upgrade(move |socket| terminal_socket(state, instance_id, admin.username, socket)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appearance_defaults_are_stable() {
+        assert_eq!(parse_theme_mode(None), ThemeMode::Auto);
+        assert_eq!(parse_theme_mode(Some("unsupported")), ThemeMode::Auto);
+        assert_eq!(stored_accent_color(None), DEFAULT_ACCENT_COLOR);
+        assert_eq!(stored_accent_color(Some("invalid")), DEFAULT_ACCENT_COLOR);
+    }
+
+    #[test]
+    fn accepts_and_normalizes_hex_accent_colors() {
+        assert_eq!(
+            normalize_accent_color("  #3BBF9B ").expect("valid accent color"),
+            "#3bbf9b"
+        );
+        assert_eq!(stored_accent_color(Some("#FFFFFF")), "#ffffff");
+    }
+
+    #[test]
+    fn rejects_invalid_accent_colors() {
+        for value in ["3bbf9b", "#fff", "#12345g", "#12345678", ""] {
+            let error = normalize_accent_color(value).expect_err("invalid accent color");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn theme_modes_use_public_wire_values() {
+        assert_eq!(theme_mode_value(ThemeMode::Auto), "auto");
+        assert_eq!(theme_mode_value(ThemeMode::Light), "light");
+        assert_eq!(theme_mode_value(ThemeMode::Dark), "dark");
+        assert_eq!(parse_theme_mode(Some("light")), ThemeMode::Light);
+        assert_eq!(parse_theme_mode(Some("dark")), ThemeMode::Dark);
+    }
+
+    #[test]
+    fn appearance_response_exposes_complete_public_configuration() {
+        let value = serde_json::to_value(AppearanceResponse {
+            background_image_url: Some("/uploads/backgrounds/example.webp".to_string()),
+            theme_mode: ThemeMode::Auto,
+            accent_color: "#3bbf9b".to_string(),
+        })
+        .expect("serialize appearance response");
+
+        assert_eq!(value["theme_mode"], "auto");
+        assert_eq!(value["accent_color"], "#3bbf9b");
+        assert_eq!(
+            value["background_image_url"],
+            "/uploads/backgrounds/example.webp"
+        );
+    }
 }

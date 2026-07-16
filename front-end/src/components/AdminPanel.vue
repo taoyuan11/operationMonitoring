@@ -1,20 +1,33 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import {
   Check,
   ClipboardList,
   Image,
   ListChecks,
   LoaderCircle,
+  Monitor,
+  Moon,
+  Palette,
   Plus,
   Settings,
+  Sun,
   Terminal,
   Trash2,
   X,
 } from 'lucide-vue-next'
-import type { ActionLog, AdminTab, CommandJob, CommandRecord, PendingInstance } from '../types/domain'
+import type {
+  ActionLog,
+  AdminTab,
+  CommandJob,
+  CommandRecord,
+  PendingInstance,
+  ResolvedTheme,
+  ThemeMode,
+} from '../types/domain'
 import { formatTime } from '../utils/format'
 
-defineProps<{
+const props = defineProps<{
   adminTab: AdminTab
   pendingInstances: PendingInstance[]
   commands: CommandRecord[]
@@ -23,7 +36,11 @@ defineProps<{
   settingsForm: {
     retention_days: number
     background_image_url: string | null
+    theme_mode: ThemeMode
+    accent_color: string
   }
+  resolvedTheme: ResolvedTheme
+  appearanceMessage: string
   backgroundFileName: string
   backgroundOperation: 'uploading' | 'removing' | null
   backgroundMessage: string
@@ -40,9 +57,30 @@ defineEmits<{
   createCommand: []
   removeCommand: [command: CommandRecord]
   saveSettings: []
+  saveAppearance: []
+  appearanceChanged: []
   selectBackgroundImage: [event: Event]
   clearBackgroundImage: []
 }>()
+
+const themeOptions = [
+  { value: 'auto' as const, label: '跟随系统', description: '自动使用设备的明暗外观', icon: Monitor },
+  { value: 'light' as const, label: '明亮', description: '始终使用浅色界面', icon: Sun },
+  { value: 'dark' as const, label: '暗黑', description: '始终使用深色界面', icon: Moon },
+]
+
+const accentPresets = [
+  { label: '翠绿', value: '#3bbf9b' },
+  { label: '海蓝', value: '#3b82f6' },
+  { label: '青蓝', value: '#159eaa' },
+  { label: '紫罗兰', value: '#8b5cf6' },
+  { label: '琥珀', value: '#d08a24' },
+  { label: '玫红', value: '#d95f80' },
+]
+
+const previewTheme = computed(() =>
+  props.settingsForm.theme_mode === 'auto' ? props.resolvedTheme : props.settingsForm.theme_mode,
+)
 </script>
 
 <template>
@@ -159,16 +197,81 @@ defineEmits<{
       </header>
 
       <div class="admin-page-grid settings-layout">
-        <div class="admin-content-card">
-          <div class="card-heading"><div><h3>数据保留</h3><p>超过保留期限的历史指标会被自动清理。</p></div></div>
-          <form class="stack-form page-form" @submit.prevent="$emit('saveSettings')">
-            <label>
-              <span>指标保留天数</span>
-              <input v-model.number="settingsForm.retention_days" min="1" max="365" type="number" />
-            </label>
-            <small class="form-help">可设置 1 至 365 天，不影响节点基础信息。</small>
-            <button class="primary-button" type="submit"><Settings :size="16" />保存设置</button>
-          </form>
+        <div class="admin-content-card appearance-settings-card">
+          <div class="card-heading">
+            <div><h3>外观主题</h3><p>设置所有访问者看到的界面明暗模式与主要强调色。</p></div>
+            <span class="appearance-current">当前显示：{{ resolvedTheme === 'light' ? '明亮' : '暗黑' }}</span>
+          </div>
+
+          <div class="appearance-settings-body">
+            <div class="appearance-controls">
+              <fieldset class="theme-mode-fieldset">
+                <legend>主题模式</legend>
+                <div class="theme-mode-options">
+                  <button
+                    v-for="option in themeOptions"
+                    :key="option.value"
+                    :class="['theme-mode-option', { active: settingsForm.theme_mode === option.value }]"
+                    type="button"
+                    :aria-pressed="settingsForm.theme_mode === option.value"
+                    @click="settingsForm.theme_mode = option.value; $emit('appearanceChanged')"
+                  >
+                    <component :is="option.icon" :size="18" />
+                    <span><strong>{{ option.label }}</strong><small>{{ option.description }}</small></span>
+                    <i aria-hidden="true"></i>
+                  </button>
+                </div>
+              </fieldset>
+
+              <fieldset class="accent-fieldset">
+                <legend>主题色</legend>
+                <div class="accent-presets">
+                  <button
+                    v-for="preset in accentPresets"
+                    :key="preset.value"
+                    :class="['accent-swatch', { active: settingsForm.accent_color === preset.value }]"
+                    :style="{ '--swatch-color': preset.value }"
+                    type="button"
+                    :title="preset.label"
+                    :aria-label="`使用${preset.label}主题色`"
+                    :aria-pressed="settingsForm.accent_color === preset.value"
+                    @click="settingsForm.accent_color = preset.value; $emit('appearanceChanged')"
+                  ><Check v-if="settingsForm.accent_color === preset.value" :size="14" /></button>
+                  <label class="custom-color-picker">
+                    <Palette :size="16" />
+                    <span>自定义</span>
+                    <input v-model="settingsForm.accent_color" type="color" aria-label="选择自定义主题色" @input="$emit('appearanceChanged')" />
+                    <code>{{ settingsForm.accent_color }}</code>
+                  </label>
+                </div>
+              </fieldset>
+
+              <div class="appearance-save-row">
+                <button class="primary-button" type="button" @click="$emit('saveAppearance')">
+                  <Palette :size="16" />保存外观
+                </button>
+                <small :class="{ success: appearanceMessage }">{{ appearanceMessage || '保存后将作为全站默认外观' }}</small>
+              </div>
+            </div>
+
+            <div
+              :class="['appearance-preview', `preview-${previewTheme}`]"
+              :style="{ '--preview-accent': settingsForm.accent_color }"
+            >
+              <span class="preview-label">实时预览</span>
+              <div class="preview-window">
+                <header><i></i><i></i><i></i></header>
+                <section>
+                  <div class="preview-sidebar"><span></span><span class="active"></span><span></span></div>
+                  <div class="preview-content">
+                    <div class="preview-summary"><i></i><i></i><i></i></div>
+                    <div class="preview-card"><strong>运行监控</strong><span></span><button type="button">主要操作</button></div>
+                  </div>
+                </section>
+              </div>
+              <small>{{ previewTheme === 'light' ? '明亮主题预览' : '暗黑主题预览' }}</small>
+            </div>
+          </div>
         </div>
 
         <div class="admin-content-card background-card">
@@ -211,6 +314,18 @@ defineEmits<{
             </Transition>
             <small :class="{ success: backgroundMessage }">{{ backgroundMessage || backgroundFileName || '支持 PNG、JPEG、WebP，最大 5MB' }}</small>
           </div>
+        </div>
+
+        <div class="admin-content-card retention-card">
+          <div class="card-heading"><div><h3>数据保留</h3><p>超过保留期限的历史指标会被自动清理。</p></div></div>
+          <form class="stack-form page-form" @submit.prevent="$emit('saveSettings')">
+            <label>
+              <span>指标保留天数</span>
+              <input v-model.number="settingsForm.retention_days" min="1" max="365" type="number" />
+            </label>
+            <small class="form-help">可设置 1 至 365 天，不影响节点基础信息。</small>
+            <button class="primary-button" type="submit"><Settings :size="16" />保存设置</button>
+          </form>
         </div>
       </div>
     </template>

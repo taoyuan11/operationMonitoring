@@ -85,11 +85,18 @@ export type ActionLog = {
 export type SettingsResponse = {
   retention_days: number
   background_image_url: string | null
+  theme_mode: ThemeMode
+  accent_color: string
 }
 
 export type AppearanceResponse = {
   background_image_url: string | null
+  theme_mode: ThemeMode
+  accent_color: string
 }
+
+export type ThemeMode = 'auto' | 'light' | 'dark'
+export type ResolvedTheme = 'light' | 'dark'
 
 export type AuthMode = 'bootstrap' | 'totp'
 

@@ -2,6 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import {
   Check,
+  ChevronDown,
   CircleAlert,
   Clock3,
   FileArchive,
@@ -58,6 +59,7 @@ const batchDragActive = reactive<Record<string, boolean>>({})
 const batchInputKeys = reactive<Record<string, number>>({})
 const fileInputKeys = reactive<Record<string, number>>({})
 const checksumInputKeys = reactive<Record<string, number>>({})
+const collapsedReleases = reactive<Record<string, boolean>>({})
 const editingReleaseId = ref<string | null>(null)
 const createReleaseFiles = ref<File[]>([])
 const createReleaseFileError = ref('')
@@ -110,6 +112,7 @@ watch(
       if (!(release.id in batchDragDepths)) batchDragDepths[release.id] = 0
       if (!(release.id in batchDragActive)) batchDragActive[release.id] = false
       if (!(release.id in batchInputKeys)) batchInputKeys[release.id] = 0
+      if (!(release.id in collapsedReleases)) collapsedReleases[release.id] = true
     }
   },
   { immediate: true },
@@ -322,6 +325,7 @@ function submitCreateRelease() {
 
 function completeCreateRelease(releaseId: string) {
   const files = createReleaseFiles.value
+  collapsedReleases[releaseId] = false
   artifactUploadRows[releaseId] = [createUploadRow('linux', 'x86_64')]
   batchFileErrors[releaseId] = ''
   batchDragDepths[releaseId] = 0
@@ -481,6 +485,7 @@ function applyUploadResult(releaseId: string, result: AgentArtifactUploadResult)
 
 function editRelease(release: AgentRelease) {
   draftEdits[release.id] = { version: release.version, notes: release.notes }
+  collapsedReleases[release.id] = false
   editingReleaseId.value = release.id
 }
 
@@ -507,6 +512,14 @@ function attemptInstanceName(attempt: AgentUpdateAttempt) {
 
 function isBusy(id: string) {
   return Boolean(props.operation) && props.busyId === id
+}
+
+function isReleaseCollapsed(releaseId: string) {
+  return collapsedReleases[releaseId] ?? true
+}
+
+function toggleRelease(releaseId: string) {
+  collapsedReleases[releaseId] = !isReleaseCollapsed(releaseId)
 }
 </script>
 
@@ -589,13 +602,18 @@ function isBusy(id: string) {
         <p>创建草稿后即可上传面向不同实例的可执行文件。</p>
       </div>
 
-      <article v-for="release in releases" :key="release.id" class="update-release-card">
+      <article
+        v-for="release in releases"
+        :key="release.id"
+        class="update-release-card"
+        :class="{ collapsed: isReleaseCollapsed(release.id) }"
+      >
         <header class="release-card-header">
           <div class="release-identity">
             <span :class="['release-status', release.status]">{{ releaseStatusText[release.status] }}</span>
             <div v-if="editingReleaseId !== release.id">
               <h3>Agent {{ release.version }}</h3>
-              <p v-if="release.notes" class="release-notes">{{ release.notes }}</p>
+              <p v-if="release.notes" class="release-notes" :title="release.notes">{{ release.notes }}</p>
               <p v-else class="release-notes empty">未填写发布说明</p>
             </div>
           </div>
@@ -636,44 +654,61 @@ function isBusy(id: string) {
                 <Trash2 :size="15" />
               </button>
             </template>
+            <button
+              class="icon-button release-collapse-button"
+              :class="{ expanded: !isReleaseCollapsed(release.id) }"
+              type="button"
+              :title="isReleaseCollapsed(release.id) ? '展开版本详情' : '折叠版本详情'"
+              :aria-label="`${isReleaseCollapsed(release.id) ? '展开' : '折叠'} Agent ${release.version} 版本详情`"
+              :aria-expanded="!isReleaseCollapsed(release.id)"
+              :aria-controls="`release-body-${release.id}`"
+              @click="toggleRelease(release.id)"
+            >
+              <ChevronDown :size="16" />
+            </button>
           </div>
         </header>
 
-        <form
-          v-if="editingReleaseId === release.id"
-          class="release-edit-form"
-          @submit.prevent="saveRelease(release.id)"
+        <div
+          v-show="!isReleaseCollapsed(release.id)"
+          :id="`release-body-${release.id}`"
+          class="release-card-body"
         >
-          <label>
-            <span>版本号</span>
-            <input v-model.trim="draftEdits[release.id].version" required autocomplete="off" />
-          </label>
-          <label>
-            <span>发布说明 <i>可选</i></span>
-            <textarea v-model.trim="draftEdits[release.id].notes"></textarea>
-          </label>
-          <div class="release-edit-actions">
-            <button class="text-button" type="button" :disabled="Boolean(operation)" @click="cancelEdit(release.id)">
-              <X :size="15" />取消
-            </button>
-            <button class="primary-button" type="submit" :disabled="Boolean(operation)">
-              <LoaderCircle v-if="isBusy(release.id) && operation === 'saving'" class="spin" :size="15" />
-              <Save v-else :size="15" />保存草稿
-            </button>
+          <form
+            v-if="editingReleaseId === release.id"
+            class="release-edit-form"
+            @submit.prevent="saveRelease(release.id)"
+          >
+            <label>
+              <span>版本号</span>
+              <input v-model.trim="draftEdits[release.id].version" required autocomplete="off" />
+            </label>
+            <label>
+              <span>发布说明 <i>可选</i></span>
+              <textarea v-model.trim="draftEdits[release.id].notes"></textarea>
+            </label>
+            <div class="release-edit-actions">
+              <button class="text-button" type="button" :disabled="Boolean(operation)" @click="cancelEdit(release.id)">
+                <X :size="15" />取消
+              </button>
+              <button class="primary-button" type="submit" :disabled="Boolean(operation)">
+                <LoaderCircle v-if="isBusy(release.id) && operation === 'saving'" class="spin" :size="15" />
+                <Save v-else :size="15" />保存草稿
+              </button>
+            </div>
+          </form>
+
+          <div class="release-coverage" :aria-label="`Agent ${release.version} 覆盖情况`">
+            <span><strong>{{ release.coverage.covered_instances }}</strong> / {{ release.coverage.eligible_instances }} 已覆盖</span>
+            <span :class="{ warning: release.coverage.missing_artifact_instances > 0 }">
+              <CircleAlert :size="14" />{{ release.coverage.missing_artifact_instances }} 缺少可执行文件
+            </span>
+            <span :class="{ warning: release.coverage.unprivileged_instances > 0 }">
+              <ShieldAlert :size="14" />{{ release.coverage.unprivileged_instances }} 权限不足
+            </span>
           </div>
-        </form>
 
-        <div class="release-coverage" :aria-label="`Agent ${release.version} 覆盖情况`">
-          <span><strong>{{ release.coverage.covered_instances }}</strong> / {{ release.coverage.eligible_instances }} 已覆盖</span>
-          <span :class="{ warning: release.coverage.missing_artifact_instances > 0 }">
-            <CircleAlert :size="14" />{{ release.coverage.missing_artifact_instances }} 缺少可执行文件
-          </span>
-          <span :class="{ warning: release.coverage.unprivileged_instances > 0 }">
-            <ShieldAlert :size="14" />{{ release.coverage.unprivileged_instances }} 权限不足
-          </span>
-        </div>
-
-        <section class="release-artifacts" :aria-labelledby="`artifacts-${release.id}`">
+          <section class="release-artifacts" :aria-labelledby="`artifacts-${release.id}`">
           <div class="release-section-heading">
             <div>
               <h4 :id="`artifacts-${release.id}`">可执行文件</h4>
@@ -841,49 +876,50 @@ function isBusy(id: string) {
               </div>
             </div>
           </form>
-        </section>
+          </section>
 
-        <section class="release-attempts" :aria-labelledby="`attempts-${release.id}`">
-          <div class="release-section-heading">
-            <div>
-              <h4 :id="`attempts-${release.id}`">实例更新</h4>
-              <span>{{ attemptsFor(release).length }} 条记录</span>
-            </div>
-          </div>
-
-          <div v-if="attemptsFor(release).length === 0" class="release-empty-row">
-            <Clock3 :size="17" />尚无实例更新记录
-          </div>
-          <div v-else class="update-attempts-table">
-            <div class="update-attempts-head">
-              <span>实例</span><span>版本</span><span>状态</span><span>说明</span><span>更新时间</span><span></span>
-            </div>
-            <article v-for="attempt in attemptsFor(release)" :key="attempt.id" class="update-attempt-row">
-              <div class="attempt-instance">
-                <strong :title="attemptInstanceName(attempt)">{{ attemptInstanceName(attempt) }}</strong>
-                <small :title="attempt.instance_id">{{ attempt.instance_id.slice(0, 12) }}</small>
+          <section class="release-attempts" :aria-labelledby="`attempts-${release.id}`">
+            <div class="release-section-heading">
+              <div>
+                <h4 :id="`attempts-${release.id}`">实例更新</h4>
+                <span>{{ attemptsFor(release).length }} 条记录</span>
               </div>
-              <span class="attempt-versions">{{ attempt.from_version }} -&gt; {{ attempt.target_version }}</span>
-              <span :class="['attempt-status', attempt.status]" :title="attemptStatusText[attempt.status]">
-                {{ attemptStatusText[attempt.status] }}
-              </span>
-              <span class="attempt-message" :title="attempt.message || '暂无补充说明'">{{ attempt.message || '—' }}</span>
-              <time>{{ formatTime(attempt.updated_at) }}</time>
-              <button
-                v-if="attempt.status === 'failed' || attempt.status === 'rollback_succeeded'"
-                class="icon-button"
-                type="button"
-                title="重新尝试更新"
-                :aria-label="`重新尝试实例 ${attempt.instance_id} 的更新`"
-                :disabled="Boolean(operation)"
-                @click="$emit('retryAttempt', attempt)"
-              >
-                <LoaderCircle v-if="isBusy(attempt.id) && operation === 'retrying'" class="spin" :size="15" />
-                <RotateCcw v-else :size="15" />
-              </button>
-            </article>
-          </div>
-        </section>
+            </div>
+
+            <div v-if="attemptsFor(release).length === 0" class="release-empty-row">
+              <Clock3 :size="17" />尚无实例更新记录
+            </div>
+            <div v-else class="update-attempts-table">
+              <div class="update-attempts-head">
+                <span>实例</span><span>版本</span><span>状态</span><span>说明</span><span>更新时间</span><span></span>
+              </div>
+              <article v-for="attempt in attemptsFor(release)" :key="attempt.id" class="update-attempt-row">
+                <div class="attempt-instance">
+                  <strong :title="attemptInstanceName(attempt)">{{ attemptInstanceName(attempt) }}</strong>
+                  <small :title="attempt.instance_id">{{ attempt.instance_id.slice(0, 12) }}</small>
+                </div>
+                <span class="attempt-versions">{{ attempt.from_version }} -&gt; {{ attempt.target_version }}</span>
+                <span :class="['attempt-status', attempt.status]" :title="attemptStatusText[attempt.status]">
+                  {{ attemptStatusText[attempt.status] }}
+                </span>
+                <span class="attempt-message" :title="attempt.message || '暂无补充说明'">{{ attempt.message || '—' }}</span>
+                <time>{{ formatTime(attempt.updated_at) }}</time>
+                <button
+                  v-if="attempt.status === 'failed' || attempt.status === 'rollback_succeeded'"
+                  class="icon-button"
+                  type="button"
+                  title="重新尝试更新"
+                  :aria-label="`重新尝试实例 ${attempt.instance_id} 的更新`"
+                  :disabled="Boolean(operation)"
+                  @click="$emit('retryAttempt', attempt)"
+                >
+                  <LoaderCircle v-if="isBusy(attempt.id) && operation === 'retrying'" class="spin" :size="15" />
+                  <RotateCcw v-else :size="15" />
+                </button>
+              </article>
+            </div>
+          </section>
+        </div>
       </article>
     </section>
   </section>

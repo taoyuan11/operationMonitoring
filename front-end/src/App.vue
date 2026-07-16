@@ -317,6 +317,8 @@ function confirmAction() {
             :jobs="consoleState.jobs.value"
             :logs="consoleState.logs.value"
             :settings-form="consoleState.settingsForm"
+            :resolved-theme="consoleState.resolvedTheme.value"
+            :appearance-message="consoleState.appearanceMessage.value"
             :background-file-name="consoleState.backgroundFileName.value"
             :background-operation="consoleState.backgroundOperation.value"
             :background-message="consoleState.backgroundMessage.value"
@@ -326,6 +328,8 @@ function confirmAction() {
             @create-command="consoleState.createCommand"
             @remove-command="requestRemoveCommand"
             @save-settings="consoleState.saveSettings"
+            @save-appearance="consoleState.saveAppearance"
+            @appearance-changed="consoleState.appearanceMessage.value = ''"
             @select-background-image="consoleState.selectBackgroundImage"
             @clear-background-image="consoleState.clearBackgroundImage"
           />

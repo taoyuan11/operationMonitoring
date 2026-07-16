@@ -186,6 +186,8 @@ pub struct SettingsRow {
 pub struct SettingsResponse {
     pub retention_days: i64,
     pub background_image_url: Option<String>,
+    pub theme_mode: ThemeMode,
+    pub accent_color: String,
 }
 
 #[derive(Deserialize)]
@@ -193,9 +195,25 @@ pub struct SettingsRequest {
     pub retention_days: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    Auto,
+    Light,
+    Dark,
+}
+
+#[derive(Deserialize)]
+pub struct AppearanceSettingsRequest {
+    pub theme_mode: ThemeMode,
+    pub accent_color: String,
+}
+
 #[derive(Serialize)]
 pub struct AppearanceResponse {
     pub background_image_url: Option<String>,
+    pub theme_mode: ThemeMode,
+    pub accent_color: String,
 }
 
 #[derive(Serialize, FromRow)]

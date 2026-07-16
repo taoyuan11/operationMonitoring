@@ -354,6 +354,14 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
         .execute(db)
         .await?;
 
+    for (key, value) in [("theme_mode", "auto"), ("accent_color", "#3bbf9b")] {
+        sqlx::query("INSERT INTO settings(key, value) VALUES($1, $2) ON CONFLICT(key) DO NOTHING;")
+            .bind(key)
+            .bind(value)
+            .execute(db)
+            .await?;
+    }
+
     ensure_bigint_columns(db).await?;
 
     Ok(())

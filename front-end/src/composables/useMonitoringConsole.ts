@@ -1,6 +1,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from '../api/http'
 import { getCountryOption } from '../data/countries'
+import { useAppearance } from './useAppearance'
 import type {
   ActionLog,
   AgentArtifactTarget,
@@ -35,6 +36,7 @@ type TrafficSnapshot = {
 type AgentUpdateOperation = 'creating' | 'saving' | 'uploading' | 'publishing' | 'deleting' | 'retrying' | null
 
 export function useMonitoringConsole() {
+  const appearance = useAppearance()
   const instances = ref<Instance[]>([])
   const pendingInstances = ref<PendingInstance[]>([])
   const commands = ref<CommandRecord[]>([])
@@ -55,11 +57,11 @@ export function useMonitoringConsole() {
   const errorMessage = ref('')
   const viewMode = ref<ViewMode>('grid')
   const adminTab = ref<AdminTab>('pending')
-  const backgroundImageUrl = ref<string | null>(null)
   const currentTime = ref(new Date())
   const backgroundFileName = ref('')
   const backgroundOperation = ref<'uploading' | 'removing' | null>(null)
   const backgroundMessage = ref('')
+  const appearanceMessage = ref('')
   const agentUpdateOperation = ref<AgentUpdateOperation>(null)
   const agentUpdateBusyId = ref('')
   const agentUpdateMessage = ref('')
@@ -85,6 +87,8 @@ export function useMonitoringConsole() {
   const settingsForm = reactive({
     retention_days: 30,
     background_image_url: null as string | null,
+    theme_mode: appearance.themeMode.value,
+    accent_color: appearance.accentColor.value,
   })
 
   const commandForm = reactive({
@@ -132,13 +136,6 @@ export function useMonitoringConsole() {
     instances.value.reduce((sum, item) => sum + (item.metrics?.network_tx || 0), 0),
   )
   const totalTraffic = computed(() => totalNetworkRx.value + totalNetworkTx.value)
-  const appearanceStyle = computed<Record<string, string>>(() => {
-    if (!backgroundImageUrl.value) return {} as Record<string, string>
-    return {
-      '--site-background-image': `url("${backgroundImageUrl.value}")`,
-    }
-  })
-
   onMounted(async () => {
     const initialResults = await Promise.allSettled([loadAppearance(), loadPublic(), checkSession()])
     const publicResult = initialResults[1]
@@ -197,8 +194,8 @@ export function useMonitoringConsole() {
   }
 
   async function loadAppearance() {
-    const appearance = await api<AppearanceResponse>('/api/public/appearance')
-    applyAppearance(appearance.background_image_url)
+    const response = await api<AppearanceResponse>('/api/public/appearance')
+    appearance.applyAppearance(response)
   }
 
   async function checkSession() {
@@ -229,8 +226,10 @@ export function useMonitoringConsole() {
     jobs.value = jobList
     logs.value = logList
     settingsForm.retention_days = settings.retention_days
-    applyAppearance(settings.background_image_url)
+    appearance.applyAppearance(settings)
     settingsForm.background_image_url = settings.background_image_url
+    settingsForm.theme_mode = settings.theme_mode
+    settingsForm.accent_color = settings.accent_color
     applyUsers(users)
   }
 
@@ -424,6 +423,23 @@ export function useMonitoringConsole() {
         body: JSON.stringify({ retention_days: settingsForm.retention_days }),
       })
       await loadAdminData()
+    })
+  }
+
+  function saveAppearance() {
+    appearanceMessage.value = ''
+    return guarded(async () => {
+      const settings = await api<SettingsResponse>('/api/admin/settings/appearance', {
+        method: 'PUT',
+        body: JSON.stringify({
+          theme_mode: settingsForm.theme_mode,
+          accent_color: settingsForm.accent_color,
+        }),
+      })
+      appearance.applyAppearance(settings)
+      settingsForm.theme_mode = settings.theme_mode
+      settingsForm.accent_color = settings.accent_color
+      appearanceMessage.value = '外观设置已保存并应用'
     })
   }
 
@@ -713,7 +729,7 @@ export function useMonitoringConsole() {
         method: 'POST',
         body,
       })
-      applyAppearance(settings.background_image_url)
+      appearance.applyAppearance(settings)
       await loadAdminData()
     })
     input.value = ''
@@ -729,7 +745,7 @@ export function useMonitoringConsole() {
       const settings = await api<SettingsResponse>('/api/admin/settings/background-image', {
         method: 'DELETE',
       })
-      applyAppearance(settings.background_image_url)
+      appearance.applyAppearance(settings)
       await loadAdminData()
     })
     backgroundOperation.value = null
@@ -759,11 +775,6 @@ export function useMonitoringConsole() {
     agentUpdateOperation.value = null
     agentUpdateBusyId.value = ''
     return success
-  }
-
-  function applyAppearance(url: string | null) {
-    backgroundImageUrl.value = url
-    settingsForm.background_image_url = url
   }
 
   function updateNetworkRates(nextInstances: Instance[]) {
@@ -803,10 +814,14 @@ export function useMonitoringConsole() {
     errorMessage,
     viewMode,
     adminTab,
-    backgroundImageUrl,
+    backgroundImageUrl: appearance.backgroundImageUrl,
+    themeMode: appearance.themeMode,
+    resolvedTheme: appearance.resolvedTheme,
+    accentColor: appearance.accentColor,
     backgroundFileName,
     backgroundOperation,
     backgroundMessage,
+    appearanceMessage,
     agentUpdateOperation,
     agentUpdateBusyId,
     agentUpdateMessage,
@@ -827,7 +842,7 @@ export function useMonitoringConsole() {
     totalNetworkTx,
     networkRxRate,
     networkTxRate,
-    appearanceStyle,
+    appearanceStyle: appearance.appearanceStyle,
     refreshAll,
     login,
     restartBootstrap,
@@ -843,6 +858,7 @@ export function useMonitoringConsole() {
     removeCommand,
     runCommand,
     saveSettings,
+    saveAppearance,
     createUserEnrollment,
     createDeviceEnrollment,
     confirmAuthEnrollment,

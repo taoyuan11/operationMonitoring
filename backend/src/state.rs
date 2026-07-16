@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use sqlx::PgPool;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use uuid::Uuid;
 
 use crate::{
@@ -26,6 +26,7 @@ pub struct AppState {
     pub terminal_sessions: Arc<RwLock<HashMap<String, TerminalSessionHandle>>>,
     pub file_requests: Arc<RwLock<HashMap<String, PendingFileRequest>>>,
     pub active_file_transfers: Arc<RwLock<HashMap<String, String>>>,
+    pub desktop_sessions: Arc<RwLock<HashMap<String, DesktopSessionHandle>>>,
 }
 
 impl AppState {
@@ -45,6 +46,7 @@ impl AppState {
             terminal_sessions: Arc::new(RwLock::new(HashMap::new())),
             file_requests: Arc::new(RwLock::new(HashMap::new())),
             active_file_transfers: Arc::new(RwLock::new(HashMap::new())),
+            desktop_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -91,4 +93,18 @@ pub struct PendingFileRequest {
     pub instance_id: String,
     pub agent_connection_id: Uuid,
     pub tx: mpsc::Sender<FileRequestEvent>,
+}
+
+#[derive(Clone)]
+pub struct DesktopSessionHandle {
+    pub instance_id: String,
+    pub actor: String,
+    pub agent_connection_id: Uuid,
+    pub token_hash: [u8; 32],
+    pub token_expires_at: i64,
+    pub token_claimed: bool,
+    pub browser_tx: mpsc::Sender<String>,
+    pub frame_tx: watch::Sender<Option<Arc<Vec<u8>>>>,
+    pub agent_input_rx: Arc<Mutex<Option<mpsc::Receiver<String>>>>,
+    pub close_tx: watch::Sender<Option<String>>,
 }

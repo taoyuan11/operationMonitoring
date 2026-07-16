@@ -116,6 +116,12 @@ export function useMonitoringConsole() {
     instance: null,
   })
 
+  const remoteDesktopState = reactive<{
+    instance: Instance | null
+  }>({
+    instance: null,
+  })
+
   const onlineCount = computed(() => instances.value.filter((item) => item.online).length)
   const avgCpu = computed(() =>
     average(instances.value.filter((item) => item.online).map((item) => item.metrics?.cpu_percent)),
@@ -313,6 +319,8 @@ export function useMonitoringConsole() {
   function logout() {
     guarded(async () => {
       await api('/api/admin/logout', { method: 'POST' })
+      terminalState.instance = null
+      remoteDesktopState.instance = null
       isAdmin.value = false
       currentUser.value = null
       pendingInstances.value = []
@@ -761,6 +769,14 @@ export function useMonitoringConsole() {
     terminalState.instance = null
   }
 
+  function openRemoteDesktop(instance: Instance) {
+    remoteDesktopState.instance = instance
+  }
+
+  function closeRemoteDesktop() {
+    remoteDesktopState.instance = null
+  }
+
   async function runAgentUpdateTask(
     operation: Exclude<AgentUpdateOperation, null>,
     targetId: string,
@@ -834,6 +850,7 @@ export function useMonitoringConsole() {
     editInstance,
     editForm,
     terminalState,
+    remoteDesktopState,
     onlineCount,
     avgCpu,
     avgMemory,
@@ -878,5 +895,7 @@ export function useMonitoringConsole() {
     clearBackgroundImage,
     openTerminal,
     closeTerminal,
+    openRemoteDesktop,
+    closeRemoteDesktop,
   }
 }

@@ -1,0 +1,1257 @@
+use std::{
+    collections::HashSet,
+    ffi::{OsStr, c_void},
+    mem::{size_of, zeroed},
+    os::windows::{ffi::OsStrExt, io::AsRawHandle, process::CommandExt},
+    process::{Child, Command, Stdio},
+    ptr::{null, null_mut},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, anyhow, bail};
+use futures_util::{SinkExt, StreamExt};
+use image::{DynamicImage, ImageBuffer, Rgb, imageops::FilterType};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions},
+    sync::{mpsc, oneshot, watch},
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+};
+use uuid::Uuid;
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, HANDLE, HMODULE, LocalFree},
+        Graphics::{
+            Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0},
+            Direct3D11::{
+                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+                D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+                ID3D11Texture2D,
+            },
+            Dxgi::{
+                Common::{
+                    DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180,
+                    DXGI_MODE_ROTATION_ROTATE270,
+                },
+                CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
+                DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
+                IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+            },
+        },
+        Security::{
+            Authorization::{
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                SDDL_REVISION_1,
+            },
+            DuplicateTokenEx, GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+            SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_QUERY, TOKEN_USER, TokenPrimary,
+            TokenUser,
+        },
+        System::{
+            Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
+            Pipes::GetNamedPipeClientProcessId,
+            RemoteDesktop::{
+                ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive,
+                WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+                WTSQueryUserToken,
+            },
+            StationsAndDesktops::{
+                CloseDesktop, DESKTOP_READOBJECTS, GetUserObjectInformationW, OpenInputDesktop,
+                UOI_NAME,
+            },
+            Threading::{
+                CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+                GetCurrentProcess, GetCurrentProcessId, OpenProcessToken, PROCESS_INFORMATION,
+                STARTUPINFOW, TerminateProcess,
+            },
+        },
+        UI::Input::KeyboardAndMouse::{
+            INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+            KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
+            VIRTUAL_KEY,
+        },
+    },
+    core::{ComInterface, PCWSTR, PWSTR},
+};
+
+use super::{
+    AdaptiveSettings, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl, DesktopOpenRequest,
+    DesktopOptions, FrameHeader, MAX_CONTROL_BYTES, MAX_FRAME_BYTES, absolute_pointer_coordinate,
+    dom_code_to_vk, dom_code_uses_extended_key, scaled_dimensions,
+};
+use crate::{config::AgentConfig, models::AgentInbound};
+
+const CREATE_NO_WINDOW_FLAG: u32 = 0x08000000;
+const PIPE_FRAME: u8 = 1;
+const PIPE_CONTROL: u8 = 2;
+const PIPE_INTERNAL: u8 = 3;
+const INTERNAL_STOP: &[u8] = b"stop";
+const INTERNAL_STOPPED: &[u8] = b"stopped";
+const INTERNAL_FATAL_PREFIX: &[u8] = b"fatal:";
+const PIPE_MAX_PACKET: usize = MAX_FRAME_BYTES + 1024;
+const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub async fn run_session(
+    config: AgentConfig,
+    request: DesktopOpenRequest,
+    outbound: mpsc::UnboundedSender<AgentInbound>,
+    close: oneshot::Receiver<String>,
+) -> Result<String> {
+    let established = tokio::time::timeout(
+        DATA_CHANNEL_JOIN_TIMEOUT,
+        establish_session(&config, &request),
+    )
+    .await
+    .map_err(|_| anyhow!("data_channel_timeout"))??;
+    let (socket, pipe, mut child) = established;
+    let _ = outbound.send(AgentInbound::DesktopOpened {
+        session_id: request.session_id.clone(),
+    });
+
+    let result = relay(socket, pipe, close).await;
+    child.terminate();
+    result
+}
+
+async fn establish_session(
+    config: &AgentConfig,
+    request: &DesktopOpenRequest,
+) -> Result<(
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio::net::windows::named_pipe::NamedPipeServer,
+    HelperProcess,
+)> {
+    let (target, user_sid) = helper_target()?;
+    let pipe_name = format!(r"\\.\pipe\omrd-{}", Uuid::new_v4());
+    let pipe = create_private_pipe(&pipe_name, &user_sid)?;
+
+    let min_fps = request.min_fps.clamp(1, 12);
+    let options = DesktopOptions {
+        pipe: pipe_name,
+        max_width: request.max_width.clamp(320, 1920),
+        max_height: request.max_height.clamp(240, 1080),
+        min_fps,
+        max_fps: request.max_fps.clamp(min_fps, 12),
+        jpeg_quality: request.jpeg_quality.clamp(50, 75),
+    };
+    let mut child = spawn_helper(&options, target)?;
+
+    let mut ws_request = desktop_websocket_url(&config.server, &request.session_id)
+        .into_client_request()
+        .context("invalid desktop websocket URL")?;
+    ws_request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {}", request.stream_token))
+            .context("invalid desktop stream token")?,
+    );
+    let connected = tokio::try_join!(
+        async {
+            connect_async(ws_request)
+                .await
+                .context("failed to connect desktop data websocket")
+        },
+        async {
+            pipe.connect()
+                .await
+                .context("desktop helper did not connect to private pipe")
+        }
+    );
+    let ((socket, _), ()) = match connected {
+        Ok(value) => value,
+        Err(error) => {
+            child.terminate();
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = validate_pipe_client(&pipe, child.pid(), target.session_id()) {
+        child.terminate();
+        return Err(error);
+    }
+    Ok((socket, pipe, child))
+}
+
+fn create_private_pipe(
+    name: &str,
+    user_sid: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    unsafe {
+        // The protected DACL grants access only to LocalSystem and the selected session user.
+        let sddl = wide(format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})"));
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )?;
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: false.into(),
+        };
+        let pipe = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(
+                name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast(),
+            )
+            .context("failed to create private desktop helper pipe");
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(descriptor.0));
+        pipe
+    }
+}
+
+fn validate_pipe_client(
+    pipe: &tokio::net::windows::named_pipe::NamedPipeServer,
+    expected_pid: u32,
+    expected_session_id: u32,
+) -> Result<()> {
+    unsafe {
+        let handle = HANDLE(pipe.as_raw_handle() as isize);
+        let mut client_pid = 0_u32;
+        GetNamedPipeClientProcessId(handle, &mut client_pid)
+            .context("failed to identify desktop helper pipe client")?;
+        if client_pid != expected_pid {
+            bail!("desktop helper pipe was claimed by an unexpected process")
+        }
+        let mut client_session_id = 0_u32;
+        ProcessIdToSessionId(client_pid, &mut client_session_id)
+            .context("failed to identify desktop helper client session")?;
+        if client_session_id != expected_session_id {
+            bail!("desktop helper connected from an unexpected Windows session")
+        }
+        Ok(())
+    }
+}
+
+async fn relay(
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+    mut close: oneshot::Receiver<String>,
+) -> Result<String> {
+    let (mut ws_write, mut ws_read) = socket.split();
+    let (pipe_read, mut pipe_write) = tokio::io::split(pipe);
+    let (frame_tx, mut frame_rx) = watch::channel::<Option<Vec<u8>>>(None);
+    let (status_tx, mut status_rx) = mpsc::channel::<String>(32);
+    let (ack_tx, mut ack_rx) = mpsc::channel::<()>(1);
+    let (fatal_tx, mut fatal_rx) = mpsc::channel::<String>(1);
+    let reader = tokio::spawn(pipe_reader(
+        pipe_read, frame_tx, status_tx, ack_tx, fatal_tx,
+    ));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_browser_message = tokio::time::Instant::now();
+
+    let result: Result<String> = async {
+        let reason = loop {
+            tokio::select! {
+            biased;
+            fatal = fatal_rx.recv() => {
+                let Some(fatal) = fatal else { break "helper_disconnected".to_string() };
+                return Err(anyhow!("desktop helper fatal: {fatal}"));
+            }
+            reason = &mut close => {
+                break reason.unwrap_or_else(|_| "agent_disconnected".to_string());
+            }
+            changed = frame_rx.changed() => {
+                if changed.is_err() { break "helper_disconnected".to_string() }
+                let Some(frame) = frame_rx.borrow_and_update().clone() else { continue };
+                validate_frame(&frame)?;
+                tokio::time::timeout(
+                    SOCKET_SEND_TIMEOUT,
+                    ws_write.send(Message::Binary(frame.into())),
+                )
+                .await
+                .context("desktop data websocket frame send timed out")??;
+            }
+            status = status_rx.recv() => {
+                let Some(status) = status else { break "helper_disconnected".to_string() };
+                tokio::time::timeout(
+                    SOCKET_SEND_TIMEOUT,
+                    ws_write.send(Message::Text(status.into())),
+                )
+                .await
+                .context("desktop data websocket status send timed out")??;
+            }
+            incoming = ws_read.next() => {
+                let Some(incoming) = incoming else { break "browser_disconnected".to_string() };
+                last_browser_message = tokio::time::Instant::now();
+                match incoming? {
+                    Message::Text(text) => {
+                        if text.len() > MAX_CONTROL_BYTES { bail!("desktop control message too large") }
+                        serde_json::from_str::<DesktopControl>(&text)
+                            .context("invalid desktop control message")?;
+                        write_packet(&mut pipe_write, PIPE_CONTROL, text.as_bytes()).await?;
+                    }
+                    Message::Ping(value) => {
+                        tokio::time::timeout(
+                            SOCKET_SEND_TIMEOUT,
+                            ws_write.send(Message::Pong(value)),
+                        )
+                        .await
+                        .context("desktop data websocket pong send timed out")??;
+                    }
+                    Message::Pong(_) => {}
+                    Message::Close(_) => break "browser_closed".to_string(),
+                    Message::Binary(_) => bail!("unexpected browser desktop binary message"),
+                    _ => {}
+                }
+            }
+            _ = heartbeat.tick() => {
+                if last_browser_message.elapsed() >= Duration::from_secs(30) {
+                    break "browser_heartbeat_timeout".to_string();
+                }
+                tokio::time::timeout(
+                    SOCKET_SEND_TIMEOUT,
+                    ws_write.send(Message::Ping(Vec::new().into())),
+                )
+                .await
+                .context("desktop data websocket ping send timed out")??;
+            }
+            }
+        };
+        Ok(reason)
+    }
+    .await;
+
+    // Keep the reader alive while the helper drains input state. This prevents a queued JPEG
+    // packet from filling the pipe and blocking the helper before it can receive the stop packet.
+    if write_packet(&mut pipe_write, PIPE_INTERNAL, INTERNAL_STOP)
+        .await
+        .is_ok()
+    {
+        match tokio::time::timeout(Duration::from_secs(2), ack_rx.recv()).await {
+            Ok(_) => {}
+            Err(_) => {
+                // SendInput cannot release keys on Winlogon/UAC desktops. Keep this session's
+                // ActivityGuard and helper alive until Default returns and the release ACK is
+                // received, so an update cannot race a helper that still owns pressed input.
+                crate::logging::info(format_args!(
+                    "desktop helper input release is pending until the default desktop returns"
+                ));
+                let _ = ack_rx.recv().await;
+            }
+        }
+    }
+    reader.abort();
+    result
+}
+
+async fn pipe_reader<R: AsyncRead + Unpin>(
+    mut reader: R,
+    frame_tx: watch::Sender<Option<Vec<u8>>>,
+    status_tx: mpsc::Sender<String>,
+    ack_tx: mpsc::Sender<()>,
+    fatal_tx: mpsc::Sender<String>,
+) -> Result<()> {
+    loop {
+        let (kind, value) = read_packet(&mut reader).await?;
+        match kind {
+            PIPE_FRAME => {
+                frame_tx.send_replace(Some(value));
+            }
+            PIPE_CONTROL => {
+                let text = String::from_utf8(value).context("helper sent non-UTF8 control")?;
+                status_tx.send(text).await?;
+            }
+            PIPE_INTERNAL if value == INTERNAL_STOPPED => {
+                let _ = ack_tx.try_send(());
+            }
+            PIPE_INTERNAL if value.starts_with(INTERNAL_FATAL_PREFIX) => {
+                let reason = String::from_utf8(value[INTERNAL_FATAL_PREFIX.len()..].to_vec())
+                    .context("helper sent non-UTF8 fatal reason")?;
+                let _ = fatal_tx.try_send(reason);
+            }
+            _ => bail!("unknown desktop helper packet type"),
+        }
+    }
+}
+
+pub async fn run_helper(options: DesktopOptions) -> Result<()> {
+    let pipe = tokio::time::timeout(DATA_CHANNEL_JOIN_TIMEOUT, connect_pipe(&options.pipe))
+        .await
+        .map_err(|_| anyhow!("desktop helper pipe connection timeout"))??;
+    let (mut read, mut write) = tokio::io::split(pipe);
+    let (capture_tx, mut capture_rx) = mpsc::channel::<HelperEvent>(1);
+    let settings = Arc::new(Mutex::new(AdaptiveSettings::initial(
+        options.min_fps,
+        options.max_fps,
+        options.jpeg_quality,
+    )));
+    let capture_settings = settings.clone();
+    let capture_options = options.clone();
+    std::thread::Builder::new()
+        .name("om-desktop-capture".to_string())
+        .spawn(move || capture_loop(capture_options, capture_settings, capture_tx))?;
+
+    let mut input = InputState::default();
+    let mut input_desktop_available = default_input_desktop();
+    let mut pending_release = false;
+    let mut stopping = false;
+    let mut desktop_check = tokio::time::interval(Duration::from_millis(100));
+    desktop_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let ready = serde_json::json!({"type":"ready"}).to_string();
+    write_packet(&mut write, PIPE_CONTROL, ready.as_bytes()).await?;
+    loop {
+        tokio::select! {
+            _ = desktop_check.tick() => {
+                let available = default_input_desktop();
+                if input_desktop_available && !available {
+                    pending_release = !input.release_all();
+                }
+                input_desktop_available = available;
+                if available && pending_release {
+                    pending_release = !input.release_all();
+                }
+                if stopping && !pending_release {
+                    write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
+                    break;
+                }
+            }
+            event = capture_rx.recv() => {
+                let Some(event) = event else { break };
+                match event {
+                    HelperEvent::Frame(frame) if !stopping => write_packet(&mut write, PIPE_FRAME, &frame).await?,
+                    HelperEvent::Status(status) if !stopping => write_packet(&mut write, PIPE_CONTROL, status.as_bytes()).await?,
+                    HelperEvent::Fatal(reason) => {
+                        let mut fatal = INTERNAL_FATAL_PREFIX.to_vec();
+                        fatal.extend_from_slice(reason.as_bytes());
+                        write_packet(&mut write, PIPE_INTERNAL, &fatal).await?;
+                        stopping = true;
+                        pending_release = !input.release_all();
+                        if !pending_release {
+                            write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            packet = read_packet(&mut read) => {
+                let (kind, value) = packet?;
+                if kind == PIPE_INTERNAL && value == INTERNAL_STOP {
+                    stopping = true;
+                    pending_release = !input.release_all();
+                    if !pending_release {
+                        write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
+                        break;
+                    }
+                    continue;
+                }
+                if kind != PIPE_CONTROL { bail!("unexpected service packet type") }
+                let control: DesktopControl = serde_json::from_slice(&value)?;
+                match control {
+                    DesktopControl::Feedback { sequence, fps, decode_ms } if !stopping => {
+                        settings.lock().unwrap().update(
+                            options.min_fps,
+                            options.max_fps,
+                            sequence,
+                            fps,
+                            decode_ms,
+                        );
+                    }
+                    DesktopControl::ReleaseAll => {
+                        pending_release = !input.release_all();
+                    }
+                    control if !stopping => {
+                        let available = default_input_desktop();
+                        if input_desktop_available && !available {
+                            pending_release = !input.release_all();
+                        }
+                        input_desktop_available = available;
+                        if available && pending_release {
+                            pending_release = !input.release_all();
+                        }
+                        if available && !pending_release {
+                            let releasing = matches!(
+                                &control,
+                                DesktopControl::Key { down: false, .. }
+                                    | DesktopControl::PointerButton { down: false, .. }
+                            );
+                            if let Err(error) = input.apply(control) {
+                                crate::logging::error(format_args!(
+                                    "remote desktop input injection failed: {error:#}"
+                                ));
+                                if releasing {
+                                    pending_release = true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let _ = input.release_all();
+    Ok(())
+}
+
+async fn connect_pipe(name: &str) -> Result<NamedPipeClient> {
+    loop {
+        match ClientOptions::new().open(name) {
+            Ok(pipe) => return Ok(pipe),
+            Err(error) if error.raw_os_error() == Some(2) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => return Err(error).context("failed to open desktop helper pipe"),
+        }
+    }
+}
+
+enum HelperEvent {
+    Frame(Vec<u8>),
+    Status(String),
+    Fatal(String),
+}
+
+fn capture_loop(
+    options: DesktopOptions,
+    settings: Arc<Mutex<AdaptiveSettings>>,
+    tx: mpsc::Sender<HelperEvent>,
+) {
+    let mut capture: Option<DxgiCapture> = None;
+    let mut sequence = 0_u64;
+    let mut was_paused = false;
+    let mut next_capture = Instant::now();
+    loop {
+        let now = Instant::now();
+        if now < next_capture {
+            std::thread::sleep(next_capture - now);
+        }
+        let adaptive = *settings.lock().unwrap();
+        next_capture =
+            Instant::now() + Duration::from_millis(1000 / u64::from(adaptive.fps.max(1)));
+        if !default_input_desktop() {
+            if !was_paused {
+                let _ = tx.blocking_send(HelperEvent::Status(
+                    serde_json::json!({"type":"paused","reason":"secure_desktop"}).to_string(),
+                ));
+                was_paused = true;
+            }
+            capture = None;
+            continue;
+        }
+        if was_paused {
+            let _ = tx.blocking_send(HelperEvent::Status(
+                serde_json::json!({"type":"ready"}).to_string(),
+            ));
+            was_paused = false;
+        }
+        if capture.is_none() {
+            match DxgiCapture::new() {
+                Ok(value) => capture = Some(value),
+                Err(error) => {
+                    let _ = tx.blocking_send(HelperEvent::Fatal(format!(
+                        "failed to initialize DXGI desktop duplication: {error:#}"
+                    )));
+                    return;
+                }
+            }
+        }
+        let result = capture.as_mut().unwrap().capture_jpeg(
+            options.max_width,
+            options.max_height,
+            adaptive.jpeg_quality,
+        );
+        match result {
+            Ok(Some((jpeg, width, height))) => {
+                sequence += 1;
+                let mut frame = Vec::with_capacity(32 + jpeg.len());
+                frame.extend_from_slice(
+                    &FrameHeader {
+                        sequence,
+                        captured_at_ms: now_ms(),
+                        width,
+                        height,
+                    }
+                    .encode(),
+                );
+                frame.extend_from_slice(&jpeg);
+                if frame.len() <= MAX_FRAME_BYTES {
+                    let _ = tx.try_send(HelperEvent::Frame(frame));
+                }
+            }
+            Ok(None) => {}
+            Err(error) if error.to_string().contains("DXGI_ERROR_ACCESS_LOST") => capture = None,
+            Err(error) if error.to_string().contains("frame_too_large") => {
+                let _ = tx.blocking_send(HelperEvent::Fatal("frame_too_large".to_string()));
+                return;
+            }
+            Err(error) => {
+                crate::logging::error(format_args!("desktop capture failed: {error:#}"));
+                capture = None;
+            }
+        }
+    }
+}
+
+struct DxgiCapture {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    duplication: IDXGIOutputDuplication,
+    rotation: DXGI_MODE_ROTATION,
+}
+
+unsafe fn primary_output() -> Result<(
+    IDXGIAdapter1,
+    windows::Win32::Graphics::Dxgi::IDXGIOutput,
+    DXGI_MODE_ROTATION,
+)> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+    let mut adapter_index = 0_u32;
+    loop {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(adapter_index) }) else {
+            break;
+        };
+        let mut output_index = 0_u32;
+        loop {
+            let Ok(output) = (unsafe { adapter.EnumOutputs(output_index) }) else {
+                break;
+            };
+            let mut description = DXGI_OUTPUT_DESC::default();
+            unsafe { output.GetDesc(&mut description)? };
+            let bounds = description.DesktopCoordinates;
+            if description.AttachedToDesktop.as_bool()
+                && bounds.left <= 0
+                && bounds.top <= 0
+                && bounds.right > 0
+                && bounds.bottom > 0
+            {
+                return Ok((adapter, output, description.Rotation));
+            }
+            output_index += 1;
+        }
+        adapter_index += 1;
+    }
+    bail!("no_active_session: no primary desktop output is attached")
+}
+
+impl DxgiCapture {
+    fn new() -> Result<Self> {
+        unsafe {
+            let (adapter, output, rotation) = primary_output()?;
+            let output1: IDXGIOutput1 = output.cast()?;
+            let mut device = None;
+            let mut context = None;
+            D3D11CreateDevice(
+                &adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE(0),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )?;
+            let device = device.context("D3D11 did not return a device")?;
+            let context = context.context("D3D11 did not return an immediate context")?;
+            let duplication = output1.DuplicateOutput(&device)?;
+            Ok(Self {
+                device,
+                context,
+                duplication,
+                rotation,
+            })
+        }
+    }
+
+    fn capture_jpeg(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+        mut quality: u8,
+    ) -> Result<Option<(Vec<u8>, u32, u32)>> {
+        unsafe {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+            if let Err(error) = self
+                .duplication
+                .AcquireNextFrame(0, &mut info, &mut resource)
+            {
+                if error.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                    return Ok(None);
+                }
+                if error.code() == DXGI_ERROR_ACCESS_LOST {
+                    bail!("DXGI_ERROR_ACCESS_LOST")
+                }
+                return Err(error.into());
+            }
+            let captured = (|| -> Result<_> {
+                if info.AccumulatedFrames == 0 {
+                    return Ok(None);
+                }
+                let texture: ID3D11Texture2D = resource.context("missing DXGI frame")?.cast()?;
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                texture.GetDesc(&mut desc);
+                let staging_desc = D3D11_TEXTURE2D_DESC {
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                    ..desc
+                };
+                let mut staging = None;
+                self.device
+                    .CreateTexture2D(&staging_desc, None, Some(&mut staging))?;
+                let staging = staging.context("D3D11 did not create staging texture")?;
+                self.context.CopyResource(&staging, &texture);
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                self.context
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+                let rgb = copy_bgra_to_rgb(
+                    mapped.pData.cast(),
+                    mapped.RowPitch,
+                    desc.Width,
+                    desc.Height,
+                );
+                self.context.Unmap(&staging, 0);
+                let source = ImageBuffer::<Rgb<u8>, _>::from_raw(desc.Width, desc.Height, rgb)
+                    .context("invalid desktop image buffer")?;
+                let source = DynamicImage::ImageRgb8(source);
+                let source = if self.rotation == DXGI_MODE_ROTATION_ROTATE90 {
+                    source.rotate90()
+                } else if self.rotation == DXGI_MODE_ROTATION_ROTATE180 {
+                    source.rotate180()
+                } else if self.rotation == DXGI_MODE_ROTATION_ROTATE270 {
+                    source.rotate270()
+                } else {
+                    source
+                };
+                let source_width = source.width();
+                let source_height = source.height();
+                let (width, height) =
+                    scaled_dimensions(source_width, source_height, max_width, max_height);
+                let image = if width != source_width || height != source_height {
+                    source.resize_exact(width, height, FilterType::Triangle)
+                } else {
+                    source
+                };
+                loop {
+                    let mut jpeg = Vec::new();
+                    image.write_with_encoder(
+                        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality),
+                    )?;
+                    if jpeg.len() + 32 <= MAX_FRAME_BYTES || quality <= 50 {
+                        if jpeg.len() + 32 > MAX_FRAME_BYTES {
+                            bail!("frame_too_large")
+                        }
+                        return Ok(Some((jpeg, width, height)));
+                    }
+                    quality = quality.saturating_sub(5).max(50);
+                }
+            })();
+            let _ = self.duplication.ReleaseFrame();
+            captured
+        }
+    }
+}
+
+unsafe fn copy_bgra_to_rgb(data: *const u8, pitch: u32, width: u32, height: u32) -> Vec<u8> {
+    let mut rgb = vec![0_u8; (width * height * 3) as usize];
+    for y in 0..height as usize {
+        let row =
+            unsafe { std::slice::from_raw_parts(data.add(y * pitch as usize), width as usize * 4) };
+        for x in 0..width as usize {
+            let source = x * 4;
+            let target = (y * width as usize + x) * 3;
+            rgb[target] = row[source + 2];
+            rgb[target + 1] = row[source + 1];
+            rgb[target + 2] = row[source];
+        }
+    }
+    rgb
+}
+
+#[derive(Default)]
+struct InputState {
+    keys: HashSet<(u16, bool)>,
+    buttons: HashSet<u8>,
+}
+
+impl InputState {
+    fn apply(&mut self, control: DesktopControl) -> Result<()> {
+        match control {
+            DesktopControl::PointerMove { x, y } => send_pointer_move(x, y),
+            DesktopControl::PointerButton { x, y, button, down } => {
+                send_pointer_move(x, y)?;
+                send_pointer_button(button, down)?;
+                if down {
+                    self.buttons.insert(button);
+                } else {
+                    self.buttons.remove(&button);
+                }
+                Ok(())
+            }
+            DesktopControl::Wheel {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => {
+                send_pointer_move(x, y)?;
+                send_wheel(delta_x, delta_y)
+            }
+            DesktopControl::Key { code, down, .. } => {
+                let Some(vk) = dom_code_to_vk(&code) else {
+                    return Ok(());
+                };
+                let extended = dom_code_uses_extended_key(&code);
+                send_key(vk, down, extended)?;
+                if down {
+                    self.keys.insert((vk, extended));
+                } else {
+                    self.keys.remove(&(vk, extended));
+                }
+                Ok(())
+            }
+            DesktopControl::ReleaseAll => {
+                if !self.release_all() {
+                    bail!("one or more remote desktop inputs are still pending release")
+                }
+                Ok(())
+            }
+            DesktopControl::Feedback { .. } => Ok(()),
+        }
+    }
+
+    fn release_all(&mut self) -> bool {
+        for key in self.keys.clone() {
+            if send_key(key.0, false, key.1).is_ok() {
+                self.keys.remove(&key);
+            }
+        }
+        for button in self.buttons.clone() {
+            if send_pointer_button(button, false).is_ok() {
+                self.buttons.remove(&button);
+            }
+        }
+        self.keys.is_empty() && self.buttons.is_empty()
+    }
+}
+
+impl Drop for InputState {
+    fn drop(&mut self) {
+        let _ = self.release_all();
+    }
+}
+
+fn send_pointer_move(x: f64, y: f64) -> Result<()> {
+    let x = absolute_pointer_coordinate(x);
+    let y = absolute_pointer_coordinate(y);
+    send_mouse(x, y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)
+}
+
+fn send_pointer_button(button: u8, down: bool) -> Result<()> {
+    let flags = match (button, down) {
+        (0, true) => MOUSEEVENTF_LEFTDOWN,
+        (0, false) => MOUSEEVENTF_LEFTUP,
+        (1, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (1, false) => MOUSEEVENTF_MIDDLEUP,
+        (2, true) => MOUSEEVENTF_RIGHTDOWN,
+        (2, false) => MOUSEEVENTF_RIGHTUP,
+        _ => return Ok(()),
+    };
+    send_mouse(0, 0, 0, flags)
+}
+
+fn send_wheel(delta_x: i32, delta_y: i32) -> Result<()> {
+    if delta_y != 0 {
+        send_mouse(0, 0, delta_y.saturating_neg() as u32, MOUSEEVENTF_WHEEL)?;
+    }
+    if delta_x != 0 {
+        send_mouse(0, 0, delta_x as u32, MOUSEEVENTF_HWHEEL)?;
+    }
+    Ok(())
+}
+
+fn send_mouse(
+    dx: i32,
+    dy: i32,
+    data: u32,
+    flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+) -> Result<()> {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: data,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    if unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } != 1 {
+        bail!("SendInput mouse failed")
+    }
+    Ok(())
+}
+
+fn send_key(vk: u16, down: bool, extended: bool) -> Result<()> {
+    let mut flags = if down {
+        Default::default()
+    } else {
+        KEYEVENTF_KEYUP
+    };
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    if unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } != 1 {
+        bail!("SendInput keyboard failed")
+    }
+    Ok(())
+}
+
+fn default_input_desktop() -> bool {
+    unsafe {
+        let Ok(desktop) = OpenInputDesktop(Default::default(), false, DESKTOP_READOBJECTS) else {
+            return false;
+        };
+        let desktop_handle = HANDLE(desktop.0);
+        let mut needed = 0_u32;
+        let _ = GetUserObjectInformationW(desktop_handle, UOI_NAME, None, 0, Some(&mut needed));
+        let mut value = vec![0_u16; (needed as usize / 2).max(1)];
+        let result = GetUserObjectInformationW(
+            desktop_handle,
+            UOI_NAME,
+            Some(value.as_mut_ptr().cast()),
+            needed,
+            Some(&mut needed),
+        )
+        .is_ok();
+        let _ = CloseDesktop(desktop);
+        if !result {
+            return false;
+        }
+        let len = value.iter().position(|v| *v == 0).unwrap_or(value.len());
+        String::from_utf16_lossy(&value[..len]).eq_ignore_ascii_case("Default")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HelperTarget {
+    Current { session_id: u32 },
+    ServiceSession { session_id: u32 },
+}
+
+impl HelperTarget {
+    fn session_id(self) -> u32 {
+        match self {
+            Self::Current { session_id } | Self::ServiceSession { session_id } => session_id,
+        }
+    }
+}
+
+enum HelperProcess {
+    Child(Child),
+    Handle { handle: HANDLE, pid: u32 },
+}
+
+unsafe impl Send for HelperProcess {}
+
+impl HelperProcess {
+    fn terminate(&mut self) {
+        match self {
+            Self::Child(child) => {
+                let _ = child.kill();
+            }
+            Self::Handle { handle, .. } if !handle.is_invalid() => unsafe {
+                let _ = TerminateProcess(*handle, 1);
+            },
+            Self::Handle { .. } => {}
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        match self {
+            Self::Child(child) => child.id(),
+            Self::Handle { pid, .. } => *pid,
+        }
+    }
+}
+
+impl Drop for HelperProcess {
+    fn drop(&mut self) {
+        self.terminate();
+        if let Self::Handle { handle, .. } = self {
+            if !handle.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(*handle);
+                }
+            }
+        }
+    }
+}
+
+fn spawn_helper(options: &DesktopOptions, target: HelperTarget) -> Result<HelperProcess> {
+    match target {
+        HelperTarget::ServiceSession { session_id } => {
+            spawn_helper_in_active_session(options, session_id)
+        }
+        HelperTarget::Current { .. } => {
+            let mut command = Command::new(std::env::current_exe()?);
+            append_helper_args(&mut command, options);
+            command
+                .creation_flags(CREATE_NO_WINDOW_FLAG)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("failed to launch desktop helper")
+                .map(HelperProcess::Child)
+        }
+    }
+}
+
+fn append_helper_args(command: &mut Command, options: &DesktopOptions) {
+    command
+        .arg("desktop-helper")
+        .arg("--pipe")
+        .arg(&options.pipe)
+        .arg("--max-width")
+        .arg(options.max_width.to_string())
+        .arg("--max-height")
+        .arg(options.max_height.to_string())
+        .arg("--min-fps")
+        .arg(options.min_fps.to_string())
+        .arg("--max-fps")
+        .arg(options.max_fps.to_string())
+        .arg("--jpeg-quality")
+        .arg(options.jpeg_quality.to_string());
+}
+
+fn current_session_id() -> Result<u32> {
+    let mut id = 0_u32;
+    unsafe {
+        ProcessIdToSessionId(GetCurrentProcessId(), &mut id)?;
+    }
+    Ok(id)
+}
+
+fn helper_target() -> Result<(HelperTarget, String)> {
+    let current_session_id = current_session_id()?;
+    if current_session_id == 0 {
+        let session_id = select_active_session()?;
+        let mut token = HANDLE::default();
+        unsafe { WTSQueryUserToken(session_id, &mut token)? };
+        let sid = token_user_sid(token);
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        Ok((HelperTarget::ServiceSession { session_id }, sid?))
+    } else {
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)? };
+        let sid = token_user_sid(token);
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        Ok((
+            HelperTarget::Current {
+                session_id: current_session_id,
+            },
+            sid?,
+        ))
+    }
+}
+
+fn token_user_sid(token: HANDLE) -> Result<String> {
+    unsafe {
+        let mut needed = 0_u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed < size_of::<TOKEN_USER>() as u32 {
+            bail!("Windows user token did not contain a SID")
+        }
+        let words = (needed as usize).div_ceil(size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )?;
+        let token_user = &*(buffer.as_ptr().cast::<TOKEN_USER>());
+        let mut string_sid = PWSTR::null();
+        ConvertSidToStringSidW(token_user.User.Sid, &mut string_sid)?;
+        let sid = string_sid
+            .to_string()
+            .context("Windows user SID was not UTF-16")?;
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(string_sid.0.cast()));
+        Ok(sid)
+    }
+}
+
+fn select_active_session() -> Result<u32> {
+    unsafe {
+        let console = WTSGetActiveConsoleSessionId();
+        let mut sessions: *mut WTS_SESSION_INFOW = null_mut();
+        let mut count = 0_u32;
+        WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sessions, &mut count)?;
+        let entries = std::slice::from_raw_parts(sessions, count as usize);
+        let active: Vec<u32> = entries
+            .iter()
+            .filter(|v| v.State == WTSActive)
+            .map(|v| v.SessionId)
+            .collect();
+        WTSFreeMemory(sessions.cast());
+        if active.contains(&console) {
+            return Ok(console);
+        }
+        match active.as_slice() {
+            [] => bail!("no_active_session"),
+            [only] => Ok(*only),
+            _ => bail!("multiple_active_sessions"),
+        }
+    }
+}
+
+fn spawn_helper_in_active_session(
+    options: &DesktopOptions,
+    session_id: u32,
+) -> Result<HelperProcess> {
+    unsafe {
+        let mut user_token = HANDLE::default();
+        WTSQueryUserToken(session_id, &mut user_token)?;
+        let mut primary_token = HANDLE::default();
+        let duplicate = DuplicateTokenEx(
+            user_token,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary_token,
+        );
+        let _ = CloseHandle(user_token);
+        duplicate?;
+
+        let executable = std::env::current_exe()?;
+        let mut command = Command::new(&executable);
+        append_helper_args(&mut command, options);
+        let mut command_line = wide(&format!(
+            "\"{}\" {}",
+            executable.display(),
+            command
+                .get_args()
+                .map(|v| quote_arg(v))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        let application = wide(executable.as_os_str());
+        let desktop = wide("winsta0\\default");
+        let mut environment: *mut c_void = null_mut();
+        CreateEnvironmentBlock(&mut environment, primary_token, false)?;
+        let startup = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop.as_ptr() as *mut _),
+            ..zeroed()
+        };
+        let mut process: PROCESS_INFORMATION = zeroed();
+        let created = CreateProcessAsUserW(
+            primary_token,
+            PCWSTR(application.as_ptr()),
+            PWSTR(command_line.as_mut_ptr()),
+            None,
+            None,
+            false,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            Some(environment),
+            PCWSTR(null()),
+            &startup,
+            &mut process,
+        );
+        let _ = DestroyEnvironmentBlock(environment);
+        let _ = CloseHandle(primary_token);
+        created?;
+        let _ = CloseHandle(process.hThread);
+        Ok(HelperProcess::Handle {
+            handle: process.hProcess,
+            pid: process.dwProcessId,
+        })
+    }
+}
+
+fn quote_arg(value: &OsStr) -> String {
+    format!("\"{}\"", value.to_string_lossy().replace('"', "\\\""))
+}
+fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
+    value.as_ref().encode_wide().chain(Some(0)).collect()
+}
+
+fn desktop_websocket_url(server: &str, session_id: &str) -> String {
+    let trimmed = server.trim_end_matches('/');
+    let base = if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        format!("ws://{trimmed}")
+    };
+    format!("{base}/api/agent/desktop/ws?session_id={session_id}")
+}
+
+fn validate_frame(frame: &[u8]) -> Result<()> {
+    if frame.len() > MAX_FRAME_BYTES {
+        bail!("frame_too_large")
+    }
+    let header = FrameHeader::decode(frame)?;
+    if header.width == 0 || header.height == 0 || header.width > 1920 || header.height > 1080 {
+        bail!("invalid desktop frame dimensions")
+    }
+    Ok(())
+}
+
+async fn write_packet<W: AsyncWrite + Unpin>(writer: &mut W, kind: u8, value: &[u8]) -> Result<()> {
+    if value.len() > PIPE_MAX_PACKET {
+        bail!("desktop helper packet too large")
+    }
+    writer.write_u32((value.len() + 1) as u32).await?;
+    writer.write_u8(kind).await?;
+    writer.write_all(value).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(u8, Vec<u8>)> {
+    let length = reader.read_u32().await? as usize;
+    if length == 0 || length > PIPE_MAX_PACKET + 1 {
+        bail!("invalid desktop helper packet length")
+    }
+    let kind = reader.read_u8().await?;
+    let mut value = vec![0_u8; length - 1];
+    reader.read_exact(&mut value).await?;
+    Ok((kind, value))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}

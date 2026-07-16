@@ -271,6 +271,11 @@ pub struct AgentWsQuery {
 }
 
 #[derive(Deserialize)]
+pub struct DesktopAgentWsQuery {
+    pub session_id: String,
+}
+
+#[derive(Deserialize)]
 pub struct CreateAgentReleaseRequest {
     pub version: String,
     #[serde(default)]
@@ -506,6 +511,19 @@ pub enum AgentOutbound {
     TerminalClose {
         session_id: String,
     },
+    DesktopOpen {
+        session_id: String,
+        stream_token: String,
+        max_width: u32,
+        max_height: u32,
+        min_fps: u8,
+        max_fps: u8,
+        jpeg_quality: u8,
+    },
+    DesktopClose {
+        session_id: String,
+        reason: String,
+    },
     FileRequest {
         request_id: String,
         request: FileRequest,
@@ -569,6 +587,13 @@ pub enum AgentInbound {
         session_id: String,
         exit_code: Option<i64>,
         reason: Option<String>,
+    },
+    DesktopOpened {
+        session_id: String,
+    },
+    DesktopClosed {
+        session_id: String,
+        reason: String,
     },
     FileResponse {
         request_id: String,

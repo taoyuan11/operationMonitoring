@@ -10,6 +10,7 @@ mod logging;
 mod metrics;
 mod models;
 mod profile;
+mod remote_desktop;
 mod terminal;
 mod time;
 mod update;
@@ -69,6 +70,21 @@ fn run() -> Result<()> {
             )?;
             update::apply_update(&plan_file)
         }
+        AgentCommand::DesktopHelper {
+            pipe,
+            max_width,
+            max_height,
+            min_fps,
+            max_fps,
+            jpeg_quality,
+        } => remote_desktop::run_helper(remote_desktop::DesktopOptions {
+            pipe,
+            max_width,
+            max_height,
+            min_fps,
+            max_fps,
+            jpeg_quality,
+        }),
     }
 }
 

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+output=
+inputs=()
+for argument in "$@"; do
+  case "$argument" in
+    -out:*) output=${argument#-out:} ;;
+    -nologo) ;;
+    *) inputs+=("$argument") ;;
+  esac
+done
+
+[ -n "$output" ] || { echo 'llvm-lib wrapper: missing -out:<archive>' >&2; exit 2; }
+exec zig ar crs --format=coff "$output" "${inputs[@]}"

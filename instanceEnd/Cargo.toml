@@ -1,6 +1,6 @@
 [package]
 name = "instanceEnd"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.89"
 
@@ -31,13 +31,25 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 windows-service = "0.7"
 windows = { version = "0.52", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Environment",
     "Win32_System_Performance",
+    "Win32_System_Pipes",
     "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
+    "Win32_System_StationsAndDesktops",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

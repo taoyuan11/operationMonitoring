@@ -49,6 +49,21 @@ pub enum AgentCommand {
         #[arg(long)]
         plan_file: PathBuf,
     },
+    #[command(name = "desktop-helper", hide = true)]
+    DesktopHelper {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long, default_value_t = 1920)]
+        max_width: u32,
+        #[arg(long, default_value_t = 1080)]
+        max_height: u32,
+        #[arg(long, default_value_t = 8)]
+        min_fps: u8,
+        #[arg(long, default_value_t = 12)]
+        max_fps: u8,
+        #[arg(long, default_value_t = 70)]
+        jpeg_quality: u8,
+    },
 }
 
 #[derive(Args, Debug, Clone)]

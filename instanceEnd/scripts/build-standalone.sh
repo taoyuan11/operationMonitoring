@@ -8,9 +8,10 @@ Usage:
   ./scripts/build-standalone.sh all
 
 Environment:
-  OM_STANDALONE_BUILDER=auto|cargo|zigbuild
+  OM_STANDALONE_BUILDER=auto|cargo|zigbuild|xwin
     Select the Cargo builder. The default uses cargo-zigbuild when cross-compiling
-    a Linux target and falls back to cargo otherwise.
+    a Linux target, cargo-xwin when cross-compiling an MSVC Windows target, and
+    falls back to cargo otherwise.
 
 Examples:
   ./scripts/build-standalone.sh all
@@ -52,8 +53,8 @@ VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)
 
 REQUESTED_BUILDER=${OM_STANDALONE_BUILDER:-auto}
 case "$REQUESTED_BUILDER" in
-  auto|cargo|zigbuild) ;;
-  *) echo "OM_STANDALONE_BUILDER must be auto, cargo, or zigbuild" >&2; exit 2 ;;
+  auto|cargo|zigbuild|xwin) ;;
+  *) echo "OM_STANDALONE_BUILDER must be auto, cargo, zigbuild, or xwin" >&2; exit 2 ;;
 esac
 
 HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')
@@ -66,7 +67,7 @@ build_target() {
   local os=$2
   local arch=$3
   local builder=$REQUESTED_BUILDER
-  local source artifact extension
+  local source artifact extension xwin_tool_path
   local -a build_command
 
   case "$os" in
@@ -85,7 +86,12 @@ build_target() {
   esac
 
   if [ "$builder" = auto ]; then
-    if [ "$target" != "$HOST_TARGET" ] && [[ "$target" == *-linux-* ]] \
+    if [ "$target" != "$HOST_TARGET" ] && [[ "$target" == *-windows-msvc ]] \
+      && command -v cargo-xwin >/dev/null 2>&1 \
+      && command -v clang >/dev/null 2>&1 \
+      && { command -v llvm-lib >/dev/null 2>&1 || command -v zig >/dev/null 2>&1; }; then
+      builder=xwin
+    elif [ "$target" != "$HOST_TARGET" ] && [[ "$target" == *-linux-* ]] \
       && command -v cargo-zigbuild >/dev/null 2>&1 \
       && command -v zig >/dev/null 2>&1; then
       builder=zigbuild
@@ -94,7 +100,25 @@ build_target() {
     fi
   fi
 
-  if [ "$builder" = zigbuild ]; then
+  xwin_tool_path=
+  if [ "$builder" = xwin ]; then
+    command -v cargo-xwin >/dev/null 2>&1 || {
+      echo "cargo-xwin is required; install it with: cargo install --locked cargo-xwin" >&2
+      return 1
+    }
+    command -v clang >/dev/null 2>&1 || {
+      echo "Clang is required by cargo-xwin; install LLVM and make clang available in PATH" >&2
+      return 1
+    }
+    if ! command -v llvm-lib >/dev/null 2>&1; then
+      command -v zig >/dev/null 2>&1 || {
+        echo "llvm-lib or Zig is required by cargo-xwin" >&2
+        return 1
+      }
+      xwin_tool_path="$ROOT/scripts/xwin-tools"
+    fi
+    build_command=(cargo xwin build)
+  elif [ "$builder" = zigbuild ]; then
     command -v cargo-zigbuild >/dev/null 2>&1 || {
       echo "cargo-zigbuild is required; install it with: cargo install cargo-zigbuild" >&2
       return 1
@@ -109,7 +133,16 @@ build_target() {
   fi
 
   printf 'Building %s/%s (%s) with %s\n' "$os" "$arch" "$target" "$builder"
-  (cd "$ROOT" && "${build_command[@]}" --locked --release --target "$target" --bin om-agent) || return $?
+  if [ "$builder" = xwin ]; then
+    (
+      cd "$ROOT"
+      PATH="${xwin_tool_path:+$xwin_tool_path:}$PATH" \
+        XWIN_CROSS_COMPILER="${XWIN_CROSS_COMPILER:-clang}" \
+        "${build_command[@]}" --locked --release --target "$target" --bin om-agent
+    ) || return $?
+  else
+    (cd "$ROOT" && "${build_command[@]}" --locked --release --target "$target" --bin om-agent) || return $?
+  fi
   [ -f "$source" ] || { echo "Built executable not found: $source" >&2; return 1; }
 
   artifact="$OUTPUT_DIR/om-agent_${VERSION}_${os}_${arch}.${extension}"

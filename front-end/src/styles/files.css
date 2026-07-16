@@ -75,7 +75,7 @@
 .operation-section > header p { margin-top: 4px; color: #79847f; font-size: 11px; }
 .operation-connection { display: inline-flex; align-items: center; gap: 6px; color: var(--danger-text); font-size: 11px; }
 .operation-connection.online { color: #7bd6b8; }
-.operation-command-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.operation-command-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .operation-command-grid > button { display: grid; min-height: 82px; grid-template-columns: 38px minmax(0, 1fr); grid-template-rows: auto auto; align-content: center; column-gap: 11px; padding: 12px 14px; color: var(--muted-strong); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 7px; text-align: left; }
 .operation-command-grid > button:hover:not(:disabled) { background: var(--surface-hover); border-color: var(--line-strong); }
 .operation-command-grid > button > span { display: inline-flex; width: 38px; height: 38px; grid-row: 1 / 3; align-items: center; justify-content: center; color: var(--accent-strong); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 6px; }
@@ -171,6 +171,7 @@
 .file-dialog-actions .confirm-button { min-height: 40px; }
 
 @media (max-width: 900px) {
+  .operation-command-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .detail-grid > div:nth-child(4n) { border-right: 1px solid var(--line); }
   .detail-grid > div:nth-child(2n) { border-right: 0; }

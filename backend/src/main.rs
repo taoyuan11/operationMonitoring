@@ -7,6 +7,7 @@ mod files;
 mod handlers;
 mod jobs;
 mod models;
+mod remote_desktop;
 mod state;
 mod updates;
 mod utils;
@@ -39,6 +40,7 @@ use handlers::{
     admin_upload_background_image, agent_register, agent_report, agent_ws, health,
     public_appearance, public_instances, public_metrics,
 };
+use remote_desktop::{admin_desktop_ws, agent_desktop_ws};
 use state::AppState;
 use std::{io::ErrorKind, path::Path};
 use tower_http::{cors::CorsLayer, services::ServeDir};
@@ -172,6 +174,10 @@ async fn main() -> anyhow::Result<()> {
             get(admin_terminal_ws),
         )
         .route(
+            "/api/admin/instances/{id}/desktop/ws",
+            get(admin_desktop_ws),
+        )
+        .route(
             "/api/admin/instances/{id}/files/roots",
             get(admin_file_roots),
         )
@@ -226,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/agent/register", post(agent_register))
         .route("/api/agent/report", post(agent_report))
         .route("/api/agent/ws", get(agent_ws))
+        .route("/api/agent/desktop/ws", get(agent_desktop_ws))
         .route("/api/agent/update/manifest", get(agent_update_manifest))
         .route(
             "/api/agent/update/artifacts/{artifact_id}/download",

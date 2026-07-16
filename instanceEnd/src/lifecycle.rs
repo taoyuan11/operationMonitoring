@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
+use tokio::sync::watch;
 
 use crate::{config::AgentConfig, identity::load_or_create_identity, ws::agent_ws_loop};
 
@@ -114,19 +115,29 @@ pub async fn run_agent(config: AgentConfig) -> Result<()> {
     crate::logging::info(format_args!("server: {}", config.server));
     guard.mark_ready()?;
 
-    tokio::select! {
-        result = agent_ws_loop(config, identity) => result,
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let websocket = agent_ws_loop(config, identity, shutdown_rx);
+    tokio::pin!(websocket);
+    let lifecycle_result = tokio::select! {
+        result = &mut websocket => return result,
         result = wait_for_stop(guard.stop_file(), guard.pid()) => {
-            result?;
-            crate::logging::info(format_args!("stop requested; agent is shutting down"));
-            Ok(())
+            if result.is_ok() {
+                crate::logging::info(format_args!("stop requested; agent is shutting down"));
+            }
+            result
         },
         result = wait_for_shutdown_signal() => {
-            result?;
-            crate::logging::info(format_args!("shutdown signal received; agent is shutting down"));
-            Ok(())
+            if result.is_ok() {
+                crate::logging::info(format_args!("shutdown signal received; agent is shutting down"));
+            }
+            result
         },
-    }
+    };
+
+    shutdown_tx.send_replace(true);
+    let websocket_result = websocket.await;
+    lifecycle_result?;
+    websocket_result
 }
 
 #[cfg(unix)]

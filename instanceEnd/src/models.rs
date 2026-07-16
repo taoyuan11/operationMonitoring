@@ -254,6 +254,19 @@ pub enum AgentOutbound {
         #[serde(default)]
         retry_count: i64,
     },
+    DesktopOpen {
+        session_id: String,
+        stream_token: String,
+        max_width: u32,
+        max_height: u32,
+        min_fps: u8,
+        max_fps: u8,
+        jpeg_quality: u8,
+    },
+    DesktopClose {
+        session_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -303,6 +316,13 @@ pub enum AgentInbound {
         status: UpdateStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+    },
+    DesktopOpened {
+        session_id: String,
+    },
+    DesktopClosed {
+        session_id: String,
+        reason: String,
     },
 }
 
@@ -406,6 +426,38 @@ mod tests {
                     "sequence": 3,
                     "transferred_bytes": 1024
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn desktop_messages_use_stable_tagged_protocol_shapes() {
+        let open = json!({
+            "type": "desktop_open",
+            "session_id": "desktop-1",
+            "stream_token": "one-time-token",
+            "max_width": 1920,
+            "max_height": 1080,
+            "min_fps": 8,
+            "max_fps": 12,
+            "jpeg_quality": 70
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentOutbound>(open).unwrap(),
+            AgentOutbound::DesktopOpen { session_id, jpeg_quality: 70, .. }
+                if session_id == "desktop-1"
+        ));
+
+        assert_eq!(
+            serde_json::to_value(AgentInbound::DesktopClosed {
+                session_id: "desktop-1".to_string(),
+                reason: "browser_disconnected".to_string(),
+            })
+            .unwrap(),
+            json!({
+                "type": "desktop_closed",
+                "session_id": "desktop-1",
+                "reason": "browser_disconnected"
             })
         );
     }

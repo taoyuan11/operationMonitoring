@@ -13,6 +13,7 @@ use crate::{
     models::{
         AgentInbound, AgentOutbound, MetricPayload, TerminalClientMessage, TerminalServerMessage,
     },
+    remote_desktop::{close_connection_desktops, desktop_agent_closed, desktop_agent_opened},
     state::{AgentHandle, AppState, TerminalSessionHandle},
     updates::{confirm_update_version, offer_update_on_connect, record_update_status},
     utils::now_ts,
@@ -137,6 +138,7 @@ pub async fn agent_socket(
     drop(agents);
 
     close_connection_terminals(&state, &instance_id, connection_id).await;
+    close_connection_desktops(&state, &instance_id, connection_id).await;
     close_connection_file_requests(&state, &instance_id, connection_id).await;
     info!(%instance_id, %connection_id, "agent websocket disconnected");
 }
@@ -216,6 +218,12 @@ async fn handle_agent_message(
                 true,
             )
             .await;
+        }
+        AgentInbound::DesktopOpened { session_id } => {
+            desktop_agent_opened(state, instance_id, connection_id, &session_id).await;
+        }
+        AgentInbound::DesktopClosed { session_id, reason } => {
+            desktop_agent_closed(state, instance_id, connection_id, &session_id, &reason).await;
         }
         AgentInbound::FileResponse {
             request_id,

@@ -11,6 +11,7 @@ import {
   Info,
   MapPin,
   MemoryStick,
+  Monitor,
   Network,
   Pause,
   Pencil,
@@ -59,6 +60,7 @@ const emit = defineEmits<{
   close: []
   edit: [instance: Instance]
   terminal: [instance: Instance]
+  remoteDesktop: [instance: Instance]
   disable: [instance: Instance]
   delete: [instance: Instance]
   runCommand: [instance: Instance, command: CommandRecord]
@@ -83,6 +85,17 @@ watch(
 const supportsFiles = computed(() =>
   props.instance.capabilities?.includes('file_manager_v1') === true,
 )
+
+const remoteDesktopUnavailableReason = computed(() => {
+  if (!props.instance.online) return '实例离线，无法连接远程桌面'
+  if (!props.instance.os.trim().toLowerCase().includes('windows')) {
+    return '远程桌面仅支持 Windows 实例'
+  }
+  if (!props.instance.capabilities?.includes('remote_desktop_v1')) {
+    return '当前 Agent 不支持远程桌面，请先更新 Agent'
+  }
+  return ''
+})
 
 const selectedHistoryRange = computed(() =>
   historyRanges.find((option) => option.value === historyRange.value) || historyRanges[0],
@@ -335,7 +348,7 @@ async function loadMetricHistory() {
         <section v-else-if="activeTab === 'actions'" class="instance-operations" role="tabpanel">
           <div class="operation-section">
             <header>
-              <div><h3>实例操作</h3><p>管理资料或进入交互式终端</p></div>
+              <div><h3>实例操作</h3><p>管理资料，或进入交互式终端与远程桌面</p></div>
               <span :class="['operation-connection', { online: instance.online }]">
                 <Wifi v-if="instance.online" :size="14" />
                 <WifiOff v-else :size="14" />
@@ -352,6 +365,16 @@ async function loadMetricHistory() {
                 <span><Terminal :size="18" /></span>
                 <strong>Web 终端</strong>
                 <small>打开交互式 Shell</small>
+              </button>
+              <button
+                type="button"
+                :disabled="Boolean(remoteDesktopUnavailableReason) || loading"
+                :title="remoteDesktopUnavailableReason || '在浏览器中控制 Windows 桌面'"
+                @click="emit('remoteDesktop', instance)"
+              >
+                <span><Monitor :size="18" /></span>
+                <strong>远程桌面</strong>
+                <small>{{ remoteDesktopUnavailableReason || '浏览器内操作 Windows' }}</small>
               </button>
             </div>
           </div>

@@ -13,6 +13,7 @@ import { useMonitoringConsole } from './composables/useMonitoringConsole'
 import type { AdminTab, AgentRelease, AppPage, CommandRecord, Instance } from './types/domain'
 
 const TerminalModal = defineAsyncComponent(() => import('./components/TerminalModal.vue'))
+const RemoteDesktopModal = defineAsyncComponent(() => import('./components/RemoteDesktopModal.vue'))
 const EditInstanceModal = defineAsyncComponent(() => import('./components/EditInstanceModal.vue'))
 const InstanceDetailModal = defineAsyncComponent(() => import('./components/InstanceDetailModal.vue'))
 
@@ -171,6 +172,11 @@ function editSelectedInstance(instance: Instance) {
 function openSelectedTerminal(instance: Instance) {
   selectedInstanceId.value = ''
   consoleState.openTerminal(instance)
+}
+
+function openSelectedRemoteDesktop(instance: Instance) {
+  selectedInstanceId.value = ''
+  consoleState.openRemoteDesktop(instance)
 }
 
 function requestPublishAgentRelease(release: AgentRelease) {
@@ -346,6 +352,7 @@ function confirmAction() {
         @close="selectedInstanceId = ''"
         @edit="editSelectedInstance"
         @terminal="openSelectedTerminal"
+        @remote-desktop="openSelectedRemoteDesktop"
         @disable="requestDisable"
         @delete="requestDelete"
         @run-command="requestRunCommand"
@@ -380,6 +387,14 @@ function confirmAction() {
         v-if="consoleState.terminalState.instance"
         :instance="consoleState.terminalState.instance"
         @close="consoleState.closeTerminal"
+      />
+    </Transition>
+
+    <Transition name="modal" appear>
+      <RemoteDesktopModal
+        v-if="consoleState.remoteDesktopState.instance"
+        :instance="consoleState.remoteDesktopState.instance"
+        @close="consoleState.closeRemoteDesktop"
       />
     </Transition>
 

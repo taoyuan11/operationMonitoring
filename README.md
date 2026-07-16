@@ -88,6 +88,22 @@ cargo build --release
 
 `start` 会在后台启动实例端并立即释放命令行，标准输出和错误输出会写入命令返回的日志路径。Windows 使用同目录下的 `om-agent.exe`，后台子进程不会创建控制台窗口。
 
+## Windows 网页远程桌面
+
+Windows 10/11 和带 Desktop Experience 的 Windows Server 2016 及以上版本，在更新到包含
+`remote_desktop_v1` 能力的 Agent 后，可以从实例详情的“操作”页直接打开远程桌面。画面和
+键鼠输入通过 Agent 主动建立的专用 WebSocket 传输，不需要开放 3389 端口，也不依赖 Windows
+RDP、Guacamole、STUN 或 TURN。
+
+安装为 Windows 服务时，Agent 服务会在当前活动的登录用户会话中启动同一程序的受限桌面
+helper；前台 `log` 模式则使用当前用户会话。第一版每台实例只允许一名管理员独占控制主显示器，
+画面上限为 1920×1080、目标 8–12 FPS。锁屏、Windows 登录界面和 UAC 安全桌面不会被捕获或
+注入输入；返回普通桌面后会自动恢复。多个非控制台活动会话、Windows Server Core、剪贴板、
+音频、录屏和移动端触控暂不支持。
+
+远程桌面包含实时画面和控制输入，生产部署必须通过 HTTPS/WSS 访问前端和后端。后端会记录
+会话管理员、实例、开始时间、结束时间和结束原因，但不会保存画面或键鼠内容。
+
 查询状态或停止实例端：
 
 ```bash
@@ -226,9 +242,11 @@ om-agent uninstall --yes # 无人值守
 
 ### 构建产物
 
-先修改 `instanceEnd/Cargo.toml` 中的版本号，再为每个目标系统和 CPU 架构单独构建。Cargo 二进制名称固定为 `om-agent`。
+完整的环境准备、各操作系统打包步骤、交叉编译依赖、目标架构对照、产物校验和常见故障处理，请参阅：[实例端 standalone 打包指南](docs/instance-agent-packaging.md)。
 
-在 Bash 环境中使用：
+打包前先修改 `instanceEnd/Cargo.toml` 中的版本号，并同步 `Cargo.lock`。Cargo 二进制名称固定为 `om-agent`。
+
+在 Linux 或 macOS 的 Bash 环境中，可以构建单个目标，也可以依次构建全部 10 个支持目标：
 
 ```bash
 cd instanceEnd
@@ -236,7 +254,7 @@ cd instanceEnd
 ./scripts/build-standalone.sh all
 ```
 
-常用示例：
+例如：
 
 ```bash
 # Linux x86_64（glibc）
@@ -245,24 +263,21 @@ cd instanceEnd
 # OpenWrt x86_64（musl）
 ./scripts/build-standalone.sh x86_64-unknown-linux-musl linux x86_64-musl
 
-# Linux / OpenWrt aarch64（musl）
-./scripts/build-standalone.sh aarch64-unknown-linux-musl linux aarch64
-
 # macOS Apple Silicon
 ./scripts/build-standalone.sh aarch64-apple-darwin macos arm64
 
-# macOS Intel
-./scripts/build-standalone.sh x86_64-apple-darwin macos x86_64
+# Windows x64（从 Linux/macOS 交叉编译）
+./scripts/build-standalone.sh x86_64-pc-windows-msvc windows x64
 ```
 
-Windows 推荐直接使用 `.cmd` 入口。无参数时会依次构建 Windows x64、x86 和 ARM64，不受 PowerShell 脚本执行策略影响：
+Windows 原生打包推荐使用 `.cmd` 入口。无参数时会依次构建 Windows x64、x86 和 ARM64：
 
 ```powershell
 cd instanceEnd
 .\scripts\build-standalone.cmd
 ```
 
-也可以只构建一个 Windows Rust target；架构会从目标矩阵自动推导：
+也可以只构建一个 Windows target：
 
 ```powershell
 .\scripts\build-standalone.cmd x86_64-pc-windows-msvc
@@ -270,41 +285,20 @@ cd instanceEnd
 .\scripts\build-standalone.cmd i686-pc-windows-msvc
 ```
 
-脚本会通过 `rustup` 自动安装缺失的 Windows Rust targets。x64 和 x86 使用已安装的 MSVC 工具链；ARM64 需要 Visual Studio 的“MSVC ARM64 生成工具”，或者预先安装 LLVM 与 `cargo-xwin`（`cargo install --locked cargo-xwin`）。脚本检测到 `cargo-xwin` 后会自动用于 ARM64，并在 Windows 普通用户环境下选择不需要符号链接权限的 Clang sysroot 后端；首次构建会下载并缓存数 GB 的 MSVC sysroot。直接调用 `.ps1` 时，如果系统执行策略禁止脚本运行，可使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-standalone.ps1`；该设置仅作用于本次子进程，不会修改系统或用户级执行策略。
+脚本默认自动选择构建器：原生目标使用 Cargo，Linux 交叉目标在工具可用时使用 `cargo-zigbuild`，Windows MSVC 交叉目标使用 `cargo-xwin`。如果系统缺少 `llvm-lib`，Bash 脚本会使用项目内置包装器和 `zig ar` 完成 Windows 静态库归档。也可以通过 `OM_STANDALONE_BUILDER=cargo|zigbuild|xwin` 强制选择构建器。
 
-`all` 会依次尝试控制台支持的全部 10 个系统/架构组合，并允许在任意目标失败后继续构建：Linux glibc `x86_64`、Linux/OpenWrt musl `x86_64-musl`、Linux `aarch64`、`arm`、`x86`，Windows `x64`、`arm64`、`x86`，以及 macOS `arm64`、`x86_64`。Bash 和 PowerShell 脚本使用相同的目标矩阵。全部尝试结束后，脚本会汇总每个失败项的系统、架构、Rust target 和首条构建错误；只要存在失败，最终退出状态即为非零。
-
-脚本在原生目标上执行 `cargo build --locked --release --target ... --bin om-agent`。从当前主机交叉编译 Linux 目标时，如果系统已安装 Zig 和 `cargo-zigbuild`，脚本会自动改用 `cargo zigbuild`，避免 `ring` 等含 C/汇编代码的依赖因缺少目标链接器而失败。随后脚本将产物复制到 `instanceEnd/dist/standalone/`，并生成同名 `.sha256` 文件：
+`all` 会依次尝试 Linux 5 个目标、Windows 3 个目标和 macOS 2 个目标。单个目标失败后仍会继续构建，最后统一汇总失败原因。产物和同名 SHA-256 文件位于 `instanceEnd/dist/standalone/`：
 
 ```text
-om-agent_0.1.0_linux_x86_64.bin
-om-agent_0.1.0_linux_x86_64.bin.sha256
-om-agent_0.1.0_linux_x86_64-musl.bin
-om-agent_0.1.0_linux_x86_64-musl.bin.sha256
-om-agent_0.1.0_macos_arm64.bin
-om-agent_0.1.0_macos_arm64.bin.sha256
-om-agent_0.1.0_windows_x64.exe
-om-agent_0.1.0_windows_x64.exe.sha256
-om-agent_0.1.0_windows_x86.exe
-om-agent_0.1.0_windows_x86.exe.sha256
-om-agent_0.1.0_windows_arm64.exe
-om-agent_0.1.0_windows_arm64.exe.sha256
+om-agent_<version>_linux_x86_64.bin
+om-agent_<version>_linux_x86_64.bin.sha256
+om-agent_<version>_windows_x64.exe
+om-agent_<version>_windows_x64.exe.sha256
+om-agent_<version>_macos_arm64.bin
+om-agent_<version>_macos_arm64.bin.sha256
 ```
 
-交叉编译前需要安装相应 Rust target 和工具链。例如：
-
-```bash
-rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-rustup target add armv7-unknown-linux-gnueabihf i686-unknown-linux-gnu
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
-rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc i686-pc-windows-msvc
-cargo install cargo-zigbuild
-# Windows ARM64（未安装 Visual Studio ARM64 生成工具时）
-cargo install --locked cargo-xwin
-# macOS: brew install zig
-```
-
-部分目标不能仅靠 `rustup target add` 完成：从 macOS 构建 Linux glibc 或 musl 目标通常需要 Zig/`cargo-zigbuild`；OpenWrt MIPS/MIPSel 需要使用与固件版本、CPU 和 libc ABI 匹配的 OpenWrt SDK 编译。使用 SDK 已配置好的 Cargo 链接器时，设置 `OM_STANDALONE_BUILDER=cargo` 可关闭 Zig 自动选择。也可以设置 `OM_STANDALONE_BUILDER=zigbuild` 强制使用 Zig。OpenWrt x86_64 使用 `linux / x86_64-musl / standalone`，普通 glibc Linux x86_64 使用 `linux / x86_64 / standalone`；Agent 会按该原生架构标识精确匹配更新，避免两种 libc 的产物互相覆盖或误发。其他 OpenWrt 架构仍必须确保二进制与设备 ABI 完全兼容。
+发布时必须同时上传可执行文件及其 `.sha256` 文件。Linux glibc `x86_64` 与 musl `x86_64-musl` 是不同更新目标，不能混用。完整目标矩阵和 OpenWrt SDK 注意事项见[打包指南](docs/instance-agent-packaging.md)。
 
 ### 首次分发和安装
 

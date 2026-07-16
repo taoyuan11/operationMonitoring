@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -15,6 +15,7 @@ use crate::{
     metrics::MetricsCollector,
     models::{AgentInbound, AgentOutbound, Identity, UpdateOffer, UpdateStatus},
     profile::host_profile,
+    remote_desktop::{CAPABILITY as DESKTOP_CAPABILITY, DesktopManager, DesktopOpenRequest},
     terminal::TerminalManager,
     update::{PrepareResult, UpdateManager, update_capability},
 };
@@ -24,6 +25,7 @@ const MANIFEST_INTERVAL: Duration = Duration::from_secs(60);
 enum SocketOutcome {
     Disconnected,
     ApplyUpdate,
+    Shutdown,
 }
 
 enum UpdateTaskEvent {
@@ -44,7 +46,11 @@ impl Drop for ActiveUpdate {
     }
 }
 
-pub async fn agent_ws_loop(config: AgentConfig, identity: Identity) -> Result<()> {
+pub async fn agent_ws_loop(
+    config: AgentConfig,
+    identity: Identity,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(30))
@@ -63,10 +69,17 @@ pub async fn agent_ws_loop(config: AgentConfig, identity: Identity) -> Result<()
         }
     };
     loop {
-        match register_once(&config, &identity, &http_client).await {
+        let registration = tokio::select! {
+            biased;
+            _ = shutdown_requested(&mut shutdown) => return Ok(()),
+            registration = register_once(&config, &identity, &http_client) => registration,
+        };
+        match registration {
             Ok(response) if response.disabled => {
                 crate::logging::info(format_args!("websocket paused: instance disabled"));
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                if wait_or_shutdown(Duration::from_secs(10), &mut shutdown).await {
+                    return Ok(());
+                }
                 continue;
             }
             Ok(response) if !response.approved => {
@@ -74,20 +87,29 @@ pub async fn agent_ws_loop(config: AgentConfig, identity: Identity) -> Result<()
                     "websocket waiting for approval: {}",
                     response.message
                 ));
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                if wait_or_shutdown(Duration::from_secs(10), &mut shutdown).await {
+                    return Ok(());
+                }
                 continue;
             }
             Ok(_) => {}
             Err(error) => {
                 crate::logging::error(format_args!("register before websocket failed: {error:#}"));
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                if wait_or_shutdown(Duration::from_secs(10), &mut shutdown).await {
+                    return Ok(());
+                }
                 continue;
             }
         }
 
         let url = websocket_url(&config.server, &identity);
         crate::logging::info(format_args!("connecting websocket: {url}"));
-        match connect_async(&url).await {
+        let connection = tokio::select! {
+            biased;
+            _ = shutdown_requested(&mut shutdown) => return Ok(()),
+            connection = connect_async(&url) => connection,
+        };
+        match connection {
             Ok((stream, _)) => {
                 crate::logging::info(format_args!("websocket connected"));
                 match handle_agent_socket(
@@ -96,10 +118,12 @@ pub async fn agent_ws_loop(config: AgentConfig, identity: Identity) -> Result<()
                     &identity,
                     activity.clone(),
                     update_manager.clone(),
+                    &mut shutdown,
                 )
                 .await
                 {
                     Ok(SocketOutcome::ApplyUpdate) => return Ok(()),
+                    Ok(SocketOutcome::Shutdown) => return Ok(()),
                     Ok(SocketOutcome::Disconnected) => {}
                     Err(error) => crate::logging::error(format_args!("websocket error: {error:#}")),
                 }
@@ -108,7 +132,9 @@ pub async fn agent_ws_loop(config: AgentConfig, identity: Identity) -> Result<()
                 crate::logging::error(format_args!("websocket connect failed: {error:#}"))
             }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        if wait_or_shutdown(Duration::from_secs(5), &mut shutdown).await {
+            return Ok(());
+        }
     }
 }
 
@@ -120,12 +146,14 @@ async fn handle_agent_socket(
     _identity: &Identity,
     activity: ActivityTracker,
     update_manager: Option<UpdateManager>,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<SocketOutcome> {
     let (mut write, mut read) = stream.split();
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<AgentInbound>();
     let (binary_tx, mut binary_rx) = mpsc::channel(4);
     let mut terminals = TerminalManager::new(outbound_tx.clone(), activity.clone());
     let mut files = FileManager::new(outbound_tx.clone(), binary_tx, activity.clone());
+    let mut desktops = DesktopManager::new(config.clone(), activity.clone(), outbound_tx.clone());
     let mut collector = MetricsCollector::new();
     let mut report_interval =
         tokio::time::interval(Duration::from_secs(config.report_interval.max(1)));
@@ -147,8 +175,13 @@ async fn handle_agent_socket(
             }
         }
     }
-    let outcome = loop {
-        tokio::select! {
+    let result: Result<SocketOutcome> = async {
+        let outcome = loop {
+            tokio::select! {
+            biased;
+            _ = shutdown_requested(shutdown) => {
+                break SocketOutcome::Shutdown;
+            }
             _ = report_interval.tick() => {
                 let profile = host_profile();
                 outbound_tx.send(AgentInbound::Metrics {
@@ -361,6 +394,26 @@ async fn handle_agent_socket(
                                     }
                                 }
                             }
+                            AgentOutbound::DesktopOpen {
+                                session_id,
+                                stream_token,
+                                max_width,
+                                max_height,
+                                min_fps,
+                                max_fps,
+                                jpeg_quality,
+                            } => desktops.open(DesktopOpenRequest {
+                                session_id,
+                                stream_token,
+                                max_width,
+                                max_height,
+                                min_fps,
+                                max_fps,
+                                jpeg_quality,
+                            }),
+                            AgentOutbound::DesktopClose { session_id, reason } => {
+                                desktops.close(&session_id, &reason);
+                            }
                         }
                     }
                     Message::Binary(data) => files.handle_binary(&data),
@@ -371,13 +424,44 @@ async fn handle_agent_socket(
                     _ => {}
                 }
             }
-        }
-    };
+            }
+        };
+        Ok(outcome)
+    }
+    .await;
 
     terminals.close_all();
     files.close_all();
+    let close_reason = if matches!(
+        &result,
+        Ok(SocketOutcome::Shutdown | SocketOutcome::ApplyUpdate)
+    ) {
+        "agent_shutdown"
+    } else {
+        "agent_disconnected"
+    };
+    desktops.close_all(close_reason).await;
     drop(active_update);
-    Ok(outcome)
+    result
+}
+
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
+async fn wait_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown_requested(shutdown) => true,
+        _ = tokio::time::sleep(duration) => false,
+    }
 }
 
 fn spawn_update_task(
@@ -416,9 +500,14 @@ fn websocket_url(server: &str, identity: &Identity) -> String {
     } else {
         format!("ws://{trimmed}")
     };
+    let capabilities = if cfg!(windows) {
+        format!("{FILE_MANAGER_CAPABILITY},{DESKTOP_CAPABILITY}")
+    } else {
+        FILE_MANAGER_CAPABILITY.to_string()
+    };
     format!(
-        "{base}/api/agent/ws?instance_id={}&secret={}&capabilities={FILE_MANAGER_CAPABILITY}",
-        identity.instance_id, identity.secret,
+        "{base}/api/agent/ws?instance_id={}&secret={}&capabilities={capabilities}",
+        identity.instance_id, identity.secret
     )
 }
 
@@ -435,9 +524,9 @@ mod tests {
                 secret: "secret-1".to_string(),
             },
         );
-        assert_eq!(
-            url,
+        assert!(url.starts_with(
             "wss://monitor.example/api/agent/ws?instance_id=instance-1&secret=secret-1&capabilities=file_manager_v1"
-        );
+        ));
+        assert_eq!(url.contains(DESKTOP_CAPABILITY), cfg!(windows));
     }
 }

@@ -213,6 +213,40 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS desktop_sessions (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            started_at BIGINT NOT NULL,
+            ended_at BIGINT,
+            end_reason TEXT
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_desktop_sessions_instance_started ON desktop_sessions(instance_id, started_at DESC);",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_desktop_sessions_ended ON desktop_sessions(ended_at) WHERE ended_at IS NOT NULL;",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "UPDATE desktop_sessions SET ended_at = $1, end_reason = 'backend_restarted' WHERE ended_at IS NULL",
+    )
+    .bind(now_ts())
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS action_logs (
             id TEXT PRIMARY KEY,
             actor TEXT NOT NULL,
@@ -405,6 +439,7 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
             &["created_at", "completed_at", "exit_code"][..],
         ),
         ("ssh_sessions", &["started_at", "ended_at"][..]),
+        ("desktop_sessions", &["started_at", "ended_at"][..]),
         ("action_logs", &["created_at"][..]),
         ("admin_users", &["enabled", "created_at"][..]),
         ("authenticator_devices", &["created_at", "last_used_at"][..]),
@@ -736,6 +771,15 @@ pub async fn cleanup_loop(state: AppState) {
                     .await
                 {
                     error!(?error, "failed to clean old metrics");
+                }
+                if let Err(error) = sqlx::query(
+                    "DELETE FROM desktop_sessions WHERE ended_at IS NOT NULL AND ended_at < $1",
+                )
+                .bind(cutoff)
+                .execute(&state.db)
+                .await
+                {
+                    error!(?error, "failed to clean old desktop sessions");
                 }
             }
             Err(error) => error!(?error, "failed to read retention setting"),

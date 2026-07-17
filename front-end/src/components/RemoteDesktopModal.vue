@@ -685,6 +685,9 @@ function desktopReason(reason: string) {
     agent_draining: 'Agent 正在准备更新，暂不接受新的远程桌面会话',
     unsupported_platform: '该实例平台不支持远程桌面',
     helper_disconnected: 'Windows 桌面捕获进程已断开',
+    helper_error: 'Windows 桌面捕获进程发生错误，请查看 Agent 日志',
+    agent_data_error: 'Agent 远程桌面数据连接发生错误',
+    agent_error: 'Agent 处理远程桌面时发生错误，请查看 Agent 日志',
     frame_too_large: '桌面画面复杂度过高，JPEG 帧超过 2 MiB 限制',
   }
   return reasons[reason] || reason || '远程桌面会话已结束'

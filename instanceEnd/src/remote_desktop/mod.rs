@@ -196,7 +196,7 @@ pub fn run_helper(options: DesktopOptions) -> Result<()> {
     }
 }
 
-fn error_reason(error: &anyhow::Error) -> String {
+pub(super) fn error_reason(error: &anyhow::Error) -> String {
     let value = error.to_string();
     const KNOWN: [&str; 8] = [
         "no_active_session",
@@ -208,11 +208,16 @@ fn error_reason(error: &anyhow::Error) -> String {
         "data_channel_timeout",
         "frame_too_large",
     ];
-    KNOWN
-        .into_iter()
-        .find(|reason| value.contains(reason))
-        .unwrap_or("agent_error")
-        .to_string()
+    if let Some(reason) = KNOWN.into_iter().find(|reason| value.contains(reason)) {
+        return reason.to_string();
+    }
+    if value.contains("desktop helper") || value.contains("pipe") {
+        "helper_error".to_string()
+    } else if value.contains("websocket") {
+        "agent_data_error".to_string()
+    } else {
+        "agent_error".to_string()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -568,6 +573,22 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<DesktopControl>(r#"{"type":"secure_attention"}"#).unwrap(),
             DesktopControl::SecureAttention
+        );
+    }
+
+    #[test]
+    fn classifies_remote_desktop_transport_errors() {
+        assert_eq!(
+            error_reason(&anyhow::anyhow!("desktop helper fatal: broken pipe")),
+            "helper_error"
+        );
+        assert_eq!(
+            error_reason(&anyhow::anyhow!("desktop data websocket send failed")),
+            "agent_data_error"
+        );
+        assert_eq!(
+            error_reason(&anyhow::anyhow!("frame_too_large")),
+            "frame_too_large"
         );
     }
 

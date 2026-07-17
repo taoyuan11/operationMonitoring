@@ -4,7 +4,8 @@ import vue from '@vitejs/plugin-vue'
 const proxy = {
   '/api': {
     target: 'http://127.0.0.1:13500',
-    changeOrigin: true,
+    // Preserve the browser-facing host for the backend WebSocket Origin check.
+    changeOrigin: false,
     ws: true,
   },
   '/uploads': {

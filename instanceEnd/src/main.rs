@@ -73,15 +73,21 @@ fn run() -> Result<()> {
             max_fps,
             jpeg_quality,
             system_helper,
-        } => remote_desktop::run_helper(remote_desktop::DesktopOptions {
-            pipe,
-            max_width,
-            max_height,
-            min_fps,
-            max_fps,
-            jpeg_quality,
-            system_helper,
-        }),
+        } => {
+            init_agent_logging(&cli.agent)?;
+            std::panic::set_hook(Box::new(|panic| {
+                logging::error(format_args!("desktop helper panicked: {panic}"));
+            }));
+            remote_desktop::run_helper(remote_desktop::DesktopOptions {
+                pipe,
+                max_width,
+                max_height,
+                min_fps,
+                max_fps,
+                jpeg_quality,
+                system_helper,
+            })
+        }
     }
 }
 

@@ -222,7 +222,7 @@ async fn desktop_browser_socket(
     let mut helper_timeout = Box::pin(tokio::time::sleep(HELPER_JOIN_TIMEOUT));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut reason = "browser_disconnected";
+    let mut reason = "browser_disconnected".to_string();
 
     loop {
         tokio::select! {
@@ -243,13 +243,13 @@ async fn desktop_browser_socket(
                                 };
                                 if reliable && !delivered {
                                     let _ = send_text(&mut sender, &server_error("input_queue_overflow", "远程输入队列拥塞")).await;
-                                    reason = "input_queue_overflow";
+                                    reason = "input_queue_overflow".to_string();
                                     break;
                                 }
                             }
                             Err((code, message)) => {
                                 let _ = send_text(&mut sender, &server_error(code, message)).await;
-                                reason = "invalid_control_message";
+                                reason = "invalid_control_message".to_string();
                                 break;
                             }
                         }
@@ -262,16 +262,22 @@ async fn desktop_browser_socket(
                     Ok(Message::Close(_)) | Err(_) => break,
                     Ok(Message::Binary(_)) => {
                         let _ = send_text(&mut sender, &server_error("invalid_message", "浏览器不得发送二进制数据")).await;
-                        reason = "invalid_control_message";
+                        reason = "invalid_control_message".to_string();
                         break;
                     }
                 }
             }
             message = browser_rx.recv() => {
                 let Some(message) = message else { break; };
-                if message_type(&message).as_deref() == Some("ready") { joined = true; }
-                let closed = message_type(&message).as_deref() == Some("closed");
-                if !send_text(&mut sender, &message).await || closed { break; }
+                let kind = message_type(&message);
+                if kind.as_deref() == Some("ready") { joined = true; }
+                let close_reason = (kind.as_deref() == Some("closed"))
+                    .then(|| message_reason(&message).unwrap_or_else(|| "agent_closed".to_string()));
+                if !send_text(&mut sender, &message).await { break; }
+                if let Some(close_reason) = close_reason {
+                    reason = close_reason;
+                    break;
+                }
             }
             changed = frame_rx.changed() => {
                 if changed.is_err() { break; }
@@ -283,7 +289,7 @@ async fn desktop_browser_socket(
                     )
                     .await
                     {
-                        reason = "browser_send_timeout";
+                        reason = "browser_send_timeout".to_string();
                         break;
                     }
                 }
@@ -292,41 +298,41 @@ async fn desktop_browser_socket(
                 if changed.is_err() { break; }
                 let close_reason = { close_rx.borrow_and_update().clone() };
                 if let Some(close_reason) = close_reason {
-                    let _ = send_text(&mut sender, &json!({"type":"closed", "reason":close_reason}).to_string()).await;
-                    reason = "closed";
+                    let _ = send_text(&mut sender, &json!({"type":"closed", "reason":&close_reason}).to_string()).await;
+                    reason = close_reason;
                     break;
                 }
             }
             _ = &mut helper_timeout, if !joined => {
                 let _ = send_text(&mut sender, &server_error("helper_timeout", "远程桌面启动超时")).await;
-                reason = "helper_timeout";
+                reason = "helper_timeout".to_string();
                 break;
             }
             _ = heartbeat.tick() => {
                 let now = Instant::now();
                 if now.duration_since(last_inbound) > HEARTBEAT_TIMEOUT {
-                    reason = "browser_heartbeat_timeout";
+                    reason = "browser_heartbeat_timeout".to_string();
                     break;
                 }
                 if now.duration_since(last_activity) >= IDLE_TIMEOUT {
                     let _ = send_text(&mut sender, &json!({"type":"closed", "reason":"idle_timeout"}).to_string()).await;
-                    reason = "idle_timeout";
+                    reason = "idle_timeout".to_string();
                     break;
                 }
                 if now.duration_since(started) >= SESSION_TIMEOUT {
                     let _ = send_text(&mut sender, &json!({"type":"closed", "reason":"session_timeout"}).to_string()).await;
-                    reason = "session_timeout";
+                    reason = "session_timeout".to_string();
                     break;
                 }
                 if !send_socket_message(&mut sender, Message::Ping(Vec::new().into())).await {
-                    reason = "browser_send_timeout";
+                    reason = "browser_send_timeout".to_string();
                     break;
                 }
             }
         }
     }
 
-    end_desktop_session(&state, &session_id, reason).await;
+    end_desktop_session(&state, &session_id, &reason).await;
     info!(%session_id, %instance_id, %reason, "desktop browser websocket disconnected");
 }
 
@@ -354,7 +360,7 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_inbound = Instant::now();
-    let mut reason = "agent_data_disconnected";
+    let mut reason = "agent_data_disconnected".to_string();
     info!(%session_id, instance_id = %handle.instance_id, "desktop agent data websocket connected");
 
     loop {
@@ -366,6 +372,8 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
                         last_inbound = Instant::now();
                         match validate_agent_message(&text) {
                             Ok(()) => {
+                                let close_reason = (message_type(&text).as_deref() == Some("closed"))
+                                    .then(|| message_reason(&text).unwrap_or_else(|| "agent_closed".to_string()));
                                 let delivered = tokio::time::timeout(
                                     Duration::from_secs(1),
                                     handle.browser_tx.send(text.to_string()),
@@ -373,13 +381,17 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
                                 .await
                                 .is_ok_and(|result| result.is_ok());
                                 if !delivered {
-                                    reason = "browser_control_queue_overflow";
+                                    reason = "browser_control_queue_overflow".to_string();
+                                    break;
+                                }
+                                if let Some(close_reason) = close_reason {
+                                    reason = close_reason;
                                     break;
                                 }
                             }
                             Err((code, message)) => {
                                 let _ = handle.browser_tx.send(server_error(code, message)).await;
-                                reason = "invalid_agent_message";
+                                reason = "invalid_agent_message".to_string();
                                 break;
                             }
                         }
@@ -388,7 +400,7 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
                         last_inbound = Instant::now();
                         if let Err((code, message)) = validate_frame(&frame) {
                             let _ = handle.browser_tx.send(server_error(code, message)).await;
-                            reason = "invalid_frame";
+                            reason = "invalid_frame".to_string();
                             break;
                         }
                         handle.frame_tx.send_replace(Some(Arc::new(frame.to_vec())));
@@ -404,33 +416,33 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
             input = input_rx.recv() => {
                 let Some(input) = input else { break; };
                 if !send_socket_message(&mut sender, Message::Text(input.into())).await {
-                    reason = "agent_send_timeout";
+                    reason = "agent_send_timeout".to_string();
                     break;
                 }
             }
             changed = close_rx.changed() => {
                 if changed.is_err() { break; }
-                let closed = { close_rx.borrow_and_update().is_some() };
-                if closed {
+                let close_reason = { close_rx.borrow_and_update().clone() };
+                if let Some(close_reason) = close_reason {
                     let _ = send_socket_message(&mut sender, Message::Close(None)).await;
-                    reason = "closed";
+                    reason = close_reason;
                     break;
                 }
             }
             _ = heartbeat.tick() => {
                 if last_inbound.elapsed() > HEARTBEAT_TIMEOUT {
-                    reason = "agent_heartbeat_timeout";
+                    reason = "agent_heartbeat_timeout".to_string();
                     break;
                 }
                 if !send_socket_message(&mut sender, Message::Ping(Vec::new().into())).await {
-                    reason = "agent_send_timeout";
+                    reason = "agent_send_timeout".to_string();
                     break;
                 }
             }
         }
     }
 
-    end_desktop_session(&state, &session_id, reason).await;
+    end_desktop_session(&state, &session_id, &reason).await;
     info!(%session_id, %reason, "desktop agent data websocket disconnected");
 }
 
@@ -760,6 +772,14 @@ fn message_type(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn message_reason(text: &str) -> Option<String> {
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .get("reason")?
+        .as_str()
+        .map(sanitize_reason)
+}
+
 fn sanitize_reason(reason: &str) -> String {
     let reason = reason.trim();
     if reason.is_empty() {
@@ -851,6 +871,15 @@ mod tests {
             first_hash,
             <[u8; 32]>::from(Sha256::digest(first.as_bytes()))
         );
+    }
+
+    #[test]
+    fn extracts_and_sanitizes_agent_close_reason() {
+        assert_eq!(
+            message_reason(r#"{"type":"closed","reason":" helper_error "}"#).as_deref(),
+            Some("helper_error")
+        );
+        assert_eq!(message_reason(r#"{"type":"closed"}"#), None);
     }
 
     #[test]

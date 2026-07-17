@@ -24,7 +24,7 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, FreeLibrary, HANDLE, HMODULE, HWND, LocalFree},
+        Foundation::{CloseHandle, FreeLibrary, HANDLE, HMODULE, HWND, LocalFree, STILL_ACTIVE},
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0},
             Direct3D11::{
@@ -54,22 +54,28 @@ use windows::{
                 SDDL_REVISION_1,
             },
             DuplicateTokenEx, GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-            SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_QUERY, TOKEN_USER,
-            TokenPrimary, TokenSessionId, TokenUser,
+            SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER,
+            TokenPrimary, TokenUser,
         },
         System::{
             Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
             LibraryLoader::{GetProcAddress, LoadLibraryW},
             Pipes::GetNamedPipeClientProcessId,
-            RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
+            RemoteDesktop::{
+                ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
+                WTSEnumerateProcessesW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+            },
             StationsAndDesktops::{
-                CloseDesktop, DESKTOP_READOBJECTS, GetThreadDesktop, GetUserObjectInformationW,
-                HDESK, OpenInputDesktop, SetThreadDesktop, UOI_NAME,
+                CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS,
+                GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, HDESK,
+                OpenInputDesktop, OpenWindowStationW, SetProcessWindowStation, SetThreadDesktop,
+                UOI_NAME,
             },
             Threading::{
                 CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-                GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenProcessToken,
-                PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
+                GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess,
+                OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
+                PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW, TerminateProcess,
             },
         },
         UI::Input::KeyboardAndMouse::{
@@ -79,7 +85,10 @@ use windows::{
             MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
             VIRTUAL_KEY,
         },
-        UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
+        UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, WINSTA_ENUMDESKTOPS, WINSTA_READATTRIBUTES,
+            WINSTA_READSCREEN, WINSTA_WRITEATTRIBUTES,
+        },
     },
     core::{ComInterface, PCWSTR, PWSTR},
 };
@@ -87,7 +96,7 @@ use windows::{
 use super::{
     AdaptiveSettings, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl, DesktopOpenRequest,
     DesktopOptions, FrameHeader, MAX_CONTROL_BYTES, MAX_FRAME_BYTES, absolute_pointer_coordinate,
-    dom_code_to_vk, dom_code_uses_extended_key, scaled_dimensions,
+    dom_code_to_vk, dom_code_uses_extended_key, error_reason, scaled_dimensions,
 };
 use crate::{config::AgentConfig, models::AgentInbound};
 
@@ -100,6 +109,8 @@ const INTERNAL_STOPPED: &[u8] = b"stopped";
 const INTERNAL_FATAL_PREFIX: &[u8] = b"fatal:";
 const PIPE_MAX_PACKET: usize = MAX_FRAME_BYTES + 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const INPUT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 
 pub async fn run_session(
     config: AgentConfig,
@@ -118,7 +129,14 @@ pub async fn run_session(
         session_id: request.session_id.clone(),
     });
 
-    let result = relay(socket, pipe, close).await;
+    let mut result = relay(socket, pipe, close).await;
+    if result.is_err()
+        && let Some(exit_code) = child.exit_code()
+    {
+        result = result.map_err(|error| {
+            error.context(format!("desktop helper exited with code 0x{exit_code:08X}"))
+        });
+    }
     child.terminate();
     result
 }
@@ -145,7 +163,7 @@ async fn establish_session(
         jpeg_quality: request.jpeg_quality.clamp(50, 75),
         system_helper: matches!(target, HelperTarget::ServiceSession { .. }),
     };
-    let mut child = spawn_helper(&options, target)?;
+    let mut child = spawn_helper(&options, target, config)?;
 
     let mut ws_request = desktop_websocket_url(&config.server, &request.session_id)
         .into_client_request()
@@ -334,6 +352,17 @@ async fn relay(
     }
     .await;
 
+    let close_reason = match &result {
+        Ok(reason) => reason.clone(),
+        Err(error) => error_reason(error),
+    };
+    let closed = serde_json::json!({"type":"closed", "reason":close_reason}).to_string();
+    let _ = tokio::time::timeout(
+        SOCKET_SEND_TIMEOUT,
+        ws_write.send(Message::Text(closed.into())),
+    )
+    .await;
+
     // Keep the reader alive while the helper drains input state. This prevents a queued JPEG
     // packet from filling the pipe and blocking the helper before it can receive the stop packet.
     if write_packet(&mut pipe_write, PIPE_INTERNAL, INTERNAL_STOP)
@@ -364,30 +393,41 @@ async fn pipe_reader<R: AsyncRead + Unpin>(
     ack_tx: mpsc::Sender<()>,
     fatal_tx: mpsc::Sender<String>,
 ) -> Result<()> {
-    loop {
-        let (kind, value) = read_packet(&mut reader).await?;
-        match kind {
-            PIPE_FRAME => {
-                frame_tx.send_replace(Some(value));
+    let result: Result<()> = async {
+        loop {
+            let (kind, value) = read_packet(&mut reader)
+                .await
+                .context("failed to read desktop helper pipe")?;
+            match kind {
+                PIPE_FRAME => {
+                    frame_tx.send_replace(Some(value));
+                }
+                PIPE_CONTROL => {
+                    let text = String::from_utf8(value).context("helper sent non-UTF8 control")?;
+                    status_tx.send(text).await?;
+                }
+                PIPE_INTERNAL if value == INTERNAL_STOPPED => {
+                    let _ = ack_tx.try_send(());
+                }
+                PIPE_INTERNAL if value.starts_with(INTERNAL_FATAL_PREFIX) => {
+                    let reason = String::from_utf8(value[INTERNAL_FATAL_PREFIX.len()..].to_vec())
+                        .context("helper sent non-UTF8 fatal reason")?;
+                    let _ = fatal_tx.try_send(reason);
+                }
+                _ => bail!("unknown desktop helper packet type"),
             }
-            PIPE_CONTROL => {
-                let text = String::from_utf8(value).context("helper sent non-UTF8 control")?;
-                status_tx.send(text).await?;
-            }
-            PIPE_INTERNAL if value == INTERNAL_STOPPED => {
-                let _ = ack_tx.try_send(());
-            }
-            PIPE_INTERNAL if value.starts_with(INTERNAL_FATAL_PREFIX) => {
-                let reason = String::from_utf8(value[INTERNAL_FATAL_PREFIX.len()..].to_vec())
-                    .context("helper sent non-UTF8 fatal reason")?;
-                let _ = fatal_tx.try_send(reason);
-            }
-            _ => bail!("unknown desktop helper packet type"),
         }
     }
+    .await;
+    if let Err(error) = &result {
+        let _ = fatal_tx.send(format!("{error:#}")).await;
+    }
+    result
 }
 
 pub async fn run_helper(options: DesktopOptions) -> Result<()> {
+    bind_interactive_window_station()?;
+    log_helper_security_context(&options)?;
     let pipe = tokio::time::timeout(DATA_CHANNEL_JOIN_TIMEOUT, connect_pipe(&options.pipe))
         .await
         .map_err(|_| anyhow!("desktop helper pipe connection timeout"))??;
@@ -412,6 +452,8 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     let mut input_desktop_available = options.system_helper || default_input_desktop();
     let mut pending_release = false;
     let mut stopping = false;
+    let mut last_input_error_log = None;
+    let mut suppressed_input_errors = 0_u64;
     let mut desktop_check = tokio::time::interval(Duration::from_millis(100));
     desktop_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let ready = serde_json::json!({"type":"ready"}).to_string();
@@ -433,7 +475,13 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                 }
             }
             event = capture_rx.recv() => {
-                let Some(event) = event else { break };
+                let Some(event) = event else {
+                    let reason = "desktop capture thread stopped unexpectedly";
+                    let mut fatal = INTERNAL_FATAL_PREFIX.to_vec();
+                    fatal.extend_from_slice(reason.as_bytes());
+                    write_packet(&mut write, PIPE_INTERNAL, &fatal).await?;
+                    bail!(reason)
+                };
                 match event {
                     HelperEvent::Frame(frame) if !stopping => write_packet(&mut write, PIPE_FRAME, &frame).await?,
                     HelperEvent::Status(status) if !stopping => write_packet(&mut write, PIPE_CONTROL, status.as_bytes()).await?,
@@ -466,7 +514,10 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                 let control: DesktopControl = serde_json::from_slice(&value)?;
                 match control {
                     DesktopControl::Feedback { sequence, fps, decode_ms } if !stopping => {
-                        settings.lock().unwrap().update(
+                        let mut settings = settings
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        settings.update(
                             options.min_fps,
                             options.max_fps,
                             sequence,
@@ -494,9 +545,11 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                                     | DesktopControl::PointerButton { down: false, .. }
                             );
                             if let Err(error) = apply_on_input_desktop(&mut input, control) {
-                                crate::logging::error(format_args!(
-                                    "remote desktop input injection failed: {error:#}"
-                                ));
+                                log_input_injection_error(
+                                    &error,
+                                    &mut last_input_error_log,
+                                    &mut suppressed_input_errors,
+                                );
                                 if releasing {
                                     pending_release = true;
                                 }
@@ -554,7 +607,9 @@ fn capture_loop(
         if now < next_capture {
             std::thread::sleep(next_capture - now);
         }
-        let adaptive = *settings.lock().unwrap();
+        let adaptive = *settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         next_capture =
             Instant::now() + Duration::from_millis(1000 / u64::from(adaptive.fps.max(1)));
         let desktop_name = match attach_input_desktop(&mut attached_desktop) {
@@ -675,8 +730,11 @@ fn attach_input_desktop(current: &mut Option<(HDESK, String)>) -> Result<(String
 }
 
 fn desktop_name(desktop: HDESK) -> Result<String> {
+    user_object_name(HANDLE(desktop.0))
+}
+
+fn user_object_name(handle: HANDLE) -> Result<String> {
     unsafe {
-        let handle = HANDLE(desktop.0);
         let mut needed = 0_u32;
         let _ = GetUserObjectInformationW(handle, UOI_NAME, None, 0, Some(&mut needed));
         let mut value = vec![0_u16; (needed as usize / 2).max(1)];
@@ -692,11 +750,52 @@ fn desktop_name(desktop: HDESK) -> Result<String> {
     }
 }
 
+fn bind_interactive_window_station() -> Result<()> {
+    unsafe {
+        let name = wide("WinSta0");
+        let access = (WINSTA_ENUMDESKTOPS
+            | WINSTA_READATTRIBUTES
+            | WINSTA_READSCREEN
+            | WINSTA_WRITEATTRIBUTES) as u32;
+        let station = OpenWindowStationW(PCWSTR(name.as_ptr()), false, access)
+            .context("failed to open interactive window station")?;
+        SetProcessWindowStation(station)
+            .context("failed to bind desktop helper to interactive window station")?;
+        // The station must remain associated with the process until this short-lived helper exits.
+        Ok(())
+    }
+}
+
+fn log_helper_security_context(options: &DesktopOptions) -> Result<()> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .context("failed to inspect desktop helper token")?;
+        let sid = token_user_sid(token);
+        let _ = CloseHandle(token);
+        let station =
+            GetProcessWindowStation().context("failed to inspect desktop helper window station")?;
+        let station_name = user_object_name(HANDLE(station.0))?;
+        crate::logging::info(format_args!(
+            "remote desktop helper security context: session_id={}, token_sid={}, window_station={}, system_helper={}",
+            current_session_id()?,
+            sid?,
+            station_name,
+            options.system_helper
+        ));
+        Ok(())
+    }
+}
+
 fn apply_on_input_desktop(input: &mut InputState, control: DesktopControl) -> Result<()> {
     unsafe {
         let original = GetThreadDesktop(GetCurrentThreadId())?;
-        let desktop = OpenInputDesktop(Default::default(), false, DESKTOP_READOBJECTS)
-            .context("input desktop is unavailable")?;
+        let desktop = OpenInputDesktop(
+            Default::default(),
+            false,
+            DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0),
+        )
+        .context("input desktop is unavailable for input injection")?;
         SetThreadDesktop(desktop).context("failed to bind input thread to input desktop")?;
         let result = input.apply(control);
         let _ = SetThreadDesktop(original);
@@ -930,6 +1029,8 @@ fn capture_gdi_jpeg(
             ..Default::default()
         };
         let rows = if copied {
+            // GetDIBits requires the bitmap not to be selected into a device context.
+            let _ = SelectObject(memory, previous);
             GetDIBits(
                 memory,
                 bitmap,
@@ -940,9 +1041,9 @@ fn capture_gdi_jpeg(
                 DIB_RGB_COLORS,
             )
         } else {
+            let _ = SelectObject(memory, previous);
             0
         };
-        let _ = SelectObject(memory, previous);
         let _ = DeleteObject(bitmap);
         let _ = DeleteDC(memory);
         let _ = ReleaseDC(HWND(0), screen);
@@ -1127,8 +1228,12 @@ fn send_mouse(
             },
         },
     };
-    if unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } != 1 {
-        bail!("SendInput mouse failed")
+    let sent = unsafe {
+        windows_sys::Win32::Foundation::SetLastError(0);
+        SendInput(&[input], size_of::<INPUT>() as i32)
+    };
+    if sent != 1 {
+        return Err(send_input_error("mouse"));
     }
     Ok(())
 }
@@ -1154,10 +1259,52 @@ fn send_key(vk: u16, down: bool, extended: bool) -> Result<()> {
             },
         },
     };
-    if unsafe { SendInput(&[input], size_of::<INPUT>() as i32) } != 1 {
-        bail!("SendInput keyboard failed")
+    let sent = unsafe {
+        windows_sys::Win32::Foundation::SetLastError(0);
+        SendInput(&[input], size_of::<INPUT>() as i32)
+    };
+    if sent != 1 {
+        return Err(send_input_error("keyboard"));
     }
     Ok(())
+}
+
+fn send_input_error(kind: &str) -> anyhow::Error {
+    let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    if code == 0 {
+        anyhow!(
+            "SendInput {kind} failed (Win32 error 0; Windows may have blocked input through UIPI or desktop/session isolation)"
+        )
+    } else {
+        let description = std::io::Error::from_raw_os_error(code as i32);
+        anyhow!("SendInput {kind} failed (Win32 error {code}: {description})")
+    }
+}
+
+fn log_input_injection_error(
+    error: &anyhow::Error,
+    last_log: &mut Option<Instant>,
+    suppressed: &mut u64,
+) {
+    if last_log
+        .as_ref()
+        .is_some_and(|last| last.elapsed() < INPUT_ERROR_LOG_INTERVAL)
+    {
+        *suppressed = suppressed.saturating_add(1);
+        return;
+    }
+    if *suppressed == 0 {
+        crate::logging::error(format_args!(
+            "remote desktop input injection failed: {error:#}"
+        ));
+    } else {
+        crate::logging::error(format_args!(
+            "remote desktop input injection failed: {error:#} ({} similar errors suppressed)",
+            *suppressed
+        ));
+    }
+    *last_log = Some(Instant::now());
+    *suppressed = 0;
 }
 
 fn default_input_desktop() -> bool {
@@ -1226,6 +1373,25 @@ impl HelperProcess {
             Self::Handle { pid, .. } => *pid,
         }
     }
+
+    fn exit_code(&mut self) -> Option<u32> {
+        match self {
+            Self::Child(child) => child
+                .try_wait()
+                .ok()
+                .flatten()
+                .and_then(|status| status.code())
+                .map(|code| code as u32),
+            Self::Handle { handle, .. } if !handle.is_invalid() => unsafe {
+                let mut code = STILL_ACTIVE.0 as u32;
+                GetExitCodeProcess(*handle, &mut code)
+                    .is_ok()
+                    .then_some(code)
+                    .filter(|code| *code != STILL_ACTIVE.0 as u32)
+            },
+            Self::Handle { .. } => None,
+        }
+    }
 }
 
 impl Drop for HelperProcess {
@@ -1241,14 +1407,19 @@ impl Drop for HelperProcess {
     }
 }
 
-fn spawn_helper(options: &DesktopOptions, target: HelperTarget) -> Result<HelperProcess> {
+fn spawn_helper(
+    options: &DesktopOptions,
+    target: HelperTarget,
+    config: &AgentConfig,
+) -> Result<HelperProcess> {
     match target {
         HelperTarget::ServiceSession { session_id } => {
-            spawn_helper_in_active_session(options, session_id)
+            spawn_helper_in_active_session(options, session_id, config)
         }
         HelperTarget::Current { .. } => {
             let mut command = Command::new(std::env::current_exe()?);
             append_helper_args(&mut command, options);
+            config.append_cli_args(&mut command);
             command
                 .creation_flags(CREATE_NO_WINDOW_FLAG)
                 .stdin(Stdio::null())
@@ -1348,35 +1519,100 @@ fn select_active_session() -> Result<u32> {
     Ok(console)
 }
 
-fn spawn_helper_in_active_session(
-    options: &DesktopOptions,
-    session_id: u32,
-) -> Result<HelperProcess> {
+fn duplicate_session_system_token(session_id: u32) -> Result<HANDLE> {
     unsafe {
-        let mut user_token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut user_token)?;
+        // Merely changing TokenSessionId on the Session 0 service token does not give the helper
+        // the target interactive logon context. Winlogon already owns the correct LocalSystem
+        // token for this session, so duplicate that token after validating its SID.
+        let mut processes: *mut WTS_PROCESS_INFOW = null_mut();
+        let mut count = 0_u32;
+        WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut processes, &mut count)
+            .context("failed to enumerate target session processes")?;
+
+        let result = (|| -> Result<HANDLE> {
+            if processes.is_null() {
+                bail!("target session process enumeration returned no data")
+            }
+            let entries = std::slice::from_raw_parts(processes, count as usize);
+            let mut last_error = None;
+            for process in entries {
+                if process.SessionId != session_id || process.pProcessName.is_null() {
+                    continue;
+                }
+                let Ok(name) = process.pProcessName.to_string() else {
+                    continue;
+                };
+                if !name.eq_ignore_ascii_case("winlogon.exe") {
+                    continue;
+                }
+                match duplicate_system_process_token(process.ProcessId) {
+                    Ok(Some(token)) => return Ok(token),
+                    Ok(None) => {}
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if let Some(error) = last_error {
+                Err(error).context("failed to duplicate target session winlogon token")
+            } else {
+                bail!("no LocalSystem winlogon process found in target session {session_id}")
+            }
+        })();
+        WTSFreeMemory(processes.cast());
+        result
+    }
+}
+
+fn duplicate_system_process_token(process_id: u32) -> Result<Option<HANDLE>> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+            .with_context(|| format!("failed to open winlogon process {process_id}"))?;
+        let mut source_token = HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_DUPLICATE | TOKEN_QUERY, &mut source_token);
+        let _ = CloseHandle(process);
+        opened.with_context(|| format!("failed to open winlogon token {process_id}"))?;
+
+        let sid = match token_user_sid(source_token) {
+            Ok(sid) => sid,
+            Err(error) => {
+                let _ = CloseHandle(source_token);
+                return Err(error).context("failed to identify winlogon token owner");
+            }
+        };
+        if sid != LOCAL_SYSTEM_SID {
+            let _ = CloseHandle(source_token);
+            return Ok(None);
+        }
+
         let mut primary_token = HANDLE::default();
-        let duplicate = DuplicateTokenEx(
-            user_token,
+        let duplicated = DuplicateTokenEx(
+            source_token,
             TOKEN_ALL_ACCESS,
             None,
             SecurityImpersonation,
             TokenPrimary,
             &mut primary_token,
         );
-        let _ = CloseHandle(user_token);
-        duplicate?;
-        let target_session_id = session_id;
-        SetTokenInformation(
-            primary_token,
-            TokenSessionId,
-            (&target_session_id as *const u32).cast(),
-            size_of::<u32>() as u32,
-        )?;
+        let _ = CloseHandle(source_token);
+        duplicated.context("failed to duplicate winlogon primary token")?;
+        Ok(Some(primary_token))
+    }
+}
+
+fn spawn_helper_in_active_session(
+    options: &DesktopOptions,
+    session_id: u32,
+    config: &AgentConfig,
+) -> Result<HelperProcess> {
+    unsafe {
+        let primary_token = duplicate_session_system_token(session_id)?;
+        crate::logging::info(format_args!(
+            "launching remote desktop helper with target session LocalSystem token: session_id={session_id}"
+        ));
 
         let executable = std::env::current_exe()?;
         let mut command = Command::new(&executable);
         append_helper_args(&mut command, options);
+        config.append_cli_args(&mut command);
         let mut command_line = wide(&format!(
             "\"{}\" {}",
             executable.display(),

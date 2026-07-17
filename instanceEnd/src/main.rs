@@ -19,7 +19,7 @@ mod ws;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use config::{AgentCommand, Cli};
-use lifecycle::{run_agent, start, status, stop};
+use lifecycle::{follow_logs, run_agent, start, status, stop};
 
 fn main() {
     if let Err(error) = run() {
@@ -52,12 +52,7 @@ fn run() -> Result<()> {
         AgentCommand::Start => start(&cli.agent),
         AgentCommand::Stop { timeout } => stop(&cli.agent, timeout),
         AgentCommand::Status => status(&cli.agent),
-        AgentCommand::Log => {
-            if cli.agent.log_file.is_some() {
-                init_agent_logging(&cli.agent)?;
-            }
-            tokio::runtime::Runtime::new()?.block_on(run_agent(cli.agent))
-        }
+        AgentCommand::Log => tokio::runtime::Runtime::new()?.block_on(follow_logs(&cli.agent)),
         AgentCommand::ServiceRun => unreachable!(),
         AgentCommand::ApplyUpdate { plan_file } => {
             let parent = plan_file

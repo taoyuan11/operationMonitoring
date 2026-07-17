@@ -40,7 +40,7 @@ pub enum AgentCommand {
     },
     /// Show whether the agent is running
     Status,
-    /// Run the agent in the foreground and print logs
+    /// Show existing agent logs and follow new output
     Log,
     #[command(name = "service-run", hide = true)]
     ServiceRun,
@@ -188,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn log_runs_in_the_foreground() {
+    fn parses_the_log_follow_command() {
         let cli = Cli::try_parse_from(["agent", "log"]).unwrap();
 
         assert_eq!(cli.command, AgentCommand::Log);

@@ -133,6 +133,7 @@ pub struct MetricRecord {
     pub gpu_memory_total: Option<i64>,
     pub uptime_seconds: i64,
     pub load_average: Option<f64>,
+    pub latency_ms: Option<f64>,
 }
 
 #[derive(Serialize)]

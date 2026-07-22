@@ -475,15 +475,9 @@ impl RuntimePaths {
         config: &AgentConfig,
         installed: Option<&InstalledRuntimePaths>,
     ) -> Result<Self> {
-        let state_dir = config
-            .state_dir
-            .clone()
-            .or_else(|| installed.map(|paths| paths.state_dir.clone()))
-            .or_else(|| {
-                ProjectDirs::from("com", "operation-monitoring", "agent")
-                    .map(|dirs| dirs.data_local_dir().join("runtime"))
-            })
-            .unwrap_or(env::current_dir()?.join(".om-agent"));
+        let state_dir = resolve_state_dir(config, installed, || {
+            Ok(env::current_dir()?.join(".om-agent"))
+        })?;
         let log_file = config.log_file.clone().unwrap_or_else(|| {
             if config.state_dir.is_none()
                 && let Some(paths) = installed
@@ -557,6 +551,23 @@ impl RuntimePaths {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+fn resolve_state_dir(
+    config: &AgentConfig,
+    installed: Option<&InstalledRuntimePaths>,
+    fallback: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = &config.state_dir {
+        return Ok(path.clone());
+    }
+    if let Some(paths) = installed {
+        return Ok(paths.state_dir.clone());
+    }
+    if let Some(dirs) = ProjectDirs::from("com", "operation-monitoring", "agent") {
+        return Ok(dirs.data_local_dir().join("runtime"));
+    }
+    fallback()
 }
 
 #[derive(Debug)]
@@ -977,6 +988,24 @@ mod tests {
 
         assert_eq!(paths.state_dir, installed.state_dir);
         assert_eq!(paths.log_file, installed.log_file);
+    }
+
+    #[test]
+    fn installed_paths_do_not_require_a_valid_working_directory() {
+        let root = std::env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+        let installed = InstalledRuntimePaths {
+            state_dir: root.join("runtime"),
+            log_file: root.join("logs/agent.log"),
+        };
+
+        let state_dir = resolve_state_dir(
+            &test_config_with_optional_state(None),
+            Some(&installed),
+            || bail!("working directory fallback must not be evaluated"),
+        )
+        .unwrap();
+
+        assert_eq!(state_dir, installed.state_dir);
     }
 
     #[test]

@@ -14,7 +14,9 @@ type ChartCoordinate = {
   y: number
 }
 
-const props = defineProps<{
+type ValueType = 'percent' | 'milliseconds'
+
+const props = withDefaults(defineProps<{
   title: string
   points: MetricChartPoint[]
   from: number
@@ -22,7 +24,10 @@ const props = defineProps<{
   bucketSeconds: number
   color: string
   loading: boolean
-}>()
+  valueType?: ValueType
+}>(), {
+  valueType: 'percent',
+})
 
 const chartWidth = 420
 const chartHeight = 132
@@ -32,26 +37,33 @@ const chartTop = 7
 const chartBottom = 125
 const hoverIndex = ref<number | null>(null)
 
+const validPoints = computed(() => props.points
+  .filter((point): point is { ts: number; value: number } =>
+    Number.isFinite(point.ts)
+    && typeof point.value === 'number'
+    && Number.isFinite(point.value)
+    && point.ts >= props.from
+    && point.ts <= props.to,
+  )
+  .sort((left, right) => left.ts - right.ts))
+
+const chartMaxValue = computed(() => {
+  if (props.valueType === 'percent') return 100
+  const maximum = validPoints.value.reduce((current, point) => Math.max(current, point.value), 0)
+  return niceCeiling(Math.max(1, maximum * 1.1))
+})
+
 const coordinates = computed<ChartCoordinate[]>(() => {
   const duration = Math.max(1, props.to - props.from)
-  return props.points
-    .filter((point): point is { ts: number; value: number } =>
-      Number.isFinite(point.ts)
-      && typeof point.value === 'number'
-      && Number.isFinite(point.value)
-      && point.ts >= props.from
-      && point.ts <= props.to,
-    )
-    .sort((left, right) => left.ts - right.ts)
-    .map((point) => {
-      const value = Math.max(0, Math.min(100, point.value))
-      return {
-        ...point,
-        value,
-        x: chartLeft + ((point.ts - props.from) / duration) * (chartRight - chartLeft),
-        y: chartBottom - (value / 100) * (chartBottom - chartTop),
-      }
-    })
+  return validPoints.value.map((point) => {
+    const value = Math.max(0, Math.min(chartMaxValue.value, point.value))
+    return {
+      ...point,
+      value,
+      x: chartLeft + ((point.ts - props.from) / duration) * (chartRight - chartLeft),
+      y: chartBottom - (value / chartMaxValue.value) * (chartBottom - chartTop),
+    }
+  })
 })
 
 const linePaths = computed(() => {
@@ -101,7 +113,17 @@ function updateHover(event: PointerEvent) {
 }
 
 function formatValue(value: number | undefined) {
-  return typeof value === 'number' ? `${value.toFixed(value >= 10 ? 0 : 1)}%` : '暂无数据'
+  if (typeof value !== 'number') return '暂无数据'
+  const formatted = value.toFixed(value >= 10 ? 0 : 1)
+  return props.valueType === 'milliseconds' ? `${formatted} ms` : `${formatted}%`
+}
+
+function niceCeiling(value: number) {
+  const exponent = Math.floor(Math.log10(value))
+  const magnitude = 10 ** exponent
+  const fraction = value / magnitude
+  const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10
+  return niceFraction * magnitude
 }
 
 function formatPointTime(timestamp: number | undefined) {
@@ -142,11 +164,11 @@ function formatAxisTime(timestamp: number) {
         :viewBox="`0 0 ${chartWidth} ${chartHeight}`"
         preserveAspectRatio="none"
         role="img"
-        :aria-label="`${title}历史使用率折线图`"
+        :aria-label="`${title}历史折线图`"
         @pointermove="updateHover"
         @pointerleave="hoverIndex = null"
       >
-        <line v-for="value in [0, 25, 50, 75, 100]" :key="value" x1="2" x2="418" :y1="chartBottom - (value / 100) * (chartBottom - chartTop)" :y2="chartBottom - (value / 100) * (chartBottom - chartTop)" class="metric-chart-grid" />
+        <line v-for="ratio in [0, 0.25, 0.5, 0.75, 1]" :key="ratio" x1="2" x2="418" :y1="chartBottom - ratio * (chartBottom - chartTop)" :y2="chartBottom - ratio * (chartBottom - chartTop)" class="metric-chart-grid" />
         <path
           v-for="(path, index) in linePaths"
           :key="index"

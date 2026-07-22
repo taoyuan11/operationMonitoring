@@ -20,6 +20,7 @@ import {
   Server,
   ShieldAlert,
   Terminal,
+  Timer,
   Trash2,
   UploadCloud,
   Wifi,
@@ -101,14 +102,39 @@ const selectedHistoryRange = computed(() =>
   historyRanges.find((option) => option.value === historyRange.value) || historyRanges[0],
 )
 
-const chartTo = computed(() => Math.max(historyTo.value, props.instance.metrics?.ts || 0))
-const chartFrom = computed(() => historyFrom.value || chartTo.value - selectedHistoryRange.value.seconds)
+const historyWindowTo = computed(() => Math.max(historyTo.value, props.instance.metrics?.ts || 0))
+const historyWindowFrom = computed(() =>
+  historyFrom.value || historyWindowTo.value - selectedHistoryRange.value.seconds,
+)
 
 const chartMetrics = computed(() => {
   const metrics = new Map(historyMetrics.value.map((metric) => [metric.ts, metric]))
   const latest = props.instance.metrics
-  if (latest && latest.ts >= chartFrom.value) metrics.set(latest.ts, latest)
-  return [...metrics.values()].sort((left, right) => left.ts - right.ts)
+  if (latest && latest.ts >= historyWindowFrom.value) metrics.set(latest.ts, latest)
+  return [...metrics.values()]
+    .filter((metric) => metric.ts >= historyWindowFrom.value && metric.ts <= historyWindowTo.value)
+    .sort((left, right) => left.ts - right.ts)
+})
+
+const chartDomain = computed(() => {
+  const fallback = {
+    from: historyWindowFrom.value,
+    to: historyWindowTo.value,
+  }
+  if (!chartMetrics.value.length) return fallback
+
+  const dataFrom = chartMetrics.value[0].ts
+  const dataTo = chartMetrics.value[chartMetrics.value.length - 1].ts
+  const bucketSeconds = selectedHistoryRange.value.bucketSeconds
+  const coversWindow = dataFrom <= historyWindowFrom.value + bucketSeconds
+    && dataTo >= historyWindowTo.value - bucketSeconds
+  if (coversWindow) return fallback
+
+  if (dataFrom === dataTo) {
+    const halfBucket = bucketSeconds / 2
+    return { from: dataFrom - halfBucket, to: dataTo + halfBucket }
+  }
+  return { from: dataFrom, to: dataTo }
 })
 
 const cpuHistory = computed(() => chartMetrics.value.map((metric) => ({
@@ -131,6 +157,11 @@ const gpuHistory = computed(() => chartMetrics.value.map((metric) => ({
   value: metric.gpu_percent,
 })))
 
+const latencyHistory = computed(() => chartMetrics.value.map((metric) => ({
+  ts: metric.ts,
+  value: metric.latency_ms,
+})))
+
 watch(
   [() => props.instance.id, historyRange],
   () => void loadMetricHistory(),
@@ -147,6 +178,11 @@ function instanceCountry() {
   return getCountryOption(props.instance.country_code)?.name
     || props.instance.country
     || '未设置国家'
+}
+
+function formatLatency(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '未知'
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ms`
 }
 
 async function loadMetricHistory() {
@@ -271,8 +307,8 @@ async function loadMetricHistory() {
               <MetricHistoryChart
                 title="CPU"
                 :points="cpuHistory"
-                :from="chartFrom"
-                :to="chartTo"
+                :from="chartDomain.from"
+                :to="chartDomain.to"
                 :bucket-seconds="selectedHistoryRange.bucketSeconds"
                 color="#58d4b1"
                 :loading="historyLoading"
@@ -282,8 +318,8 @@ async function loadMetricHistory() {
               <MetricHistoryChart
                 title="内存"
                 :points="memoryHistory"
-                :from="chartFrom"
-                :to="chartTo"
+                :from="chartDomain.from"
+                :to="chartDomain.to"
                 :bucket-seconds="selectedHistoryRange.bucketSeconds"
                 color="#55b8cf"
                 :loading="historyLoading"
@@ -293,8 +329,8 @@ async function loadMetricHistory() {
               <MetricHistoryChart
                 title="磁盘"
                 :points="diskHistory"
-                :from="chartFrom"
-                :to="chartTo"
+                :from="chartDomain.from"
+                :to="chartDomain.to"
                 :bucket-seconds="selectedHistoryRange.bucketSeconds"
                 color="#e5ae54"
                 :loading="historyLoading"
@@ -304,13 +340,26 @@ async function loadMetricHistory() {
               <MetricHistoryChart
                 title="GPU"
                 :points="gpuHistory"
-                :from="chartFrom"
-                :to="chartTo"
+                :from="chartDomain.from"
+                :to="chartDomain.to"
                 :bucket-seconds="selectedHistoryRange.bucketSeconds"
                 color="#aaa5dc"
                 :loading="historyLoading"
               >
                 <template #icon><Zap :size="16" /></template>
+              </MetricHistoryChart>
+              <MetricHistoryChart
+                class="latency-history-chart"
+                title="通信延迟"
+                :points="latencyHistory"
+                :from="chartDomain.from"
+                :to="chartDomain.to"
+                :bucket-seconds="selectedHistoryRange.bucketSeconds"
+                color="#df8f72"
+                :loading="historyLoading"
+                value-type="milliseconds"
+              >
+                <template #icon><Timer :size="16" /></template>
               </MetricHistoryChart>
             </div>
           </div>
@@ -340,6 +389,7 @@ async function loadMetricHistory() {
               <div><dt><Radio :size="13" />网络发送</dt><dd>{{ formatBytes(instance.metrics?.network_tx) }}</dd></div>
               <div><dt><Gauge :size="13" />系统负载</dt><dd>{{ instance.metrics?.load_average?.toFixed(2) || '未知' }}</dd></div>
               <div><dt><Box :size="13" />GPU 显存</dt><dd>{{ formatBytes(instance.metrics?.gpu_memory_used) }} / {{ formatBytes(instance.metrics?.gpu_memory_total) }}</dd></div>
+              <div><dt><Timer :size="13" />最近通信延迟</dt><dd>{{ formatLatency(instance.metrics?.latency_ms) }}</dd></div>
               <div><dt>{{ instance.online ? '连接状态' : '离线状态' }}</dt><dd>{{ instance.online ? 'WebSocket 已连接' : '等待 Agent 重连' }}</dd></div>
             </dl>
           </div>

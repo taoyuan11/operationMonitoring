@@ -22,6 +22,12 @@ use crate::{
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 
+#[derive(Debug)]
+struct PendingHeartbeat {
+    token: i64,
+    sent_at: Instant,
+}
+
 pub async fn agent_socket(
     state: AppState,
     instance_id: String,
@@ -53,6 +59,9 @@ pub async fn agent_socket(
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_inbound = Instant::now();
+    let mut heartbeat_token = 0_i64;
+    let mut pending_heartbeat: Option<PendingHeartbeat> = None;
+    let mut latency_ms = None;
 
     loop {
         tokio::select! {
@@ -86,13 +95,27 @@ pub async fn agent_socket(
                         last_inbound = Instant::now();
                         match serde_json::from_str::<AgentInbound>(&text) {
                             Ok(message) => {
-                                if let Err(error) = handle_agent_message(
-                                    &state,
-                                    &instance_id,
-                                    connection_id,
-                                    message,
-                                ).await {
-                                    error!(?error, %instance_id, "failed to handle agent websocket message");
+                                match message {
+                                    AgentInbound::Pong { now } => {
+                                        if let Some(sample) = accept_heartbeat_pong(
+                                            &mut pending_heartbeat,
+                                            now,
+                                            Instant::now(),
+                                        ) {
+                                            latency_ms = Some(sample);
+                                        }
+                                    }
+                                    message => {
+                                        if let Err(error) = handle_agent_message(
+                                            &state,
+                                            &instance_id,
+                                            connection_id,
+                                            message,
+                                            latency_ms,
+                                        ).await {
+                                            error!(?error, %instance_id, "failed to handle agent websocket message");
+                                        }
+                                    }
                                 }
                             }
                             Err(error) => warn!(?error, %text, "invalid agent websocket message"),
@@ -117,13 +140,19 @@ pub async fn agent_socket(
                     warn!(%instance_id, %connection_id, "agent websocket heartbeat timed out");
                     break;
                 }
-                let ping = AgentOutbound::Ping { now: now_ts() };
+                heartbeat_token = heartbeat_token.wrapping_add(1);
+                let sent_at = Instant::now();
+                let ping = AgentOutbound::Ping { now: heartbeat_token };
                 let Ok(text) = serde_json::to_string(&ping) else {
                     continue;
                 };
                 if sender.send(Message::Text(text.into())).await.is_err() {
                     break;
                 }
+                pending_heartbeat = Some(PendingHeartbeat {
+                    token: heartbeat_token,
+                    sent_at,
+                });
             }
         }
     }
@@ -148,6 +177,7 @@ async fn handle_agent_message(
     instance_id: &str,
     connection_id: Uuid,
     message: AgentInbound,
+    latency_ms: Option<f64>,
 ) -> AppResult<()> {
     match message {
         AgentInbound::Pong { .. } => {}
@@ -172,6 +202,7 @@ async fn handle_agent_message(
                 native_arch.as_deref(),
                 update_privileged,
                 metrics,
+                latency_ms,
             )
             .await?;
         }
@@ -267,6 +298,7 @@ async fn store_metrics(
     native_arch: Option<&str>,
     update_privileged: Option<bool>,
     metrics: MetricPayload,
+    latency_ms: Option<f64>,
 ) -> AppResult<()> {
     sqlx::query(
         r#"
@@ -296,8 +328,9 @@ async fn store_metrics(
         r#"
         INSERT INTO metrics(instance_id, ts, cpu_percent, memory_used, memory_total,
                             disk_used, disk_total, network_rx, network_tx, gpu_percent,
-                            gpu_memory_used, gpu_memory_total, uptime_seconds, load_average)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                            gpu_memory_used, gpu_memory_total, uptime_seconds, load_average,
+                            latency_ms)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         "#,
     )
     .bind(instance_id)
@@ -314,10 +347,58 @@ async fn store_metrics(
     .bind(metrics.gpu_memory_total)
     .bind(metrics.uptime_seconds)
     .bind(metrics.load_average)
+    .bind(latency_ms)
     .execute(&state.db)
     .await?;
 
     Ok(())
+}
+
+fn accept_heartbeat_pong(
+    pending: &mut Option<PendingHeartbeat>,
+    token: i64,
+    received_at: Instant,
+) -> Option<f64> {
+    if pending
+        .as_ref()
+        .is_none_or(|heartbeat| heartbeat.token != token)
+    {
+        return None;
+    }
+
+    let heartbeat = pending.take()?;
+    Some(
+        received_at
+            .saturating_duration_since(heartbeat.sent_at)
+            .as_secs_f64()
+            * 1_000.0,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_pong_returns_millisecond_latency_and_clears_pending_heartbeat() {
+        let sent_at = Instant::now();
+        let mut pending = Some(PendingHeartbeat { token: 42, sent_at });
+
+        let latency = accept_heartbeat_pong(&mut pending, 42, sent_at + Duration::from_millis(37))
+            .expect("matching pong should produce a latency sample");
+
+        assert!((latency - 37.0).abs() < f64::EPSILON);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn mismatched_pong_is_ignored_without_clearing_pending_heartbeat() {
+        let sent_at = Instant::now();
+        let mut pending = Some(PendingHeartbeat { token: 42, sent_at });
+
+        assert!(accept_heartbeat_pong(&mut pending, 41, sent_at).is_none());
+        assert_eq!(pending.as_ref().map(|heartbeat| heartbeat.token), Some(42));
+    }
 }
 
 async fn send_terminal_event(

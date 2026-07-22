@@ -12,6 +12,7 @@ export type Metric = {
   gpu_memory_total: number | null
   uptime_seconds: number
   load_average: number | null
+  latency_ms: number | null
 }
 
 export type Instance = {

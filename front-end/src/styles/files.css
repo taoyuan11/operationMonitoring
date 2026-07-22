@@ -38,6 +38,7 @@
 .metric-history-error { display: flex; min-height: 34px; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 9px; color: var(--danger-text); background: rgba(236, 113, 130, .07); border: 1px solid rgba(236, 113, 130, .16); border-radius: 5px; font-size: 10px; }
 .metric-history-error button { flex: 0 0 auto; padding: 4px 8px; color: #ffc0c9; background: transparent; border: 1px solid rgba(236, 113, 130, .24); border-radius: 4px; }
 .detail-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.latency-history-chart { grid-column: 1 / -1; }
 .metric-history-card { min-width: 0; padding: 13px 13px 10px; overflow: hidden; background: var(--surface-inset); border: 1px solid var(--line); border-radius: 7px; }
 .metric-history-card > header { display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .metric-history-title { display: flex; min-width: 0; align-items: center; gap: 7px; color: #a7b0ac; font-size: 12px; }

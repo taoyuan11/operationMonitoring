@@ -42,6 +42,11 @@ pub enum AgentCommand {
     Status,
     /// Show existing agent logs and follow new output
     Log,
+    /// Force-install a local agent package when automatic updates are unavailable
+    Update {
+        /// Path to the replacement om-agent executable
+        package: PathBuf,
+    },
     #[command(name = "service-run", hide = true)]
     ServiceRun,
     #[command(name = "apply-update", hide = true)]
@@ -192,6 +197,18 @@ mod tests {
         let cli = Cli::try_parse_from(["agent", "log"]).unwrap();
 
         assert_eq!(cli.command, AgentCommand::Log);
+    }
+
+    #[test]
+    fn parses_a_forced_update_package_path() {
+        let cli = Cli::try_parse_from(["agent", "update", "/tmp/om-agent.next"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            AgentCommand::Update {
+                package: PathBuf::from("/tmp/om-agent.next")
+            }
+        );
     }
 
     #[test]

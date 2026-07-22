@@ -12,6 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(windows, test))]
+use std::io;
+
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
 use fs2::{FileExt, available_space};
@@ -43,6 +46,10 @@ const OLD_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVICE_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
+const PACKAGE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const PARENT_HANDOFF_GRACE: Duration = Duration::from_secs(1);
+#[cfg(windows)]
+const WINDOWS_FILE_REPLACE_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DISK_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CHECKSUM_FILE_BYTES: usize = 4096;
@@ -142,6 +149,8 @@ enum AttemptPhase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedAttempt {
     offer: UpdateOffer,
+    #[serde(default)]
+    manual: bool,
     status: UpdateStatus,
     message: Option<String>,
     package_path: Option<PathBuf>,
@@ -209,6 +218,189 @@ pub fn update_capability() -> UpdateCapability {
     UPDATE_CAPABILITY
         .get_or_init(detect_update_capability)
         .clone()
+}
+
+pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
+    let capability = update_capability();
+    if capability.package_type.as_deref() != Some(PackageType::Standalone.as_str()) {
+        bail!("forced updates require a managed standalone installation");
+    }
+    if !capability.update_privileged {
+        bail!("forced updates require root or administrator privileges");
+    }
+
+    let source = fs::canonicalize(package)
+        .with_context(|| format!("failed to resolve update package {}", package.display()))?;
+    if !source.is_file() {
+        bail!("update package {} is not a regular file", source.display());
+    }
+    validate_package_magic(PackageType::Standalone, &source)?;
+
+    let installed_executable = installed_standalone_executable()?;
+    let mut force_config = config.clone();
+    if force_config.update_dir.is_none() && force_config.state_dir.is_none() {
+        force_config.update_dir = Some(installed_standalone_update_dir()?);
+    }
+    let paths = UpdatePaths::from_config(&force_config)?;
+    paths.prepare()?;
+    if update_lock_is_held(&paths.lock_file)? {
+        bail!("another updater is already running; wait for it to finish before forcing an update");
+    }
+
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let staged_path = paths.packages.join(format!(
+        "manual-{}{}",
+        safe_component(&operation_id),
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::copy(&source, &staged_path).with_context(|| {
+        format!(
+            "failed to stage forced update package {}",
+            staged_path.display()
+        )
+    })?;
+    let prepared = (|| {
+        set_owner_only_executable(&staged_path)?;
+        let version = inspect_agent_package_version(&staged_path)?;
+        let (size_bytes, sha256) = file_integrity(&staged_path)?;
+        verify_package_at_rest(&staged_path, PackageType::Standalone, size_bytes, &sha256)?;
+        Result::<_>::Ok((version, size_bytes, sha256))
+    })();
+    let (version, size_bytes, sha256) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = fs::remove_file(&staged_path);
+            return Err(error);
+        }
+    };
+    let offer = UpdateOffer {
+        release_id: format!("manual-{operation_id}"),
+        version: version.clone(),
+        artifact_id: format!("manual-{operation_id}"),
+        download_url: format!("local://{}", source.display()),
+        sha256,
+        size_bytes: i64::try_from(size_bytes).context("forced update package is too large")?,
+        package_type: PackageType::Standalone.as_str().to_string(),
+        native_arch: standalone_native_arch(),
+        retry_count: 0,
+    };
+
+    let mut state = read_update_state(&paths.state_file)?;
+    state.attempt = Some(PersistedAttempt {
+        offer: offer.clone(),
+        manual: true,
+        status: UpdateStatus::AwaitingRestart,
+        message: Some(format!("forced update from {}", source.display())),
+        package_path: Some(staged_path.clone()),
+        previous_package: None,
+        phase: AttemptPhase::Target,
+        updated_at: now_ts(),
+    });
+    write_update_state(&paths.state_file, &state)?;
+
+    let manager = UpdateManager {
+        config: force_config,
+        identity: Identity {
+            instance_id: "manual-update".to_string(),
+            secret: String::new(),
+        },
+        client: Client::new(),
+        activity: ActivityTracker::default(),
+        capability,
+        paths,
+    };
+    // This is the recovery path for a broken automatic handoff. The state is armed before
+    // launch and the worker observes a grace period, so success depends only on starting the
+    // detached process, not on the parent being able to inspect the Windows ownership lock.
+    if let Err(error) = manager.spawn_updater_for_executable(
+        &offer,
+        staged_path,
+        installed_executable.clone(),
+        false,
+    ) {
+        let message = format!("failed to launch forced updater: {error:#}");
+        let mut state = read_update_state(&manager.paths.state_file)?;
+        if let Some(attempt) = &mut state.attempt
+            && attempt.offer.artifact_id == offer.artifact_id
+        {
+            attempt.status = UpdateStatus::Failed;
+            attempt.message = Some(message.clone());
+            attempt.phase = AttemptPhase::Completed;
+            attempt.updated_at = now_ts();
+            write_update_state(&manager.paths.state_file, &state)?;
+        }
+        bail!(message);
+    }
+
+    println!("forced update to {version} has been handed off");
+    println!("target: {}", installed_executable.display());
+    println!("the agent service will restart automatically");
+    Ok(())
+}
+
+fn inspect_agent_package_version(path: &Path) -> Result<String> {
+    let spec = CommandSpec {
+        program: path.as_os_str().to_owned(),
+        args: vec!["--version".into()],
+    };
+    let output = run_command_output_with_timeout(
+        &spec,
+        PACKAGE_INSPECTION_TIMEOUT,
+        "forced update package inspection",
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!(
+            "update package --version exited with {}: {}{}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+    parse_agent_package_version(&stdout)
+}
+
+fn parse_agent_package_version(output: &str) -> Result<String> {
+    let version = output
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("om-agent "))
+        .context("update package did not identify itself as om-agent")?;
+    Ok(Version::parse(version.trim())?.to_string())
+}
+
+fn installed_standalone_update_dir() -> Result<PathBuf> {
+    let marker = standalone_install_marker().context("standalone install marker is missing")?;
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        return Ok(marker
+            .parent()
+            .context("standalone install marker has no parent directory")?
+            .join("updates"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if marker.starts_with("/etc/om-agent") {
+            Ok(PathBuf::from("/var/lib/om-agent/updates"))
+        } else {
+            Ok(PathBuf::from("/var/lib/operation-monitoring-agent/updates"))
+        }
+    }
+}
+
+fn installed_standalone_executable() -> Result<PathBuf> {
+    let preferred = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("ProgramFiles").context("ProgramFiles is missing")?)
+            .join("OM Agent/om-agent.exe")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from("/usr/local/bin/om-agent")
+    } else if Path::new("/etc/openwrt_release").exists() {
+        PathBuf::from("/usr/bin/om-agent")
+    } else {
+        PathBuf::from("/usr/local/bin/om-agent")
+    };
+    Ok(preferred)
 }
 
 impl UpdateManager {
@@ -353,6 +545,10 @@ impl UpdateManager {
                     connected_at: now_ts(),
                 },
             )?;
+        }
+
+        if attempt.manual {
+            return Ok(None);
         }
 
         Ok(Some(update_status_message(&attempt.offer, status, message)))
@@ -686,6 +882,7 @@ impl UpdateManager {
         let mut state = read_update_state(&self.paths.state_file)?;
         state.attempt = Some(PersistedAttempt {
             offer: offer.clone(),
+            manual: false,
             status: UpdateStatus::Waiting,
             message: None,
             package_path: None,
@@ -772,6 +969,16 @@ impl UpdateManager {
     }
 
     fn spawn_updater(&self, offer: &UpdateOffer, package_path: PathBuf) -> Result<()> {
+        self.spawn_updater_for_executable(offer, package_path, std::env::current_exe()?, true)
+    }
+
+    fn spawn_updater_for_executable(
+        &self,
+        offer: &UpdateOffer,
+        package_path: PathBuf,
+        installed_executable: PathBuf,
+        verify_ownership: bool,
+    ) -> Result<()> {
         let mut state = read_update_state(&self.paths.state_file)?;
         let mut previous_package = state
             .attempt
@@ -781,14 +988,16 @@ impl UpdateManager {
                     && attempt.offer.retry_count == offer.retry_count
             })
             .and_then(|attempt| attempt.previous_package.clone());
-        if previous_package.is_none() && offer.package_type == PackageType::Standalone.as_str() {
-            let current = std::env::current_exe()?;
+        if previous_package.is_none()
+            && offer.package_type == PackageType::Standalone.as_str()
+            && installed_executable.is_file()
+        {
             let rollback_path = self.paths.packages.join(format!(
                 "standalone-rollback-{}{}",
                 env!("CARGO_PKG_VERSION"),
                 std::env::consts::EXE_SUFFIX
             ));
-            fs::copy(&current, &rollback_path)?;
+            fs::copy(&installed_executable, &rollback_path)?;
             set_owner_only_executable(&rollback_path)?;
             let (size_bytes, sha256) = file_integrity(&rollback_path)?;
             previous_package = Some(CachedPackage {
@@ -830,7 +1039,7 @@ impl UpdateManager {
             lock_owner_file: self.paths.lock_owner_file.clone(),
             lock_owner: uuid::Uuid::new_v4().to_string(),
             old_pid: std::process::id(),
-            installed_executable: Some(std::env::current_exe()?),
+            installed_executable: Some(installed_executable),
         };
         write_json_atomic(&plan_path, &plan)?;
 
@@ -867,7 +1076,9 @@ impl UpdateManager {
                 .spawn()
                 .with_context(|| format!("failed to start updater {}", updater_path.display()))?;
         }
-        wait_for_worker_ownership(&plan, WORKER_LOCK_TIMEOUT)?;
+        if verify_ownership {
+            wait_for_worker_ownership(&plan, WORKER_LOCK_TIMEOUT)?;
+        }
         Ok(())
     }
 }
@@ -1128,7 +1339,7 @@ fn wait_for_worker_ownership(plan: &ApplyPlan, timeout: Duration) -> Result<()> 
             Ok(()) => {
                 FileExt::unlock(&lock)?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if update_lock_is_contended(&error) => {
                 let owner = fs::read_to_string(&plan.lock_owner_file)
                     .ok()
                     .and_then(|value| serde_json::from_str::<String>(&value).ok());
@@ -1153,9 +1364,16 @@ fn update_lock_is_held(path: &Path) -> Result<bool> {
             FileExt::unlock(&lock)?;
             Ok(false)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) if update_lock_is_contended(&error) => Ok(true),
         Err(error) => Err(error).context("failed to inspect updater ownership lock"),
     }
+}
+
+fn update_lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| fs2::lock_contended_error().raw_os_error() == Some(code))
 }
 
 impl UpdatePaths {
@@ -1164,10 +1382,10 @@ impl UpdatePaths {
             path.clone()
         } else if let Some(path) = &config.state_dir {
             path.join("updates")
+        } else if let Some(dirs) = ProjectDirs::from("com", "operation-monitoring", "agent") {
+            dirs.data_local_dir().join("updates")
         } else {
-            ProjectDirs::from("com", "operation-monitoring", "agent")
-                .map(|dirs| dirs.data_local_dir().join("updates"))
-                .unwrap_or(std::env::current_dir()?.join(".operation-monitoring-updates"))
+            std::env::current_dir()?.join(".operation-monitoring-updates")
         };
         Ok(Self {
             packages: root.join("packages"),
@@ -1208,6 +1426,7 @@ pub fn apply_update(plan_file: &Path) -> Result<()> {
         plan.offer.version,
         plan.package_path.display()
     ));
+    thread::sleep(PARENT_HANDOFF_GRACE);
 
     let result = apply_update_inner(&plan);
     if let Err(error) = &result {
@@ -1505,7 +1724,6 @@ fn run_command_with_timeout(
     wait_for_command(&mut child, spec, timeout, description)
 }
 
-#[cfg(any(windows, test))]
 fn run_command_output_with_timeout(
     spec: &CommandSpec,
     timeout: Duration,
@@ -1982,6 +2200,9 @@ fn install_standalone(plan: &ApplyPlan, source: &Path) -> Result<()> {
         .installed_executable
         .as_ref()
         .ok_or_else(|| anyhow!("standalone update plan has no installed executable"))?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let temporary = target.with_extension("update-new");
     fs::copy(source, &temporary).with_context(|| {
         format!(
@@ -1992,13 +2213,52 @@ fn install_standalone(plan: &ApplyPlan, source: &Path) -> Result<()> {
     set_installed_executable_permissions(&temporary)?;
     #[cfg(windows)]
     {
+        if !target.exists() {
+            retry_windows_file_operation(WINDOWS_FILE_REPLACE_TIMEOUT, || {
+                fs::rename(&temporary, target)
+            })
+            .with_context(|| {
+                format!(
+                    "failed to restore missing installed executable {}",
+                    target.display()
+                )
+            })?;
+            return Ok(());
+        }
         let backup = target.with_extension("update-old.exe");
-        let _ = fs::remove_file(&backup);
-        fs::rename(target, &backup)?;
-        fs::rename(&temporary, target).inspect_err(|_| {
-            let _ = fs::rename(&backup, target);
-        })?;
-        let _ = fs::remove_file(backup);
+        remove_windows_file_if_exists(&backup, WINDOWS_FILE_REPLACE_TIMEOUT).with_context(
+            || {
+                format!(
+                    "failed to remove previous update backup {}",
+                    backup.display()
+                )
+            },
+        )?;
+        retry_windows_file_operation(WINDOWS_FILE_REPLACE_TIMEOUT, || fs::rename(target, &backup))
+            .with_context(|| {
+                format!(
+                    "failed to release installed executable {} for replacement",
+                    target.display()
+                )
+            })?;
+        if let Err(error) = retry_windows_file_operation(WINDOWS_FILE_REPLACE_TIMEOUT, || {
+            fs::rename(&temporary, target)
+        }) {
+            let restore = retry_windows_file_operation(WINDOWS_FILE_REPLACE_TIMEOUT, || {
+                fs::rename(&backup, target)
+            });
+            return match restore {
+                Ok(()) => Err(error).with_context(|| {
+                    format!("failed to install new executable {}", target.display())
+                }),
+                Err(restore_error) => bail!(
+                    "failed to install new executable {}: {error}; also failed to restore {}: {restore_error}",
+                    target.display(),
+                    backup.display()
+                ),
+            };
+        }
+        let _ = remove_windows_file_if_exists(&backup, WINDOWS_FILE_REPLACE_TIMEOUT);
     }
     #[cfg(not(windows))]
     {
@@ -2007,15 +2267,55 @@ fn install_standalone(plan: &ApplyPlan, source: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+fn retry_windows_file_operation<T>(
+    timeout: Duration,
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let started = Instant::now();
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if started.elapsed() < timeout => {
+                thread::sleep(POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+                if started.elapsed() >= timeout {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn remove_windows_file_if_exists(path: &Path, timeout: Duration) -> io::Result<()> {
+    retry_windows_file_operation(timeout, || match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    })
+}
+
 fn stop_standalone_service() -> Result<()> {
     #[cfg(windows)]
     {
+        let mut found = false;
+        let mut errors = Vec::new();
         for service_name in [LEGACY_SERVICE_NAME, SERVICE_NAME] {
             if query_windows_agent_service(service_name).is_ok() {
-                return stop_windows_agent_service(service_name);
+                found = true;
+                if let Err(error) = stop_windows_agent_service(service_name) {
+                    errors.push(format!("{service_name}: {error:#}"));
+                }
             }
         }
-        bail!("OM Agent Windows service is not installed");
+        if !errors.is_empty() {
+            bail!("{}", errors.join("; "));
+        }
+        if !found {
+            bail!("OM Agent Windows service is not installed");
+        }
+        return Ok(());
     }
     #[cfg(target_os = "macos")]
     {
@@ -2197,6 +2497,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_forced_update_package_versions() {
+        assert_eq!(
+            parse_agent_package_version("om-agent 1.2.3\n").unwrap(),
+            "1.2.3"
+        );
+        assert!(parse_agent_package_version("different-agent 1.2.3\n").is_err());
+        assert!(parse_agent_package_version("om-agent invalid\n").is_err());
+    }
+
+    #[test]
     fn downloaded_package_must_match_offer_and_sidecar() {
         #[cfg(windows)]
         let package: &[u8] = b"MZtrusted-executable";
@@ -2306,6 +2616,7 @@ mod tests {
                 current_package: Some(previous.clone()),
                 attempt: Some(PersistedAttempt {
                     offer: offer.clone(),
+                    manual: false,
                     status: UpdateStatus::Verifying,
                     message: None,
                     package_path: Some(paths.packages.join("target.standalone")),
@@ -2477,6 +2788,42 @@ mod tests {
     }
 
     #[test]
+    fn forced_install_can_restore_a_missing_executable() {
+        let directory = std::env::temp_dir().join(format!("om-update-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source-agent");
+        let target = directory.join(format!("installed-agent{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&source, b"replacement-agent").unwrap();
+        let plan = ApplyPlan {
+            offer: UpdateOffer {
+                release_id: "manual-release".to_string(),
+                version: "9.9.9".to_string(),
+                artifact_id: "manual-artifact".to_string(),
+                download_url: "local://replacement".to_string(),
+                sha256: "a".repeat(64),
+                size_bytes: 17,
+                package_type: "standalone".to_string(),
+                native_arch: standalone_native_arch(),
+                retry_count: 0,
+            },
+            package_path: source.clone(),
+            previous_package: None,
+            state_file: directory.join("state.json"),
+            health_file: directory.join("health.json"),
+            lock_file: directory.join("updater.lock"),
+            lock_owner_file: directory.join("updater-owner.json"),
+            lock_owner: "manual-owner".to_string(),
+            old_pid: 1,
+            installed_executable: Some(target.clone()),
+        };
+
+        install_standalone(&plan, &source).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"replacement-agent");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn delayed_old_plan_cannot_rewrite_a_newer_generation() {
         let directory = std::env::temp_dir().join(format!("om-update-{}", uuid::Uuid::new_v4()));
         let state_file = directory.join("state.json");
@@ -2517,6 +2864,7 @@ mod tests {
                 current_package: Some(previous.clone()),
                 attempt: Some(PersistedAttempt {
                     offer: new_offer,
+                    manual: false,
                     status: UpdateStatus::Waiting,
                     message: None,
                     package_path: None,
@@ -2587,6 +2935,38 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_the_platform_file_lock_contention_error() {
+        let error = fs2::lock_contended_error();
+
+        assert!(update_lock_is_contended(&error));
+        assert!(!update_lock_is_contended(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unrelated file access failure",
+        )));
+        #[cfg(windows)]
+        assert_eq!(error.raw_os_error(), Some(33));
+    }
+
+    #[test]
+    fn windows_file_replacement_retries_transient_lock_failures() {
+        let mut attempts = 0;
+        retry_windows_file_operation(Duration::from_secs(2), || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "executable is still locked",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
     fn connected_target_finalizes_cache_before_signaling_health() {
         let directory = std::env::temp_dir().join(format!("om-update-{}", uuid::Uuid::new_v4()));
         let config = AgentConfig {
@@ -2648,6 +3028,7 @@ mod tests {
                 current_package: Some(previous.clone()),
                 attempt: Some(PersistedAttempt {
                     offer: offer.clone(),
+                    manual: false,
                     status: UpdateStatus::AwaitingRestart,
                     message: Some("waiting for restart".to_string()),
                     package_path: Some(target_path.clone()),
@@ -2690,6 +3071,23 @@ mod tests {
             Duration::from_millis(10),
         ));
 
+        let mut manual_state = read_update_state(&paths.state_file).unwrap();
+        let manual_attempt = manual_state.attempt.as_mut().unwrap();
+        manual_attempt.manual = true;
+        manual_attempt.status = UpdateStatus::AwaitingRestart;
+        manual_attempt.phase = AttemptPhase::Target;
+        write_update_state(&paths.state_file, &manual_state).unwrap();
+        fs::remove_file(&paths.health_file).unwrap();
+
+        assert!(manager.connected_status().unwrap().is_none());
+        assert!(wait_for_health(
+            &paths.health_file,
+            "artifact-target",
+            env!("CARGO_PKG_VERSION"),
+            0,
+            Duration::from_millis(10),
+        ));
+
         let mut next_state = read_update_state(&paths.state_file).unwrap();
         let mut next_offer = offer.clone();
         next_offer.release_id = "release-next".to_string();
@@ -2697,6 +3095,7 @@ mod tests {
         next_offer.version = "9.9.9".to_string();
         next_state.attempt = Some(PersistedAttempt {
             offer: next_offer,
+            manual: false,
             status: UpdateStatus::Waiting,
             message: None,
             package_path: None,

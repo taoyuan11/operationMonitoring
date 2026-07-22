@@ -139,12 +139,15 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             gpu_memory_used BIGINT,
             gpu_memory_total BIGINT,
             uptime_seconds BIGINT NOT NULL,
-            load_average DOUBLE PRECISION
+            load_average DOUBLE PRECISION,
+            latency_ms DOUBLE PRECISION
         );
         "#,
     )
     .execute(db)
     .await?;
+
+    ensure_metric_columns(db).await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_metrics_instance_ts ON metrics(instance_id, ts DESC);",
@@ -497,6 +500,14 @@ async fn ensure_instance_location_columns(db: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn ensure_metric_columns(db: &PgPool) -> anyhow::Result<()> {
+    sqlx::query("ALTER TABLE metrics ADD COLUMN IF NOT EXISTS latency_ms DOUBLE PRECISION")
+        .execute(db)
+        .await?;
+
+    Ok(())
+}
+
 async fn ensure_capability_columns(db: &PgPool, table: &str) -> anyhow::Result<()> {
     for (name, definition) in [
         ("package_type", "TEXT NOT NULL DEFAULT ''"),
@@ -698,7 +709,7 @@ pub async fn latest_metric(db: &PgPool, instance_id: &str) -> AppResult<Option<M
         r#"
         SELECT ts, cpu_percent, memory_used, memory_total, disk_used, disk_total,
                network_rx, network_tx, gpu_percent, gpu_memory_used, gpu_memory_total,
-               uptime_seconds, load_average
+               uptime_seconds, load_average, latency_ms
         FROM metrics
         WHERE instance_id = $1
         ORDER BY ts DESC

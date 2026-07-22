@@ -76,6 +76,7 @@ use windows::{
                 GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess,
                 OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
                 PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW, TerminateProcess,
+                WaitForSingleObject,
             },
         },
         UI::Input::KeyboardAndMouse::{
@@ -1359,9 +1360,15 @@ impl HelperProcess {
         match self {
             Self::Child(child) => {
                 let _ = child.kill();
+                unsafe {
+                    let handle = HANDLE(child.as_raw_handle() as isize);
+                    let _ = WaitForSingleObject(handle, 5_000);
+                }
+                let _ = child.try_wait();
             }
             Self::Handle { handle, .. } if !handle.is_invalid() => unsafe {
                 let _ = TerminateProcess(*handle, 1);
+                let _ = WaitForSingleObject(*handle, 5_000);
             },
             Self::Handle { .. } => {}
         }

@@ -102,7 +102,7 @@ pub async fn public_metrics(
         let bucket_seconds = bucket_seconds.clamp(60, 24 * 3600);
         let metrics = sqlx::query_as::<_, MetricRecord>(
             r#"
-            SELECT (ts / $4) * $4 AS ts,
+            SELECT ROUND(AVG(ts))::BIGINT AS ts,
                    AVG(cpu_percent)::DOUBLE PRECISION AS cpu_percent,
                    ROUND(AVG(memory_used))::BIGINT AS memory_used,
                    ROUND(AVG(memory_total))::BIGINT AS memory_total,
@@ -114,7 +114,8 @@ pub async fn public_metrics(
                    ROUND(AVG(gpu_memory_used))::BIGINT AS gpu_memory_used,
                    ROUND(AVG(gpu_memory_total))::BIGINT AS gpu_memory_total,
                    ROUND(AVG(uptime_seconds))::BIGINT AS uptime_seconds,
-                   AVG(load_average)::DOUBLE PRECISION AS load_average
+                   AVG(load_average)::DOUBLE PRECISION AS load_average,
+                   AVG(latency_ms)::DOUBLE PRECISION AS latency_ms
             FROM metrics
             WHERE instance_id = $1 AND ts BETWEEN $2 AND $3
             GROUP BY (ts / $4)
@@ -137,7 +138,7 @@ pub async fn public_metrics(
         r#"
         SELECT ts, cpu_percent, memory_used, memory_total, disk_used, disk_total,
                network_rx, network_tx, gpu_percent, gpu_memory_used, gpu_memory_total,
-               uptime_seconds, load_average
+               uptime_seconds, load_average, latency_ms
         FROM metrics
         WHERE instance_id = $1 AND ts BETWEEN $2 AND $3
         ORDER BY ts ASC
@@ -919,8 +920,9 @@ pub async fn agent_report(
         r#"
         INSERT INTO metrics(instance_id, ts, cpu_percent, memory_used, memory_total,
                             disk_used, disk_total, network_rx, network_tx, gpu_percent,
-                            gpu_memory_used, gpu_memory_total, uptime_seconds, load_average)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                            gpu_memory_used, gpu_memory_total, uptime_seconds, load_average,
+                            latency_ms)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL)
         "#,
     )
     .bind(&payload.instance_id)

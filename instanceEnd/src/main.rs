@@ -53,6 +53,7 @@ fn run() -> Result<()> {
         AgentCommand::Stop { timeout } => stop(&cli.agent, timeout),
         AgentCommand::Status => status(&cli.agent),
         AgentCommand::Log => tokio::runtime::Runtime::new()?.block_on(follow_logs(&cli.agent)),
+        AgentCommand::Update { package } => update::force_update(&cli.agent, &package),
         AgentCommand::ServiceRun => unreachable!(),
         AgentCommand::ApplyUpdate { plan_file } => {
             let parent = plan_file

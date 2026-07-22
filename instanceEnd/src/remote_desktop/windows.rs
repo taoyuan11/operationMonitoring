@@ -24,7 +24,9 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, FreeLibrary, HANDLE, HMODULE, HWND, LocalFree, STILL_ACTIVE},
+        Foundation::{
+            CloseHandle, FreeLibrary, GENERIC_WRITE, HANDLE, HMODULE, HWND, LocalFree, STILL_ACTIVE,
+        },
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0},
             Direct3D11::{
@@ -63,13 +65,15 @@ use windows::{
             Pipes::GetNamedPipeClientProcessId,
             RemoteDesktop::{
                 ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
-                WTSEnumerateProcessesW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+                WTS_SESSION_INFOW, WTSActive, WTSEnumerateProcessesW, WTSEnumerateSessionsW,
+                WTSFreeMemory, WTSGetActiveConsoleSessionId,
             },
             StationsAndDesktops::{
-                CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS,
-                GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, HDESK,
-                OpenInputDesktop, OpenWindowStationW, SetProcessWindowStation, SetThreadDesktop,
-                UOI_NAME,
+                CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CREATEMENU, DESKTOP_CREATEWINDOW,
+                DESKTOP_ENUMERATE, DESKTOP_HOOKCONTROL, DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP,
+                DESKTOP_WRITEOBJECTS, GetProcessWindowStation, GetThreadDesktop,
+                GetUserObjectInformationW, HDESK, OpenInputDesktop, OpenWindowStationW,
+                SetProcessWindowStation, SetThreadDesktop, UOI_NAME,
             },
             Threading::{
                 CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
@@ -86,10 +90,7 @@ use windows::{
             MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
             VIRTUAL_KEY,
         },
-        UI::WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, WINSTA_ENUMDESKTOPS, WINSTA_READATTRIBUTES,
-            WINSTA_READSCREEN, WINSTA_WRITEATTRIBUTES,
-        },
+        UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
     },
     core::{ComInterface, PCWSTR, PWSTR},
 };
@@ -112,6 +113,20 @@ const PIPE_MAX_PACKET: usize = MAX_FRAME_BYTES + 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+// WINSTA_ALL_ACCESS from winuser.h; windows 0.52 does not expose the aggregate constant.
+const WINSTA_ALL_ACCESS_MASK: u32 = 0x0000_037f;
+// SetThreadDesktop constrains subsequent USER calls to the rights on this handle. Generic write
+// supplies the journal playback rights used by software input injection.
+const INPUT_DESKTOP_ACCESS: DESKTOP_ACCESS_FLAGS = DESKTOP_ACCESS_FLAGS(
+    DESKTOP_CREATEMENU.0
+        | DESKTOP_CREATEWINDOW.0
+        | DESKTOP_ENUMERATE.0
+        | DESKTOP_HOOKCONTROL.0
+        | DESKTOP_READOBJECTS.0
+        | DESKTOP_SWITCHDESKTOP.0
+        | DESKTOP_WRITEOBJECTS.0
+        | GENERIC_WRITE.0,
+);
 
 pub async fn run_session(
     config: AgentConfig,
@@ -753,15 +768,20 @@ fn user_object_name(handle: HANDLE) -> Result<String> {
 
 fn bind_interactive_window_station() -> Result<()> {
     unsafe {
+        let current = GetProcessWindowStation()
+            .context("failed to inspect current process window station")?;
+        if user_object_name(HANDLE(current.0))?.eq_ignore_ascii_case("WinSta0") {
+            return Ok(());
+        }
+
         let name = wide("WinSta0");
-        let access = (WINSTA_ENUMDESKTOPS
-            | WINSTA_READATTRIBUTES
-            | WINSTA_READSCREEN
-            | WINSTA_WRITEATTRIBUTES) as u32;
-        let station = OpenWindowStationW(PCWSTR(name.as_ptr()), false, access)
+        let station = OpenWindowStationW(PCWSTR(name.as_ptr()), false, WINSTA_ALL_ACCESS_MASK)
             .context("failed to open interactive window station")?;
-        SetProcessWindowStation(station)
-            .context("failed to bind desktop helper to interactive window station")?;
+        if let Err(error) = SetProcessWindowStation(station) {
+            let _ = windows::Win32::System::StationsAndDesktops::CloseWindowStation(station);
+            return Err(error)
+                .context("failed to bind desktop helper to interactive window station");
+        }
         // The station must remain associated with the process until this short-lived helper exits.
         Ok(())
     }
@@ -791,15 +811,18 @@ fn log_helper_security_context(options: &DesktopOptions) -> Result<()> {
 fn apply_on_input_desktop(input: &mut InputState, control: DesktopControl) -> Result<()> {
     unsafe {
         let original = GetThreadDesktop(GetCurrentThreadId())?;
-        let desktop = OpenInputDesktop(
-            Default::default(),
-            false,
-            DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0),
-        )
-        .context("input desktop is unavailable for input injection")?;
-        SetThreadDesktop(desktop).context("failed to bind input thread to input desktop")?;
-        let result = input.apply(control);
-        let _ = SetThreadDesktop(original);
+        let desktop = OpenInputDesktop(Default::default(), false, INPUT_DESKTOP_ACCESS)
+            .context("input desktop is unavailable for input injection")?;
+        let result = (|| -> Result<()> {
+            let name = desktop_name(desktop)?;
+            SetThreadDesktop(desktop).context("failed to bind input thread to input desktop")?;
+            let applied = input
+                .apply(control)
+                .with_context(|| format!("input desktop {name}"));
+            let restored = SetThreadDesktop(original)
+                .context("failed to restore input thread desktop after injection");
+            applied.and(restored)
+        })();
         let _ = CloseDesktop(desktop);
         result
     }
@@ -1519,11 +1542,37 @@ fn token_user_sid(token: HANDLE) -> Result<String> {
 }
 
 fn select_active_session() -> Result<u32> {
-    let console = unsafe { WTSGetActiveConsoleSessionId() };
-    if console == u32::MAX {
-        bail!("no_active_session")
+    unsafe {
+        let console = WTSGetActiveConsoleSessionId();
+        let mut sessions: *mut WTS_SESSION_INFOW = null_mut();
+        let mut count = 0_u32;
+        WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sessions, &mut count)
+            .context("failed to enumerate Windows sessions")?;
+        let active = if sessions.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(sessions, count as usize)
+                .iter()
+                .filter(|session| session.State == WTSActive)
+                .map(|session| session.SessionId)
+                .collect::<Vec<_>>()
+        };
+        if !sessions.is_null() {
+            WTSFreeMemory(sessions.cast());
+        }
+        choose_active_session(console, &active)
     }
-    Ok(console)
+}
+
+fn choose_active_session(console: u32, active: &[u32]) -> Result<u32> {
+    if active.contains(&console) {
+        return Ok(console);
+    }
+    match active {
+        [] => bail!("no_active_session"),
+        [only] => Ok(*only),
+        _ => bail!("multiple_active_sessions"),
+    }
 }
 
 fn duplicate_session_system_token(session_id: u32) -> Result<HANDLE> {
@@ -1720,4 +1769,56 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_desktop_access_includes_injection_rights() {
+        for required in [
+            DESKTOP_CREATEMENU.0,
+            DESKTOP_CREATEWINDOW.0,
+            DESKTOP_ENUMERATE.0,
+            DESKTOP_HOOKCONTROL.0,
+            DESKTOP_READOBJECTS.0,
+            DESKTOP_SWITCHDESKTOP.0,
+            DESKTOP_WRITEOBJECTS.0,
+            GENERIC_WRITE.0,
+        ] {
+            assert_eq!(INPUT_DESKTOP_ACCESS.0 & required, required);
+        }
+    }
+
+    #[test]
+    fn interactive_window_station_access_matches_win32_all_access() {
+        assert_eq!(WINSTA_ALL_ACCESS_MASK, 0x037f);
+    }
+
+    #[test]
+    fn active_console_session_is_preferred() {
+        assert_eq!(choose_active_session(2, &[1, 2]).unwrap(), 2);
+    }
+
+    #[test]
+    fn unique_active_rdp_session_is_selected_without_active_console() {
+        assert_eq!(choose_active_session(u32::MAX, &[3]).unwrap(), 3);
+    }
+
+    #[test]
+    fn ambiguous_or_missing_active_sessions_are_rejected() {
+        assert_eq!(
+            choose_active_session(u32::MAX, &[])
+                .unwrap_err()
+                .to_string(),
+            "no_active_session"
+        );
+        assert_eq!(
+            choose_active_session(u32::MAX, &[1, 2])
+                .unwrap_err()
+                .to_string(),
+            "multiple_active_sessions"
+        );
+    }
 }

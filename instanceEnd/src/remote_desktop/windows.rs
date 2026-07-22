@@ -447,7 +447,14 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     let pipe = tokio::time::timeout(DATA_CHANNEL_JOIN_TIMEOUT, connect_pipe(&options.pipe))
         .await
         .map_err(|_| anyhow!("desktop helper pipe connection timeout"))??;
-    let (mut read, mut write) = tokio::io::split(pipe);
+    let (read, mut write) = tokio::io::split(pipe);
+    // `read_packet` is not cancellation-safe: if another `select!` branch wins after the length
+    // or kind byte has been consumed, dropping the future leaves the next read in the middle of a
+    // packet. Browser feedback arrives while the timer and capture branches are also active, so
+    // this used to desynchronize the pipe and terminate the helper a few seconds after joining.
+    // Keep the packet read in its own task and only select on complete packets instead.
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Result<(u8, Vec<u8>)>>(1);
+    tokio::spawn(helper_pipe_reader(read, packet_tx));
     let (capture_tx, mut capture_rx) = mpsc::channel::<HelperEvent>(1);
     let settings = Arc::new(Mutex::new(AdaptiveSettings::initial(
         options.min_fps,
@@ -515,8 +522,9 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                     _ => {}
                 }
             }
-            packet = read_packet(&mut read) => {
-                let (kind, value) = packet?;
+            packet = packet_rx.recv() => {
+                let (kind, value) = packet
+                    .context("desktop service pipe reader stopped unexpectedly")??;
                 if kind == PIPE_INTERNAL && value == INTERNAL_STOP {
                     stopping = true;
                     pending_release = !release_on_input_desktop(&mut input);
@@ -588,6 +596,21 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     }
     let _ = release_on_input_desktop(&mut input);
     Ok(())
+}
+
+async fn helper_pipe_reader<R: AsyncRead + Unpin>(
+    mut reader: R,
+    tx: mpsc::Sender<Result<(u8, Vec<u8>)>>,
+) {
+    loop {
+        let packet = read_packet(&mut reader)
+            .await
+            .context("failed to read desktop service pipe");
+        let failed = packet.is_err();
+        if tx.send(packet).await.is_err() || failed {
+            break;
+        }
+    }
 }
 
 async fn connect_pipe(name: &str) -> Result<NamedPipeClient> {
@@ -1764,6 +1787,24 @@ async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(u8, Vec<u8
     Ok((kind, value))
 }
 
+#[cfg(test)]
+async fn write_fragmented_packet<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    kind: u8,
+    value: &[u8],
+) -> Result<()> {
+    let length = ((value.len() + 1) as u32).to_be_bytes();
+    for byte in length
+        .into_iter()
+        .chain(std::iter::once(kind))
+        .chain(value.iter().copied())
+    {
+        writer.write_all(&[byte]).await?;
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1774,6 +1815,34 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn helper_pipe_reader_preserves_fragmented_packet_boundaries() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (packet_tx, mut packet_rx) = mpsc::channel(1);
+        let reader = tokio::spawn(helper_pipe_reader(reader, packet_tx));
+        let packets = [
+            (
+                PIPE_CONTROL,
+                br#"{"type":"feedback","sequence":0}"#.as_slice(),
+            ),
+            (PIPE_INTERNAL, INTERNAL_STOP),
+        ];
+
+        for (kind, value) in packets {
+            write_fragmented_packet(&mut writer, kind, value)
+                .await
+                .unwrap();
+            assert_eq!(
+                packet_rx.recv().await.unwrap().unwrap(),
+                (kind, value.to_vec())
+            );
+        }
+
+        drop(writer);
+        assert!(packet_rx.recv().await.unwrap().is_err());
+        reader.await.unwrap();
+    }
 
     #[test]
     fn input_desktop_access_includes_injection_rights() {

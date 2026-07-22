@@ -217,7 +217,7 @@ pub async fn admin_upload_agent_artifact(
     multipart: Multipart,
 ) -> AppResult<(StatusCode, Json<AgentArtifactRecord>)> {
     let admin = require_admin(&state, &headers).await?;
-    require_draft_release(&state, &release_id).await?;
+    get_release(&state, &release_id).await?;
     let received = receive_artifact(&state, multipart).await?;
     let result = store_artifact(&state, &release_id, received).await;
     let artifact = result?;
@@ -242,7 +242,6 @@ pub async fn admin_delete_agent_artifact(
     Path((release_id, artifact_id)): Path<(String, String)>,
 ) -> AppResult<StatusCode> {
     let admin = require_admin(&state, &headers).await?;
-    require_draft_release(&state, &release_id).await?;
     let artifact = get_artifact(&state, &artifact_id)
         .await?
         .filter(|artifact| artifact.release_id == release_id)
@@ -251,22 +250,17 @@ pub async fn admin_delete_agent_artifact(
     let deleted = sqlx::query(
         r#"
         DELETE FROM agent_artifacts
-        WHERE id = $1 AND release_id = $2
-          AND EXISTS (
-              SELECT 1 FROM agent_releases
-              WHERE id = $3 AND status = 'draft'
-          )
+        WHERE id = $1 AND release_id = $2 AND status = 'draft'
         "#,
     )
     .bind(&artifact_id)
-    .bind(&release_id)
     .bind(&release_id)
     .execute(&state.db)
     .await?;
     if deleted.rows_affected() != 1 {
         return Err(AppError::new(
             StatusCode::CONFLICT,
-            "已发布版本的可执行文件不能删除",
+            "已发布的可执行文件不能删除",
         ));
     }
     remove_stored_file(&state, &artifact.storage_path).await;
@@ -288,39 +282,56 @@ pub async fn admin_publish_agent_release(
     Path(release_id): Path<String>,
 ) -> AppResult<Json<AgentReleaseDetail>> {
     let admin = require_admin(&state, &headers).await?;
-    let release = require_draft_release(&state, &release_id).await?;
-    let target = Version::parse(&release.version)
-        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "版本号不是有效的 SemVer"))?;
     let instances = capability_instances(&state).await?;
     let now = now_ts();
     let mut transaction = state.db.begin().await?;
-    let updated = sqlx::query(
-        "UPDATE agent_releases SET status = 'published', published_at = $1 WHERE id = $2 AND status = 'draft'",
+    let release = sqlx::query_as::<_, AgentReleaseRecord>(
+        "SELECT id, version, notes, status, created_at, published_at FROM agent_releases WHERE id = $1 FOR UPDATE",
     )
-    .bind(now)
     .bind(&release_id)
-    .execute(&mut *transaction)
-    .await?;
-    if updated.rows_affected() != 1 {
-        return Err(AppError::new(StatusCode::CONFLICT, "Agent 版本已发布"));
-    }
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Agent 版本不存在"))?;
+    let target = Version::parse(&release.version)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "版本号不是有效的 SemVer"))?;
     let artifacts = sqlx::query_as::<_, AgentArtifactRecord>(
         r#"
         SELECT id, release_id, os, package_type, native_arch, file_name, size_bytes, sha256,
-               storage_path, created_at
-        FROM agent_artifacts WHERE release_id = $1 ORDER BY os, package_type, native_arch
+               storage_path, created_at, status, published_at
+        FROM agent_artifacts
+        WHERE release_id = $1 AND status = 'draft'
+        ORDER BY os, package_type, native_arch
+        FOR UPDATE
         "#,
     )
     .bind(&release_id)
     .fetch_all(&mut *transaction)
     .await?;
     if artifacts.is_empty() {
-        return Err(AppError::new(
-            StatusCode::BAD_REQUEST,
-            "至少上传一个可执行文件后才能发布",
-        ));
+        let (status, message) = if release.status == "draft" {
+            (StatusCode::BAD_REQUEST, "至少上传一个可执行文件后才能发布")
+        } else {
+            (StatusCode::CONFLICT, "没有待发布的新增可执行文件")
+        };
+        return Err(AppError::new(status, message));
     }
 
+    sqlx::query(
+        "UPDATE agent_releases SET status = 'published', published_at = COALESCE(published_at, $1) WHERE id = $2",
+    )
+    .bind(now)
+    .bind(&release_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE agent_artifacts SET status = 'published', published_at = $1 WHERE release_id = $2 AND status = 'draft'",
+    )
+    .bind(now)
+    .bind(&release_id)
+    .execute(&mut *transaction)
+    .await?;
+
+    let mut notified_instance_ids = Vec::new();
     for instance in instances {
         if !version_is_newer(&target, &instance.agent_version) {
             continue;
@@ -336,7 +347,7 @@ pub async fn admin_publish_agent_release(
             continue;
         };
         let (status, message, completed_at) = publish_attempt_state(&instance, now);
-        sqlx::query(
+        let inserted = sqlx::query(
             r#"
             INSERT INTO agent_update_attempts(
                 id, release_id, artifact_id, instance_id, from_version, target_version,
@@ -358,6 +369,9 @@ pub async fn admin_publish_agent_release(
         .bind(completed_at)
         .execute(&mut *transaction)
         .await?;
+        if inserted.rows_affected() == 1 && status == "pending" {
+            notified_instance_ids.push(instance.id);
+        }
     }
     transaction.commit().await?;
 
@@ -366,10 +380,14 @@ pub async fn admin_publish_agent_release(
         &admin.username,
         "publish_agent_release",
         &release_id,
-        &format!("发布 Agent 版本 {}", release.version),
+        &format!(
+            "发布 Agent 版本 {} 的 {} 个新增可执行文件",
+            release.version,
+            artifacts.len()
+        ),
     )
     .await?;
-    notify_release_instances(&state, &release_id).await;
+    notify_instances(&state, notified_instance_ids).await;
     let published = get_release(&state, &release_id).await?;
     Ok(Json(load_release_detail(&state, published).await?))
 }
@@ -545,10 +563,10 @@ async fn authorized_artifact_download(
     let artifact = sqlx::query_as::<_, AgentArtifactRecord>(
         r#"
         SELECT a.id, a.release_id, a.os, a.package_type, a.native_arch, a.file_name,
-               a.size_bytes, a.sha256, a.storage_path, a.created_at
+               a.size_bytes, a.sha256, a.storage_path, a.created_at, a.status, a.published_at
         FROM agent_artifacts a
         JOIN agent_releases r ON r.id = a.release_id
-        WHERE a.id = $1 AND r.status = 'published'
+        WHERE a.id = $1 AND r.status = 'published' AND a.status = 'published'
         "#,
     )
     .bind(artifact_id)
@@ -871,26 +889,6 @@ async fn store_artifact(
         let _ = fs::remove_file(&received.temp_path).await;
         return Err(error);
     }
-    let duplicate: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(*) FROM agent_artifacts
-        WHERE release_id = $1 AND os = $2 AND package_type = $3 AND native_arch = $4
-        "#,
-    )
-    .bind(release_id)
-    .bind(&received.os)
-    .bind(&received.package_type)
-    .bind(&received.native_arch)
-    .fetch_one(&state.db)
-    .await?;
-    if duplicate > 0 {
-        let _ = fs::remove_file(&received.temp_path).await;
-        return Err(AppError::new(
-            StatusCode::CONFLICT,
-            "该版本已包含相同目标的可执行文件",
-        ));
-    }
-
     let id = Uuid::new_v4().to_string();
     let extension = expected_extension(&received.os);
     let relative_path = format!("{release_id}/{id}.{extension}");
@@ -916,14 +914,32 @@ async fn store_artifact(
         sha256: received.sha256,
         storage_path: relative_path,
         created_at: now_ts(),
+        status: "draft".to_string(),
+        published_at: None,
     };
+    let mut transaction = match state.db.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let _ = fs::remove_file(&final_path).await;
+            let _ = fs::remove_file(&checksum_final_path).await;
+            return Err(error.into());
+        }
+    };
+    let release_exists =
+        sqlx::query_scalar::<_, String>("SELECT id FROM agent_releases WHERE id = $1 FOR SHARE")
+            .bind(release_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+    if release_exists.is_none() {
+        let _ = fs::remove_file(&final_path).await;
+        let _ = fs::remove_file(&checksum_final_path).await;
+        return Err(AppError::new(StatusCode::NOT_FOUND, "Agent 版本不存在"));
+    }
     let result = sqlx::query(
         r#"
         INSERT INTO agent_artifacts(id, release_id, os, package_type, native_arch, file_name,
-                                    size_bytes, sha256, storage_path, created_at)
-        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-        FROM agent_releases
-        WHERE id = $11 AND status = 'draft'
+                                    size_bytes, sha256, storage_path, created_at, status)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft')
         "#,
     )
     .bind(&artifact.id)
@@ -936,8 +952,7 @@ async fn store_artifact(
     .bind(&artifact.sha256)
     .bind(&artifact.storage_path)
     .bind(artifact.created_at)
-    .bind(release_id)
-    .execute(&state.db)
+    .execute(&mut *transaction)
     .await;
     let inserted = match result {
         Ok(inserted) => inserted,
@@ -956,14 +971,11 @@ async fn store_artifact(
             return Err(error.into());
         }
     };
-    if inserted.rows_affected() != 1 {
+    debug_assert_eq!(inserted.rows_affected(), 1);
+    if let Err(error) = transaction.commit().await {
         let _ = fs::remove_file(&final_path).await;
         let _ = fs::remove_file(&checksum_final_path).await;
-        require_draft_release(state, release_id).await?;
-        return Err(AppError::new(
-            StatusCode::CONFLICT,
-            "Agent 版本已在上传过程中发布",
-        ));
+        return Err(error.into());
     }
     Ok(artifact)
 }
@@ -1140,7 +1152,7 @@ async fn release_artifacts(
     Ok(sqlx::query_as::<_, AgentArtifactRecord>(
         r#"
         SELECT id, release_id, os, package_type, native_arch, file_name, size_bytes, sha256,
-               storage_path, created_at
+               storage_path, created_at, status, published_at
         FROM agent_artifacts WHERE release_id = $1 ORDER BY os, package_type, native_arch
         "#,
     )
@@ -1156,7 +1168,7 @@ async fn get_artifact(
     Ok(sqlx::query_as::<_, AgentArtifactRecord>(
         r#"
         SELECT id, release_id, os, package_type, native_arch, file_name, size_bytes, sha256,
-               storage_path, created_at
+               storage_path, created_at, status, published_at
         FROM agent_artifacts WHERE id = $1
         "#,
     )
@@ -1170,9 +1182,14 @@ async fn load_release_detail(
     release: AgentReleaseRecord,
 ) -> AppResult<AgentReleaseDetail> {
     let artifacts = release_artifacts(state, &release.id).await?;
+    let published_artifacts = artifacts
+        .iter()
+        .filter(|artifact| artifact.status == "published")
+        .cloned()
+        .collect::<Vec<_>>();
     let instances = capability_instances(state).await?;
     if release.status == "published" {
-        backfill_unprivileged_attempts(state, &release, &artifacts, &instances).await?;
+        backfill_unprivileged_attempts(state, &release, &published_artifacts, &instances).await?;
     }
     let attempts = sqlx::query_as::<_, AgentUpdateAttemptRecord>(
         r#"
@@ -1233,7 +1250,6 @@ async fn backfill_unprivileged_attempts(
     let Ok(target) = Version::parse(&release.version) else {
         return Ok(());
     };
-    let recorded_at = release.published_at.unwrap_or_else(now_ts);
     for instance in instances {
         if instance.update_privileged == 1 || !version_is_newer(&target, &instance.agent_version) {
             continue;
@@ -1248,6 +1264,10 @@ async fn backfill_unprivileged_attempts(
         }) else {
             continue;
         };
+        let recorded_at = artifact
+            .published_at
+            .or(release.published_at)
+            .unwrap_or_else(now_ts);
         let (status, message, completed_at) = publish_attempt_state(instance, recorded_at);
         sqlx::query(
             r#"
@@ -1425,7 +1445,7 @@ async fn retried_offer_for_instance(
         JOIN agent_releases r ON r.id = u.release_id
         JOIN agent_artifacts a ON a.id = u.artifact_id
         WHERE u.instance_id = $1 AND u.status = 'pending' AND u.retry_count > 0
-          AND r.status = 'published'
+          AND r.status = 'published' AND a.status = 'published'
         ORDER BY u.updated_at DESC
         "#,
     )
@@ -1478,7 +1498,8 @@ async fn select_update_candidate(
                a.native_arch, a.sha256, a.size_bytes
         FROM agent_releases r
         JOIN agent_artifacts a ON a.release_id = r.id
-        WHERE r.status = 'published' AND lower(a.os) = lower($1)
+        WHERE r.status = 'published' AND a.status = 'published'
+          AND lower(a.os) = lower($1)
           AND a.package_type = $2 AND a.native_arch = $3
         "#,
     )
@@ -1587,14 +1608,7 @@ async fn notify_retried_attempt(state: &AppState, instance_id: &str, attempt_id:
     let _ = handle.tx.send(outbound_offer(offer));
 }
 
-async fn notify_release_instances(state: &AppState, release_id: &str) {
-    let instance_ids = sqlx::query_scalar::<_, String>(
-        "SELECT instance_id FROM agent_update_attempts WHERE release_id = $1 AND status = 'pending'",
-    )
-    .bind(release_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+async fn notify_instances(state: &AppState, instance_ids: Vec<String>) {
     for instance_id in instance_ids {
         notify_instance(state, &instance_id).await;
     }
@@ -1744,8 +1758,9 @@ mod tests {
             r#"
             INSERT INTO agent_artifacts(
                 id, release_id, os, package_type, native_arch, file_name, size_bytes,
-                sha256, storage_path, created_at
-            ) VALUES($1, $2, 'linux', $3, $4, 'agent.bin', 8, 'digest', 'stored.bin', 1)
+                sha256, storage_path, created_at, status, published_at
+            ) VALUES($1, $2, 'linux', $3, $4, 'agent.bin', 8, 'digest', 'stored.bin', 1,
+                     'published', 1)
             "#,
         )
         .bind(artifact_id)
@@ -1920,9 +1935,9 @@ mod tests {
             r#"
             INSERT INTO agent_artifacts(
                 id, release_id, os, package_type, native_arch, file_name, size_bytes,
-                sha256, storage_path, created_at
+                sha256, storage_path, created_at, status, published_at
             ) VALUES('artifact-2.1.0-arm64', 'release-2.1.0', 'linux', 'standalone', 'arm64',
-                     'agent-arm64.bin', 8, 'digest', 'stored-arm64.bin', 1)
+                     'agent-arm64.bin', 8, 'digest', 'stored-arm64.bin', 1, 'published', 1)
             "#,
         )
         .execute(&state.db)
@@ -2192,9 +2207,10 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
-    async fn refuses_to_store_an_artifact_after_its_release_is_published() {
+    async fn stores_a_draft_artifact_after_publication_and_offers_it_only_after_publishing() {
         let state = test_state().await;
         insert_release(&state, "5.0.0", "standalone", "amd64").await;
+        insert_instance(&state, "late-arm-agent", "ubuntu", "standalone", "arm64").await;
         let temporary = state.update_dir.join("late-upload.bin");
         fs::create_dir_all(&state.update_dir)
             .await
@@ -2215,18 +2231,46 @@ mod tests {
             temp_path: temporary,
         };
 
-        let error = match store_artifact(&state, "release-5.0.0", received).await {
-            Err(error) => error,
-            Ok(_) => panic!("published releases are immutable"),
-        };
-        assert_eq!(error.status, StatusCode::CONFLICT);
+        let artifact = store_artifact(&state, "release-5.0.0", received)
+            .await
+            .expect("published releases accept new draft targets");
+        assert_eq!(artifact.status, "draft");
+        assert_eq!(artifact.published_at, None);
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_artifacts WHERE release_id = 'release-5.0.0'",
         )
         .fetch_one(&state.db)
         .await
         .expect("count artifacts");
-        assert_eq!(count, 1, "the pre-existing published artifact is unchanged");
+        assert_eq!(
+            count, 2,
+            "the new target is stored alongside the published one"
+        );
+
+        let instance = get_instance(&state.db, "late-arm-agent")
+            .await
+            .expect("load late target instance");
+        assert!(
+            find_update_for_instance(&state, &instance)
+                .await
+                .expect("check draft package visibility")
+                .is_none(),
+            "draft packages must not be offered"
+        );
+
+        sqlx::query(
+            "UPDATE agent_artifacts SET status = 'published', published_at = 2 WHERE id = $1",
+        )
+        .bind(&artifact.id)
+        .execute(&state.db)
+        .await
+        .expect("publish newly added target");
+        let offer = find_update_for_instance(&state, &instance)
+            .await
+            .expect("check published package visibility")
+            .expect("published package is offered");
+        assert_eq!(offer.artifact_id, artifact.id);
+        assert_eq!(offer.version, "5.0.0");
     }
 
     #[test]

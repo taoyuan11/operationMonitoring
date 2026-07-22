@@ -505,6 +505,10 @@ function attemptsFor(release: AgentRelease) {
     : props.attempts.filter((attempt) => attempt.release_id === release.id)
 }
 
+function draftArtifactCount(release: AgentRelease) {
+  return release.artifacts.filter((artifact) => artifact.status === 'draft').length
+}
+
 function attemptInstanceName(attempt: AgentUpdateAttempt) {
   const instance = instancesById.value.get(attempt.instance_id)
   return instance?.name || instance?.hostname || attempt.instance_id
@@ -634,16 +638,6 @@ function toggleRelease(releaseId: string) {
                 <Pencil :size="15" />
               </button>
               <button
-                class="primary-button release-publish-button"
-                type="button"
-                :title="release.artifacts.length ? '发布更新' : '至少添加一个可执行文件后才能发布'"
-                :disabled="Boolean(operation) || release.artifacts.length === 0"
-                @click="$emit('publishRelease', release)"
-              >
-                <LoaderCircle v-if="isBusy(release.id) && operation === 'publishing'" class="spin" :size="15" />
-                <Send v-else :size="15" />发布
-              </button>
-              <button
                 class="icon-button danger"
                 type="button"
                 title="删除草稿"
@@ -654,6 +648,17 @@ function toggleRelease(releaseId: string) {
                 <Trash2 :size="15" />
               </button>
             </template>
+            <button
+              v-if="draftArtifactCount(release) > 0"
+              class="primary-button release-publish-button"
+              type="button"
+              :title="release.status === 'published' ? '发布新增更新包' : '发布更新'"
+              :disabled="Boolean(operation)"
+              @click="$emit('publishRelease', release)"
+            >
+              <LoaderCircle v-if="isBusy(release.id) && operation === 'publishing'" class="spin" :size="15" />
+              <Send v-else :size="15" />{{ release.status === 'published' ? '发布新增包' : '发布' }}
+            </button>
             <button
               class="icon-button release-collapse-button"
               :class="{ expanded: !isReleaseCollapsed(release.id) }"
@@ -726,12 +731,18 @@ function toggleRelease(releaseId: string) {
                 <strong :title="artifact.file_name">{{ artifact.file_name }}</strong>
                 <span>{{ artifact.os }} / {{ artifact.native_arch }} / {{ artifact.package_type }}</span>
               </div>
+              <span
+                :class="['artifact-status', artifact.status]"
+                :title="artifact.status === 'published' ? `发布于 ${formatTime(artifact.published_at)}` : '再次确认发布后才会向实例推送'"
+              >
+                {{ artifact.status === 'published' ? '已发布' : '待发布' }}
+              </span>
               <div class="artifact-integrity">
                 <span>{{ formatBytes(artifact.size_bytes) }}</span>
                 <code :title="artifact.sha256">{{ artifact.sha256.slice(0, 12) }}</code>
               </div>
               <button
-                v-if="release.status === 'draft'"
+                v-if="artifact.status === 'draft'"
                 class="icon-button danger"
                 type="button"
                 title="移除可执行文件"
@@ -745,7 +756,7 @@ function toggleRelease(releaseId: string) {
             </article>
           </div>
 
-          <form v-if="release.status === 'draft'" class="artifact-upload-form" @submit.prevent="submitArtifacts(release)">
+          <form class="artifact-upload-form" @submit.prevent="submitArtifacts(release)">
             <div class="artifact-upload-toolbar">
               <label
                 :class="[

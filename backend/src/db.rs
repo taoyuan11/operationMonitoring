@@ -350,8 +350,41 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             sha256 TEXT NOT NULL,
             storage_path TEXT NOT NULL,
             created_at BIGINT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'published')),
+            published_at BIGINT,
             UNIQUE(release_id, os, package_type, native_arch)
         );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("ALTER TABLE agent_artifacts ADD COLUMN IF NOT EXISTS published_at BIGINT")
+        .execute(db)
+        .await?;
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'agent_artifacts'
+                  AND column_name = 'status'
+            ) THEN
+                ALTER TABLE agent_artifacts
+                    ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'
+                    CHECK(status IN ('draft', 'published'));
+                UPDATE agent_artifacts AS artifact
+                SET status = 'published',
+                    published_at = COALESCE(release.published_at, artifact.created_at)
+                FROM agent_releases AS release
+                WHERE artifact.release_id = release.id
+                  AND release.status = 'published';
+            END IF;
+        END
+        $$
         "#,
     )
     .execute(db)
@@ -448,7 +481,10 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
         ("authenticator_devices", &["created_at", "last_used_at"][..]),
         ("admin_enrollments", &["created_at", "expires_at"][..]),
         ("agent_releases", &["created_at", "published_at"][..]),
-        ("agent_artifacts", &["size_bytes", "created_at"][..]),
+        (
+            "agent_artifacts",
+            &["size_bytes", "created_at", "published_at"][..],
+        ),
         (
             "agent_update_attempts",
             &["retry_count", "created_at", "updated_at", "completed_at"][..],

@@ -180,10 +180,13 @@ function openSelectedRemoteDesktop(instance: Instance) {
 }
 
 function requestPublishAgentRelease(release: AgentRelease) {
+  const draftArtifacts = release.artifacts.filter((artifact) => artifact.status === 'draft')
+  const targets = draftArtifacts.map((artifact) => `${artifact.os}/${artifact.native_arch}`).join('、')
+  const isAdditionalBatch = release.status === 'published'
   confirmation.value = {
-    title: '发布 Agent 更新',
-    message: `发布 ${release.version} 后，符合条件的实例会自动安装对应更新包。尚未完成过受管更新的实例可能没有可用的回滚包。`,
-    confirmLabel: '确认发布',
+    title: isAdditionalBatch ? '发布新增更新包' : '发布 Agent 更新',
+    message: `将发布 ${release.version} 的 ${draftArtifacts.length} 个更新包（${targets}）。符合条件的实例会自动安装对应更新包。尚未完成过受管更新的实例可能没有可用的回滚包。`,
+    confirmLabel: isAdditionalBatch ? '确认发布新增包' : '确认发布',
     tone: 'warning',
     action: () => consoleState.publishAgentRelease(release),
   }

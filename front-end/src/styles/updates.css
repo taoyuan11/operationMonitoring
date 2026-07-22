@@ -55,13 +55,16 @@
 .release-empty-row { display: flex; min-height: 48px; align-items: center; gap: 8px; padding: 0 11px; color: var(--muted); border: 1px dashed var(--line-strong); border-radius: 6px; font-size: 12px; }
 
 .artifact-list { display: flex; flex-direction: column; border-top: 1px solid var(--line); }
-.artifact-row { display: grid; grid-template-columns: auto minmax(0, 1.3fr) minmax(145px, .42fr) auto; align-items: center; gap: 11px; min-height: 59px; padding: 9px 2px; border-bottom: 1px solid var(--line); }
+.artifact-row { display: grid; grid-template-columns: auto minmax(0, 1.3fr) auto minmax(145px, .42fr) auto; align-items: center; gap: 11px; min-height: 59px; padding: 9px 2px; border-bottom: 1px solid var(--line); }
 .artifact-icon { display: inline-flex; width: 30px; height: 30px; align-items: center; justify-content: center; color: #82cddd; background: rgba(85, 184, 207, .09); border: 1px solid rgba(85, 184, 207, .15); border-radius: 5px; }
 .artifact-name, .artifact-integrity { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
 .artifact-name strong { overflow: hidden; color: var(--text-strong); font-size: 12px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
 .artifact-name span, .artifact-integrity span { color: #77837e; font-size: 11px; }
 .artifact-integrity { align-items: flex-end; }
 .artifact-integrity code { max-width: 100%; overflow: hidden; color: #83cbb8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-status { display: inline-flex; min-height: 22px; align-items: center; padding: 0 7px; border-radius: 4px; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.artifact-status.draft { color: var(--warning-text); background: rgba(229, 174, 84, .11); }
+.artifact-status.published { color: var(--success-text); background: rgba(73, 200, 159, .1); }
 
 .artifact-upload-form { display: flex; flex-direction: column; gap: 10px; margin-top: 13px; padding: 13px 0 1px; }
 .artifact-upload-toolbar { display: flex; align-items: stretch; gap: 9px; }
@@ -121,7 +124,9 @@
   .release-coverage { padding: 10px 15px; }
   .release-artifacts, .release-attempts { padding-left: 15px; padding-right: 15px; }
   .artifact-row { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .artifact-status { grid-column: 3; grid-row: 1; }
   .artifact-integrity { grid-column: 2; align-items: flex-start; }
+  .artifact-row > .icon-button { grid-column: 3; grid-row: 2; }
   .artifact-upload-toolbar { flex-wrap: wrap; }
   .artifact-batch-picker { width: 100%; min-width: 0; flex-basis: 100%; }
   .artifact-upload-row { grid-template-columns: minmax(0, 1fr) auto; }

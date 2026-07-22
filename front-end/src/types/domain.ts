@@ -178,6 +178,8 @@ export type AgentArtifact = AgentArtifactTarget & {
   size_bytes: number
   sha256: string
   created_at: number
+  status: AgentReleaseStatus
+  published_at: number | null
 }
 
 export type AgentUpdateAttemptStatus =

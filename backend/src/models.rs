@@ -306,6 +306,8 @@ pub struct AgentArtifactRecord {
     #[serde(skip_serializing)]
     pub storage_path: String,
     pub created_at: i64,
+    pub status: String,
+    pub published_at: Option<i64>,
 }
 
 #[derive(Serialize, FromRow, Clone)]

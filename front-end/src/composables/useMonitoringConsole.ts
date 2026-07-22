@@ -686,12 +686,13 @@ export function useMonitoringConsole() {
   }
 
   function publishAgentRelease(release: AgentRelease) {
+    const additionalBatch = release.status === 'published'
     return runAgentUpdateTask('publishing', release.id, async () => {
       await api<AgentRelease>(`/api/admin/agent-releases/${release.id}/publish`, {
         method: 'POST',
       })
       await loadAgentUpdates()
-    }, `${release.version} 已发布`)
+    }, additionalBatch ? `${release.version} 的新增更新包已发布` : `${release.version} 已发布`)
   }
 
   function deleteAgentRelease(release: AgentRelease) {

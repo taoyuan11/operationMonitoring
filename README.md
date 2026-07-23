@@ -61,6 +61,11 @@ instanceEnd/src/
   ws.rs           Agent WebSocket、指标上报、命令与终端复用通道
 ```
 
+Windows 网页终端优先使用 ConPTY。Windows Server 2016 没有系统级 ConPTY API，Agent 会自动
+切换到隐藏窗口的管道终端，仍可执行交互式 `cmd.exe` 命令；该兼容模式不支持真实 PTY 的
+窗口大小同步和部分控制台专用快捷键。若兼容终端启动失败，终端会把具体原因返回到页面，
+并写入 Agent 日志，不会再因为打开终端导致 Agent 进程退出。
+
 ## 本地启动
 
 启动后端：
@@ -328,7 +333,13 @@ Windows 请在 PowerShell 或命令提示符中运行下载的 `.exe`：
 - Linux：`/usr/local/bin/om-agent` + systemd。
 - OpenWrt：`/usr/bin/om-agent` + procd。
 - macOS：`/usr/local/bin/om-agent` + LaunchDaemon。
-- Windows：`%ProgramFiles%\OM Agent` + Windows Service + 机器级 `PATH`。
+- Windows：`%ProgramFiles%\OM Agent` + Windows Service + 机器级 `PATH`，并在
+  Windows 系统命令目录创建 `om-agent.exe` 全局命令入口（64 位系统同时覆盖 64 位和
+  WOW64 命令搜索目录）。该入口不依赖 Explorer 或终端刷新，兼容 Windows Server Core、
+  RDP 长期会话及 Windows Server 2016。
+
+Windows 安装或自动更新后，当前 CMD/PowerShell 可直接使用 `om-agent`。如需诊断，
+可分别运行 `where om-agent`、`"%ProgramFiles%\OM Agent\om-agent.exe" status`。
 
 安装完成后可直接执行：
 

@@ -2223,6 +2223,7 @@ fn install_standalone(plan: &ApplyPlan, source: &Path) -> Result<()> {
                     target.display()
                 )
             })?;
+            repair_windows_global_command_best_effort(target);
             return Ok(());
         }
         let backup = target.with_extension("update-old.exe");
@@ -2259,12 +2260,25 @@ fn install_standalone(plan: &ApplyPlan, source: &Path) -> Result<()> {
             };
         }
         let _ = remove_windows_file_if_exists(&backup, WINDOWS_FILE_REPLACE_TIMEOUT);
+        repair_windows_global_command_best_effort(target);
     }
     #[cfg(not(windows))]
     {
         fs::rename(&temporary, target)?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn repair_windows_global_command_best_effort(target: &Path) {
+    if let Err(error) = crate::install::repair_windows_global_command(target) {
+        // The installed executable is the update contract. A machine-wide convenience entry can
+        // be protected by System32 ACLs or a third-party file lock, so leave the update successful
+        // and let the service startup retry the repair with its service token.
+        crate::logging::error(format_args!(
+            "failed to repair the global Windows command after update; continuing with the installed executable: {error:#}"
+        ));
+    }
 }
 
 #[cfg(any(windows, test))]

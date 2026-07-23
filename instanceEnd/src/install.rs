@@ -578,8 +578,12 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
         "sc create",
     )?;
     windows_path(&legacy_install, false)?;
-    windows_path(&install, true)?;
+    repair_windows_global_command(&binary)?;
     run("sc.exe", &["start", WINDOWS_SERVICE_NAME])?;
+    println!(
+        "agent installed and started; open a new terminal to use om-agent globally ({})",
+        binary.display()
+    );
     if env::current_exe()?.starts_with(&legacy_install) {
         let command = format!(
             "ping 127.0.0.1 -n 3 >nul & rmdir /S /Q \"{}\"",
@@ -591,6 +595,158 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(windows)]
+pub(crate) fn repair_windows_global_command(installed_executable: &Path) -> Result<()> {
+    let install_dir = installed_executable
+        .parent()
+        .context("installed Windows executable has no parent directory")?;
+    windows_path(install_dir, true)?;
+    for command in windows_command_paths()? {
+        install_windows_command_entry(installed_executable, &command)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_windows_command_entry(installed_executable: &Path, command: &Path) -> Result<()> {
+    if files_equal(installed_executable, command)? {
+        return Ok(());
+    }
+
+    // The command entry is normally a hard link created during installation. Updating its
+    // contents in place avoids requiring DELETE access on the protected System32 directory and
+    // keeps that hard link valid after the installed executable is replaced.
+    let command_is_regular_file =
+        fs::symlink_metadata(command).is_ok_and(|metadata| metadata.file_type().is_file());
+    if command_is_regular_file {
+        let overwrite = (|| -> Result<()> {
+            make_windows_file_writable(command)?;
+            fs::copy(installed_executable, command).with_context(|| {
+                format!(
+                    "failed to update global command contents {}",
+                    command.display()
+                )
+            })?;
+            if !files_equal(installed_executable, command)? {
+                bail!(
+                    "global command {} does not match the installed executable after in-place update",
+                    command.display()
+                );
+            }
+            Ok(())
+        })();
+        if overwrite.is_ok() {
+            return Ok(());
+        }
+    }
+
+    let temporary =
+        command.with_file_name(format!("om-agent-command-{}.new.exe", std::process::id()));
+    let _ = make_windows_file_writable(&temporary);
+    let _ = fs::remove_file(&temporary);
+
+    if let Err(link_error) = fs::hard_link(installed_executable, &temporary) {
+        fs::copy(installed_executable, &temporary).with_context(|| {
+            format!(
+                "failed to create global command {} after hard-link creation failed: {link_error}",
+                temporary.display()
+            )
+        })?;
+    }
+
+    let _ = make_windows_file_writable(&command);
+    if let Err(error) = fs::remove_file(&command)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("failed to replace global command {}", command.display()));
+    }
+    if let Err(error) = fs::rename(&temporary, &command) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("failed to activate global command {}", command.display()));
+    }
+
+    if !files_equal(installed_executable, &command)? {
+        bail!(
+            "global command {} does not match the installed executable after replacement",
+            command.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn make_windows_file_writable(path: &Path) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn files_equal(left: &Path, right: &Path) -> Result<bool> {
+    use std::io::Read;
+
+    let left_metadata = fs::metadata(left)?;
+    let right_metadata = match fs::metadata(right) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+
+    let mut left = io::BufReader::new(fs::File::open(left)?);
+    let mut right = io::BufReader::new(fs::File::open(right)?);
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_command_paths() -> Result<Vec<std::path::PathBuf>> {
+    let system_root =
+        std::path::PathBuf::from(env::var_os("SystemRoot").context("SystemRoot missing")?);
+    let is_wow64 = cfg!(target_arch = "x86") && env::var_os("PROCESSOR_ARCHITEW6432").is_some();
+    let has_syswow64 = system_root.join("SysWOW64").is_dir();
+    Ok(windows_command_paths_from_root(
+        &system_root,
+        is_wow64,
+        has_syswow64,
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn windows_command_paths_from_root(
+    system_root: &Path,
+    is_wow64: bool,
+    has_syswow64: bool,
+) -> Vec<std::path::PathBuf> {
+    let mut directories = vec![if is_wow64 { "Sysnative" } else { "System32" }];
+    if has_syswow64 {
+        directories.push(if is_wow64 { "System32" } else { "SysWOW64" });
+    }
+    directories
+        .into_iter()
+        .map(|directory| system_root.join(directory).join("om-agent.exe"))
+        .collect()
+}
+
 #[cfg(windows)]
 fn uninstall_windows() -> Result<()> {
     let install =
@@ -606,72 +762,156 @@ fn uninstall_windows() -> Result<()> {
     windows_path(&install, false)?;
     windows_path(&legacy_install, false)?;
     let _ = fs::remove_dir_all(data);
-    let current_executable = env::current_exe()?;
-    let running_install = if current_executable.starts_with(&install) {
-        Some(&install)
-    } else if current_executable.starts_with(&legacy_install) {
-        Some(&legacy_install)
-    } else {
-        None
-    };
-    if let Some(running_install) = running_install {
-        let other_install = if running_install == &install {
-            &legacy_install
-        } else {
-            &install
-        };
-        let _ = fs::remove_dir_all(other_install);
-        let command = format!(
-            "ping 127.0.0.1 -n 3 >nul & rmdir /S /Q \"{}\"",
-            running_install.display()
-        );
-        Command::new("cmd.exe").args(["/C", &command]).spawn()?;
-    } else {
-        let _ = fs::remove_dir_all(&install);
-        let _ = fs::remove_dir_all(&legacy_install);
+    let mut cleanup = String::from("ping 127.0.0.1 -n 3 >nul");
+    for command in windows_command_paths()? {
+        cleanup.push_str(&format!(" & del /F /Q \"{}\" >nul 2>&1", command.display()));
     }
+    cleanup.push_str(&format!(
+        " & rmdir /S /Q \"{}\" >nul 2>&1 & rmdir /S /Q \"{}\" >nul 2>&1",
+        install.display(),
+        legacy_install.display()
+    ));
+    Command::new("cmd.exe")
+        .args(["/D", "/S", "/C", &cleanup])
+        .spawn()
+        .context("failed to schedule Windows uninstall cleanup")?;
     Ok(())
 }
 #[cfg(windows)]
 fn windows_path(path: &Path, add: bool) -> Result<()> {
-    let key = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
-    let out = Command::new("reg.exe")
-        .args(["query", key, "/v", "Path"])
-        .output()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let current = text
-        .lines()
-        .find_map(|l| {
-            l.split_once("REG_EXPAND_SZ")
-                .or_else(|| l.split_once("REG_SZ"))
-                .map(|x| x.1.trim())
-        })
-        .unwrap_or("");
-    let target = path.to_string_lossy();
-    let mut parts: Vec<&str> = current
-        .split(';')
-        .filter(|x| !x.is_empty() && !x.eq_ignore_ascii_case(&target))
-        .collect();
-    if add {
-        parts.push(&target)
+    use std::{mem::size_of, os::windows::ffi::OsStrExt};
+    use windows::{
+        Win32::{
+            Foundation::{LPARAM, WPARAM},
+            System::Registry::{
+                HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ,
+                REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+            },
+            UI::WindowsAndMessaging::{
+                HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+            },
+        },
+        core::PCWSTR,
+    };
+
+    struct RegistryKey(HKEY);
+    impl Drop for RegistryKey {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = RegCloseKey(self.0);
+            }
+        }
     }
-    let value = parts.join(";");
-    success(
-        Command::new("reg.exe")
-            .args([
-                "add",
-                key,
-                "/v",
-                "Path",
-                "/t",
-                "REG_EXPAND_SZ",
-                "/d",
-                &value,
-                "/f",
-            ])
-            .status()?,
-        "reg add",
-    )
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(Some(0)).collect()
+    }
+
+    let subkey = wide(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment");
+    let value_name = wide("Path");
+    let mut raw_key = HKEY::default();
+    unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            0,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            &mut raw_key,
+        )
+        .context("failed to open the machine environment registry key")?;
+    }
+    let key = RegistryKey(raw_key);
+
+    let mut value_type = REG_VALUE_TYPE::default();
+    let mut byte_len = 0_u32;
+    unsafe {
+        RegQueryValueExW(
+            key.0,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            None,
+            Some(&mut byte_len),
+        )
+        .context("failed to read the machine PATH size")?;
+    }
+    if value_type != REG_SZ && value_type != REG_EXPAND_SZ {
+        bail!("machine PATH has an unsupported registry value type");
+    }
+    if byte_len as usize % size_of::<u16>() != 0 {
+        bail!("machine PATH contains malformed UTF-16 data");
+    }
+
+    let mut buffer = vec![0_u16; byte_len as usize / size_of::<u16>()];
+    unsafe {
+        RegQueryValueExW(
+            key.0,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut byte_len),
+        )
+        .context("failed to read the machine PATH")?;
+    }
+    let current = String::from_utf16(buffer.strip_suffix(&[0]).unwrap_or(buffer.as_slice()))
+        .context("machine PATH contains invalid UTF-16")?;
+    let target = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let target = String::from_utf16(&target).context("install path contains invalid UTF-16")?;
+    let value = update_windows_path(&current, &target, add);
+    let encoded = value.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            encoded.as_ptr().cast::<u8>(),
+            encoded.len() * size_of::<u16>(),
+        )
+    };
+    unsafe {
+        RegSetValueExW(
+            key.0,
+            PCWSTR(value_name.as_ptr()),
+            0,
+            value_type,
+            Some(bytes),
+        )
+        .context("failed to update the machine PATH")?;
+    }
+
+    // Notify Explorer and other long-running applications so terminals opened after installation
+    // inherit the new machine PATH. An already-open cmd.exe still needs to be reopened.
+    let environment = wide("Environment");
+    unsafe {
+        let _ = SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            WPARAM(0),
+            LPARAM(environment.as_ptr() as isize),
+            SMTO_ABORTIFHUNG,
+            5_000,
+            None,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn update_windows_path(current: &str, target: &str, add: bool) -> String {
+    let matches_target = |entry: &str| {
+        entry
+            .trim()
+            .trim_matches('"')
+            .trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(target.trim_end_matches(['\\', '/']))
+    };
+    let mut entries = current
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty() && !matches_target(entry))
+        .collect::<Vec<_>>();
+    if add {
+        entries.push(target);
+    }
+    entries.join(";")
 }
 #[cfg(windows)]
 fn windows_service_state(service_name: &str) -> Result<Option<u32>> {
@@ -827,7 +1067,9 @@ const MACOS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUB
 
 #[cfg(test)]
 mod tests {
-    use super::migrate_path;
+    #[cfg(windows)]
+    use super::install_windows_command_entry;
+    use super::{migrate_path, update_windows_path, windows_command_paths_from_root};
     use std::fs;
 
     #[test]
@@ -853,6 +1095,103 @@ mod tests {
             "legacy update"
         );
         assert!(!legacy.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_path_adds_the_install_directory_without_losing_existing_entries() {
+        let path = update_windows_path(
+            r"%SystemRoot%\system32;C:\Tools",
+            r"C:\Program Files\OM Agent",
+            true,
+        );
+
+        assert_eq!(
+            path,
+            r"%SystemRoot%\system32;C:\Tools;C:\Program Files\OM Agent"
+        );
+    }
+
+    #[test]
+    fn windows_path_repairs_equivalent_install_directory_entries() {
+        let path = update_windows_path(
+            r#"C:\Tools;"C:\Program Files\OM Agent\";C:\Other"#,
+            r"C:\Program Files\OM Agent",
+            true,
+        );
+
+        assert_eq!(path, r"C:\Tools;C:\Other;C:\Program Files\OM Agent");
+    }
+
+    #[test]
+    fn windows_path_removes_all_install_directory_entries() {
+        let path = update_windows_path(
+            r"C:\Program Files\OM Agent;C:\Tools;c:\program files\om agent\",
+            r"C:\Program Files\OM Agent",
+            false,
+        );
+
+        assert_eq!(path, r"C:\Tools");
+    }
+
+    #[test]
+    fn windows_command_uses_system32_for_native_agents() {
+        assert_eq!(
+            windows_command_paths_from_root(std::path::Path::new(r"C:\Windows"), false, false),
+            vec![
+                std::path::PathBuf::from(r"C:\Windows")
+                    .join("System32")
+                    .join("om-agent.exe")
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_x86_command_covers_native_and_wow64_system_directories() {
+        assert_eq!(
+            windows_command_paths_from_root(std::path::Path::new(r"C:\Windows"), true, true),
+            vec![
+                std::path::PathBuf::from(r"C:\Windows")
+                    .join("Sysnative")
+                    .join("om-agent.exe"),
+                std::path::PathBuf::from(r"C:\Windows")
+                    .join("System32")
+                    .join("om-agent.exe")
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_x64_command_covers_system32_and_syswow64() {
+        assert_eq!(
+            windows_command_paths_from_root(std::path::Path::new(r"C:\Windows"), false, true),
+            vec![
+                std::path::PathBuf::from(r"C:\Windows")
+                    .join("System32")
+                    .join("om-agent.exe"),
+                std::path::PathBuf::from(r"C:\Windows")
+                    .join("SysWOW64")
+                    .join("om-agent.exe")
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_update_clears_readonly_before_overwriting() {
+        let root = std::env::temp_dir().join(format!("om-agent-command-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let installed = root.join("installed.exe");
+        let command = root.join("om-agent.exe");
+        fs::write(&installed, b"new-agent").unwrap();
+        fs::write(&command, b"old-agent").unwrap();
+        let mut permissions = fs::metadata(&command).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&command, permissions).unwrap();
+
+        install_windows_command_entry(&installed, &command).unwrap();
+
+        assert_eq!(fs::read(&command).unwrap(), b"new-agent");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -945,6 +1284,20 @@ mod windows_service_impl {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         })?;
+        h.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::StartPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 1,
+            wait_hint: Duration::from_secs(30),
+            process_id: None,
+        })?;
+        if let Err(error) = super::repair_windows_global_command(&std::env::current_exe()?) {
+            crate::logging::error(format_args!(
+                "failed to repair the global Windows command: {error:#}"
+            ));
+        }
         h.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: ServiceState::Running,

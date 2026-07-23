@@ -1,14 +1,35 @@
-# External PostgreSQL deployment; use docker-compose.with-db.yml for a self-contained stack.
+# Default self-contained deployment with a PostgreSQL service.
 name: operation-monitoring
 
 services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-operation_monitoring}
+      POSTGRES_USER: ${POSTGRES_USER:-operation_monitoring}
+      POSTGRES_PASSWORD: ${OM_DATABASE_PASSWORD:?set OM_DATABASE_PASSWORD}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready --username="$${POSTGRES_USER}" --dbname="$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       OM_BIND: 0.0.0.0:13500
-      OM_DATABASE_URL: ${OM_DATABASE_URL:?set OM_DATABASE_URL}
-      OM_DATABASE_PASSWORD: ${OM_DATABASE_PASSWORD:?set OM_DATABASE_PASSWORD for external PostgreSQL}
+      OM_DATABASE_URL: postgresql://${POSTGRES_USER:-operation_monitoring}@postgres:5432/${POSTGRES_DB:-operation_monitoring}
+      OM_DATABASE_PASSWORD: ${OM_DATABASE_PASSWORD:?set OM_DATABASE_PASSWORD}
       OM_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:-admin123}
       OM_AUTH_KEY_FILE: /app/db/auth-secret.key
       OM_SECURE_COOKIES: ${OM_SECURE_COOKIES:-false}
@@ -38,6 +59,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  postgres-data:
   backend-db:
   backend-uploads:
   backend-updates:

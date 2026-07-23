@@ -2,6 +2,11 @@
 
 一个自托管的远程资源监控系统 MVP，用于小规模服务器、电脑实例的资源上报、审批管理、快捷命令、Web 终端和远程文件管理。
 
+## 文档
+
+- [Docker Compose 部署指南](docs/deployment.md)：默认部署方式、PostgreSQL、HTTPS、持久化、备份、升级与故障排查。
+- [实例端 standalone 打包指南](docs/instance-agent-packaging.md)：跨平台构建、校验与分发。
+
 ## 项目结构
 
 ```text
@@ -9,6 +14,9 @@ operationMonitoring/
   front-end/      Vue 3 + Vite 前端控制台
   backend/        Rust + Axum + SQLx 后端服务
   instanceEnd/    Rust 实例端 Agent
+  docs/           部署与实例端打包文档
+  docker-compose.with-db.yml  默认自带 PostgreSQL 部署
+  docker-compose.yml          外部 PostgreSQL 部署
   需求.md          产品需求草案
   执行计划.md      MVP 执行计划
 ```
@@ -34,7 +42,7 @@ backend/src/
   auth.rs         TOTP、密钥加密和管理员 session 校验
   admin_auth.rs   管理员初始化、登录、用户与认证设备 API
   config.rs       启动参数和环境变量
-  db.rs           SQLite 连接、建表、查询辅助、清理任务
+  db.rs           PostgreSQL 连接、建表、查询辅助、清理任务
   error.rs        统一错误响应
   handlers/       HTTP API handler
   jobs.rs         命令任务创建、下发、完成
@@ -66,16 +74,42 @@ Windows 网页终端优先使用 ConPTY。Windows Server 2016 没有系统级 Co
 窗口大小同步和部分控制台专用快捷键。若兼容终端启动失败，终端会把具体原因返回到页面，
 并写入 Agent 日志，不会再因为打开终端导致 Agent 进程退出。
 
-## 本地启动
+## 默认部署：Docker Compose
 
-启动后端：
+生产和试用环境默认使用 `docker-compose.with-db.yml`，同时启动 PostgreSQL、后端与前端。Compose 会初始化业务数据库，并持久化数据库、认证密钥、背景图片和 Agent 更新包。
+
+```bash
+if [ ! -f .env ]; then cp .env.example .env; fi
+# 编辑 .env，至少替换数据库密码和管理员初始化密码
+chmod 600 .env
+docker compose -f docker-compose.with-db.yml config --quiet
+docker compose -f docker-compose.with-db.yml up -d --build
+docker compose -f docker-compose.with-db.yml ps
+```
+
+默认地址：
+
+- 前端控制台：`http://localhost:13501`
+- 后端 API：`http://localhost:13500`
+- 健康检查：`http://localhost:13500/api/health`
+
+首次初始化只使用一次 `OM_ADMIN_PASSWORD` 创建管理员；登录后需绑定 Authenticator 并使用 TOTP。生产环境应通过 HTTPS/WSS 访问，将 `OM_SECURE_COOKIES` 设为 `true`，并按部署场景限制宿主机端口暴露。实例端通常连接前端代理地址，前端会转发 API、上传和 WebSocket。
+
+PostgreSQL 默认只在 Compose 网络内开放。需要使用已有或托管 PostgreSQL 时，改用 `docker-compose.yml`，并同时显式设置 `OM_DATABASE_URL` 和 `OM_DATABASE_PASSWORD`。Compose 项目名固定为 `operation-monitoring`，详细的两种数据库模式、反向代理、备份恢复、升级、管理员认证恢复和排障步骤见[Docker Compose 部署指南](docs/deployment.md)。
+
+## 源码开发
+
+源码启动仅用于开发和调试。先准备可访问的 PostgreSQL，再启动后端：
 
 ```bash
 cd backend
-OM_DATABASE_PASSWORD='<数据库密码>' OM_ADMIN_PASSWORD=admin123 cargo run
+OM_DATABASE_URL='postgresql://operation_monitoring@127.0.0.1:5432/operation_monitoring' \
+OM_DATABASE_PASSWORD='<数据库密码>' \
+OM_ADMIN_PASSWORD=admin123 \
+cargo run
 ```
 
-启动前端：
+启动前端开发服务器：
 
 ```bash
 cd front-end
@@ -131,86 +165,6 @@ cargo run -- start --server http://127.0.0.1:13500
 cargo run -- status
 cargo run -- log
 cargo run -- stop
-```
-
-## Docker Compose 部署
-
-安装 Docker 和 Docker Compose 后，在项目根目录构建并启动前端与后端：
-
-```bash
-docker compose up -d --build
-```
-
-默认可通过以下地址访问：
-
-- 前端控制台：`http://localhost`
-- 后端 API：`http://localhost:13500`
-- 健康检查：`http://localhost:13500/api/health`
-
-默认密码 `admin123` 仅用于第一次启动时创建首位管理员。首次登录后必须填写
-用户名、使用手机 Authenticator 扫描二维码并输入 6 位代码；确认成功后密码入口会
-永久关闭，之后统一使用“用户名 + Authenticator 代码”登录。兼容 Google
-Authenticator、Microsoft Authenticator、1Password 等标准 TOTP 应用。
-
-生产环境必须在首次初始化前通过 `OM_ADMIN_PASSWORD` 设置强密码；也可以覆盖前后端端口：
-
-```bash
-OM_ADMIN_PASSWORD='replace-with-a-strong-password' \
-OM_DATABASE_PASSWORD='<数据库密码>' \
-FRONTEND_PORT=8080 \
-BACKEND_PORT=13500 \
-docker compose up -d --build
-```
-
-Agent 可以连接前端代理地址（例如 `http://服务器地址:8080`）或后端直连地址
-（例如 `http://服务器地址:13500`）。前端代理支持 API、上传资源和 WebSocket。
-
-业务数据保存在外部 PostgreSQL 中。管理员认证密钥、背景图片和 Agent 更新包分别保存在
-`backend-db`、`backend-uploads` 和 `backend-updates` 命名卷中，重新创建容器不会删除这些文件。
-删除命名卷前请先备份。常用管理命令：
-
-```bash
-docker compose ps
-docker compose logs -f
-docker compose down
-```
-
-后台“用户管理”页面可以现场添加管理员和多台 Authenticator。创建、停用、删除、
-撤销设备等敏感操作都需要当前管理员再次输入自己的 6 位代码。二维码只在创建页面
-临时显示，刷新后不能恢复；未确认的注册可取消后重新生成。
-
-TOTP 密钥使用 AES-256-GCM 加密。默认加密主密钥保存在 SQLite 同一命名卷内的
-`/app/db/auth-secret.key`，备份数据库时必须同时备份该文件；丢失后现有
-Authenticator 无法恢复。也可以通过 `OM_AUTH_SECRET_KEY` 提供 Base64 编码的
-32 字节主密钥，此时应由外部 Secret 管理系统保存。
-
-若唯一管理员遗失全部设备，只能在后端主机上停止正常服务后执行显式恢复：
-
-```bash
-cd backend
-cargo run -- --reset-admin-auth \
-  --confirm-reset-admin-auth RESET-ADMIN-AUTH
-```
-
-Docker 部署使用挂载了同一数据库卷的一次性后端容器：
-
-```bash
-docker compose stop backend
-docker compose run --rm backend --reset-admin-auth \
-  --confirm-reset-admin-auth RESET-ADMIN-AUTH
-docker compose up -d backend
-```
-
-恢复命令会删除所有管理员与认证设备并立即退出；下一次正常启动重新开放一次性
-密码初始化。操作日志和业务数据不会删除。
-
-默认允许上传 256 MiB 的 Agent 包和传输 1 GiB 的实例文件。修改任一后端限制时，应让 Nginx 请求体限制不小于两者中的较大值：
-
-```bash
-OM_AGENT_PACKAGE_MAX_BYTES=536870912 \
-OM_FILE_TRANSFER_MAX_BYTES=1073741824 \
-NGINX_CLIENT_MAX_BODY_SIZE=1100m \
-docker compose up -d --build
 ```
 
 ## 实例端一键安装
@@ -387,10 +341,10 @@ Windows 路径含空格时需要加引号，例如 `om-agent update "C:\Temp\om-
 
 ```bash
 OM_BIND=127.0.0.1:13500
-OM_DATABASE_URL=postgresql://root@192.168.100.1:5432/operation_monitoring
+OM_DATABASE_URL=postgresql://operation_monitoring@127.0.0.1:5432/operation_monitoring
 OM_DATABASE_PASSWORD=<数据库密码>
 OM_ADMIN_PASSWORD=admin123
-OM_AUTH_KEY_FILE=db/auth-secret.key
+OM_AUTH_KEY_FILE=auth/auth-secret.key
 # OM_AUTH_SECRET_KEY=<Base64 编码的 32 字节主密钥>
 OM_SECURE_COOKIES=false
 OM_UPLOAD_DIR=uploads
@@ -400,10 +354,12 @@ OM_FILE_TRANSFER_MAX_BYTES=1073741824
 ```
 
 未设置 `OM_DATABASE_URL` 时，后端默认连接
-`postgresql://root@192.168.100.1:5432/operation_monitoring`。如果该数据库不存在且
+`postgresql://root@127.0.0.1:5432/operation_monitoring`。如果该数据库不存在且
 连接用户具有 `CREATEDB` 权限，后端会自动创建它。数据库密码必须通过
 `OM_DATABASE_PASSWORD` 注入，不要将密码写入配置文件或提交到仓库。首次启动时，
 后端会在目标 PostgreSQL 数据库中自动创建所需表和索引。
+
+上述 URL 是后端进程直接启动时的默认值。`docker-compose.with-db.yml` 会自动改用 Compose 内网中的 `postgres` 服务；外部数据库用的 `docker-compose.yml` 则要求显式设置 `OM_DATABASE_URL` 和 `OM_DATABASE_PASSWORD`，避免错误连接到后端容器自身或使用空密码。
 
 `OM_ADMIN_PASSWORD` 仅在管理员表为空时有效，完成首位管理员绑定后即使仍保留该
 变量也会被忽略。`OM_SECURE_COOKIES` 在 HTTPS/WSS 生产部署中应设为 `true`；

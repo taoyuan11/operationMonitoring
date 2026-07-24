@@ -64,15 +64,14 @@ CREATE DATABASE operation_monitoring OWNER operation_monitoring;
 将外部数据库连接写入 `.env` 后，使用基础 Compose 文件启动：
 
 ```bash
-docker compose -f docker-compose.yml config --quiet
-docker compose -f docker-compose.yml up -d --build
+./deploy.sh deploy docker-compose.yml
 ```
 
 两种 Compose 文件使用同一个项目名，但不会自动迁移数据库。切换模式前先用当前文件执行 `down`，通过 `pg_dump`/`pg_restore` 迁移业务数据，再用目标文件启动；不要同时运行两套文件。
 
 ## 3. 配置环境变量
 
-在仓库根目录执行：
+可以在仓库根目录手动创建环境文件：
 
 ```bash
 if [ ! -f .env ]; then cp .env.example .env; fi
@@ -127,10 +126,12 @@ OM_ADMIN_PASSWORD=replace-with-a-long-random-bootstrap-password
 从仓库根目录验证自带数据库 Compose 配置并启动：
 
 ```bash
-docker compose -f docker-compose.with-db.yml config --quiet
-docker compose -f docker-compose.with-db.yml up -d --build
-docker compose -f docker-compose.with-db.yml ps
+./deploy.sh deploy docker-compose.with-db.yml
 ```
+
+如果 `.env` 不存在，脚本会从 `.env.example` 创建该文件、将权限设置为 `600`，然后暂停部署。
+至少替换数据库密码和管理员初始化密码后，重新执行同一命令。脚本内部会先运行
+`docker compose config --quiet`，再构建、启动并显示服务状态。
 
 除“外部 PostgreSQL 模式”小节外，本文后续 Compose 命令均针对默认的 `docker-compose.with-db.yml`。外部数据库部署执行相同操作时，将文件名替换为 `docker-compose.yml`，数据库备份和恢复则使用外部平台提供的工具。
 
@@ -285,14 +286,17 @@ docker compose -f docker-compose.with-db.yml ps
 升级前备份 PostgreSQL 与三个卷，然后在仓库根目录执行：
 
 ```bash
-git pull --ff-only
-docker compose -f docker-compose.with-db.yml pull postgres
-docker compose -f docker-compose.with-db.yml build --pull
-docker compose -f docker-compose.with-db.yml up -d --remove-orphans
-docker compose -f docker-compose.with-db.yml ps
+./deploy.sh update docker-compose.with-db.yml
 ```
 
-外部数据库模式跳过 `pull postgres`。后端启动时会执行所需的表结构补齐。升级后检查健康接口、管理员登录、Agent WebSocket、文件上传和更新包下载。回滚代码前应确认新版本没有不可逆的数据结构变化；必要时先恢复升级前的 PostgreSQL 备份，再切回旧代码并重新构建镜像。
+外部数据库模式改用 `./deploy.sh update docker-compose.yml`。更新脚本会拒绝存在本地修改的
+Git 工作区，从 `origin` 选择版本号最高、格式为 `主版本.次版本.修订号` 的稳定 TAG，并以
+detached HEAD 方式切换到该版本。随后脚本拉取仅使用镜像的服务、重新构建前后端并刷新容器；
+不会删除 Compose 命名卷，也不会自动备份或回滚。
+
+后端启动时会执行所需的表结构补齐。升级后检查健康接口、管理员登录、Agent WebSocket、
+文件上传和更新包下载。回滚代码前应确认新版本没有不可逆的数据结构变化；必要时先恢复升级前
+的 PostgreSQL 备份，再检出旧 TAG 并使用相同 Compose 文件重新构建镜像。
 
 ## 9. 管理员认证恢复
 

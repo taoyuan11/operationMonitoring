@@ -79,13 +79,13 @@ Windows 网页终端优先使用 ConPTY。Windows Server 2016 没有系统级 Co
 生产和试用环境默认使用 `docker-compose.with-db.yml`，同时启动 PostgreSQL、后端与前端。Compose 会初始化业务数据库，并持久化数据库、认证密钥、背景图片和 Agent 更新包。
 
 ```bash
-if [ ! -f .env ]; then cp .env.example .env; fi
-# 编辑 .env，至少替换数据库密码和管理员初始化密码
-chmod 600 .env
-docker compose -f docker-compose.with-db.yml config --quiet
-docker compose -f docker-compose.with-db.yml up -d --build
-docker compose -f docker-compose.with-db.yml ps
+./deploy.sh deploy docker-compose.with-db.yml
+# 首次执行会生成 .env 并暂停；编辑密码等配置后重新执行同一命令
 ```
+
+脚本会校验 Compose 配置、构建镜像并在后台启动服务。使用外部 PostgreSQL 时执行
+`./deploy.sh deploy docker-compose.yml`。升级前完成数据备份，再执行
+`./deploy.sh update <Compose 文件>`；更新会拒绝有本地修改的工作区，并切换到远端版本号最高的稳定 TAG。
 
 默认地址：
 

@@ -14,11 +14,11 @@ instanceEnd/dist/standalone/
 
 | 操作系统 | CPU/运行环境 | Rust target | 平台架构标识 | 产物后缀 |
 | --- | --- | --- | --- | --- |
-| Linux | x86_64 glibc | `x86_64-unknown-linux-gnu` | `x86_64` | `.bin` |
+| Linux | x86_64 glibc 2.17+ | `x86_64-unknown-linux-gnu` | `x86_64` | `.bin` |
 | Linux/OpenWrt | x86_64 musl | `x86_64-unknown-linux-musl` | `x86_64-musl` | `.bin` |
 | Linux | ARM64 musl | `aarch64-unknown-linux-musl` | `aarch64` | `.bin` |
-| Linux | ARMv7 glibc | `armv7-unknown-linux-gnueabihf` | `arm` | `.bin` |
-| Linux | x86 glibc | `i686-unknown-linux-gnu` | `x86` | `.bin` |
+| Linux | ARMv7 glibc 2.17+ | `armv7-unknown-linux-gnueabihf` | `arm` | `.bin` |
+| Linux | x86 glibc 2.17+ | `i686-unknown-linux-gnu` | `x86` | `.bin` |
 | Windows | x64 | `x86_64-pc-windows-msvc` | `x64` | `.exe` |
 | Windows | ARM64 | `aarch64-pc-windows-msvc` | `arm64` | `.exe` |
 | Windows | x86 | `i686-pc-windows-msvc` | `x86` | `.exe` |
@@ -190,7 +190,7 @@ cd instanceEnd
 ./scripts/build-standalone.sh i686-unknown-linux-gnu linux x86
 ```
 
-非本机 Linux target 会在检测到 Zig 和 cargo-zigbuild 后自动使用 `cargo zigbuild`。
+GNU/Linux target 会自动使用 `cargo zigbuild` 并追加 glibc 2.17 最低版本约束；其他非本机 Linux target 会在检测到 Zig 和 cargo-zigbuild 后自动使用 `cargo zigbuild`。
 
 ## 4. 在 Linux 上打包
 
@@ -211,14 +211,14 @@ sudo dnf install -y gcc gcc-c++ clang curl pkgconf-pkg-config
 
 然后安装 Rust，并根据所需目标执行 `rustup target add`。
 
-### 4.2 构建本机 Linux x86_64 glibc
+### 4.2 构建 Linux x86_64 glibc
 
 ```bash
 cd instanceEnd
 ./scripts/build-standalone.sh x86_64-unknown-linux-gnu linux x86_64
 ```
 
-在 x86_64 glibc Linux 主机上，该目标默认使用普通 `cargo build --release`。
+该目标始终以 glibc 2.17 为最低兼容基线，默认使用 cargo-zigbuild，即使构建机本身也是 x86_64 glibc Linux。这样生成的文件可以用于 CentOS 7，并避免发布产物意外依赖构建机上的较新 glibc。构建前必须按下一节安装 Zig 和 cargo-zigbuild。
 
 ### 4.3 构建 musl 和其他 Linux 架构
 
@@ -373,8 +373,8 @@ Bash 和 PowerShell 脚本都支持 `OM_STANDALONE_BUILDER`：
 
 | 值 | 行为 |
 | --- | --- |
-| `auto` | 默认。原生目标使用 Cargo，Linux 交叉目标优先使用 cargo-zigbuild，Windows MSVC 交叉目标优先使用 cargo-xwin |
-| `cargo` | 强制使用普通 `cargo build`，适合原生工具链或自行配置好链接器的环境 |
+| `auto` | 默认。GNU/Linux 目标固定使用 cargo-zigbuild 和 glibc 2.17 基线，其他 Linux 交叉目标优先使用 cargo-zigbuild，Windows MSVC 交叉目标优先使用 cargo-xwin |
+| `cargo` | 强制使用普通 `cargo build`，适合原生工具链或自行配置好链接器的环境；GNU/Linux 目标不允许使用此模式 |
 | `zigbuild` | 强制使用 `cargo zigbuild` |
 | `xwin` | 强制使用 `cargo xwin build` |
 
@@ -401,7 +401,13 @@ Remove-Item Env:OM_STANDALONE_BUILDER
 cd instanceEnd/dist/standalone
 sha256sum -c om-agent_0.1.5_linux_x86_64.bin.sha256
 file om-agent_0.1.5_linux_x86_64.bin
+readelf --version-info om-agent_0.1.5_linux_x86_64.bin \
+  | grep -o 'GLIBC_[0-9.]*' \
+  | sort -V \
+  | tail -n 1
 ```
+
+GNU/Linux 产物的最后一条命令应输出 `GLIBC_2.17` 或更低版本。Bash 打包脚本也会在复制产物前执行等价检查，超过该基线时构建失败。
 
 ### 7.2 macOS
 

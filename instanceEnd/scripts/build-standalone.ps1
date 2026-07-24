@@ -81,6 +81,7 @@ if ($null -eq $HostTargetLine -or "$HostTargetLine" -notmatch '^host: (.+)$') {
 }
 $HostTarget = $Matches[1]
 $OutputDirectory = Join-Path $Root 'dist/standalone'
+$MinimumGlibcVersion = '2.17'
 
 function Get-BuildFailureReason {
     param(
@@ -144,11 +145,18 @@ function Build-StandaloneTarget {
         $HasXWin = $null -ne (Get-Command cargo-xwin -ErrorAction SilentlyContinue)
         if ($Target -eq 'aarch64-pc-windows-msvc' -and $HasXWin) {
             $Builder = 'xwin'
+        } elseif ($Target -like '*-linux-gnu*' -and $HasZigBuild -and $HasZig) {
+            $Builder = 'zigbuild'
+        } elseif ($Target -like '*-linux-gnu*') {
+            throw "cargo-zigbuild and Zig are required to build $Target against glibc $MinimumGlibcVersion"
         } elseif ($Target -ne $HostTarget -and $Target -like '*-linux-*' -and $HasZigBuild -and $HasZig) {
             $Builder = 'zigbuild'
         } else {
             $Builder = 'cargo'
         }
+    }
+    if ($Target -like '*-linux-gnu*' -and $Builder -ne 'zigbuild') {
+        throw "$Target must be built with cargo-zigbuild to enforce the glibc $MinimumGlibcVersion baseline"
     }
 
     if ($Builder -eq 'xwin') {
@@ -173,9 +181,14 @@ function Build-StandaloneTarget {
     } else {
         $CargoArguments = @('build')
     }
-    $CargoArguments += @('--locked', '--release', '--target', $Target, '--bin', 'om-agent')
+    $CargoTarget = if ($Builder -eq 'zigbuild' -and $Target -like '*-linux-gnu*') {
+        "$Target.$MinimumGlibcVersion"
+    } else {
+        $Target
+    }
+    $CargoArguments += @('--locked', '--release', '--target', $CargoTarget, '--bin', 'om-agent')
 
-    Write-Host "Building $OS/$Architecture ($Target) with $Builder"
+    Write-Host "Building $OS/$Architecture ($CargoTarget) with $Builder"
     $SetXWinCompiler =
         $Builder -eq 'xwin' -and
         [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and

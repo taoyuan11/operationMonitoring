@@ -244,7 +244,7 @@ cd instanceEnd
 .\scripts\build-standalone.cmd i686-pc-windows-msvc
 ```
 
-脚本默认自动选择构建器：原生目标使用 Cargo，Linux 交叉目标在工具可用时使用 `cargo-zigbuild`，Windows MSVC 交叉目标使用 `cargo-xwin`。如果系统缺少 `llvm-lib`，Bash 脚本会使用项目内置包装器和 `zig ar` 完成 Windows 静态库归档。也可以通过 `OM_STANDALONE_BUILDER=cargo|zigbuild|xwin` 强制选择构建器。
+脚本默认自动选择构建器：GNU/Linux 目标固定使用 `cargo-zigbuild` 并以 glibc 2.17 为最低兼容基线，其他 Linux 交叉目标在工具可用时也使用 `cargo-zigbuild`，Windows MSVC 交叉目标使用 `cargo-xwin`。因此执行 `all` 前必须安装 Zig 和 cargo-zigbuild。如果系统缺少 `llvm-lib`，Bash 脚本会使用项目内置包装器和 `zig ar` 完成 Windows 静态库归档。也可以通过 `OM_STANDALONE_BUILDER=cargo|zigbuild|xwin` 强制选择构建器，但 GNU/Linux 目标不允许覆盖为其他构建器，以免绕过 glibc 2.17 基线。
 
 `all` 会依次尝试 Linux 5 个目标、Windows 3 个目标和 macOS 2 个目标。单个目标失败后仍会继续构建，最后统一汇总失败原因。产物和同名 SHA-256 文件位于 `instanceEnd/dist/standalone/`：
 

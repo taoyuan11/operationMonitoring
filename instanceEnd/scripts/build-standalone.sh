@@ -9,9 +9,9 @@ Usage:
 
 Environment:
   OM_STANDALONE_BUILDER=auto|cargo|zigbuild|xwin
-    Select the Cargo builder. The default uses cargo-zigbuild when cross-compiling
-    a Linux target, cargo-xwin when cross-compiling an MSVC Windows target, and
-    falls back to cargo otherwise.
+    Select the Cargo builder. The default uses cargo-zigbuild for GNU/Linux and
+    cross-compiled Linux targets, cargo-xwin when cross-compiling an MSVC Windows
+    target, and falls back to cargo otherwise.
 
 Examples:
   ./scripts/build-standalone.sh all
@@ -61,13 +61,59 @@ HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')
 [ -n "$HOST_TARGET" ] || { echo "Unable to read the host target from rustc" >&2; exit 1; }
 
 OUTPUT_DIR="$ROOT/dist/standalone"
+MINIMUM_GLIBC_VERSION=2.17
+
+required_glibc_version() {
+  LC_ALL=C strings "$1" | awk '
+    {
+      line = $0
+      while (match(line, /GLIBC_[0-9]+\.[0-9]+/)) {
+        version = substr(line, RSTART + 6, RLENGTH - 6)
+        split(version, parts, ".")
+        major = parts[1] + 0
+        minor = parts[2] + 0
+        if (!found || major > max_major || (major == max_major && minor > max_minor)) {
+          max_major = major
+          max_minor = minor
+        }
+        found = 1
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }
+    END {
+      if (found) printf "%d.%d", max_major, max_minor
+    }
+  '
+}
+
+verify_glibc_baseline() {
+  local target=$1
+  local executable=$2
+  local required required_major required_minor minimum_major minimum_minor
+
+  [[ "$target" == *-linux-gnu* ]] || return 0
+  required=$(required_glibc_version "$executable")
+  [ -n "$required" ] || {
+    echo "Unable to determine the required glibc version for $executable" >&2
+    return 1
+  }
+  IFS=. read -r required_major required_minor <<< "$required"
+  IFS=. read -r minimum_major minimum_minor <<< "$MINIMUM_GLIBC_VERSION"
+  if (( required_major > minimum_major \
+    || (required_major == minimum_major && required_minor > minimum_minor) )); then
+    echo "$executable requires glibc $required, newer than the supported baseline $MINIMUM_GLIBC_VERSION" >&2
+    return 1
+  fi
+  printf 'Verified glibc baseline: requires %s (maximum %s)\n' \
+    "$required" "$MINIMUM_GLIBC_VERSION"
+}
 
 build_target() {
   local target=$1
   local os=$2
   local arch=$3
   local builder=$REQUESTED_BUILDER
-  local source artifact extension xwin_tool_path
+  local source artifact extension xwin_tool_path cargo_target
   local -a build_command
 
   case "$os" in
@@ -91,6 +137,13 @@ build_target() {
       && command -v clang >/dev/null 2>&1 \
       && { command -v llvm-lib >/dev/null 2>&1 || command -v zig >/dev/null 2>&1; }; then
       builder=xwin
+    elif [[ "$target" == *-linux-gnu* ]] \
+      && command -v cargo-zigbuild >/dev/null 2>&1 \
+      && command -v zig >/dev/null 2>&1; then
+      builder=zigbuild
+    elif [[ "$target" == *-linux-gnu* ]]; then
+      echo "cargo-zigbuild and Zig are required to build $target against glibc $MINIMUM_GLIBC_VERSION" >&2
+      return 1
     elif [ "$target" != "$HOST_TARGET" ] && [[ "$target" == *-linux-* ]] \
       && command -v cargo-zigbuild >/dev/null 2>&1 \
       && command -v zig >/dev/null 2>&1; then
@@ -98,6 +151,10 @@ build_target() {
     else
       builder=cargo
     fi
+  fi
+  if [[ "$target" == *-linux-gnu* ]] && [ "$builder" != zigbuild ]; then
+    echo "$target must be built with cargo-zigbuild to enforce the glibc $MINIMUM_GLIBC_VERSION baseline" >&2
+    return 1
   fi
 
   xwin_tool_path=
@@ -132,18 +189,24 @@ build_target() {
     build_command=(cargo build)
   fi
 
-  printf 'Building %s/%s (%s) with %s\n' "$os" "$arch" "$target" "$builder"
+  cargo_target=$target
+  if [ "$builder" = zigbuild ] && [[ "$target" == *-linux-gnu* ]]; then
+    cargo_target="$target.$MINIMUM_GLIBC_VERSION"
+  fi
+
+  printf 'Building %s/%s (%s) with %s\n' "$os" "$arch" "$cargo_target" "$builder"
   if [ "$builder" = xwin ]; then
     (
       cd "$ROOT"
       PATH="${xwin_tool_path:+$xwin_tool_path:}$PATH" \
         XWIN_CROSS_COMPILER="${XWIN_CROSS_COMPILER:-clang}" \
-        "${build_command[@]}" --locked --release --target "$target" --bin om-agent
+        "${build_command[@]}" --locked --release --target "$cargo_target" --bin om-agent
     ) || return $?
   else
-    (cd "$ROOT" && "${build_command[@]}" --locked --release --target "$target" --bin om-agent) || return $?
+    (cd "$ROOT" && "${build_command[@]}" --locked --release --target "$cargo_target" --bin om-agent) || return $?
   fi
   [ -f "$source" ] || { echo "Built executable not found: $source" >&2; return 1; }
+  verify_glibc_baseline "$target" "$source" || return $?
 
   artifact="$OUTPUT_DIR/om-agent_${VERSION}_${os}_${arch}.${extension}"
   mkdir -p "$OUTPUT_DIR" || return $?

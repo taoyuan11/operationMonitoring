@@ -1,9 +1,21 @@
-use std::process::Command;
+use std::{ffi::OsString, process::Command};
+
+#[cfg(any(not(target_os = "linux"), test))]
+use std::collections::HashSet;
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+use std::collections::HashMap;
+
+#[cfg(any(target_os = "linux", test))]
+use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 
 #[cfg(target_os = "windows")]
-use std::{collections::HashMap, mem::size_of};
+use std::mem::size_of;
 
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{Disk, Disks, Networks, System};
 
 #[cfg(target_os = "windows")]
 use windows::{
@@ -48,6 +60,28 @@ struct GpuCollector {
     windows: WindowsGpuCollector,
 }
 
+#[derive(Clone, Debug)]
+struct DiskSample {
+    #[cfg(any(target_os = "linux", test))]
+    source: OsString,
+    file_system: OsString,
+    #[cfg(any(target_os = "linux", test))]
+    mount_point: PathBuf,
+    total: u64,
+    free: u64,
+    #[cfg(any(target_os = "linux", test))]
+    device_id: Option<u64>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Eq, Hash, PartialEq)]
+enum LinuxDiskIdentity {
+    Device(u64),
+    ZfsPool(OsString),
+    Source(OsString),
+    MountPoint(PathBuf),
+}
+
 impl MetricsCollector {
     pub fn new() -> Self {
         let mut system = System::new_all();
@@ -65,16 +99,8 @@ impl MetricsCollector {
         self.disks.refresh_list();
         self.networks.refresh();
 
-        let (disk_used, disk_total) = aggregate_disk_metrics(
-            self.disks.iter().map(|disk| {
-                (
-                    disk.file_system() == "apfs",
-                    disk.total_space(),
-                    disk.available_space(),
-                )
-            }),
-            cfg!(target_os = "macos"),
-        );
+        let disk_samples = self.disks.iter().map(disk_sample).collect::<Vec<_>>();
+        let (disk_used, disk_total) = aggregate_disk_metrics(&disk_samples);
 
         let (network_rx, network_tx) = self.networks.iter().fold((0_i64, 0_i64), |acc, item| {
             (
@@ -105,25 +131,211 @@ impl MetricsCollector {
     }
 }
 
-fn aggregate_disk_metrics(
-    disks: impl Iterator<Item = (bool, u64, u64)>,
+fn disk_sample(disk: &Disk) -> DiskSample {
+    DiskSample {
+        #[cfg(any(target_os = "linux", test))]
+        source: disk.name().to_owned(),
+        file_system: disk.file_system().to_owned(),
+        #[cfg(any(target_os = "linux", test))]
+        mount_point: disk.mount_point().to_owned(),
+        total: disk.total_space(),
+        free: disk_free_space(disk),
+        #[cfg(any(target_os = "linux", test))]
+        device_id: disk_device_id(disk.mount_point()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn disk_free_space(disk: &Disk) -> u64 {
+    fs2::free_space(disk.mount_point()).unwrap_or_else(|_| disk.available_space())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disk_free_space(disk: &Disk) -> u64 {
+    disk.available_space()
+}
+
+#[cfg(target_os = "linux")]
+fn disk_device_id(mount_point: &Path) -> Option<u64> {
+    std::fs::metadata(mount_point)
+        .ok()
+        .map(|metadata| metadata.dev())
+}
+
+#[cfg(all(not(target_os = "linux"), test))]
+fn disk_device_id(_mount_point: &Path) -> Option<u64> {
+    None
+}
+
+fn aggregate_disk_metrics(disks: &[DiskSample]) -> (i64, i64) {
+    #[cfg(target_os = "linux")]
+    {
+        return aggregate_linux_disk_metrics(disks);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    aggregate_standard_disk_metrics(disks, cfg!(target_os = "macos"))
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn aggregate_standard_disk_metrics(
+    disks: &[DiskSample],
     deduplicate_shared_apfs: bool,
 ) -> (i64, i64) {
-    let mut seen_apfs_capacities = std::collections::HashSet::new();
-    let (total, available) = disks
-        .filter(|(is_apfs, total, available)| {
-            !deduplicate_shared_apfs
-                || !is_apfs
-                || seen_apfs_capacities.insert((*total, *available))
-        })
-        .fold((0_i64, 0_i64), |(total, available), disk| {
-            (
-                total.saturating_add(disk.1.min(i64::MAX as u64) as i64),
-                available.saturating_add(disk.2.min(i64::MAX as u64) as i64),
-            )
-        });
+    let mut seen_apfs_capacities = HashSet::new();
+    sum_disk_metrics(disks.iter().filter(|disk| {
+        !deduplicate_shared_apfs
+            || disk.file_system != "apfs"
+            || seen_apfs_capacities.insert((disk.total, disk.free))
+    }))
+}
 
-    ((total - available).max(0), total)
+#[cfg(any(target_os = "linux", test))]
+fn aggregate_linux_disk_metrics(disks: &[DiskSample]) -> (i64, i64) {
+    let mut unique = HashMap::<LinuxDiskIdentity, &DiskSample>::new();
+    let mut root_container_layer = None;
+
+    for disk in disks {
+        if disk.total == 0 {
+            continue;
+        }
+        if is_linux_container_layer(disk) {
+            if disk.mount_point == Path::new("/") {
+                root_container_layer = Some(disk);
+            }
+            continue;
+        }
+        if is_linux_ignored_disk(disk) {
+            continue;
+        }
+
+        let identity = linux_disk_identity(disk);
+        unique
+            .entry(identity)
+            .and_modify(|current| {
+                if disk.total > current.total
+                    || (disk.total == current.total && disk.free > current.free)
+                {
+                    *current = disk;
+                }
+            })
+            .or_insert(disk);
+    }
+
+    if unique.is_empty() {
+        return sum_disk_metrics(root_container_layer.into_iter());
+    }
+    sum_disk_metrics(unique.into_values())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_disk_identity(disk: &DiskSample) -> LinuxDiskIdentity {
+    if disk.file_system == "zfs" {
+        let pool = disk
+            .source
+            .to_string_lossy()
+            .split('/')
+            .next()
+            .map(OsString::from)
+            .filter(|pool| !pool.is_empty());
+        if let Some(pool) = pool {
+            return LinuxDiskIdentity::ZfsPool(pool);
+        }
+    }
+    if let Some(device_id) = disk.device_id {
+        return LinuxDiskIdentity::Device(device_id);
+    }
+    if !disk.source.is_empty() && disk.source != "none" {
+        return LinuxDiskIdentity::Source(disk.source.clone());
+    }
+    LinuxDiskIdentity::MountPoint(disk.mount_point.clone())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_linux_container_layer(disk: &DiskSample) -> bool {
+    matches!(
+        disk.file_system.to_string_lossy().as_ref(),
+        "overlay" | "overlay2" | "aufs" | "unionfs" | "fuse-overlayfs" | "fuse.overlayfs"
+    ) || is_container_runtime_root(&disk.mount_point)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_container_runtime_root(mount_point: &Path) -> bool {
+    let path = mount_point.to_string_lossy();
+    (path.starts_with("/var/lib/docker/overlay2/") && path.ends_with("/merged"))
+        || (path.starts_with("/var/lib/docker/aufs/mnt/"))
+        || (path.starts_with("/var/lib/docker/devicemapper/mnt/") && path.ends_with("/rootfs"))
+        || (path.starts_with("/var/lib/containers/storage/overlay/") && path.ends_with("/merged"))
+        || (path.starts_with("/run/containerd/io.containerd.runtime.v2.task/")
+            && path.ends_with("/rootfs"))
+        || (path
+            .starts_with("/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/")
+            && path.ends_with("/fs"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_linux_ignored_disk(disk: &DiskSample) -> bool {
+    let file_system = disk.file_system.to_string_lossy();
+    if matches!(
+        file_system.as_ref(),
+        "rootfs"
+            | "sysfs"
+            | "proc"
+            | "devtmpfs"
+            | "devpts"
+            | "tmpfs"
+            | "ramfs"
+            | "cgroup"
+            | "cgroup2"
+            | "pstore"
+            | "securityfs"
+            | "debugfs"
+            | "tracefs"
+            | "configfs"
+            | "fusectl"
+            | "mqueue"
+            | "hugetlbfs"
+            | "autofs"
+            | "binfmt_misc"
+            | "efivarfs"
+            | "nsfs"
+            | "squashfs"
+            | "iso9660"
+            | "udf"
+            | "rpc_pipefs"
+            | "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb3"
+            | "ceph"
+            | "glusterfs"
+            | "lustre"
+            | "9p"
+            | "virtiofs"
+            | "fuse.sshfs"
+            | "fuse.rclone"
+            | "davfs"
+            | "davfs2"
+    ) {
+        return true;
+    }
+
+    let source = disk.source.to_string_lossy();
+    source.starts_with("/dev/loop")
+        || source.starts_with("/dev/ram")
+        || source.starts_with("/dev/zram")
+}
+
+fn sum_disk_metrics<'a>(disks: impl Iterator<Item = &'a DiskSample>) -> (i64, i64) {
+    let (total, free) = disks.fold((0_i64, 0_i64), |(total, free), disk| {
+        let disk_total = disk.total.min(i64::MAX as u64) as i64;
+        let disk_free = disk.free.min(disk.total).min(i64::MAX as u64) as i64;
+        (
+            total.saturating_add(disk_total),
+            free.saturating_add(disk_free),
+        )
+    });
+    (total.saturating_sub(free), total)
 }
 
 impl GpuCollector {
@@ -644,8 +856,8 @@ fn parse_ioreg_integer(output: &str, key: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuSample, aggregate_disk_metrics, aggregate_gpu_samples, parse_macos_ioreg,
-        parse_nvidia_smi,
+        DiskSample, GpuSample, aggregate_gpu_samples, aggregate_linux_disk_metrics,
+        aggregate_standard_disk_metrics, parse_macos_ioreg, parse_nvidia_smi,
     };
 
     #[cfg(target_os = "windows")]
@@ -653,16 +865,34 @@ mod tests {
         WindowsGpuCollector, aggregate_windows_engine_samples, aggregate_windows_memory_samples,
     };
 
+    fn disk(
+        source: &str,
+        file_system: &str,
+        mount_point: &str,
+        total: u64,
+        free: u64,
+        device_id: Option<u64>,
+    ) -> DiskSample {
+        DiskSample {
+            source: source.into(),
+            file_system: file_system.into(),
+            mount_point: mount_point.into(),
+            total,
+            free,
+            device_id,
+        }
+    }
+
     #[test]
     fn deduplicates_macos_apfs_volumes_that_share_capacity() {
         let disks = [
-            (true, 1_000, 400),
-            (true, 1_000, 400),
-            (true, 1_000, 250),
-            (false, 2_000, 1_000),
+            disk("disk3s1", "apfs", "/", 1_000, 400, None),
+            disk("disk3s2", "apfs", "/System", 1_000, 400, None),
+            disk("disk3s3", "apfs", "/Data", 1_000, 250, None),
+            disk("disk4s1", "hfs", "/Volumes/data", 2_000, 1_000, None),
         ];
 
-        let (used, total) = aggregate_disk_metrics(disks.into_iter(), true);
+        let (used, total) = aggregate_standard_disk_metrics(&disks, true);
 
         assert_eq!(used, 2_350);
         assert_eq!(total, 4_000);
@@ -670,12 +900,106 @@ mod tests {
 
     #[test]
     fn keeps_all_volumes_when_apfs_deduplication_is_disabled() {
-        let disks = [(true, 1_000, 400), (true, 1_000, 400)];
+        let disks = [
+            disk("disk3s1", "apfs", "/", 1_000, 400, None),
+            disk("disk3s2", "apfs", "/System", 1_000, 400, None),
+        ];
 
-        let (used, total) = aggregate_disk_metrics(disks.into_iter(), false);
+        let (used, total) = aggregate_standard_disk_metrics(&disks, false);
 
         assert_eq!(used, 1_200);
         assert_eq!(total, 2_000);
+    }
+
+    #[test]
+    fn linux_ignores_docker_layers_and_deduplicates_bind_mounts() {
+        let disks = [
+            disk("/dev/vda1", "ext4", "/", 10_000, 4_000, Some(1)),
+            disk(
+                "/dev/vdb1",
+                "xfs",
+                "/var/lib/docker",
+                20_000,
+                8_000,
+                Some(2),
+            ),
+            disk(
+                "/dev/vdb1",
+                "xfs",
+                "/var/lib/docker/volumes/app/_data",
+                20_000,
+                8_000,
+                Some(2),
+            ),
+            disk(
+                "overlay",
+                "overlay",
+                "/var/lib/docker/overlay2/abc/merged",
+                20_000,
+                8_000,
+                Some(20),
+            ),
+            disk(
+                "/dev/mapper/docker-container",
+                "ext4",
+                "/var/lib/docker/devicemapper/mnt/abc/rootfs",
+                20_000,
+                8_000,
+                Some(21),
+            ),
+        ];
+
+        assert_eq!(aggregate_linux_disk_metrics(&disks), (18_000, 30_000));
+    }
+
+    #[test]
+    fn linux_keeps_distinct_local_filesystems_with_equal_capacities() {
+        let disks = [
+            disk("/dev/vda1", "ext4", "/", 10_000, 4_000, Some(1)),
+            disk("/dev/vdb1", "xfs", "/data", 10_000, 4_000, Some(2)),
+        ];
+
+        assert_eq!(aggregate_linux_disk_metrics(&disks), (12_000, 20_000));
+    }
+
+    #[test]
+    fn linux_excludes_memory_loop_and_remote_filesystems() {
+        let disks = [
+            disk("/dev/vda1", "ext4", "/", 10_000, 4_000, Some(1)),
+            disk("tmpfs", "tmpfs", "/tmp", 2_000, 1_500, Some(10)),
+            disk("/dev/loop0", "ext4", "/mnt/image", 3_000, 1_000, Some(11)),
+            disk("server:/data", "nfs4", "/mnt/nfs", 20_000, 5_000, Some(12)),
+        ];
+
+        assert_eq!(aggregate_linux_disk_metrics(&disks), (6_000, 10_000));
+    }
+
+    #[test]
+    fn linux_uses_root_overlay_when_running_inside_a_container() {
+        let disks = [
+            disk("overlay", "overlay", "/", 10_000, 4_000, Some(20)),
+            disk("overlay", "overlay", "/workspace", 10_000, 4_000, Some(21)),
+        ];
+
+        assert_eq!(aggregate_linux_disk_metrics(&disks), (6_000, 10_000));
+    }
+
+    #[test]
+    fn linux_groups_zfs_datasets_by_pool() {
+        let disks = [
+            disk("tank/root", "zfs", "/", 10_000, 4_000, Some(30)),
+            disk("tank/data", "zfs", "/data", 8_000, 3_000, Some(31)),
+            disk("backup", "zfs", "/backup", 5_000, 2_000, Some(32)),
+        ];
+
+        assert_eq!(aggregate_linux_disk_metrics(&disks), (9_000, 15_000));
+    }
+
+    #[test]
+    fn disk_usage_is_calculated_from_free_blocks() {
+        let disks = [disk("/dev/vda1", "ext4", "/", 10_000, 4_000, Some(1))];
+
+        assert_eq!(aggregate_linux_disk_metrics(&disks), (6_000, 10_000));
     }
 
     #[test]

@@ -97,8 +97,9 @@ use windows::{
 
 use super::{
     AdaptiveSettings, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl, DesktopOpenRequest,
-    DesktopOptions, FrameHeader, MAX_CONTROL_BYTES, MAX_FRAME_BYTES, absolute_pointer_coordinate,
-    dom_code_to_vk, dom_code_uses_extended_key, error_reason, scaled_dimensions,
+    DesktopOptions, FrameHeader, MAX_CONTROL_BYTES, MAX_FRAME_BYTES, MAX_JPEG_QUALITY,
+    MIN_JPEG_QUALITY, absolute_pointer_coordinate, dom_code_to_vk, dom_code_uses_extended_key,
+    error_reason, scaled_dimensions,
 };
 use crate::{config::AgentConfig, models::AgentInbound};
 
@@ -176,7 +177,9 @@ async fn establish_session(
         max_height: request.max_height.clamp(240, 1080),
         min_fps,
         max_fps: request.max_fps.clamp(min_fps, 12),
-        jpeg_quality: request.jpeg_quality.clamp(50, 75),
+        jpeg_quality: request
+            .jpeg_quality
+            .clamp(MIN_JPEG_QUALITY, MAX_JPEG_QUALITY),
         system_helper: matches!(target, HelperTarget::ServiceSession { .. }),
     };
     let mut child = spawn_helper(&options, target, config)?;
@@ -1002,13 +1005,13 @@ impl DxgiCapture {
                     image.write_with_encoder(
                         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality),
                     )?;
-                    if jpeg.len() + 32 <= MAX_FRAME_BYTES || quality <= 50 {
+                    if jpeg.len() + 32 <= MAX_FRAME_BYTES || quality <= MIN_JPEG_QUALITY {
                         if jpeg.len() + 32 > MAX_FRAME_BYTES {
                             bail!("frame_too_large")
                         }
                         return Ok(Some((jpeg, width, height)));
                     }
-                    quality = quality.saturating_sub(5).max(50);
+                    quality = quality.saturating_sub(5).max(MIN_JPEG_QUALITY);
                 }
             })();
             let _ = self.duplication.ReleaseFrame();
@@ -1119,13 +1122,13 @@ fn capture_gdi_jpeg(
             image.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
                 &mut jpeg, quality,
             ))?;
-            if jpeg.len() + 32 <= MAX_FRAME_BYTES || quality <= 50 {
+            if jpeg.len() + 32 <= MAX_FRAME_BYTES || quality <= MIN_JPEG_QUALITY {
                 if jpeg.len() + 32 > MAX_FRAME_BYTES {
                     bail!("frame_too_large")
                 }
                 return Ok(Some((jpeg, target_width, target_height)));
             }
-            quality = quality.saturating_sub(5).max(50);
+            quality = quality.saturating_sub(5).max(MIN_JPEG_QUALITY);
         }
     }
 }

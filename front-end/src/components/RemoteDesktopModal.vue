@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   Expand,
   Fullscreen,
+  Gauge,
   Maximize2,
   Monitor,
   RefreshCw,
@@ -17,11 +18,20 @@ const MAX_FRAME_BYTES = 2 * 1024 * 1024
 const POINTER_INTERVAL_MS = 1000 / 30
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000
 const SESSION_TIMEOUT_MS = 2 * 60 * 60 * 1000
+const DESKTOP_QUALITY_STORAGE_KEY = 'operation-monitoring.desktop-quality'
 
 type ConnectionState = 'connecting' | 'ready' | 'paused' | 'closed' | 'error' | 'disconnected'
 type ViewMode = 'fit' | 'actual'
+type DesktopQuality = 'low' | 'balanced' | 'high' | 'original'
 type PointerButton = 0 | 1 | 2
 type KeyModifier = 'alt' | 'ctrl' | 'shift' | 'meta'
+
+const desktopQualityOptions: Array<{ value: DesktopQuality; label: string }> = [
+  { value: 'low', label: '省流 540p' },
+  { value: 'balanced', label: '均衡 720p' },
+  { value: 'high', label: '清晰 900p' },
+  { value: 'original', label: '原画 1080p' },
+]
 
 type DesktopFrame = {
   generation: number
@@ -78,6 +88,7 @@ const displayWidth = ref(0)
 const displayHeight = ref(0)
 const renderedFps = ref(0)
 const viewMode = ref<ViewMode>('fit')
+const desktopQuality = ref<DesktopQuality>(readDesktopQuality())
 const isFullscreen = ref(false)
 const isNarrowViewport = ref(false)
 const hasCoarsePointer = ref(false)
@@ -210,7 +221,10 @@ function openConnection() {
 
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const id = encodeURIComponent(props.instance.id)
-  const nextSocket = new WebSocket(`${protocol}//${window.location.host}/api/admin/instances/${id}/desktop/ws`)
+  const quality = encodeURIComponent(desktopQuality.value)
+  const nextSocket = new WebSocket(
+    `${protocol}//${window.location.host}/api/admin/instances/${id}/desktop/ws?quality=${quality}`,
+  )
   nextSocket.binaryType = 'arraybuffer'
   socket = nextSocket
 
@@ -441,6 +455,11 @@ function clearCanvas() {
 function setViewMode(mode: ViewMode) {
   viewMode.value = mode
   void nextTick(drawCurrentFrame)
+}
+
+function changeDesktopQuality() {
+  cacheDesktopQuality(desktopQuality.value)
+  connect()
 }
 
 async function toggleFullscreen() {
@@ -702,6 +721,28 @@ function updateMediaState() {
 function handleVisibilityChange() {
   if (document.hidden) releaseAllInputs()
 }
+
+function readDesktopQuality(): DesktopQuality {
+  try {
+    const value = window.localStorage.getItem(DESKTOP_QUALITY_STORAGE_KEY)
+    if (isDesktopQuality(value)) return value
+  } catch {
+    // Storage may be unavailable in hardened browser contexts.
+  }
+  return 'balanced'
+}
+
+function cacheDesktopQuality(value: DesktopQuality) {
+  try {
+    window.localStorage.setItem(DESKTOP_QUALITY_STORAGE_KEY, value)
+  } catch {
+    // Keep the selection for this component lifetime when storage is unavailable.
+  }
+}
+
+function isDesktopQuality(value: string | null): value is DesktopQuality {
+  return value === 'low' || value === 'balanced' || value === 'high' || value === 'original'
+}
 </script>
 
 <template>
@@ -722,6 +763,18 @@ function handleVisibilityChange() {
         </div>
 
         <div class="remote-desktop-tools">
+          <label class="desktop-quality-control" title="切换远程桌面画质">
+            <Gauge :size="15" aria-hidden="true" />
+            <select
+              v-model="desktopQuality"
+              aria-label="远程桌面画质"
+              @change="changeDesktopQuality"
+            >
+              <option v-for="option in desktopQualityOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+          </label>
           <div class="desktop-view-toggle" role="group" aria-label="远程桌面缩放模式">
             <button
               :class="{ active: viewMode === 'fit' }"

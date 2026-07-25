@@ -18,6 +18,8 @@ pub const CAPABILITY: &str = "remote_desktop_v1";
 pub const FRAME_HEADER_LEN: usize = 32;
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CONTROL_BYTES: usize = 16 * 1024;
+pub const MIN_JPEG_QUALITY: u8 = 25;
+pub const MAX_JPEG_QUALITY: u8 = 75;
 pub(super) const DATA_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
@@ -297,15 +299,20 @@ pub enum DesktopControl {
 pub struct AdaptiveSettings {
     pub fps: u8,
     pub jpeg_quality: u8,
+    min_jpeg_quality: u8,
+    max_jpeg_quality: u8,
     last_sequence: Option<u64>,
 }
 
 impl AdaptiveSettings {
     pub fn initial(min_fps: u8, max_fps: u8, jpeg_quality: u8) -> Self {
         let min_fps = min_fps.clamp(1, 12);
+        let jpeg_quality = jpeg_quality.clamp(MIN_JPEG_QUALITY, MAX_JPEG_QUALITY);
         Self {
             fps: max_fps.clamp(min_fps, 12),
-            jpeg_quality: jpeg_quality.clamp(50, 75),
+            jpeg_quality,
+            min_jpeg_quality: jpeg_quality.saturating_sub(20).max(MIN_JPEG_QUALITY),
+            max_jpeg_quality: jpeg_quality.saturating_add(5).min(MAX_JPEG_QUALITY),
             // Browser feedback starts at sequence zero before the first frame. Treat that as
             // already observed so a static/not-yet-captured desktop cannot lower quality.
             last_sequence: Some(0),
@@ -329,10 +336,16 @@ impl AdaptiveSettings {
         let max_fps = max_fps.clamp(min_fps, 12);
         if rendered_fps + 1.0 < f64::from(self.fps) || decode_ms > 60.0 {
             self.fps = self.fps.saturating_sub(1).max(min_fps);
-            self.jpeg_quality = self.jpeg_quality.saturating_sub(5).max(50);
+            self.jpeg_quality = self
+                .jpeg_quality
+                .saturating_sub(5)
+                .max(self.min_jpeg_quality);
         } else if rendered_fps >= f64::from(self.fps) - 0.25 && decode_ms < 30.0 {
             self.fps = self.fps.saturating_add(1).min(max_fps);
-            self.jpeg_quality = self.jpeg_quality.saturating_add(2).min(75);
+            self.jpeg_quality = self
+                .jpeg_quality
+                .saturating_add(2)
+                .min(self.max_jpeg_quality);
         }
     }
 }
@@ -541,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_settings_stay_within_v1_limits() {
+    fn adaptive_settings_stay_within_selected_quality_limits() {
         let mut settings = AdaptiveSettings::initial(8, 12, 70);
         settings.update(8, 12, 0, 0.0, 500.0);
         assert_eq!((settings.fps, settings.jpeg_quality), (12, 70));
@@ -561,6 +574,38 @@ mod tests {
             settings.update(8, 12, sequence, 1.0, 500.0);
         }
         assert_eq!((settings.fps, settings.jpeg_quality), (12, 75));
+    }
+
+    #[test]
+    fn adaptive_quality_ranges_follow_desktop_presets() {
+        for (min_fps, max_fps, initial, minimum, maximum) in [
+            (4, 6, 35, 25, 40),
+            (6, 8, 50, 30, 55),
+            (8, 10, 60, 40, 65),
+            (8, 12, 70, 50, 75),
+        ] {
+            let mut settings = AdaptiveSettings::initial(min_fps, max_fps, initial);
+            assert_eq!(settings.fps, max_fps);
+            for sequence in (12..=240).step_by(12) {
+                settings.update(min_fps, max_fps, sequence, 1.0, 100.0);
+            }
+            assert_eq!(settings.fps, min_fps);
+            assert_eq!(settings.jpeg_quality, minimum);
+
+            for sequence in (252..=720).step_by(12) {
+                settings.update(min_fps, max_fps, sequence, 12.0, 5.0);
+            }
+            assert_eq!(settings.fps, max_fps);
+            assert_eq!(settings.jpeg_quality, maximum);
+        }
+    }
+
+    #[test]
+    fn adaptive_quality_clamps_untrusted_open_parameters() {
+        let minimum = AdaptiveSettings::initial(4, 6, 0);
+        let maximum = AdaptiveSettings::initial(8, 12, u8::MAX);
+        assert_eq!(minimum.jpeg_quality, MIN_JPEG_QUALITY);
+        assert_eq!(maximum.jpeg_quality, MAX_JPEG_QUALITY);
     }
 
     #[test]

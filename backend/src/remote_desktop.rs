@@ -14,6 +14,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use rand::{RngCore, rngs::OsRng};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -42,10 +43,71 @@ const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum DesktopQuality {
+    Low,
+    #[default]
+    Balanced,
+    High,
+    Original,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DesktopBrowserWsQuery {
+    #[serde(default)]
+    quality: DesktopQuality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DesktopStreamSettings {
+    max_width: u32,
+    max_height: u32,
+    min_fps: u8,
+    max_fps: u8,
+    jpeg_quality: u8,
+}
+
+impl DesktopQuality {
+    fn stream_settings(self) -> DesktopStreamSettings {
+        match self {
+            Self::Low => DesktopStreamSettings {
+                max_width: 960,
+                max_height: 540,
+                min_fps: 4,
+                max_fps: 6,
+                jpeg_quality: 35,
+            },
+            Self::Balanced => DesktopStreamSettings {
+                max_width: 1280,
+                max_height: 720,
+                min_fps: 6,
+                max_fps: 8,
+                jpeg_quality: 50,
+            },
+            Self::High => DesktopStreamSettings {
+                max_width: 1600,
+                max_height: 900,
+                min_fps: 8,
+                max_fps: 10,
+                jpeg_quality: 60,
+            },
+            Self::Original => DesktopStreamSettings {
+                max_width: 1920,
+                max_height: 1080,
+                min_fps: 8,
+                max_fps: 12,
+                jpeg_quality: 70,
+            },
+        }
+    }
+}
+
 pub async fn admin_desktop_ws(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(instance_id): Path<String>,
+    Query(query): Query<DesktopBrowserWsQuery>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
     ensure_same_origin(&headers, state.secure_cookies)?;
@@ -76,7 +138,7 @@ pub async fn admin_desktop_ws(
     }
 
     Ok(ws.on_upgrade(move |socket| {
-        desktop_browser_socket(state, instance_id, admin.username, socket)
+        desktop_browser_socket(state, instance_id, admin.username, query.quality, socket)
     }))
 }
 
@@ -95,6 +157,7 @@ async fn desktop_browser_socket(
     state: AppState,
     instance_id: String,
     actor: String,
+    quality: DesktopQuality,
     socket: WebSocket,
 ) {
     let Some(agent) = state.agents.read().await.get(&instance_id).cloned() else {
@@ -190,16 +253,17 @@ async fn desktop_browser_socket(
         return;
     }
 
+    let stream_settings = quality.stream_settings();
     if agent
         .tx
         .send(AgentOutbound::DesktopOpen {
             session_id: session_id.clone(),
             stream_token,
-            max_width: 1920,
-            max_height: 1080,
-            min_fps: 8,
-            max_fps: 12,
-            jpeg_quality: 70,
+            max_width: stream_settings.max_width,
+            max_height: stream_settings.max_height,
+            min_fps: stream_settings.min_fps,
+            max_fps: stream_settings.max_fps,
+            jpeg_quality: stream_settings.jpeg_quality,
         })
         .is_err()
     {
@@ -839,6 +903,69 @@ mod tests {
         let mut invalid = valid_frame();
         invalid[4] = 2;
         assert!(validate_frame(&invalid).is_err());
+    }
+
+    #[test]
+    fn desktop_quality_defaults_to_balanced() {
+        let query: DesktopBrowserWsQuery = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(query.quality, DesktopQuality::Balanced);
+        assert_eq!(
+            query.quality.stream_settings(),
+            DesktopStreamSettings {
+                max_width: 1280,
+                max_height: 720,
+                min_fps: 6,
+                max_fps: 8,
+                jpeg_quality: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn desktop_quality_presets_map_to_stream_limits() {
+        assert_eq!(
+            [
+                DesktopQuality::Low.stream_settings(),
+                DesktopQuality::Balanced.stream_settings(),
+                DesktopQuality::High.stream_settings(),
+                DesktopQuality::Original.stream_settings(),
+            ],
+            [
+                DesktopStreamSettings {
+                    max_width: 960,
+                    max_height: 540,
+                    min_fps: 4,
+                    max_fps: 6,
+                    jpeg_quality: 35,
+                },
+                DesktopStreamSettings {
+                    max_width: 1280,
+                    max_height: 720,
+                    min_fps: 6,
+                    max_fps: 8,
+                    jpeg_quality: 50,
+                },
+                DesktopStreamSettings {
+                    max_width: 1600,
+                    max_height: 900,
+                    min_fps: 8,
+                    max_fps: 10,
+                    jpeg_quality: 60,
+                },
+                DesktopStreamSettings {
+                    max_width: 1920,
+                    max_height: 1080,
+                    min_fps: 8,
+                    max_fps: 12,
+                    jpeg_quality: 70,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_desktop_quality() {
+        assert!(serde_json::from_value::<DesktopQuality>(json!("ultra")).is_err());
     }
 
     #[test]

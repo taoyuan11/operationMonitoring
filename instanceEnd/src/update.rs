@@ -1145,7 +1145,7 @@ fn read_update_state(path: &Path) -> Result<UpdateState> {
             }
             Ok(state)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(UpdateState::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(UpdateState::default()),
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
 }
@@ -1259,7 +1259,7 @@ fn detach(command: &mut Command) {
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
+                Err(io::Error::last_os_error())
             } else {
                 Ok(())
             }
@@ -1369,8 +1369,8 @@ fn update_lock_is_held(path: &Path) -> Result<bool> {
     }
 }
 
-fn update_lock_is_contended(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::WouldBlock
+fn update_lock_is_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
         || error
             .raw_os_error()
             .is_some_and(|code| fs2::lock_contended_error().raw_os_error() == Some(code))
@@ -1997,7 +1997,7 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<()> {
 #[cfg(unix)]
 fn process_is_running(pid: u32) -> bool {
     let result = unsafe { libc::kill(pid as i32, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]

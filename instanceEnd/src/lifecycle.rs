@@ -27,7 +27,7 @@ pub fn start(config: &AgentConfig) -> Result<()> {
     }
     paths.remove_stale_files();
 
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(env::current_exe()?);
     command
         .arg("start")
         .arg("--daemon-child")
@@ -929,7 +929,7 @@ mod tests {
     #[test]
     fn runtime_guard_exposes_running_state_and_cleans_up() {
         let state_dir =
-            std::env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+            env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
         let paths = RuntimePaths::from_config(&test_config(state_dir.clone())).unwrap();
         paths.prepare().unwrap();
 
@@ -954,7 +954,7 @@ mod tests {
     #[test]
     fn missing_state_directory_is_reported_as_stopped() {
         let state_dir =
-            std::env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+            env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
         let paths = RuntimePaths::from_config(&test_config(state_dir)).unwrap();
 
         assert!(matches!(
@@ -966,7 +966,7 @@ mod tests {
     #[test]
     fn stopping_a_missing_agent_does_not_create_runtime_files() {
         let state_dir =
-            std::env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+            env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
 
         assert!(!stop_if_running(&test_config(state_dir.clone()), 0).unwrap());
         assert!(!state_dir.exists());
@@ -974,7 +974,7 @@ mod tests {
 
     #[test]
     fn observer_uses_installed_paths_when_options_are_not_explicit() {
-        let root = std::env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+        let root = env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
         let installed = InstalledRuntimePaths {
             state_dir: root.join("runtime"),
             log_file: root.join("logs/agent.log"),
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn installed_paths_do_not_require_a_valid_working_directory() {
-        let root = std::env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+        let root = env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
         let installed = InstalledRuntimePaths {
             state_dir: root.join("runtime"),
             log_file: root.join("logs/agent.log"),
@@ -1033,7 +1033,7 @@ mod tests {
 
     #[test]
     fn explicit_paths_override_installed_paths() {
-        let root = std::env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+        let root = env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
         let explicit_state = root.join("explicit-runtime");
         let explicit_log = root.join("explicit.log");
         let installed = InstalledRuntimePaths {
@@ -1052,7 +1052,7 @@ mod tests {
 
     #[test]
     fn log_follower_reads_appends_and_rotated_files() {
-        let root = std::env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+        let root = env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
         let path = root.join("agent.log");
         fs::create_dir_all(&root).unwrap();
         fs::write(&path, "first\n").unwrap();

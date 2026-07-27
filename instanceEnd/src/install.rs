@@ -243,7 +243,7 @@ fn migrate_path(legacy: &str, current: &str) -> Result<()> {
         } else {
             fs::remove_file(legacy)?;
         }
-        return Ok(());
+        Ok(())
     }
 
     migrate(Path::new(legacy), Path::new(current))

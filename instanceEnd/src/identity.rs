@@ -125,7 +125,7 @@ mod tests {
             .map(|_| {
                 let path = path.clone();
                 let barrier = barrier.clone();
-                std::thread::spawn(move || {
+                thread::spawn(move || {
                     barrier.wait();
                     load_or_create_identity(Some(path)).unwrap()
                 })

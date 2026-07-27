@@ -92,15 +92,12 @@ impl DesktopManager {
         let (close_tx, close_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             let _activity = activity;
-            let reason = match run_session(config, request, outbound.clone(), close_rx).await {
-                Ok(reason) => reason,
-                Err(error) => {
-                    crate::logging::error(format_args!(
-                        "remote desktop session {task_session_id} failed: {error:#}"
-                    ));
-                    error_reason(&error)
-                }
-            };
+            let reason = run_session(config, request, outbound.clone(), close_rx).await.unwrap_or_else(|error| {
+                crate::logging::error(format_args!(
+                    "remote desktop session {task_session_id} failed: {error:#}"
+                ));
+                error_reason(&error)
+            });
             let _ = outbound.send(AgentInbound::DesktopClosed {
                 session_id: task_session_id,
                 reason,
@@ -251,10 +248,10 @@ impl FrameHeader {
             bail!("unsupported remote desktop frame version or codec")
         }
         Ok(Self {
-            sequence: u64::from_be_bytes(value[8..16].try_into().unwrap()),
-            captured_at_ms: u64::from_be_bytes(value[16..24].try_into().unwrap()),
-            width: u32::from_be_bytes(value[24..28].try_into().unwrap()),
-            height: u32::from_be_bytes(value[28..32].try_into().unwrap()),
+            sequence: u64::from_be_bytes(value[8..16].try_into()?),
+            captured_at_ms: u64::from_be_bytes(value[16..24].try_into()?),
+            width: u32::from_be_bytes(value[24..28].try_into()?),
+            height: u32::from_be_bytes(value[28..32].try_into()?),
         })
     }
 }

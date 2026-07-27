@@ -391,7 +391,7 @@ fn collect_nvidia_samples() -> Vec<GpuSample> {
     };
 
     #[cfg(not(target_os = "windows"))]
-    let commands = vec![std::path::PathBuf::from("nvidia-smi")];
+    let commands = vec![PathBuf::from("nvidia-smi")];
 
     let Some(output) = commands.into_iter().find_map(|command| {
         Command::new(command)

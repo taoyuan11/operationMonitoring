@@ -168,7 +168,7 @@ fn run_terminal_inner(
                         break;
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }

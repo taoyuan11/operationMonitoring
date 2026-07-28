@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -62,6 +64,333 @@ pub struct MetricPayload {
     pub gpu_memory_total: Option<i64>,
     pub uptime_seconds: i64,
     pub load_average: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerStatusState {
+    NotInstalled,
+    DaemonUnreachable,
+    PermissionDenied,
+    UnsupportedVersion,
+    Ready,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerStatus {
+    pub state: DockerStatusState,
+    pub cli_version: Option<String>,
+    pub engine_version: Option<String>,
+    pub api_version: Option<String>,
+    pub compose_version: Option<String>,
+    pub message: Option<String>,
+    pub checked_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerErrorCode {
+    InvalidRequest,
+    NotFound,
+    PermissionDenied,
+    NotInstalled,
+    DaemonUnavailable,
+    UnsupportedVersion,
+    Busy,
+    Conflict,
+    Timeout,
+    Cancelled,
+    OutputTooLarge,
+    CommandFailed,
+    Unsupported,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerError {
+    pub code: DockerErrorCode,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerPortProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerPortSpec {
+    pub host_ip: Option<String>,
+    pub host_port: Option<u16>,
+    pub container_port: u16,
+    pub protocol: DockerPortProtocol,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerMountKind {
+    Volume,
+    Bind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerMountSpec {
+    pub kind: DockerMountKind,
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerRestartPolicy {
+    No,
+    Always,
+    UnlessStopped,
+    OnFailure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DockerContainerCreateSpec {
+    pub name: Option<String>,
+    pub image: String,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub ports: Vec<DockerPortSpec>,
+    #[serde(default)]
+    pub mounts: Vec<DockerMountSpec>,
+    pub network: Option<String>,
+    pub restart_policy: Option<DockerRestartPolicy>,
+    pub restart_max_retries: Option<u32>,
+    pub cpus: Option<f64>,
+    pub memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub confirm_bind_write: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerContainerAction {
+    Start,
+    Stop,
+    Restart,
+    Kill,
+    Pause,
+    Unpause,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerNetworkCreateSpec {
+    pub name: String,
+    pub driver: Option<String>,
+    #[serde(default)]
+    pub internal: bool,
+    #[serde(default)]
+    pub attachable: bool,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerVolumeCreateSpec {
+    pub name: String,
+    pub driver: Option<String>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerComposeTarget {
+    pub project: Option<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerComposeAction {
+    Pull,
+    Up,
+    Start,
+    Stop,
+    Restart,
+    Down,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerComposeServiceSummary {
+    pub name: String,
+    pub image: Option<String>,
+    pub ports: Vec<String>,
+    pub mounts: Vec<String>,
+    pub networks: Vec<String>,
+    pub profiles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerComposeConfigSummary {
+    pub service_count: u32,
+    pub network_count: u32,
+    pub volume_count: u32,
+    pub config_count: u32,
+    pub secret_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockerComposeValidation {
+    pub project: Option<String>,
+    pub services: Vec<String>,
+    pub service_summaries: Vec<DockerComposeServiceSummary>,
+    pub config_summary: DockerComposeConfigSummary,
+    pub warnings: Vec<String>,
+    pub config_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum DockerRequest {
+    ContainerList {
+        #[serde(default)]
+        all: bool,
+    },
+    ContainerInspect {
+        container: String,
+    },
+    ContainerCreate {
+        spec: DockerContainerCreateSpec,
+    },
+    ContainerAction {
+        container: String,
+        action: DockerContainerAction,
+        timeout_seconds: Option<u64>,
+    },
+    ContainerRename {
+        container: String,
+        name: String,
+    },
+    ContainerRemove {
+        container: String,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        remove_volumes: bool,
+    },
+    ContainerStats {
+        container: Option<String>,
+    },
+    ImageList {
+        #[serde(default)]
+        all: bool,
+    },
+    ImageInspect {
+        image: String,
+    },
+    ImagePull {
+        image: String,
+    },
+    ImageTag {
+        source: String,
+        target: String,
+    },
+    ImageRemove {
+        image: String,
+        #[serde(default)]
+        force: bool,
+    },
+    ImagePrune,
+    NetworkList,
+    NetworkInspect {
+        network: String,
+    },
+    NetworkCreate {
+        spec: DockerNetworkCreateSpec,
+    },
+    NetworkConnect {
+        network: String,
+        container: String,
+        #[serde(default)]
+        aliases: Vec<String>,
+    },
+    NetworkDisconnect {
+        network: String,
+        container: String,
+        #[serde(default)]
+        force: bool,
+    },
+    NetworkRemove {
+        network: String,
+    },
+    NetworkPrune,
+    VolumeList,
+    VolumeInspect {
+        volume: String,
+    },
+    VolumeCreate {
+        spec: DockerVolumeCreateSpec,
+    },
+    VolumeRemove {
+        volume: String,
+        #[serde(default)]
+        force: bool,
+    },
+    VolumePrune,
+    ComposeList,
+    ComposeInspect {
+        target: DockerComposeTarget,
+    },
+    ComposeValidate {
+        target: DockerComposeTarget,
+    },
+    ComposeDeploy {
+        target: DockerComposeTarget,
+        config_digest: String,
+        #[serde(default)]
+        confirm_high_risk: bool,
+    },
+    ComposeAction {
+        target: DockerComposeTarget,
+        action: DockerComposeAction,
+        config_digest: String,
+        #[serde(default)]
+        remove_volumes: bool,
+        #[serde(default)]
+        confirm_high_risk: bool,
+    },
+    SystemDf,
+    SystemPrune {
+        #[serde(default)]
+        containers: bool,
+        #[serde(default)]
+        images: bool,
+        #[serde(default)]
+        networks: bool,
+        #[serde(default)]
+        volumes: bool,
+        #[serde(default)]
+        all_images: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum DockerResponse {
+    Data { data: serde_json::Value },
+    OperationComplete { data: serde_json::Value },
+    ComposeValidation { validation: DockerComposeValidation },
+    Error { error: DockerError },
 }
 
 #[derive(Serialize, FromRow)]
@@ -541,6 +870,44 @@ pub enum AgentOutbound {
     FileTransferCancel {
         request_id: String,
     },
+    DockerRequest {
+        request_id: String,
+        request: DockerRequest,
+    },
+    DockerCancel {
+        request_id: String,
+    },
+    DockerLogStart {
+        request_id: String,
+        container: String,
+        #[serde(default = "default_docker_log_tail")]
+        tail: u32,
+        #[serde(default)]
+        follow: bool,
+        since: Option<String>,
+    },
+    DockerLogCancel {
+        request_id: String,
+    },
+    DockerExecOpen {
+        session_id: String,
+        container: String,
+        shell: String,
+        cols: u16,
+        rows: u16,
+    },
+    DockerExecInput {
+        session_id: String,
+        data: String,
+    },
+    DockerExecResize {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    DockerExecClose {
+        session_id: String,
+    },
     UpdateAvailable {
         release_id: String,
         version: String,
@@ -572,6 +939,8 @@ pub enum AgentInbound {
         native_arch: Option<String>,
         #[serde(default)]
         update_privileged: Option<bool>,
+        #[serde(default)]
+        docker_status: Option<DockerStatus>,
         metrics: MetricPayload,
     },
     CommandResult {
@@ -602,6 +971,32 @@ pub enum AgentInbound {
         request_id: String,
         response: FileResponse,
     },
+    DockerResponse {
+        request_id: String,
+        response: DockerResponse,
+    },
+    DockerLogChunk {
+        request_id: String,
+        sequence: u64,
+        data: String,
+        cursor: Option<String>,
+    },
+    DockerLogClosed {
+        request_id: String,
+        error: Option<DockerError>,
+    },
+    DockerExecOpened {
+        session_id: String,
+    },
+    DockerExecOutput {
+        session_id: String,
+        data: String,
+    },
+    DockerExecClosed {
+        session_id: String,
+        exit_code: Option<i64>,
+        reason: Option<String>,
+    },
     UpdateStatus {
         release_id: String,
         artifact_id: String,
@@ -611,6 +1006,10 @@ pub enum AgentInbound {
         status: String,
         message: Option<String>,
     },
+}
+
+fn default_docker_log_tail() -> u32 {
+    200
 }
 
 #[derive(Serialize, Deserialize, Debug)]

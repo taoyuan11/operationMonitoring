@@ -3,18 +3,30 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 #[derive(Clone, Default)]
 pub struct ActivityTracker {
     state: Arc<ActivityState>,
 }
 
-#[derive(Default)]
 struct ActivityState {
     active: AtomicUsize,
     draining: AtomicBool,
+    draining_updates: watch::Sender<bool>,
     idle: Notify,
+}
+
+impl Default for ActivityState {
+    fn default() -> Self {
+        let (draining_updates, _) = watch::channel(false);
+        Self {
+            active: AtomicUsize::default(),
+            draining: AtomicBool::default(),
+            draining_updates,
+            idle: Notify::default(),
+        }
+    }
 }
 
 pub struct ActivityGuard {
@@ -39,11 +51,15 @@ impl ActivityTracker {
     }
 
     pub fn start_draining(&self) {
-        self.state.draining.store(true, Ordering::SeqCst);
+        self.set_draining(true);
     }
 
     pub fn stop_draining(&self) {
-        self.state.draining.store(false, Ordering::SeqCst);
+        self.set_draining(false);
+    }
+
+    pub fn subscribe_draining(&self) -> watch::Receiver<bool> {
+        self.state.draining_updates.subscribe()
     }
 
     pub fn active_count(&self) -> usize {
@@ -64,6 +80,18 @@ impl ActivityTracker {
         if self.state.active.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.state.idle.notify_waiters();
         }
+    }
+
+    fn set_draining(&self, draining: bool) {
+        self.state.draining_updates.send_if_modified(|current| {
+            self.state.draining.store(draining, Ordering::SeqCst);
+            if *current == draining {
+                false
+            } else {
+                *current = draining;
+                true
+            }
+        });
     }
 }
 
@@ -92,5 +120,21 @@ mod tests {
 
         tracker.stop_draining();
         assert!(tracker.try_enter().is_some());
+    }
+
+    #[tokio::test]
+    async fn subscribers_observe_draining_state_changes() {
+        let tracker = ActivityTracker::default();
+        let mut draining = tracker.subscribe_draining();
+
+        assert!(!*draining.borrow());
+
+        tracker.start_draining();
+        draining.changed().await.unwrap();
+        assert!(*draining.borrow_and_update());
+
+        tracker.stop_draining();
+        draining.changed().await.unwrap();
+        assert!(!*draining.borrow_and_update());
     }
 }

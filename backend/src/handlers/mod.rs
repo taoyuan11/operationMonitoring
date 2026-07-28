@@ -15,6 +15,7 @@ use crate::{
         approve_pending_instance, get_instance, get_instance_optional, instance_summary,
         latest_metric, register_or_touch_pending, retention_days, setting_value, write_action_log,
     },
+    docker::cancel_instance_docker,
     error::{AppError, AppResult},
     jobs::{create_command_job, dispatch_command},
     models::{
@@ -77,7 +78,12 @@ pub async fn public_instances(
     let mut summaries = Vec::with_capacity(records.len());
     for record in records {
         let metrics = latest_metric(&state.db, &record.id).await?;
-        let capabilities = connected.get(&record.id).cloned();
+        let capabilities = connected.get(&record.id).cloned().map(|capabilities| {
+            capabilities
+                .into_iter()
+                .filter(|capability| capability != "docker_manager_v1")
+                .collect()
+        });
         summaries.push(instance_summary(
             record,
             metrics,
@@ -327,7 +333,8 @@ pub async fn admin_disable_instance(
         .bind(&id)
         .execute(&state.db)
         .await?;
-    state.agents.write().await.remove(&id);
+    let agent = state.agents.write().await.remove(&id);
+    cancel_instance_docker(&state, &id, agent.as_ref()).await;
     write_action_log(
         &state.db,
         &admin.username,
@@ -351,6 +358,12 @@ pub async fn admin_delete_instance(
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
 
+    sqlx::query("UPDATE instances SET disabled = 1 WHERE id = $1")
+        .bind(&id)
+        .execute(&state.db)
+        .await?;
+    let agent = state.agents.write().await.remove(&id);
+    cancel_instance_docker(&state, &id, agent.as_ref()).await;
     sqlx::query("DELETE FROM metrics WHERE instance_id = $1")
         .bind(&id)
         .execute(&state.db)
@@ -363,7 +376,6 @@ pub async fn admin_delete_instance(
         .bind(&id)
         .execute(&state.db)
         .await?;
-    state.agents.write().await.remove(&id);
     write_action_log(
         &state.db,
         &admin.username,

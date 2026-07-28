@@ -7,6 +7,11 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    docker::{
+        CAPABILITY as DOCKER_CAPABILITY, close_connection_docker, handle_docker_exec_event,
+        handle_docker_log_chunk, handle_docker_log_closed, handle_docker_response,
+        update_current_docker_status,
+    },
     error::AppResult,
     files::{close_connection_file_requests, handle_agent_file_binary, handle_agent_file_response},
     jobs::complete_command_job,
@@ -39,6 +44,9 @@ pub async fn agent_socket(
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentOutbound>();
     let (binary_tx, mut binary_rx) = mpsc::channel::<Vec<u8>>(4);
 
+    let docker_capable = capabilities
+        .iter()
+        .any(|capability| capability == DOCKER_CAPABILITY);
     state.agents.write().await.insert(
         instance_id.clone(),
         AgentHandle {
@@ -46,8 +54,15 @@ pub async fn agent_socket(
             tx,
             binary_tx,
             capabilities,
+            docker_status: Default::default(),
         },
     );
+    if !docker_capable
+        && let Err(error) =
+            update_current_docker_status(&state, &instance_id, connection_id, None).await
+    {
+        warn!(?error, %instance_id, %connection_id, "failed to clear stale Docker status");
+    }
     let _ = sqlx::query("UPDATE instances SET last_seen = $1 WHERE id = $2")
         .bind(now_ts())
         .bind(&instance_id)
@@ -118,7 +133,7 @@ pub async fn agent_socket(
                                     }
                                 }
                             }
-                            Err(error) => warn!(?error, %text, "invalid agent websocket message"),
+                            Err(error) => warn!(?error, message_bytes = text.len(), "invalid agent websocket message"),
                         }
                     }
                     Ok(Message::Pong(_)) => last_inbound = Instant::now(),
@@ -169,6 +184,7 @@ pub async fn agent_socket(
     close_connection_terminals(&state, &instance_id, connection_id).await;
     close_connection_desktops(&state, &instance_id, connection_id).await;
     close_connection_file_requests(&state, &instance_id, connection_id).await;
+    close_connection_docker(&state, &instance_id, connection_id).await;
     info!(%instance_id, %connection_id, "agent websocket disconnected");
 }
 
@@ -189,6 +205,7 @@ async fn handle_agent_message(
             package_type,
             native_arch,
             update_privileged,
+            docker_status,
             metrics,
         } => {
             store_metrics(
@@ -201,6 +218,8 @@ async fn handle_agent_message(
                 package_type.as_deref(),
                 native_arch.as_deref(),
                 update_privileged,
+                connection_id,
+                docker_status,
                 metrics,
                 latency_ms,
             )
@@ -263,6 +282,69 @@ async fn handle_agent_message(
             handle_agent_file_response(state, instance_id, connection_id, &request_id, response)
                 .await;
         }
+        AgentInbound::DockerResponse {
+            request_id,
+            response,
+        } => {
+            handle_docker_response(state, instance_id, connection_id, &request_id, response).await;
+        }
+        AgentInbound::DockerLogChunk {
+            request_id,
+            sequence,
+            data,
+            cursor,
+        } => {
+            handle_docker_log_chunk(
+                state,
+                instance_id,
+                connection_id,
+                &request_id,
+                sequence,
+                data,
+                cursor,
+            )
+            .await;
+        }
+        AgentInbound::DockerLogClosed { request_id, error } => {
+            handle_docker_log_closed(state, instance_id, connection_id, &request_id, error).await;
+        }
+        AgentInbound::DockerExecOpened { session_id } => {
+            handle_docker_exec_event(
+                state,
+                instance_id,
+                connection_id,
+                &session_id,
+                TerminalServerMessage::Ready,
+                false,
+            )
+            .await;
+        }
+        AgentInbound::DockerExecOutput { session_id, data } => {
+            handle_docker_exec_event(
+                state,
+                instance_id,
+                connection_id,
+                &session_id,
+                TerminalServerMessage::Output { data },
+                false,
+            )
+            .await;
+        }
+        AgentInbound::DockerExecClosed {
+            session_id,
+            exit_code,
+            reason,
+        } => {
+            handle_docker_exec_event(
+                state,
+                instance_id,
+                connection_id,
+                &session_id,
+                TerminalServerMessage::Closed { exit_code, reason },
+                true,
+            )
+            .await;
+        }
         AgentInbound::UpdateStatus {
             release_id,
             artifact_id,
@@ -297,9 +379,20 @@ async fn store_metrics(
     package_type: Option<&str>,
     native_arch: Option<&str>,
     update_privileged: Option<bool>,
+    connection_id: Uuid,
+    docker_status: Option<crate::models::DockerStatus>,
     metrics: MetricPayload,
     latency_ms: Option<f64>,
 ) -> AppResult<()> {
+    if !state
+        .agents
+        .read()
+        .await
+        .get(instance_id)
+        .is_some_and(|agent| agent.connection_id == connection_id)
+    {
+        return Ok(());
+    }
     sqlx::query(
         r#"
         UPDATE instances
@@ -323,6 +416,8 @@ async fn store_metrics(
     .await?;
 
     confirm_update_version(state, instance_id, agent_version).await?;
+
+    update_current_docker_status(state, instance_id, connection_id, docker_status).await?;
 
     sqlx::query(
         r#"

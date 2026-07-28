@@ -92,12 +92,14 @@ impl DesktopManager {
         let (close_tx, close_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             let _activity = activity;
-            let reason = run_session(config, request, outbound.clone(), close_rx).await.unwrap_or_else(|error| {
-                crate::logging::error(format_args!(
-                    "remote desktop session {task_session_id} failed: {error:#}"
-                ));
-                error_reason(&error)
-            });
+            let reason = run_session(config, request, outbound.clone(), close_rx)
+                .await
+                .unwrap_or_else(|error| {
+                    crate::logging::error(format_args!(
+                        "remote desktop session {task_session_id} failed: {error:#}"
+                    ));
+                    error_reason(&error)
+                });
             let _ = outbound.send(AgentInbound::DesktopClosed {
                 session_id: task_session_id,
                 reason,

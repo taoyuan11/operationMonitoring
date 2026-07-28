@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
@@ -11,9 +11,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-#[cfg(any(windows, test))]
-use std::io;
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
@@ -1414,6 +1411,10 @@ impl UpdatePaths {
         }
         Ok(())
     }
+}
+
+pub(crate) fn docker_protected_update_root(config: &AgentConfig) -> Result<PathBuf> {
+    Ok(UpdatePaths::from_config(config)?.root)
 }
 
 pub fn apply_update(plan_file: &Path) -> Result<()> {

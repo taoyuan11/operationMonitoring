@@ -10,6 +10,7 @@ use crate::{
     activity::ActivityTracker,
     command::execute_tracked_command,
     config::AgentConfig,
+    docker::{CAPABILITY as DOCKER_CAPABILITY, DockerManager},
     file_manager::{CAPABILITY as FILE_MANAGER_CAPABILITY, FileManager},
     http::register_once,
     metrics::MetricsCollector,
@@ -103,7 +104,10 @@ pub async fn agent_ws_loop(
         }
 
         let url = websocket_url(&config.server, &identity);
-        crate::logging::info(format_args!("connecting websocket: {url}"));
+        crate::logging::info(format_args!(
+            "connecting websocket for instance {}",
+            identity.instance_id
+        ));
         let connection = tokio::select! {
             biased;
             _ = shutdown_requested(&mut shutdown) => return Ok(()),
@@ -151,15 +155,26 @@ async fn handle_agent_socket(
     let (mut write, mut read) = stream.split();
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<AgentInbound>();
     let (binary_tx, mut binary_rx) = mpsc::channel(4);
+    let (docker_stream_tx, mut docker_stream_rx) = mpsc::channel(8);
     let mut terminals = TerminalManager::new(outbound_tx.clone(), activity.clone());
     let mut files = FileManager::new(outbound_tx.clone(), binary_tx, activity.clone());
     let mut desktops = DesktopManager::new(config.clone(), activity.clone(), outbound_tx.clone());
+    let mut docker = DockerManager::new(
+        config,
+        outbound_tx.clone(),
+        docker_stream_tx,
+        activity.clone(),
+    );
+    let mut draining_updates = activity.subscribe_draining();
+    docker.start_probe();
     let mut collector = MetricsCollector::new();
     let mut report_interval =
         tokio::time::interval(Duration::from_secs(config.report_interval.max(1)));
     report_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut manifest_interval = tokio::time::interval(MANIFEST_INTERVAL);
     manifest_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut docker_probe_interval = tokio::time::interval(MANIFEST_INTERVAL);
+    docker_probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let (update_event_tx, mut update_event_rx) = mpsc::unbounded_channel();
     let mut active_update: Option<ActiveUpdate> = None;
     let capability = update_capability();
@@ -182,6 +197,11 @@ async fn handle_agent_socket(
             _ = shutdown_requested(shutdown) => {
                 break SocketOutcome::Shutdown;
             }
+            changed = draining_updates.changed() => {
+                if changed.is_ok() && *draining_updates.borrow_and_update() {
+                    docker.close_streams_for_update();
+                }
+            }
             _ = report_interval.tick() => {
                 let profile = host_profile();
                 outbound_tx.send(AgentInbound::Metrics {
@@ -192,8 +212,12 @@ async fn handle_agent_socket(
                     package_type: capability.package_type.clone(),
                     native_arch: capability.native_arch.clone(),
                     update_privileged: Some(capability.update_privileged),
+                    docker_status: docker.status(),
                     metrics: collector.sample(),
                 })?;
+            }
+            _ = docker_probe_interval.tick() => {
+                docker.start_probe();
             }
             _ = manifest_interval.tick(), if update_manager.is_some() && active_update.is_none() => {
                 let manager = update_manager.as_ref().expect("guarded by update_manager.is_some()");
@@ -281,6 +305,13 @@ async fn handle_agent_socket(
                 let payload = serde_json::to_string(&outbound)?;
                 write.send(Message::Text(payload.into())).await?;
             }
+            outbound = docker_stream_rx.recv() => {
+                let Some(outbound) = outbound else {
+                    break SocketOutcome::Disconnected;
+                };
+                let payload = serde_json::to_string(&outbound)?;
+                write.send(Message::Text(payload.into())).await?;
+            }
             binary = binary_rx.recv() => {
                 let Some(binary) = binary else {
                     break SocketOutcome::Disconnected;
@@ -337,6 +368,48 @@ async fn handle_agent_socket(
                             }
                             AgentOutbound::FileTransferCancel { request_id } => {
                                 files.cancel(&request_id);
+                            }
+                            AgentOutbound::DockerRequest { request_id, request } => {
+                                docker.handle_request(request_id, request);
+                            }
+                            AgentOutbound::DockerCancel { request_id } => {
+                                docker.cancel(&request_id);
+                            }
+                            AgentOutbound::DockerLogStart {
+                                request_id,
+                                container,
+                                tail,
+                                follow,
+                                since,
+                            } => {
+                                docker.start_logs(
+                                    request_id,
+                                    container,
+                                    tail,
+                                    follow,
+                                    since,
+                                );
+                            }
+                            AgentOutbound::DockerLogCancel { request_id } => {
+                                docker.cancel_logs(&request_id);
+                            }
+                            AgentOutbound::DockerExecOpen {
+                                session_id,
+                                container,
+                                shell,
+                                cols,
+                                rows,
+                            } => {
+                                docker.exec_open(session_id, container, shell, cols, rows);
+                            }
+                            AgentOutbound::DockerExecInput { session_id, data } => {
+                                docker.exec_input(&session_id, &data);
+                            }
+                            AgentOutbound::DockerExecResize { session_id, cols, rows } => {
+                                docker.exec_resize(&session_id, cols, rows);
+                            }
+                            AgentOutbound::DockerExecClose { session_id } => {
+                                docker.exec_close(&session_id);
                             }
                             AgentOutbound::UpdateAvailable {
                                 release_id,
@@ -432,6 +505,7 @@ async fn handle_agent_socket(
 
     terminals.close_all();
     files.close_all();
+    docker.close_all();
     let close_reason = if matches!(
         &result,
         Ok(SocketOutcome::Shutdown | SocketOutcome::ApplyUpdate)
@@ -500,11 +574,14 @@ fn websocket_url(server: &str, identity: &Identity) -> String {
     } else {
         format!("ws://{trimmed}")
     };
-    let capabilities = if cfg!(windows) {
-        format!("{FILE_MANAGER_CAPABILITY},{DESKTOP_CAPABILITY}")
-    } else {
-        FILE_MANAGER_CAPABILITY.to_string()
-    };
+    let mut capabilities = vec![FILE_MANAGER_CAPABILITY];
+    if cfg!(windows) {
+        capabilities.push(DESKTOP_CAPABILITY);
+    }
+    if crate::docker::supported() {
+        capabilities.push(DOCKER_CAPABILITY);
+    }
+    let capabilities = capabilities.join(",");
     format!(
         "{base}/api/agent/ws?instance_id={}&secret={}&capabilities={capabilities}",
         identity.instance_id, identity.secret
@@ -528,5 +605,6 @@ mod tests {
             "wss://monitor.example/api/agent/ws?instance_id=instance-1&secret=secret-1&capabilities=file_manager_v1"
         ));
         assert_eq!(url.contains(DESKTOP_CAPABILITY), cfg!(windows));
+        assert_eq!(url.contains(DOCKER_CAPABILITY), cfg!(target_os = "linux"));
     }
 }

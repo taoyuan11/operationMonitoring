@@ -29,15 +29,18 @@ import {
   Zap,
 } from 'lucide-vue-next'
 import CountryFlag from './CountryFlag.vue'
+import DockerManagerPanel from './DockerManagerPanel.vue'
 import FileManagerPanel from './FileManagerPanel.vue'
 import MetricHistoryChart from './MetricHistoryChart.vue'
 import OperatingSystemLogo from './OperatingSystemLogo.vue'
 import { api } from '../api/http'
+import { getDockerStatus } from '../api/docker'
 import { getCountryOption } from '../data/countries'
 import type { CommandRecord, Instance, Metric } from '../types/domain'
+import type { DockerStatus } from '../types/docker'
 import { formatBytes, formatDuration, formatTime, metricPercent } from '../utils/format'
 
-type DetailTab = 'details' | 'actions' | 'files'
+type DetailTab = 'details' | 'actions' | 'files' | 'docker'
 type HistoryRange = 'day' | 'week' | 'month'
 
 const historyRanges: Array<{
@@ -74,18 +77,36 @@ const historyLoading = ref(false)
 const historyError = ref('')
 const historyFrom = ref(0)
 const historyTo = ref(0)
+const dockerStatus = ref<DockerStatus | null>(null)
+let dockerStatusRequest = 0
+let dockerStatusTimer: ReturnType<typeof setInterval> | null = null
 let historyAbort: AbortController | null = null
 
 watch(
   () => props.instance.id,
   () => {
     activeTab.value = 'details'
+    dockerStatus.value = null
+    void loadDockerStatus()
+    startDockerStatusPolling()
   },
+  { immediate: true },
 )
 
 const supportsFiles = computed(() =>
   props.instance.capabilities?.includes('file_manager_v1') === true,
 )
+
+const supportsDocker = computed(() => dockerStatus.value?.installed === true)
+
+watch(
+  () => props.instance.online,
+  () => void loadDockerStatus(),
+)
+
+watch(supportsDocker, (supported) => {
+  if (!supported && activeTab.value === 'docker') activeTab.value = 'details'
+})
 
 const remoteDesktopUnavailableReason = computed(() => {
   if (!props.instance.online) return '实例离线，无法连接远程桌面'
@@ -168,7 +189,11 @@ watch(
   { immediate: true },
 )
 
-onBeforeUnmount(() => historyAbort?.abort())
+onBeforeUnmount(() => {
+  historyAbort?.abort()
+  dockerStatusRequest += 1
+  if (dockerStatusTimer) clearInterval(dockerStatusTimer)
+})
 
 function instanceName() {
   return props.instance.name || props.instance.hostname || '未命名节点'
@@ -218,6 +243,19 @@ async function loadMetricHistory() {
       historyLoading.value = false
     }
   }
+}
+
+async function loadDockerStatus() {
+  const request = ++dockerStatusRequest
+  try {
+    const status = await getDockerStatus(props.instance.id)
+    if (request === dockerStatusRequest) dockerStatus.value = status
+  } catch {}
+}
+
+function startDockerStatusPolling() {
+  if (dockerStatusTimer) clearInterval(dockerStatusTimer)
+  dockerStatusTimer = setInterval(() => void loadDockerStatus(), 15_000)
 }
 </script>
 
@@ -274,9 +312,19 @@ async function loadMetricHistory() {
         >
           <UploadCloud :size="15" />文件
         </button>
+        <button
+          v-if="supportsDocker"
+          :class="{ active: activeTab === 'docker' }"
+          type="button"
+          role="tab"
+          :aria-selected="activeTab === 'docker'"
+          @click="activeTab = 'docker'"
+        >
+          <Box :size="15" />容器
+        </button>
       </nav>
 
-      <div :class="['instance-detail-content', { 'files-active': activeTab === 'files' }]">
+      <div :class="['instance-detail-content', { 'files-active': activeTab === 'files' || activeTab === 'docker' }]">
         <section v-if="activeTab === 'details'" class="instance-overview" role="tabpanel">
           <div class="metric-history-section">
             <header class="metric-history-toolbar">
@@ -459,7 +507,7 @@ async function loadMetricHistory() {
           </div>
         </section>
 
-        <section v-else class="instance-files-tab" role="tabpanel">
+        <section v-else-if="activeTab === 'files'" class="instance-files-tab" role="tabpanel">
           <div v-if="!instance.online" class="file-unavailable">
             <WifiOff :size="30" />
             <strong>实例当前离线</strong>
@@ -471,6 +519,13 @@ async function loadMetricHistory() {
             <span>更新至包含 file_manager_v1 能力的 Agent 后即可使用。</span>
           </div>
           <FileManagerPanel v-else :instance="instance" />
+        </section>
+        <section v-else-if="dockerStatus" class="instance-docker-tab" role="tabpanel">
+          <DockerManagerPanel
+            :instance="instance"
+            :status="dockerStatus"
+            @status="dockerStatus = $event"
+          />
         </section>
       </div>
     </section>

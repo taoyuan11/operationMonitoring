@@ -633,7 +633,7 @@ async fn end_desktop_session(state: &AppState, session_id: &str, reason: &str) {
     }
 }
 
-fn ensure_same_origin(headers: &HeaderMap, secure: bool) -> AppResult<()> {
+pub(crate) fn ensure_same_origin(headers: &HeaderMap, secure: bool) -> AppResult<()> {
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -649,10 +649,7 @@ fn ensure_same_origin(headers: &HeaderMap, secure: bool) -> AppResult<()> {
     let valid_scheme = uri.scheme_str() == Some(expected_scheme);
     let origin_host = uri.authority().map(|authority| authority.as_str());
     if !valid_scheme || !origin_host.is_some_and(|value| value.eq_ignore_ascii_case(host)) {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            "拒绝跨站 WebSocket 请求",
-        ));
+        return Err(AppError::new(StatusCode::FORBIDDEN, "拒绝跨站请求"));
     }
     Ok(())
 }

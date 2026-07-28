@@ -83,7 +83,7 @@ fn wait_for_created_identity(path: &std::path::Path) -> std::io::Result<Identity
     }
 }
 
-fn identity_path(path: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn identity_path(path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = path {
         return Ok(path);
     }

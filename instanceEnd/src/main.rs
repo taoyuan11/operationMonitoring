@@ -1,6 +1,7 @@
 mod activity;
 mod command;
 mod config;
+mod docker;
 mod file_manager;
 mod http;
 mod identity;

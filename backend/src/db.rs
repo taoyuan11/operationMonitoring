@@ -102,6 +102,98 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS instance_docker_status (
+            instance_id TEXT PRIMARY KEY REFERENCES instances(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            cli_version TEXT,
+            engine_version TEXT,
+            api_version TEXT,
+            compose_version TEXT,
+            diagnostic TEXT NOT NULL DEFAULT '',
+            checked_at BIGINT NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS docker_exec_sessions (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT REFERENCES instances(id) ON DELETE SET NULL,
+            instance_snapshot TEXT NOT NULL DEFAULT '',
+            request_id TEXT NOT NULL UNIQUE,
+            actor TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            target TEXT NOT NULL DEFAULT '',
+            metadata TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL,
+            error_code TEXT,
+            error_message TEXT NOT NULL DEFAULT '',
+            requested_at BIGINT NOT NULL,
+            completed_at BIGINT
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE docker_exec_sessions ADD COLUMN IF NOT EXISTS instance_snapshot TEXT NOT NULL DEFAULT ''",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE docker_exec_sessions ADD COLUMN IF NOT EXISTS metadata TEXT NOT NULL DEFAULT '{}'",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "UPDATE docker_exec_sessions SET instance_snapshot = instance_id WHERE instance_snapshot = '' AND instance_id IS NOT NULL",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("ALTER TABLE docker_exec_sessions ALTER COLUMN instance_id DROP NOT NULL")
+        .execute(db)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE docker_exec_sessions DROP CONSTRAINT IF EXISTS docker_exec_sessions_instance_id_fkey",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'docker_exec_sessions_instance_id_fkey_set_null'
+                  AND conrelid = 'docker_exec_sessions'::regclass
+            ) THEN
+                ALTER TABLE docker_exec_sessions
+                    ADD CONSTRAINT docker_exec_sessions_instance_id_fkey_set_null
+                    FOREIGN KEY(instance_id) REFERENCES instances(id) ON DELETE SET NULL;
+            END IF;
+        END
+        $$;
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_docker_exec_instance_requested ON docker_exec_sessions(instance_id, requested_at DESC);",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "UPDATE docker_exec_sessions SET status = 'failed', error_code = 'backend_restarted', error_message = '后端服务重启', completed_at = $1 WHERE status = 'running'",
+    )
+    .bind(now_ts())
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS pending_instances (
             id TEXT PRIMARY KEY,
             secret TEXT NOT NULL,
@@ -488,6 +580,11 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
         (
             "agent_update_attempts",
             &["retry_count", "created_at", "updated_at", "completed_at"][..],
+        ),
+        ("instance_docker_status", &["checked_at"][..]),
+        (
+            "docker_exec_sessions",
+            &["requested_at", "completed_at"][..],
         ),
     ] {
         for column in columns {

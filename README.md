@@ -127,6 +127,23 @@ cargo build --release
 
 `start` 会在后台启动实例端并立即释放命令行，标准输出和错误输出会写入命令返回的日志路径。Windows 使用同目录下的 `om-agent.exe`，后台子进程不会创建控制台窗口。
 
+## 实例 Docker 管理
+
+实例详情中的“容器”页签用于管理单台 Linux 或 OpenWrt 主机上的 Docker；Windows 和 macOS
+不探测也不展示该功能。该功能要求实例端 Agent `0.1.18` 或更高版本，并要求主机已安装
+Docker CLI `20.10` 或更高版本。Compose 管理依赖 Docker Compose v2 插件；未安装插件时仅禁用
+Compose 视图，不影响容器、镜像、网络、存储卷和系统空间管理。
+
+Docker 命令由 Agent 在实例本机执行，权限、Docker context 和 credential store 均继承 Agent
+服务账号。部署前应确保该账号能够访问目标 Docker daemon，并在需要拉取私有镜像时预先为该账号
+配置 Docker 登录凭据；管理端不会接收、传输或保存 Registry 凭据。后端不挂载远端 Docker
+socket，Docker 面板和接口仅对已登录管理员开放。
+
+Agent 会定期检测 Docker。Docker 已安装但 daemon 不可达、权限不足或版本不受支持时仍保留
+“容器”页签，显示版本与诊断信息并禁用操作；实例离线时保留最后一次检测结果，但不展示离线前的
+容器、镜像、网络或存储卷清单。升级时应先部署兼容的 backend 和 front-end，再发布 Agent
+`0.1.18`；旧 Agent 不会显示 Docker 管理面板。
+
 ## Windows 网页远程桌面
 
 Windows 10/11 和带 Desktop Experience 的 Windows Server 2016 及以上版本，在更新到包含

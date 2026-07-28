@@ -2,6 +2,7 @@ mod admin_auth;
 mod auth;
 mod config;
 mod db;
+mod docker;
 mod error;
 mod files;
 mod handlers;
@@ -22,12 +23,16 @@ use admin_auth::{
 use auth::load_auth_cipher;
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Request, State},
+    http::{HeaderMap, Method},
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, patch, post, put},
 };
 use clap::Parser;
 use config::Cli;
 use db::{cleanup_loop, connect_db, init_db};
+use error::AppResult;
 use files::{
     admin_create_directory, admin_delete_file, admin_download_file, admin_file_roots,
     admin_list_files, admin_move_file, admin_upload_file,
@@ -40,7 +45,7 @@ use handlers::{
     admin_upload_background_image, agent_register, agent_report, agent_ws, health,
     public_appearance, public_instances, public_metrics,
 };
-use remote_desktop::{admin_desktop_ws, agent_desktop_ws};
+use remote_desktop::{admin_desktop_ws, agent_desktop_ws, ensure_same_origin};
 use state::AppState;
 use std::{io::ErrorKind, path::Path};
 use tower_http::{cors::CorsLayer, services::ServeDir};
@@ -177,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/instances/{id}/desktop/ws",
             get(admin_desktop_ws),
         )
+        .nest("/api/admin/instances/{id}/docker", docker::router())
         .route(
             "/api/admin/instances/{id}/files/roots",
             get(admin_file_roots),
@@ -245,6 +251,10 @@ async fn main() -> anyhow::Result<()> {
         .nest_service("/uploads", ServeDir::new(upload_dir))
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(6 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_admin_write_origin,
+        ))
         .layer(CorsLayer::permissive());
 
     let cleanup_state = state.clone();
@@ -259,6 +269,33 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("backend listening on http://{}", bind);
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn enforce_admin_write_origin(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> AppResult<Response> {
+    ensure_admin_write_origin(
+        request.method(),
+        request.uri().path(),
+        request.headers(),
+        state.secure_cookies,
+    )?;
+    Ok(next.run(request).await)
+}
+
+fn ensure_admin_write_origin(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    secure: bool,
+) -> AppResult<()> {
+    let safe_method = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+    if path.starts_with("/api/admin/") && !safe_method {
+        ensure_same_origin(headers, secure)?;
+    }
     Ok(())
 }
 
@@ -297,8 +334,24 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::paths_overlap;
+    use super::{ensure_admin_write_origin, paths_overlap};
+    use axum::http::{HeaderMap, Method, header};
     use std::path::Path;
+
+    fn session_headers(host: &str, origin: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, host.parse().expect("valid Host header"));
+        headers.insert(
+            header::COOKIE,
+            "om_session=test-session"
+                .parse()
+                .expect("valid Cookie header"),
+        );
+        if let Some(origin) = origin {
+            headers.insert(header::ORIGIN, origin.parse().expect("valid Origin header"));
+        }
+        headers
+    }
 
     #[test]
     fn private_update_storage_must_not_overlap_public_uploads() {
@@ -318,5 +371,69 @@ mod tests {
             Path::new("/srv/uploads"),
             Path::new("/srv/updates")
         ));
+    }
+
+    #[test]
+    fn authenticated_admin_writes_require_a_matching_origin() {
+        let missing = session_headers("console.example.com", None);
+        assert!(
+            ensure_admin_write_origin(
+                &Method::POST,
+                "/api/admin/instances/agent/docker/containers/web/actions/start",
+                &missing,
+                true,
+            )
+            .is_err()
+        );
+
+        let cross_site =
+            session_headers("console.example.com", Some("https://attacker.example.com"));
+        assert!(
+            ensure_admin_write_origin(
+                &Method::POST,
+                "/api/admin/instances/agent/docker/compose/projects/app/actions/down",
+                &cross_site,
+                true,
+            )
+            .is_err()
+        );
+
+        let same_origin = session_headers(
+            "console.example.com:13500",
+            Some("https://console.example.com:13500"),
+        );
+        assert!(
+            ensure_admin_write_origin(
+                &Method::DELETE,
+                "/api/admin/instances/agent/docker/images/image",
+                &same_origin,
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn origin_guard_protects_unauthenticated_admin_writes_too() {
+        let session = session_headers("console.example.com", None);
+        assert!(
+            ensure_admin_write_origin(
+                &Method::GET,
+                "/api/admin/instances/agent/docker/containers",
+                &session,
+                true,
+            )
+            .is_ok()
+        );
+
+        assert!(
+            ensure_admin_write_origin(&Method::POST, "/api/admin/login", &HeaderMap::new(), true,)
+                .is_err()
+        );
+        let login = session_headers("console.example.com", Some("https://console.example.com"));
+        assert!(ensure_admin_write_origin(&Method::POST, "/api/admin/login", &login, true).is_ok());
+        assert!(
+            ensure_admin_write_origin(&Method::POST, "/api/agent/report", &session, true,).is_ok()
+        );
     }
 }

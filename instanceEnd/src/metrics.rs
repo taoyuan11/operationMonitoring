@@ -7,7 +7,10 @@ use std::collections::HashSet;
 use std::collections::HashMap;
 
 #[cfg(any(target_os = "linux", test))]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[cfg(any(not(target_os = "windows"), test))]
+use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;

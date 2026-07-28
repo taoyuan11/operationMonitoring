@@ -292,6 +292,11 @@ pub fn log_file(config: &AgentConfig) -> Result<PathBuf> {
     Ok(RuntimePaths::from_config(config)?.log_file)
 }
 
+pub(crate) fn docker_protected_paths(config: &AgentConfig) -> Result<Vec<PathBuf>> {
+    let paths = RuntimePaths::from_config(config)?;
+    Ok(vec![paths.state_dir, paths.log_file])
+}
+
 struct LogFollower {
     path: PathBuf,
     file: File,
@@ -928,8 +933,7 @@ mod tests {
 
     #[test]
     fn runtime_guard_exposes_running_state_and_cleans_up() {
-        let state_dir =
-            env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+        let state_dir = env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
         let paths = RuntimePaths::from_config(&test_config(state_dir.clone())).unwrap();
         paths.prepare().unwrap();
 
@@ -953,8 +957,7 @@ mod tests {
 
     #[test]
     fn missing_state_directory_is_reported_as_stopped() {
-        let state_dir =
-            env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+        let state_dir = env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
         let paths = RuntimePaths::from_config(&test_config(state_dir)).unwrap();
 
         assert!(matches!(
@@ -965,8 +968,7 @@ mod tests {
 
     #[test]
     fn stopping_a_missing_agent_does_not_create_runtime_files() {
-        let state_dir =
-            env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
+        let state_dir = env::temp_dir().join(format!("om-agent-test-{}", uuid::Uuid::new_v4()));
 
         assert!(!stop_if_running(&test_config(state_dir.clone()), 0).unwrap());
         assert!(!state_dir.exists());

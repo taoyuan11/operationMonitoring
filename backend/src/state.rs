@@ -1,13 +1,20 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use sqlx::PgPool;
-use tokio::sync::{Mutex, RwLock, mpsc, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::{
     auth::AuthCipher,
     config::Cli,
-    models::{AgentOutbound, FileResponse, TerminalServerMessage},
+    models::{
+        AgentOutbound, DockerError, DockerResponse, DockerStatus, FileResponse,
+        TerminalServerMessage,
+    },
 };
 
 #[derive(Clone)]
@@ -27,6 +34,11 @@ pub struct AppState {
     pub file_requests: Arc<RwLock<HashMap<String, PendingFileRequest>>>,
     pub active_file_transfers: Arc<RwLock<HashMap<String, String>>>,
     pub desktop_sessions: Arc<RwLock<HashMap<String, DesktopSessionHandle>>>,
+    pub docker_requests: Arc<RwLock<HashMap<String, PendingDockerRequest>>>,
+    pub docker_log_streams: Arc<RwLock<HashMap<String, DockerLogStreamHandle>>>,
+    pub docker_exec_sessions: Arc<RwLock<HashMap<String, DockerExecSessionHandle>>>,
+    pub docker_request_slots: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    pub docker_stream_slots: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
 }
 
 impl AppState {
@@ -47,6 +59,11 @@ impl AppState {
             file_requests: Arc::new(RwLock::new(HashMap::new())),
             active_file_transfers: Arc::new(RwLock::new(HashMap::new())),
             desktop_sessions: Arc::new(RwLock::new(HashMap::new())),
+            docker_requests: Arc::new(RwLock::new(HashMap::new())),
+            docker_log_streams: Arc::new(RwLock::new(HashMap::new())),
+            docker_exec_sessions: Arc::new(RwLock::new(HashMap::new())),
+            docker_request_slots: Arc::new(Mutex::new(HashMap::new())),
+            docker_stream_slots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -72,6 +89,7 @@ pub struct AgentHandle {
     pub tx: mpsc::UnboundedSender<AgentOutbound>,
     pub binary_tx: mpsc::Sender<Vec<u8>>,
     pub capabilities: Vec<String>,
+    pub docker_status: Arc<RwLock<Option<DockerStatus>>>,
 }
 
 #[derive(Clone)]
@@ -107,4 +125,49 @@ pub struct DesktopSessionHandle {
     pub frame_tx: watch::Sender<Option<Arc<Vec<u8>>>>,
     pub agent_input_rx: Arc<Mutex<Option<mpsc::Receiver<String>>>>,
     pub close_tx: watch::Sender<Option<String>>,
+}
+
+#[derive(Debug)]
+pub enum DockerRequestFailure {
+    Disconnected,
+}
+
+pub struct PendingDockerRequest {
+    pub instance_id: String,
+    pub agent_connection_id: Uuid,
+    pub tx: oneshot::Sender<Result<DockerResponse, DockerRequestFailure>>,
+    pub audit_id: Option<String>,
+    pub _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Debug)]
+pub enum DockerLogEvent {
+    Chunk {
+        sequence: u64,
+        data: String,
+        cursor: Option<String>,
+    },
+    Closed {
+        error: Option<DockerError>,
+    },
+    Disconnected,
+    Backpressure,
+}
+
+#[derive(Clone)]
+pub struct DockerLogStreamHandle {
+    pub instance_id: String,
+    pub agent_connection_id: Uuid,
+    pub tx: mpsc::Sender<DockerLogEvent>,
+    pub close_tx: watch::Sender<Option<DockerLogEvent>>,
+}
+
+#[derive(Clone)]
+pub struct DockerExecSessionHandle {
+    pub instance_id: String,
+    pub agent_connection_id: Uuid,
+    pub tx: mpsc::Sender<TerminalServerMessage>,
+    pub close_tx: watch::Sender<Option<TerminalServerMessage>>,
+    pub opened: Arc<AtomicBool>,
+    pub audit_id: String,
 }

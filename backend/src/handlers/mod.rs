@@ -1,19 +1,25 @@
-use std::path::{Path as FsPath, PathBuf};
+use std::{
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    path::{Path as FsPath, PathBuf},
+};
 
 use axum::{
     Json,
-    extract::{Multipart, Path, Query, State, ws::WebSocketUpgrade},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Multipart, Path, Query, State, ws::WebSocketUpgrade},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
 };
 use tokio::fs;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    admin_auth::resolved_client_ip,
     auth::require_admin,
     db::{
         approve_pending_instance, get_instance, get_instance_optional, instance_summary,
-        latest_metric, register_or_touch_pending, retention_days, setting_value, write_action_log,
+        latest_metric, normalize_metric_timestamp, register_or_touch_pending, retention_days,
+        setting_value, write_action_log,
     },
     docker::cancel_instance_docker,
     error::{AppError, AppResult},
@@ -25,10 +31,11 @@ use crate::{
         ListQuery, MetricRecord, MetricsQuery, PendingInstance, SettingsRequest, SettingsResponse,
         ThemeMode, UpdateInstanceRequest,
     },
+    remote_desktop::ensure_same_origin,
     state::AppState,
     updates::confirm_update_version,
     utils::{non_empty_or, now_ts},
-    ws::{agent_socket, terminal_socket},
+    ws::{MAX_AGENT_MESSAGE_BYTES, agent_socket, terminal_socket},
 };
 
 const BACKGROUND_SETTING_KEY: &str = "background_image_path";
@@ -37,6 +44,18 @@ const ACCENT_COLOR_SETTING_KEY: &str = "accent_color";
 const DEFAULT_ACCENT_COLOR: &str = "#3bbf9b";
 const BACKGROUND_DIR: &str = "backgrounds";
 const MAX_BACKGROUND_BYTES: usize = 5 * 1024 * 1024;
+const DEFAULT_METRICS_RANGE_SECONDS: i64 = 60 * 60;
+const MAX_PUBLIC_METRICS_RANGE_SECONDS: i64 = 31 * 24 * 60 * 60;
+const MAX_PUBLIC_METRICS_FUTURE_SECONDS: i64 = 5 * 60;
+const PUBLIC_METRICS_STATEMENT_TIMEOUT_MS: i64 = 5_000;
+
+#[derive(Debug, PartialEq, Eq)]
+struct PublicMetricsParams {
+    from: i64,
+    to: i64,
+    limit: i64,
+    bucket_seconds: Option<i64>,
+}
 
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -100,12 +119,24 @@ pub async fn public_metrics(
     Path(id): Path<String>,
     Query(query): Query<MetricsQuery>,
 ) -> AppResult<Json<Vec<MetricRecord>>> {
-    let to = query.to.unwrap_or_else(now_ts);
-    let from = query.from.unwrap_or(to - 3600);
-    let limit = query.limit.unwrap_or(720).clamp(1, 5000);
+    let params = normalize_public_metrics_query(query, now_ts())?;
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(format!("{PUBLIC_METRICS_STATEMENT_TIMEOUT_MS}ms"))
+        .execute(&mut *tx)
+        .await?;
 
-    if let Some(bucket_seconds) = query.bucket_seconds {
-        let bucket_seconds = bucket_seconds.clamp(60, 24 * 3600);
+    let is_public: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM instances WHERE id = $1 AND approved = 1 AND disabled = 0)",
+    )
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !is_public {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "实例不存在"));
+    }
+
+    let metrics = if let Some(bucket_seconds) = params.bucket_seconds {
         let metrics = sqlx::query_as::<_, MetricRecord>(
             r#"
             SELECT ROUND(AVG(ts))::BIGINT AS ts,
@@ -129,36 +160,64 @@ pub async fn public_metrics(
             LIMIT $5
             "#,
         )
-        .bind(id)
-        .bind(from)
-        .bind(to)
+        .bind(&id)
+        .bind(params.from)
+        .bind(params.to)
         .bind(bucket_seconds)
-        .bind(limit)
-        .fetch_all(&state.db)
+        .bind(params.limit)
+        .fetch_all(&mut *tx)
         .await?;
-
-        return Ok(Json(metrics));
-    }
-
-    let metrics = sqlx::query_as::<_, MetricRecord>(
-        r#"
-        SELECT ts, cpu_percent, memory_used, memory_total, disk_used, disk_total,
-               network_rx, network_tx, gpu_percent, gpu_memory_used, gpu_memory_total,
-               uptime_seconds, load_average, latency_ms
-        FROM metrics
-        WHERE instance_id = $1 AND ts BETWEEN $2 AND $3
-        ORDER BY ts ASC
-        LIMIT $4
-        "#,
-    )
-    .bind(id)
-    .bind(from)
-    .bind(to)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await?;
+        metrics
+    } else {
+        sqlx::query_as::<_, MetricRecord>(
+            r#"
+            SELECT ts, cpu_percent, memory_used, memory_total, disk_used, disk_total,
+                   network_rx, network_tx, gpu_percent, gpu_memory_used, gpu_memory_total,
+                   uptime_seconds, load_average, latency_ms
+            FROM metrics
+            WHERE instance_id = $1 AND ts BETWEEN $2 AND $3
+            ORDER BY ts ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(&id)
+        .bind(params.from)
+        .bind(params.to)
+        .bind(params.limit)
+        .fetch_all(&mut *tx)
+        .await?
+    };
+    tx.commit().await?;
 
     Ok(Json(metrics))
+}
+
+fn normalize_public_metrics_query(query: MetricsQuery, now: i64) -> AppResult<PublicMetricsParams> {
+    let latest_allowed = now.saturating_add(MAX_PUBLIC_METRICS_FUTURE_SECONDS);
+    let to = query.to.unwrap_or(now);
+    let from = query
+        .from
+        .unwrap_or_else(|| to.saturating_sub(DEFAULT_METRICS_RANGE_SECONDS));
+
+    if from < 0 || to < 0 || to > latest_allowed {
+        return Err(AppError::bad_request("指标时间范围无效"));
+    }
+    let span = to
+        .checked_sub(from)
+        .filter(|span| *span >= 0)
+        .ok_or_else(|| AppError::bad_request("指标时间范围无效"))?;
+    if span > MAX_PUBLIC_METRICS_RANGE_SECONDS {
+        return Err(AppError::bad_request("公开指标查询范围不能超过 31 天"));
+    }
+
+    Ok(PublicMetricsParams {
+        from,
+        to,
+        limit: query.limit.unwrap_or(720).clamp(1, 5_000),
+        bucket_seconds: query
+            .bucket_seconds
+            .map(|seconds| seconds.clamp(60, 24 * 60 * 60)),
+    })
 }
 
 pub async fn admin_pending_instances(
@@ -841,9 +900,16 @@ pub async fn admin_logs(
 
 pub async fn agent_register(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<AgentRegisterRequest>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
-    register_or_touch_pending(&state.db, &payload).await?;
+    let source_key = agent_registration_source_key(resolved_client_ip(
+        state.trust_proxy_headers,
+        &headers,
+        peer.ip(),
+    ));
+    register_or_touch_pending(&state.db, &payload, &source_key).await?;
 
     let Some(instance) = get_instance_optional(&state.db, &payload.instance_id).await? else {
         return Ok(Json(AgentRegisterResponse {
@@ -870,11 +936,14 @@ pub async fn agent_register(
 
 pub async fn agent_report(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<AgentReportRequest>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let register_payload = AgentRegisterRequest {
         instance_id: payload.instance_id.clone(),
         secret: payload.secret.clone(),
+        previous_secret: None,
         hostname: payload.hostname.clone(),
         os: payload.os.clone(),
         arch: payload.arch.clone(),
@@ -883,7 +952,12 @@ pub async fn agent_report(
         native_arch: payload.native_arch.clone(),
         update_privileged: payload.update_privileged,
     };
-    register_or_touch_pending(&state.db, &register_payload).await?;
+    let source_key = agent_registration_source_key(resolved_client_ip(
+        state.trust_proxy_headers,
+        &headers,
+        peer.ip(),
+    ));
+    register_or_touch_pending(&state.db, &register_payload, &source_key).await?;
 
     let Some(instance) = get_instance_optional(&state.db, &payload.instance_id).await? else {
         return Ok(Json(AgentRegisterResponse {
@@ -928,6 +1002,7 @@ pub async fn agent_report(
 
     confirm_update_version(&state, &payload.instance_id, &payload.agent_version).await?;
 
+    let metric_timestamp = normalize_metric_timestamp(payload.metrics.ts, now_ts())?;
     sqlx::query(
         r#"
         INSERT INTO metrics(instance_id, ts, cpu_percent, memory_used, memory_total,
@@ -938,7 +1013,7 @@ pub async fn agent_report(
         "#,
     )
     .bind(&payload.instance_id)
-    .bind(payload.metrics.ts)
+    .bind(metric_timestamp)
     .bind(payload.metrics.cpu_percent)
     .bind(payload.metrics.memory_used)
     .bind(payload.metrics.memory_total)
@@ -963,11 +1038,17 @@ pub async fn agent_report(
 
 pub async fn agent_ws(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<AgentWsQuery>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
     let instance = get_instance(&state.db, &query.instance_id).await?;
-    if instance.secret != query.secret {
+    let presented_secret = agent_websocket_secret(
+        &headers,
+        query.secret.as_deref(),
+        state.allow_legacy_agent_ws_auth,
+    )?;
+    if instance.secret != presented_secret {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
     }
     if instance.disabled == 1 {
@@ -991,7 +1072,10 @@ pub async fn agent_ws(
         .map(str::to_string)
         .collect();
 
-    Ok(ws.on_upgrade(move |socket| agent_socket(state, query.instance_id, capabilities, socket)))
+    Ok(ws
+        .max_message_size(MAX_AGENT_MESSAGE_BYTES)
+        .max_frame_size(MAX_AGENT_MESSAGE_BYTES)
+        .on_upgrade(move |socket| agent_socket(state, query.instance_id, capabilities, socket)))
 }
 
 pub async fn admin_terminal_ws(
@@ -1000,9 +1084,48 @@ pub async fn admin_terminal_ws(
     Path(instance_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
+    ensure_same_origin(&headers, state.secure_cookies)?;
     let admin = require_admin(&state, &headers).await?;
     get_instance(&state.db, &instance_id).await?;
-    Ok(ws.on_upgrade(move |socket| terminal_socket(state, instance_id, admin.username, socket)))
+    let session_guard = admin.session_guard();
+    Ok(ws.on_upgrade(move |socket| {
+        terminal_socket(state, instance_id, admin.username, session_guard, socket)
+    }))
+}
+
+fn agent_websocket_secret<'a>(
+    headers: &'a HeaderMap,
+    legacy_secret: Option<&'a str>,
+    allow_legacy: bool,
+) -> AppResult<&'a str> {
+    if let Some(authorization) = headers.get(header::AUTHORIZATION) {
+        return authorization
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|secret| !secret.is_empty() && secret.len() <= 256)
+            .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, "实例认证信息无效"));
+    }
+    if allow_legacy
+        && let Some(secret) =
+            legacy_secret.filter(|secret| !secret.is_empty() && secret.len() <= 256)
+    {
+        warn!("accepting deprecated Agent WebSocket query-string authentication");
+        return Ok(secret);
+    }
+    Err(AppError::new(StatusCode::UNAUTHORIZED, "缺少实例认证信息"))
+}
+
+fn agent_registration_source_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) if let Some(ip) = ip.to_ipv4_mapped() => ip.to_string(),
+        IpAddr::V6(ip) => {
+            let mut octets = ip.octets();
+            octets[8..].fill(0);
+            format!("{}/64", Ipv6Addr::from(octets))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1032,6 +1155,95 @@ mod tests {
             let error = normalize_accent_color(value).expect_err("invalid accent color");
             assert_eq!(error.status, StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[test]
+    fn agent_websocket_secret_must_use_bearer_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer agent-secret".parse().expect("valid header"),
+        );
+        assert_eq!(
+            agent_websocket_secret(&headers, None, false).unwrap(),
+            "agent-secret"
+        );
+        assert!(agent_websocket_secret(&HeaderMap::new(), Some("legacy-secret"), false).is_err());
+        assert_eq!(
+            agent_websocket_secret(&HeaderMap::new(), Some("legacy-secret"), true).unwrap(),
+            "legacy-secret"
+        );
+
+        headers.insert(
+            header::AUTHORIZATION,
+            "Basic agent-secret".parse().expect("valid header"),
+        );
+        assert!(agent_websocket_secret(&headers, Some("legacy-secret"), true).is_err());
+    }
+
+    #[test]
+    fn agent_registration_sources_group_ipv6_prefixes() {
+        assert_eq!(
+            agent_registration_source_key("192.0.2.10".parse().unwrap()),
+            "192.0.2.10"
+        );
+        assert_eq!(
+            agent_registration_source_key("::ffff:192.0.2.10".parse().unwrap()),
+            "192.0.2.10"
+        );
+        assert_eq!(
+            agent_registration_source_key("2001:db8:1234:5678:aaaa::1".parse().unwrap()),
+            "2001:db8:1234:5678::/64"
+        );
+        assert_eq!(
+            agent_registration_source_key("2001:db8:1234:5678:bbbb::2".parse().unwrap()),
+            "2001:db8:1234:5678::/64"
+        );
+    }
+
+    #[test]
+    fn public_metrics_query_uses_bounded_defaults() {
+        let params = normalize_public_metrics_query(
+            MetricsQuery {
+                from: None,
+                to: None,
+                limit: Some(10_000),
+                bucket_seconds: Some(1),
+            },
+            10_000,
+        )
+        .expect("valid metrics query");
+
+        assert_eq!(
+            params,
+            PublicMetricsParams {
+                from: 6_400,
+                to: 10_000,
+                limit: 5_000,
+                bucket_seconds: Some(60),
+            }
+        );
+    }
+
+    #[test]
+    fn public_metrics_query_rejects_invalid_and_unbounded_ranges() {
+        let query = |from, to| MetricsQuery {
+            from: Some(from),
+            to: Some(to),
+            limit: None,
+            bucket_seconds: None,
+        };
+
+        assert!(normalize_public_metrics_query(query(100, 99), 1_000).is_err());
+        assert!(normalize_public_metrics_query(query(0, i64::MIN), 1_000).is_err());
+        assert!(
+            normalize_public_metrics_query(
+                query(0, MAX_PUBLIC_METRICS_RANGE_SECONDS + 1),
+                MAX_PUBLIC_METRICS_RANGE_SECONDS + 1,
+            )
+            .is_err()
+        );
+        assert!(normalize_public_metrics_query(query(100, 1_301), 1_000).is_err());
     }
 
     #[test]

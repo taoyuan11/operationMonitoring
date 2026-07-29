@@ -18,6 +18,11 @@ use crate::{
     utils::now_ts,
 };
 
+const MAX_PENDING_INSTANCES: i64 = 1_000;
+const MAX_PENDING_INSTANCES_PER_SOURCE: i64 = 50;
+const PENDING_INSTANCE_MAX_AGE: i64 = 7 * 24 * 60 * 60;
+const PENDING_INSTANCE_TOUCH_INTERVAL: i64 = 5;
+
 pub async fn connect_db(database_url: &str, password: Option<&str>) -> anyhow::Result<PgPool> {
     let mut options = PgConnectOptions::from_str(database_url)?;
     if let Some(password) = password {
@@ -205,9 +210,20 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             native_arch TEXT NOT NULL DEFAULT '',
             update_privileged BIGINT NOT NULL DEFAULT 0,
             first_seen BIGINT NOT NULL,
-            last_seen BIGINT NOT NULL
+            last_seen BIGINT NOT NULL,
+            source_key TEXT NOT NULL DEFAULT ''
         );
         "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE pending_instances ADD COLUMN IF NOT EXISTS source_key TEXT NOT NULL DEFAULT ''",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_pending_instances_source ON pending_instances(source_key)",
     )
     .execute(db)
     .await?;
@@ -377,9 +393,16 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             name TEXT NOT NULL,
             secret_ciphertext TEXT NOT NULL,
             created_at BIGINT NOT NULL,
-            last_used_at BIGINT
+            last_used_at BIGINT,
+            last_totp_counter BIGINT
         );
         "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "ALTER TABLE authenticator_devices ADD COLUMN IF NOT EXISTS last_totp_counter BIGINT",
     )
     .execute(db)
     .await?;
@@ -570,7 +593,10 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
         ("desktop_sessions", &["started_at", "ended_at"][..]),
         ("action_logs", &["created_at"][..]),
         ("admin_users", &["enabled", "created_at"][..]),
-        ("authenticator_devices", &["created_at", "last_used_at"][..]),
+        (
+            "authenticator_devices",
+            &["created_at", "last_used_at", "last_totp_counter"][..],
+        ),
         ("admin_enrollments", &["created_at", "expires_at"][..]),
         ("agent_releases", &["created_at", "published_at"][..]),
         (
@@ -660,9 +686,11 @@ async fn ensure_capability_columns(db: &PgPool, table: &str) -> anyhow::Result<(
 pub async fn register_or_touch_pending(
     db: &PgPool,
     payload: &AgentRegisterRequest,
+    source_key: &str,
 ) -> AppResult<()> {
+    validate_agent_registration(payload)?;
     let mut tx = db.begin().await?;
-    let instance = sqlx::query_as::<_, InstanceRecord>(
+    let mut instance = sqlx::query_as::<_, InstanceRecord>(
         r#"
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version,
@@ -670,27 +698,65 @@ pub async fn register_or_touch_pending(
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE id = $1
+        FOR UPDATE
         "#,
     )
     .bind(&payload.instance_id)
     .fetch_optional(&mut *tx)
     .await?;
 
+    let mut pending_secret: Option<String> = None;
+    if instance.is_none() {
+        pending_secret =
+            sqlx::query_scalar("SELECT secret FROM pending_instances WHERE id = $1 FOR UPDATE")
+                .bind(&payload.instance_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if pending_secret.is_none() {
+            sqlx::query("LOCK TABLE pending_instances IN SHARE ROW EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
+            instance = sqlx::query_as::<_, InstanceRecord>(
+                r#"
+                SELECT id, secret, name, region, country_code, country, province_code, province, city,
+                       remark, hostname, os, arch, agent_version,
+                       package_type, native_arch, update_privileged,
+                       approved, disabled, first_seen, last_seen
+                FROM instances
+                WHERE id = $1
+                FOR UPDATE
+                "#,
+            )
+            .bind(&payload.instance_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if instance.is_none() {
+                pending_secret = sqlx::query_scalar(
+                    "SELECT secret FROM pending_instances WHERE id = $1 FOR UPDATE",
+                )
+                .bind(&payload.instance_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            }
+        }
+    }
+
     if let Some(instance) = instance {
-        if instance.secret != payload.secret {
+        if !agent_secret_is_authorized(&instance.secret, payload) {
             return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
         }
         sqlx::query(
             r#"
             UPDATE instances
-            SET hostname = $1, os = $2, arch = $3, agent_version = $4,
-                package_type = COALESCE($5, package_type),
-                native_arch = COALESCE($6, native_arch),
-                update_privileged = COALESCE($7, update_privileged),
-                last_seen = $8
-            WHERE id = $9
+            SET secret = $1, hostname = $2, os = $3, arch = $4, agent_version = $5,
+                package_type = COALESCE($6, package_type),
+                native_arch = COALESCE($7, native_arch),
+                update_privileged = COALESCE($8, update_privileged),
+                last_seen = $9
+            WHERE id = $10
             "#,
         )
+        .bind(&payload.secret)
         .bind(&payload.hostname)
         .bind(&payload.os)
         .bind(&payload.arch)
@@ -710,40 +776,148 @@ pub async fn register_or_touch_pending(
         return Ok(());
     }
 
-    let now = now_ts();
-    sqlx::query(
-        r#"
-        INSERT INTO pending_instances(id, secret, hostname, os, arch, agent_version, package_type,
-                                      native_arch, update_privileged, first_seen, last_seen)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT(id) DO UPDATE SET
-            secret = excluded.secret,
-            hostname = excluded.hostname,
-            os = excluded.os,
-            arch = excluded.arch,
-            agent_version = excluded.agent_version,
-            package_type = excluded.package_type,
-            native_arch = excluded.native_arch,
-            update_privileged = excluded.update_privileged,
-            last_seen = excluded.last_seen
-        "#,
-    )
-    .bind(&payload.instance_id)
-    .bind(&payload.secret)
-    .bind(&payload.hostname)
-    .bind(&payload.os)
-    .bind(&payload.arch)
-    .bind(&payload.agent_version)
-    .bind(payload.package_type.as_deref().unwrap_or_default())
-    .bind(payload.native_arch.as_deref().unwrap_or_default())
-    .bind(i64::from(payload.update_privileged.unwrap_or(false)))
-    .bind(now)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
+    if let Some(secret) = pending_secret {
+        if !agent_secret_is_authorized(&secret, payload) {
+            return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
+        }
+        sqlx::query(
+            r#"
+            UPDATE pending_instances
+            SET secret = $1, hostname = $2, os = $3, arch = $4, agent_version = $5,
+                package_type = $6, native_arch = $7, update_privileged = $8, last_seen = $9
+            WHERE id = $10 AND (secret != $1 OR last_seen <= $11)
+            "#,
+        )
+        .bind(&payload.secret)
+        .bind(&payload.hostname)
+        .bind(&payload.os)
+        .bind(&payload.arch)
+        .bind(&payload.agent_version)
+        .bind(payload.package_type.as_deref().unwrap_or_default())
+        .bind(payload.native_arch.as_deref().unwrap_or_default())
+        .bind(i64::from(payload.update_privileged.unwrap_or(false)))
+        .bind(now_ts())
+        .bind(&payload.instance_id)
+        .bind(now_ts() - PENDING_INSTANCE_TOUCH_INTERVAL)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        let now = now_ts();
+        sqlx::query("DELETE FROM pending_instances WHERE first_seen < $1")
+            .bind(now - PENDING_INSTANCE_MAX_AGE)
+            .execute(&mut *tx)
+            .await?;
+        let source_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_instances WHERE source_key = $1")
+                .bind(source_key)
+                .fetch_one(&mut *tx)
+                .await?;
+        if source_count >= MAX_PENDING_INSTANCES_PER_SOURCE {
+            return Err(AppError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "该来源的待审批实例数量已达上限",
+            ));
+        }
+        let pending_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_instances")
+            .fetch_one(&mut *tx)
+            .await?;
+        if pending_count >= MAX_PENDING_INSTANCES {
+            sqlx::query(
+                r#"
+                DELETE FROM pending_instances
+                WHERE id = (
+                    SELECT id FROM pending_instances
+                    ORDER BY last_seen ASC, first_seen ASC, id ASC
+                    LIMIT 1
+                )
+                "#,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO pending_instances(id, secret, hostname, os, arch, agent_version,
+                                          package_type, native_arch, update_privileged,
+                                          first_seen, last_seen, source_key)
+            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            "#,
+        )
+        .bind(&payload.instance_id)
+        .bind(&payload.secret)
+        .bind(&payload.hostname)
+        .bind(&payload.os)
+        .bind(&payload.arch)
+        .bind(&payload.agent_version)
+        .bind(payload.package_type.as_deref().unwrap_or_default())
+        .bind(payload.native_arch.as_deref().unwrap_or_default())
+        .bind(i64::from(payload.update_privileged.unwrap_or(false)))
+        .bind(now)
+        .bind(now)
+        .bind(source_key)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     tx.commit().await?;
 
+    Ok(())
+}
+
+fn validate_agent_registration(payload: &AgentRegisterRequest) -> AppResult<()> {
+    validate_agent_identifier(&payload.instance_id)?;
+    validate_agent_secret(&payload.secret)?;
+    if let Some(value) = payload.previous_secret.as_deref() {
+        validate_agent_secret(value)?;
+    }
+    validate_agent_field("hostname", &payload.hostname, 255, false)?;
+    validate_agent_field("os", &payload.os, 64, false)?;
+    validate_agent_field("arch", &payload.arch, 64, false)?;
+    validate_agent_field("agent_version", &payload.agent_version, 64, false)?;
+    if let Some(value) = payload.package_type.as_deref() {
+        validate_agent_field("package_type", value, 64, true)?;
+    }
+    if let Some(value) = payload.native_arch.as_deref() {
+        validate_agent_field("native_arch", value, 64, true)?;
+    }
+    Ok(())
+}
+
+fn agent_secret_is_authorized(current_secret: &str, payload: &AgentRegisterRequest) -> bool {
+    payload.secret == current_secret || payload.previous_secret.as_deref() == Some(current_secret)
+}
+
+fn validate_agent_identifier(value: &str) -> AppResult<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(AppError::bad_request("实例 ID 格式无效"));
+    }
+    Ok(())
+}
+
+fn validate_agent_secret(value: &str) -> AppResult<()> {
+    if value.is_empty() || value.len() > 256 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(AppError::bad_request("实例密钥格式无效"));
+    }
+    Ok(())
+}
+
+fn validate_agent_field(
+    name: &str,
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> AppResult<()> {
+    if (!allow_empty && value.trim().is_empty())
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(AppError::bad_request(format!("实例字段 {name} 格式无效")));
+    }
     Ok(())
 }
 
@@ -758,6 +932,7 @@ pub async fn approve_pending_instance(
                update_privileged, first_seen, last_seen
         FROM pending_instances
         WHERE id = $1
+        FOR UPDATE
         "#,
     )
     .bind(id)
@@ -769,25 +944,14 @@ pub async fn approve_pending_instance(
         return Ok(None);
     };
 
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
         INSERT INTO instances(id, secret, name, region, country_code, country, province_code,
                               province, city, remark, hostname, os, arch, agent_version,
                               package_type, native_arch, update_privileged, approved, disabled,
                               first_seen, last_seen)
         VALUES($1, $2, $3, '', '', '', '', '', '', '', $4, $5, $6, $7, $8, $9, $10, 1, 0, $11, $12)
-        ON CONFLICT(id) DO UPDATE SET
-            secret = excluded.secret,
-            hostname = excluded.hostname,
-            os = excluded.os,
-            arch = excluded.arch,
-            agent_version = excluded.agent_version,
-            package_type = excluded.package_type,
-            native_arch = excluded.native_arch,
-            update_privileged = excluded.update_privileged,
-            approved = 1,
-            disabled = 0,
-            last_seen = excluded.last_seen
+        ON CONFLICT(id) DO NOTHING
         "#,
     )
     .bind(&pending.id)
@@ -804,6 +968,12 @@ pub async fn approve_pending_instance(
     .bind(pending.last_seen)
     .execute(&mut *tx)
     .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "同 ID 实例已存在，无法审批待审批记录",
+        ));
+    }
 
     sqlx::query("DELETE FROM pending_instances WHERE id = $1")
         .bind(id)
@@ -853,6 +1023,13 @@ pub async fn latest_metric(db: &PgPool, instance_id: &str) -> AppResult<Option<M
     .fetch_optional(db)
     .await?;
     Ok(metric)
+}
+
+pub fn normalize_metric_timestamp(timestamp: i64, received_at: i64) -> AppResult<i64> {
+    if timestamp <= 0 || received_at <= 0 {
+        return Err(AppError::bad_request("指标时间戳无效"));
+    }
+    Ok(timestamp.min(received_at))
 }
 
 pub fn instance_summary(
@@ -925,6 +1102,14 @@ pub async fn cleanup_loop(state: AppState) {
                 {
                     error!(?error, "failed to clean old desktop sessions");
                 }
+                if let Err(error) =
+                    sqlx::query("DELETE FROM pending_instances WHERE first_seen < $1")
+                        .bind(now_ts() - PENDING_INSTANCE_MAX_AGE)
+                        .execute(&state.db)
+                        .await
+                {
+                    error!(?error, "failed to clean stale pending instances");
+                }
             }
             Err(error) => error!(?error, "failed to read retention setting"),
         }
@@ -955,6 +1140,96 @@ pub async fn write_action_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registration_payload() -> AgentRegisterRequest {
+        AgentRegisterRequest {
+            instance_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            secret: "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            previous_secret: None,
+            hostname: "host-1".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            agent_version: "0.1.0".to_string(),
+            package_type: Some("standalone".to_string()),
+            native_arch: Some("x86_64".to_string()),
+            update_privileged: Some(true),
+        }
+    }
+
+    #[test]
+    fn validates_bounded_agent_registration_fields() {
+        assert!(validate_agent_registration(&registration_payload()).is_ok());
+
+        let mut invalid_id = registration_payload();
+        invalid_id.instance_id = "../agent".to_string();
+        assert!(validate_agent_registration(&invalid_id).is_err());
+
+        let mut oversized_hostname = registration_payload();
+        oversized_hostname.hostname = "h".repeat(256);
+        assert!(validate_agent_registration(&oversized_hostname).is_err());
+
+        let mut control_character = registration_payload();
+        control_character.os = "linux\nforged-log".to_string();
+        assert!(validate_agent_registration(&control_character).is_err());
+    }
+
+    #[test]
+    fn secret_rotation_requires_the_current_secret() {
+        let mut payload = registration_payload();
+        payload.secret = "new-agent-secret".to_string();
+        assert!(!agent_secret_is_authorized(
+            "current-agent-secret",
+            &payload
+        ));
+
+        payload.previous_secret = Some("wrong-agent-secret".to_string());
+        assert!(!agent_secret_is_authorized(
+            "current-agent-secret",
+            &payload
+        ));
+
+        payload.previous_secret = Some("current-agent-secret".to_string());
+        assert!(agent_secret_is_authorized("current-agent-secret", &payload));
+    }
+
+    #[test]
+    fn metric_timestamps_cannot_extend_into_the_future() {
+        assert_eq!(normalize_metric_timestamp(900, 1_000).unwrap(), 900);
+        assert_eq!(normalize_metric_timestamp(1_001, 1_000).unwrap(), 1_000);
+        assert_eq!(normalize_metric_timestamp(i64::MAX, 1_000).unwrap(), 1_000);
+        assert!(normalize_metric_timestamp(0, 1_000).is_err());
+        assert!(normalize_metric_timestamp(i64::MIN, 1_000).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn pending_instance_secret_cannot_be_replaced() {
+        let db = PgPoolOptions::new()
+            .max_connections(1)
+            .connect("postgresql://localhost/postgres")
+            .await
+            .expect("connect database");
+        init_db(&db).await.expect("initialize database");
+        let original = registration_payload();
+        register_or_touch_pending(&db, &original, "test-source")
+            .await
+            .expect("create pending instance");
+
+        let mut replacement = registration_payload();
+        replacement.secret = "different-agent-secret".to_string();
+        let error = register_or_touch_pending(&db, &replacement, "test-source")
+            .await
+            .expect_err("pending secret must be immutable");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+
+        let stored_secret: String =
+            sqlx::query_scalar("SELECT secret FROM pending_instances WHERE id = $1")
+                .bind(&original.instance_id)
+                .fetch_one(&db)
+                .await
+                .expect("load pending secret");
+        assert_eq!(stored_secret, original.secret);
+    }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
@@ -1033,6 +1308,7 @@ mod tests {
         let payload = AgentRegisterRequest {
             instance_id: "agent-1".to_string(),
             secret: "secret-1".to_string(),
+            previous_secret: None,
             hostname: "host-1".to_string(),
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
@@ -1042,12 +1318,12 @@ mod tests {
             update_privileged: Some(true),
         };
 
-        register_or_touch_pending(&db, &payload)
+        register_or_touch_pending(&db, &payload, "test-source")
             .await
             .expect("create pending instance");
         let (approved, registered) = tokio::join!(
             approve_pending_instance(&db, &payload.instance_id),
-            register_or_touch_pending(&db, &payload),
+            register_or_touch_pending(&db, &payload, "test-source"),
         );
         approved.expect("approve instance");
         registered.expect("register instance");

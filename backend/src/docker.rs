@@ -27,7 +27,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    auth::require_admin,
+    auth::{AdminSessionGuard, require_admin},
     db::get_instance,
     error::{AppError, AppResult},
     models::{
@@ -2892,11 +2892,20 @@ async fn admin_container_logs_ws(
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
     ensure_same_origin(&headers, state.secure_cookies)?;
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     manageable_agent(&state, &instance_id).await?;
     let permit = acquire_stream_slot(&state, &instance_id).await?;
+    let session_guard = admin.session_guard();
     Ok(ws.on_upgrade(move |socket| {
-        docker_logs_socket(state, instance_id, container, query, socket, permit)
+        docker_logs_socket(
+            state,
+            instance_id,
+            container,
+            session_guard,
+            query,
+            socket,
+            permit,
+        )
     }))
 }
 
@@ -2904,6 +2913,7 @@ async fn docker_logs_socket(
     state: AppState,
     instance_id: String,
     container: String,
+    session_guard: AdminSessionGuard,
     query: DockerLogsQuery,
     mut socket: WebSocket,
     _permit: OwnedSemaphorePermit,
@@ -2971,9 +2981,19 @@ async fn docker_logs_socket(
         let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket.close()).await;
         return;
     }
+    let authorization = session_guard.wait_until_invalid(state.clone());
+    tokio::pin!(authorization);
 
     loop {
         tokio::select! {
+            _ = &mut authorization => {
+                send_ws_event(
+                    &mut socket,
+                    &json!({"type": "closed", "reason": "authorization_revoked"}),
+                )
+                .await;
+                break;
+            }
             event = rx.recv() => {
                 match event {
                     Some(DockerLogEvent::Chunk { sequence, data, cursor }) => {
@@ -3082,14 +3102,25 @@ async fn admin_container_exec_ws(
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
     ensure_same_origin(&headers, state.secure_cookies)?;
-    let actor = require_admin(&state, &headers).await?.username;
+    let admin = require_admin(&state, &headers).await?;
     manageable_agent(&state, &instance_id).await?;
     if !matches!(query.shell.as_str(), "/bin/sh" | "/bin/bash" | "/bin/ash") {
         return Err(AppError::bad_request("不支持的容器终端 shell"));
     }
     let permit = acquire_stream_slot(&state, &instance_id).await?;
+    let actor = admin.username.clone();
+    let session_guard = admin.session_guard();
     Ok(ws.on_upgrade(move |socket| {
-        docker_exec_socket(state, instance_id, container, actor, query, socket, permit)
+        docker_exec_socket(
+            state,
+            instance_id,
+            container,
+            actor,
+            session_guard,
+            query,
+            socket,
+            permit,
+        )
     }))
 }
 
@@ -3098,6 +3129,7 @@ async fn docker_exec_socket(
     instance_id: String,
     container: String,
     actor: String,
+    session_guard: AdminSessionGuard,
     query: DockerExecQuery,
     socket: WebSocket,
     _permit: OwnedSemaphorePermit,
@@ -3205,9 +3237,23 @@ async fn docker_exec_socket(
         let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, sender.close()).await;
         return;
     }
+    let authorization = session_guard.wait_until_invalid(state.clone());
+    tokio::pin!(authorization);
+    let mut failure_code = "client_disconnected";
 
     loop {
         tokio::select! {
+            _ = &mut authorization => {
+                failure_code = "authorization_revoked";
+                let _ = send_split_terminal_event(
+                    &mut sender,
+                    &TerminalServerMessage::Error {
+                        message: "管理员会话已失效".to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
             event = rx.recv() => {
                 let Some(event) = event else {
                     let final_event = close_rx.borrow().clone();
@@ -3283,7 +3329,7 @@ async fn docker_exec_socket(
             &state,
             Some(&removed.audit_id),
             "failed",
-            Some("client_disconnected"),
+            Some(failure_code),
             "",
         )
         .await;
@@ -3707,10 +3753,12 @@ mod tests {
                 bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
                 database_url: "postgresql://localhost/postgres".to_string(),
                 database_password: None,
-                admin_password: "test".to_string(),
+                admin_password: Some("test-password-value".to_string()),
                 auth_secret_key: None,
                 auth_key_file: PathBuf::from("unused-test-auth-key"),
                 secure_cookies: false,
+                trust_proxy_headers: false,
+                allow_legacy_agent_ws_auth: false,
                 reset_admin_auth: false,
                 confirm_reset_admin_auth: None,
                 upload_dir: PathBuf::from("unused-uploads"),

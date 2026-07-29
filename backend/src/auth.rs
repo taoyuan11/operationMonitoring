@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
+    time::Duration,
 };
 
 use aes_gcm::{
@@ -16,6 +17,8 @@ use hmac::{Hmac, Mac};
 use rand::{RngCore, rngs::OsRng};
 use sha1::Sha1;
 use subtle::ConstantTimeEq;
+use tokio::sync::watch;
+use tracing::warn;
 
 use crate::{
     error::{AppError, AppResult},
@@ -26,11 +29,56 @@ use crate::{
 pub const SESSION_COOKIE: &str = "om_session";
 pub const SESSION_MAX_AGE: i64 = 7 * 24 * 3600;
 pub const ENROLLMENT_MAX_AGE: i64 = 10 * 60;
+const SESSION_REVALIDATE_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub struct AdminPrincipal {
     pub user_id: String,
     pub username: String,
+    pub(crate) session_token: String,
+    pub(crate) device_id: String,
+    session_guard: AdminSessionGuard,
+}
+
+impl AdminPrincipal {
+    pub fn session_guard(&self) -> AdminSessionGuard {
+        self.session_guard.clone()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AdminSessionGuard {
+    token: String,
+    user_id: String,
+    device_id: String,
+    expires_at: i64,
+    revoked_rx: watch::Receiver<bool>,
+}
+
+impl AdminSessionGuard {
+    pub async fn wait_until_invalid(mut self, state: AppState) {
+        if !admin_session_is_valid(&state, &self).await {
+            return;
+        }
+
+        let mut interval = tokio::time::interval(SESSION_REVALIDATE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                changed = self.revoked_rx.changed() => {
+                    if changed.is_err() || *self.revoked_rx.borrow() {
+                        return;
+                    }
+                }
+                _ = interval.tick() => {
+                    if !admin_session_is_valid(&state, &self).await {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -159,20 +207,21 @@ pub fn otpauth_uri(username: &str, secret: &[u8]) -> String {
     )
 }
 
+#[cfg(test)]
 pub fn verify_totp(secret: &[u8], code: &str, timestamp: i64) -> bool {
+    verify_totp_counter(secret, code, timestamp).is_some()
+}
+
+pub fn verify_totp_counter(secret: &[u8], code: &str, timestamp: i64) -> Option<i64> {
     let code = code.trim();
     if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
+        return None;
     }
-    let counter = timestamp.max(0) as u64 / 30;
-    [-1_i64, 0, 1].into_iter().any(|offset| {
-        let candidate_counter = if offset.is_negative() {
-            counter.saturating_sub(offset.unsigned_abs())
-        } else {
-            counter.saturating_add(offset as u64)
-        };
-        let candidate = totp_code(secret, candidate_counter);
-        candidate.as_bytes().ct_eq(code.as_bytes()).into()
+    let counter = timestamp.max(0) / 30;
+    [0_i64, -1, 1].into_iter().find_map(|offset| {
+        let candidate_counter = counter.saturating_add(offset).max(0);
+        let candidate = totp_code(secret, candidate_counter as u64);
+        bool::from(candidate.as_bytes().ct_eq(code.as_bytes())).then_some(candidate_counter)
     })
 }
 
@@ -214,7 +263,13 @@ pub async fn require_admin(state: &AppState, headers: &HeaderMap) -> AppResult<A
     let now = now_ts();
     let session = {
         let mut sessions = state.sessions.write().await;
-        sessions.retain(|_, session| session.expires_at > now);
+        sessions.retain(|_, session| {
+            let active = session.expires_at > now;
+            if !active {
+                session.revoked_tx.send_replace(true);
+            }
+            active
+        });
         sessions.get(&token).cloned()
     };
     let Some(session) = session else {
@@ -234,13 +289,23 @@ pub async fn require_admin(state: &AppState, headers: &HeaderMap) -> AppResult<A
     .fetch_optional(&state.db)
     .await?;
     if valid.is_none() {
-        state.sessions.write().await.remove(&token);
+        revoke_session(state, &token).await;
         return Err(AppError::unauthorized());
     }
 
+    let session_guard = AdminSessionGuard {
+        token: token.clone(),
+        user_id: session.user_id.clone(),
+        device_id: session.device_id.clone(),
+        expires_at: session.expires_at,
+        revoked_rx: session.revoked_tx.subscribe(),
+    };
     Ok(AdminPrincipal {
         user_id: session.user_id,
         username: session.username,
+        session_token: token,
+        device_id: session.device_id,
+        session_guard,
     })
 }
 
@@ -250,16 +315,98 @@ pub async fn insert_session(
     user_id: String,
     username: String,
     device_id: String,
+    login_totp_counter: Option<i64>,
 ) {
+    let (revoked_tx, _) = watch::channel(false);
     state.sessions.write().await.insert(
         token,
         AdminSession {
             user_id,
             username,
             device_id,
+            login_totp_counter,
             expires_at: now_ts() + SESSION_MAX_AGE,
+            revoked_tx,
         },
     );
+}
+
+pub async fn revoke_session(state: &AppState, token: &str) {
+    if let Some(session) = state.sessions.write().await.remove(token) {
+        session.revoked_tx.send_replace(true);
+    }
+}
+
+pub async fn revoke_user_sessions(state: &AppState, user_id: &str) {
+    revoke_matching_sessions(state, |session| session.user_id == user_id).await;
+}
+
+pub async fn revoke_device_sessions(state: &AppState, device_id: &str) {
+    revoke_matching_sessions(state, |session| session.device_id == device_id).await;
+}
+
+async fn revoke_matching_sessions(state: &AppState, predicate: impl Fn(&AdminSession) -> bool) {
+    let mut sessions = state.sessions.write().await;
+    revoke_matching_session_entries(&mut sessions, predicate);
+}
+
+fn revoke_matching_session_entries(
+    sessions: &mut std::collections::HashMap<String, AdminSession>,
+    predicate: impl Fn(&AdminSession) -> bool,
+) {
+    sessions.retain(|_, session| {
+        let revoked = predicate(session);
+        if revoked {
+            session.revoked_tx.send_replace(true);
+        }
+        !revoked
+    });
+}
+
+async fn admin_session_is_valid(state: &AppState, guard: &AdminSessionGuard) -> bool {
+    if *guard.revoked_rx.borrow() || guard.expires_at <= now_ts() {
+        revoke_session(state, &guard.token).await;
+        return false;
+    }
+    let present = state
+        .sessions
+        .read()
+        .await
+        .get(&guard.token)
+        .is_some_and(|session| {
+            session.user_id == guard.user_id
+                && session.device_id == guard.device_id
+                && session.expires_at == guard.expires_at
+                && !*session.revoked_tx.borrow()
+        });
+    if !present {
+        return false;
+    }
+
+    let valid = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT TRUE
+        FROM admin_users u
+        JOIN authenticator_devices d ON d.user_id = u.id
+        WHERE u.id = $1 AND u.enabled = 1 AND d.id = $2
+        "#,
+    )
+    .bind(&guard.user_id)
+    .bind(&guard.device_id)
+    .fetch_optional(&state.db)
+    .await;
+    match valid {
+        Ok(Some(true)) => true,
+        Ok(_) => {
+            revoke_session(state, &guard.token).await;
+            false
+        }
+        Err(error) => {
+            warn!(?error, "failed to revalidate privileged WebSocket session");
+            revoke_session(state, &guard.token).await;
+            false
+        }
+    }
 }
 
 pub fn session_token(headers: &HeaderMap) -> Option<String> {
@@ -275,12 +422,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn revoking_a_session_notifies_existing_guards() {
+        let (revoked_tx, revoked_rx) = watch::channel(false);
+        let mut sessions = std::collections::HashMap::from([(
+            "session-1".to_string(),
+            AdminSession {
+                user_id: "user-1".to_string(),
+                username: "admin".to_string(),
+                device_id: "device-1".to_string(),
+                login_totp_counter: None,
+                expires_at: i64::MAX,
+                revoked_tx,
+            },
+        )]);
+
+        revoke_matching_session_entries(&mut sessions, |session| session.user_id == "user-1");
+
+        assert!(sessions.is_empty());
+        assert!(*revoked_rx.borrow());
+    }
+
+    #[test]
     fn verifies_standard_totp_vector_and_adjacent_window() {
         let secret = b"12345678901234567890";
         assert!(verify_totp(secret, &"94287082"[2..], 59));
         let code = totp_code(secret, 2);
         assert!(verify_totp(secret, &code, 59));
+        assert_eq!(verify_totp_counter(secret, &code, 59), Some(2));
         assert!(!verify_totp(secret, "not-a-code", 59));
+        assert_eq!(verify_totp_counter(secret, "not-a-code", 59), None);
     }
 
     #[test]

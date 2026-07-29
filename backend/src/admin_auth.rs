@@ -1,18 +1,20 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{Executor, FromRow, PgPool, Postgres};
+use sqlx::{FromRow, PgConnection, PgPool};
+use std::net::{IpAddr, SocketAddr};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
     auth::{
         AdminPrincipal, ENROLLMENT_MAX_AGE, SESSION_COOKIE, SESSION_MAX_AGE, generate_totp_secret,
-        insert_session, otpauth_uri, require_admin, session_token, validate_username, verify_totp,
+        insert_session, otpauth_uri, require_admin, revoke_device_sessions, revoke_session,
+        revoke_user_sessions, session_token, validate_username, verify_totp_counter,
     },
     db::write_action_log,
     error::{AppError, AppResult},
@@ -23,6 +25,7 @@ use crate::{
 const AUTH_FAILURE_LIMIT: u32 = 5;
 const AUTH_WINDOW_SECONDS: i64 = 5 * 60;
 const AUTH_BLOCK_SECONDS: i64 = 5 * 60;
+const MAX_AUTH_ATTEMPT_KEYS: usize = 4_096;
 
 #[derive(Serialize)]
 pub struct AuthStatusResponse {
@@ -139,6 +142,7 @@ struct DeviceRow {
     secret_ciphertext: String,
     created_at: i64,
     last_used_at: Option<i64>,
+    last_totp_counter: Option<i64>,
 }
 
 #[derive(FromRow)]
@@ -163,23 +167,25 @@ pub async fn auth_status(State(state): State<AppState>) -> AppResult<Json<AuthSt
 
 pub async fn bootstrap_start(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<BootstrapStartRequest>,
 ) -> AppResult<Response> {
-    ensure_attempt_allowed(&state, "bootstrap").await?;
+    let attempt_key = bootstrap_attempt_key(&state, &headers, peer_addr.ip(), "start");
+    ensure_attempt_allowed(&state, &attempt_key).await?;
     if auth_initialized(&state.db).await? {
         return Err(AppError::new(StatusCode::CONFLICT, "管理员认证已经初始化"));
     }
-    if !bool::from(
-        state
-            .admin_password
-            .as_bytes()
-            .ct_eq(payload.password.as_bytes()),
-    ) {
-        record_auth_failure(&state, "bootstrap").await;
+    let password_matches = state
+        .admin_password
+        .as_deref()
+        .is_some_and(|password| bool::from(password.as_bytes().ct_eq(payload.password.as_bytes())));
+    if !password_matches {
+        record_auth_failure(&state, &attempt_key).await;
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "初始化凭据错误"));
     }
     let (username, normalized) = validate_username(&payload.username)?;
-    clear_auth_failures(&state, "bootstrap").await;
+    clear_auth_failures(&state, &attempt_key).await;
     remove_expired_enrollments(&state.db).await?;
 
     let secret = generate_totp_secret();
@@ -219,10 +225,13 @@ pub async fn bootstrap_start(
 
 pub async fn bootstrap_confirm(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(enrollment_id): Path<String>,
     Json(payload): Json<ConfirmEnrollmentRequest>,
 ) -> AppResult<Response> {
-    ensure_attempt_allowed(&state, "bootstrap-confirm").await?;
+    let attempt_key = bootstrap_attempt_key(&state, &headers, peer_addr.ip(), "confirm");
+    ensure_attempt_allowed(&state, &attempt_key).await?;
     if auth_initialized(&state.db).await? {
         return Err(AppError::new(StatusCode::CONFLICT, "管理员认证已经初始化"));
     }
@@ -233,15 +242,26 @@ pub async fn bootstrap_confirm(
     {
         return Err(AppError::bad_request("二维码已过期，请重新开始初始化"));
     }
-    if !verify_enrollment_code(&state, &enrollment, &payload.code)? {
-        record_auth_failure(&state, "bootstrap-confirm").await;
+    let Some(totp_counter) = verify_enrollment_code(&state, &enrollment, &payload.code)? else {
+        record_auth_failure(&state, &attempt_key).await;
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "验证码错误"));
-    }
+    };
 
     let user_id = Uuid::new_v4().to_string();
     let device_id = Uuid::new_v4().to_string();
     let now = now_ts();
     let mut tx = state.db.begin().await?;
+    let claimed: Option<String> =
+        sqlx::query_scalar("DELETE FROM admin_enrollments WHERE id = $1 RETURNING id")
+            .bind(&enrollment.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if claimed.is_none() {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "验证码已经使用，请重新开始初始化",
+        ));
+    }
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_users")
         .fetch_one(&mut *tx)
         .await?;
@@ -258,7 +278,7 @@ pub async fn bootstrap_confirm(
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO authenticator_devices(id, user_id, name, secret_ciphertext, created_at, last_used_at) VALUES($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO authenticator_devices(id, user_id, name, secret_ciphertext, created_at, last_used_at, last_totp_counter) VALUES($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&device_id)
     .bind(&user_id)
@@ -266,13 +286,14 @@ pub async fn bootstrap_confirm(
     .bind(&enrollment.secret_ciphertext)
     .bind(now)
     .bind(now)
+    .bind(totp_counter)
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM admin_enrollments")
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    clear_auth_failures(&state, "bootstrap-confirm").await;
+    clear_auth_failures(&state, &attempt_key).await;
     write_action_log(
         &state.db,
         &enrollment.username,
@@ -281,11 +302,20 @@ pub async fn bootstrap_confirm(
         "初始化管理员 Authenticator 认证",
     )
     .await?;
-    session_response(&state, user_id, enrollment.username, device_id).await
+    session_response(
+        &state,
+        user_id,
+        enrollment.username,
+        device_id,
+        Some(totp_counter),
+    )
+    .await
 }
 
 pub async fn admin_login(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> AppResult<Response> {
     if !auth_initialized(&state.db).await? {
@@ -294,9 +324,21 @@ pub async fn admin_login(
             "请先使用默认密码完成管理员初始化",
         ));
     }
-    let normalized = payload.username.trim().to_ascii_lowercase();
-    let attempt_key = format!("login:{normalized}");
+    let attempt_key = format!(
+        "login:{}",
+        login_client_ip(&state, &headers, peer_addr.ip())
+    );
     ensure_attempt_allowed(&state, &attempt_key).await?;
+    let normalized = match validate_username(&payload.username) {
+        Ok((_, normalized)) => normalized,
+        Err(_) => {
+            record_auth_failure(&state, &attempt_key).await;
+            return Err(AppError::new(
+                StatusCode::UNAUTHORIZED,
+                "用户名或验证码错误",
+            ));
+        }
+    };
     let user = sqlx::query_as::<_, UserRow>(
         "SELECT id, username, enabled, created_at FROM admin_users WHERE username_normalized = $1",
     )
@@ -306,11 +348,11 @@ pub async fn admin_login(
     let authenticated = if let Some(user) = user.filter(|user| user.enabled == 1) {
         verify_user_code(&state, &user.id, &payload.code)
             .await?
-            .map(|device| (user, device))
+            .map(|(device, counter)| (user, device, counter))
     } else {
         None
     };
-    let Some((user, device)) = authenticated else {
+    let Some((user, device, counter)) = authenticated else {
         record_auth_failure(&state, &attempt_key).await;
         return Err(AppError::new(
             StatusCode::UNAUTHORIZED,
@@ -318,13 +360,8 @@ pub async fn admin_login(
         ));
     };
     clear_auth_failures(&state, &attempt_key).await;
-    sqlx::query("UPDATE authenticator_devices SET last_used_at = $1 WHERE id = $2")
-        .bind(now_ts())
-        .bind(&device.id)
-        .execute(&state.db)
-        .await?;
     write_action_log(&state.db, &user.username, "login", &user.id, "管理员登录").await?;
-    session_response(&state, user.id, user.username, device.id).await
+    session_response(&state, user.id, user.username, device.id, Some(counter)).await
 }
 
 pub async fn admin_logout(
@@ -332,7 +369,7 @@ pub async fn admin_logout(
     headers: HeaderMap,
 ) -> AppResult<Response> {
     if let Some(token) = session_token(&headers) {
-        state.sessions.write().await.remove(&token);
+        revoke_session(&state, &token).await;
     }
     let mut response = Json(MeResponse {
         authenticated: false,
@@ -376,7 +413,7 @@ pub async fn admin_users(
     let mut users = Vec::with_capacity(rows.len());
     for row in rows {
         let devices = sqlx::query_as::<_, DeviceRow>(
-            "SELECT id, user_id, name, secret_ciphertext, created_at, last_used_at FROM authenticator_devices WHERE user_id = $1 ORDER BY created_at",
+            "SELECT id, user_id, name, secret_ciphertext, created_at, last_used_at, last_totp_counter FROM authenticator_devices WHERE user_id = $1 ORDER BY created_at",
         )
         .bind(&row.id)
         .fetch_all(&state.db)
@@ -499,12 +536,23 @@ pub async fn confirm_admin_enrollment(
     if enrollment.created_by_user_id.is_none() || enrollment.expires_at <= now_ts() {
         return Err(AppError::bad_request("二维码已过期，请重新生成"));
     }
-    if !verify_enrollment_code(&state, &enrollment, &payload.code)? {
+    let Some(totp_counter) = verify_enrollment_code(&state, &enrollment, &payload.code)? else {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "新设备验证码错误"));
-    }
+    };
     let now = now_ts();
     let device_id = Uuid::new_v4().to_string();
     let mut tx = state.db.begin().await?;
+    let claimed: Option<String> =
+        sqlx::query_scalar("DELETE FROM admin_enrollments WHERE id = $1 RETURNING id")
+            .bind(&enrollment.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if claimed.is_none() {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "验证码已经使用，请重新生成二维码",
+        ));
+    }
     let user_id = if let Some(user_id) = &enrollment.target_user_id {
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_users WHERE id = $1")
             .bind(user_id)
@@ -535,7 +583,7 @@ pub async fn confirm_admin_enrollment(
         user_id
     };
     sqlx::query(
-        "INSERT INTO authenticator_devices(id, user_id, name, secret_ciphertext, created_at, last_used_at) VALUES($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO authenticator_devices(id, user_id, name, secret_ciphertext, created_at, last_used_at, last_totp_counter) VALUES($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&device_id)
     .bind(&user_id)
@@ -543,6 +591,7 @@ pub async fn confirm_admin_enrollment(
     .bind(&enrollment.secret_ciphertext)
     .bind(now)
     .bind(now)
+    .bind(totp_counter)
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM admin_enrollments WHERE id = $1")
@@ -620,7 +669,7 @@ pub async fn set_admin_user_enabled(
         .await?;
     transaction.commit().await?;
     if !payload.enabled {
-        purge_user_sessions(&state, &target.id).await;
+        revoke_user_sessions(&state, &target.id).await;
     }
     write_action_log(
         &state.db,
@@ -654,15 +703,13 @@ pub async fn delete_admin_user(
         return Err(AppError::bad_request("不能删除当前登录用户"));
     }
     let mut transaction = state.db.begin().await?;
-    if target.enabled == 1 {
-        ensure_other_login_path(&mut *transaction, Some(&target.id), None).await?;
-    }
+    ensure_other_login_path(&mut *transaction, Some(&target.id), None).await?;
     sqlx::query("DELETE FROM admin_users WHERE id = $1")
         .bind(&target.id)
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await?;
-    purge_user_sessions(&state, &target.id).await;
+    revoke_user_sessions(&state, &target.id).await;
     write_action_log(
         &state.db,
         &principal.username,
@@ -683,7 +730,7 @@ pub async fn revoke_authenticator_device(
     let principal = require_admin(&state, &headers).await?;
     verify_step_up(&state, &principal, &payload.current_code).await?;
     let device = sqlx::query_as::<_, DeviceRow>(
-        "SELECT id, user_id, name, secret_ciphertext, created_at, last_used_at FROM authenticator_devices WHERE id = $1",
+        "SELECT id, user_id, name, secret_ciphertext, created_at, last_used_at, last_totp_counter FROM authenticator_devices WHERE id = $1",
     )
     .bind(&device_id)
     .fetch_optional(&state.db)
@@ -691,19 +738,13 @@ pub async fn revoke_authenticator_device(
     .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Authenticator 设备不存在"))?;
     let user = load_user(&state.db, &device.user_id).await?;
     let mut transaction = state.db.begin().await?;
-    if user.enabled == 1 {
-        ensure_other_login_path(&mut *transaction, None, Some(&device.id)).await?;
-    }
+    ensure_other_login_path(&mut *transaction, None, Some(&device.id)).await?;
     sqlx::query("DELETE FROM authenticator_devices WHERE id = $1")
         .bind(&device.id)
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await?;
-    state
-        .sessions
-        .write()
-        .await
-        .retain(|_, session| session.device_id != device.id);
+    revoke_device_sessions(&state, &device.id).await;
     write_action_log(
         &state.db,
         &principal.username,
@@ -788,10 +829,16 @@ async fn create_enrollment(
 async fn verify_step_up(state: &AppState, principal: &AdminPrincipal, code: &str) -> AppResult<()> {
     let key = format!("step-up:{}", principal.user_id);
     ensure_attempt_allowed(state, &key).await?;
-    if verify_user_code(state, &principal.user_id, code)
+    let verified_with_new_counter = verify_user_code(state, &principal.user_id, code)
         .await?
-        .is_none()
-    {
+        .is_some();
+    let verified = if verified_with_new_counter {
+        clear_login_counter_for_session(state, principal).await;
+        true
+    } else {
+        consume_login_counter_for_step_up(state, principal, code).await?
+    };
+    if !verified {
         record_auth_failure(state, &key).await;
         return Err(AppError::new(
             StatusCode::UNAUTHORIZED,
@@ -802,38 +849,111 @@ async fn verify_step_up(state: &AppState, principal: &AdminPrincipal, code: &str
     Ok(())
 }
 
+async fn clear_login_counter_for_session(state: &AppState, principal: &AdminPrincipal) {
+    let mut sessions = state.sessions.write().await;
+    if let Some(session) = sessions.get_mut(&principal.session_token)
+        && session.user_id == principal.user_id
+        && session.device_id == principal.device_id
+    {
+        session.login_totp_counter = None;
+    }
+}
+
 async fn verify_user_code(
     state: &AppState,
     user_id: &str,
     code: &str,
-) -> AppResult<Option<DeviceRow>> {
+) -> AppResult<Option<(DeviceRow, i64)>> {
     let devices = sqlx::query_as::<_, DeviceRow>(
-        "SELECT id, user_id, name, secret_ciphertext, created_at, last_used_at FROM authenticator_devices WHERE user_id = $1",
+        "SELECT id, user_id, name, secret_ciphertext, created_at, last_used_at, last_totp_counter FROM authenticator_devices WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_all(&state.db)
     .await?;
     for device in devices {
         let secret = state.auth_cipher.decrypt(&device.secret_ciphertext)?;
-        if verify_totp(&secret, code, now_ts()) {
-            sqlx::query("UPDATE authenticator_devices SET last_used_at = $1 WHERE id = $2")
-                .bind(now_ts())
-                .bind(&device.id)
-                .execute(&state.db)
-                .await?;
-            return Ok(Some(device));
+        if let Some(counter) = verify_totp_counter(&secret, code, now_ts()) {
+            if device
+                .last_totp_counter
+                .is_some_and(|last_counter| counter <= last_counter)
+            {
+                continue;
+            }
+            let updated = sqlx::query(
+                r#"
+                UPDATE authenticator_devices
+                SET last_used_at = $1, last_totp_counter = $2
+                WHERE id = $3
+                  AND (last_totp_counter IS NULL OR last_totp_counter < $2)
+                "#,
+            )
+            .bind(now_ts())
+            .bind(counter)
+            .bind(&device.id)
+            .execute(&state.db)
+            .await?;
+            if updated.rows_affected() == 1 {
+                return Ok(Some((device, counter)));
+            }
         }
     }
     Ok(None)
+}
+
+async fn consume_login_counter_for_step_up(
+    state: &AppState,
+    principal: &AdminPrincipal,
+    code: &str,
+) -> AppResult<bool> {
+    let allowed_counter = state
+        .sessions
+        .read()
+        .await
+        .get(&principal.session_token)
+        .filter(|session| {
+            session.user_id == principal.user_id && session.device_id == principal.device_id
+        })
+        .and_then(|session| session.login_totp_counter);
+    let Some(allowed_counter) = allowed_counter else {
+        return Ok(false);
+    };
+
+    let device = sqlx::query_as::<_, DeviceRow>(
+        "SELECT id, user_id, name, secret_ciphertext, created_at, last_used_at, last_totp_counter FROM authenticator_devices WHERE id = $1 AND user_id = $2",
+    )
+    .bind(&principal.device_id)
+    .bind(&principal.user_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(device) = device else {
+        return Ok(false);
+    };
+    let secret = state.auth_cipher.decrypt(&device.secret_ciphertext)?;
+    if verify_totp_counter(&secret, code, now_ts()) != Some(allowed_counter) {
+        return Ok(false);
+    }
+
+    let mut sessions = state.sessions.write().await;
+    let Some(session) = sessions.get_mut(&principal.session_token) else {
+        return Ok(false);
+    };
+    if session.user_id != principal.user_id
+        || session.device_id != principal.device_id
+        || session.login_totp_counter != Some(allowed_counter)
+    {
+        return Ok(false);
+    }
+    session.login_totp_counter = None;
+    Ok(true)
 }
 
 fn verify_enrollment_code(
     state: &AppState,
     enrollment: &EnrollmentRow,
     code: &str,
-) -> AppResult<bool> {
+) -> AppResult<Option<i64>> {
     let secret = state.auth_cipher.decrypt(&enrollment.secret_ciphertext)?;
-    Ok(verify_totp(&secret, code, now_ts()))
+    Ok(verify_totp_counter(&secret, code, now_ts()))
 }
 
 async fn auth_initialized(db: &PgPool) -> AppResult<bool> {
@@ -875,14 +995,14 @@ async fn remove_expired_enrollments(db: &PgPool) -> AppResult<()> {
     Ok(())
 }
 
-async fn ensure_other_login_path<'e, E>(
-    executor: E,
+async fn ensure_other_login_path(
+    connection: &mut PgConnection,
     excluded_user_id: Option<&str>,
     excluded_device_id: Option<&str>,
-) -> AppResult<()>
-where
-    E: Executor<'e, Database = Postgres>,
-{
+) -> AppResult<()> {
+    sqlx::query("LOCK TABLE admin_users, authenticator_devices IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *connection)
+        .await?;
     let count: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*)
@@ -897,7 +1017,7 @@ where
     .bind(excluded_user_id)
     .bind(excluded_device_id)
     .bind(excluded_device_id)
-    .fetch_one(executor)
+    .fetch_one(&mut *connection)
     .await?;
     if count == 0 {
         return Err(AppError::bad_request("该操作会移除最后一个可登录管理员"));
@@ -905,19 +1025,12 @@ where
     Ok(())
 }
 
-async fn purge_user_sessions(state: &AppState, user_id: &str) {
-    state
-        .sessions
-        .write()
-        .await
-        .retain(|_, session| session.user_id != user_id);
-}
-
 async fn session_response(
     state: &AppState,
     user_id: String,
     username: String,
     device_id: String,
+    login_totp_counter: Option<i64>,
 ) -> AppResult<Response> {
     let token = Uuid::new_v4().to_string();
     insert_session(
@@ -926,6 +1039,7 @@ async fn session_response(
         user_id.clone(),
         username.clone(),
         device_id,
+        login_totp_counter,
     )
     .await;
     let mut response = Json(LoginResponse {
@@ -958,7 +1072,8 @@ fn no_store_json<T: Serialize>(payload: T) -> AppResult<Response> {
 
 async fn ensure_attempt_allowed(state: &AppState, key: &str) -> AppResult<()> {
     let now = now_ts();
-    let attempts = state.auth_attempts.read().await;
+    let mut attempts = state.auth_attempts.write().await;
+    prune_auth_attempts(&mut attempts, now);
     if attempts
         .get(key)
         .is_some_and(|attempt| attempt.blocked_until > now)
@@ -974,6 +1089,16 @@ async fn ensure_attempt_allowed(state: &AppState, key: &str) -> AppResult<()> {
 async fn record_auth_failure(state: &AppState, key: &str) {
     let now = now_ts();
     let mut attempts = state.auth_attempts.write().await;
+    prune_auth_attempts(&mut attempts, now);
+    if !attempts.contains_key(key)
+        && attempts.len() >= MAX_AUTH_ATTEMPT_KEYS
+        && let Some(oldest) = attempts
+            .iter()
+            .min_by_key(|(_, attempt)| attempt.window_started_at)
+            .map(|(key, _)| key.clone())
+    {
+        attempts.remove(&oldest);
+    }
     let attempt = attempts.entry(key.to_string()).or_default();
     if attempt.window_started_at == 0 || now - attempt.window_started_at > AUTH_WINDOW_SECONDS {
         attempt.failures = 0;
@@ -990,6 +1115,46 @@ async fn clear_auth_failures(state: &AppState, key: &str) {
     state.auth_attempts.write().await.remove(key);
 }
 
+fn prune_auth_attempts(
+    attempts: &mut std::collections::HashMap<String, crate::state::AuthAttempt>,
+    now: i64,
+) {
+    attempts.retain(|_, attempt| {
+        attempt.blocked_until > now || now - attempt.window_started_at <= AUTH_WINDOW_SECONDS
+    });
+}
+
+fn login_client_ip(state: &AppState, headers: &HeaderMap, peer_ip: IpAddr) -> IpAddr {
+    resolved_client_ip(state.trust_proxy_headers, headers, peer_ip)
+}
+
+fn bootstrap_attempt_key(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_ip: IpAddr,
+    phase: &str,
+) -> String {
+    format!(
+        "bootstrap:{phase}:{}",
+        resolved_client_ip(state.trust_proxy_headers, headers, peer_ip)
+    )
+}
+
+pub(crate) fn resolved_client_ip(
+    trust_proxy_headers: bool,
+    headers: &HeaderMap,
+    peer_ip: IpAddr,
+) -> IpAddr {
+    if !trust_proxy_headers {
+        return peer_ip;
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(peer_ip)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, path::PathBuf};
@@ -1002,7 +1167,47 @@ mod tests {
         auth::{AuthCipher, totp_code_at},
         config::Cli,
         db::init_db,
+        state::AuthAttempt,
     };
+
+    #[test]
+    fn login_source_only_trusts_configured_proxy_header() {
+        let peer_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let forwarded_ip: IpAddr = "203.0.113.8".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.8".parse().unwrap());
+
+        assert_eq!(resolved_client_ip(false, &headers, peer_ip), peer_ip);
+        assert_eq!(resolved_client_ip(true, &headers, peer_ip), forwarded_ip);
+    }
+
+    #[test]
+    fn expired_auth_attempts_are_pruned() {
+        let now = 10_000;
+        let mut attempts = std::collections::HashMap::from([
+            (
+                "expired".to_string(),
+                AuthAttempt {
+                    failures: 1,
+                    window_started_at: now - AUTH_WINDOW_SECONDS - 1,
+                    blocked_until: 0,
+                },
+            ),
+            (
+                "blocked".to_string(),
+                AuthAttempt {
+                    failures: AUTH_FAILURE_LIMIT,
+                    window_started_at: now - AUTH_WINDOW_SECONDS - 1,
+                    blocked_until: now + 1,
+                },
+            ),
+        ]);
+
+        prune_auth_attempts(&mut attempts, now);
+
+        assert!(!attempts.contains_key("expired"));
+        assert!(attempts.contains_key("blocked"));
+    }
 
     async fn test_state() -> AppState {
         let db = PgPoolOptions::new()
@@ -1017,10 +1222,12 @@ mod tests {
                 bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
                 database_url: "postgresql://localhost/postgres".to_string(),
                 database_password: None,
-                admin_password: "bootstrap-password".to_string(),
+                admin_password: Some("bootstrap-password".to_string()),
                 auth_secret_key: None,
                 auth_key_file: PathBuf::from("unused-test-auth-key"),
                 secure_cookies: false,
+                trust_proxy_headers: false,
+                allow_legacy_agent_ws_auth: false,
                 reset_admin_auth: false,
                 confirm_reset_admin_auth: None,
                 upload_dir: PathBuf::from("unused-uploads"),
@@ -1066,11 +1273,14 @@ mod tests {
         let state = test_state().await;
         let secret = b"12345678901234567890";
         insert_user_with_device(&state, "user-1", "Admin.One", secret).await;
+        let code = totp_code_at(secret, now_ts());
         let response = admin_login(
             State(state.clone()),
+            ConnectInfo("127.0.0.1:12345".parse().expect("peer address")),
+            HeaderMap::new(),
             Json(LoginRequest {
                 username: "admin.one".to_string(),
-                code: totp_code_at(secret, now_ts()),
+                code: code.clone(),
             }),
         )
         .await
@@ -1092,9 +1302,42 @@ mod tests {
             "Admin.One"
         );
         drop(sessions);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("session cookie")
+            .to_str()
+            .expect("valid cookie")
+            .split(';')
+            .next()
+            .expect("cookie value");
+        let mut authenticated_headers = HeaderMap::new();
+        authenticated_headers.insert(header::COOKIE, cookie.parse().expect("valid cookie header"));
+        let principal = require_admin(&state, &authenticated_headers)
+            .await
+            .expect("session remains authenticated");
+        verify_step_up(&state, &principal, &code)
+            .await
+            .expect("login code may step up the same session once");
+        assert!(verify_step_up(&state, &principal, &code).await.is_err());
+
+        let replay = admin_login(
+            State(state.clone()),
+            ConnectInfo("127.0.0.2:12345".parse().expect("peer address")),
+            HeaderMap::new(),
+            Json(LoginRequest {
+                username: "admin.one".to_string(),
+                code,
+            }),
+        )
+        .await
+        .expect_err("TOTP code must only be accepted once");
+        assert_eq!(replay.status, StatusCode::UNAUTHORIZED);
 
         let error = bootstrap_start(
             State(state),
+            ConnectInfo("127.0.0.1:12345".parse().expect("peer address")),
+            HeaderMap::new(),
             Json(BootstrapStartRequest {
                 password: "bootstrap-password".to_string(),
                 username: "second-admin".to_string(),
@@ -1110,19 +1353,23 @@ mod tests {
     async fn refuses_to_remove_the_last_login_path() {
         let state = test_state().await;
         insert_user_with_device(&state, "user-1", "admin-one", b"first-secret").await;
+        let mut transaction = state.db.begin().await.expect("begin transaction");
         assert!(
-            ensure_other_login_path(&state.db, Some("user-1"), None)
+            ensure_other_login_path(&mut transaction, Some("user-1"), None)
                 .await
                 .is_err()
         );
+        transaction.rollback().await.expect("rollback transaction");
 
         insert_user_with_device(&state, "user-2", "admin-two", b"second-secret").await;
-        ensure_other_login_path(&state.db, Some("user-1"), None)
+        let mut transaction = state.db.begin().await.expect("begin transaction");
+        ensure_other_login_path(&mut transaction, Some("user-1"), None)
             .await
             .expect("second administrator remains available");
-        ensure_other_login_path(&state.db, None, Some("device-user-1"))
+        ensure_other_login_path(&mut transaction, None, Some("device-user-1"))
             .await
             .expect("second device remains available");
+        transaction.commit().await.expect("commit transaction");
     }
 
     #[tokio::test]

@@ -300,6 +300,8 @@ pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
         identity: Identity {
             instance_id: "manual-update".to_string(),
             secret: String::new(),
+            credential_version: 1,
+            previous_secret: None,
         },
         client: Client::new(),
         activity: ActivityTracker::default(),
@@ -2593,6 +2595,8 @@ mod tests {
             identity: Identity {
                 instance_id: "instance-gate".to_string(),
                 secret: "secret-gate".to_string(),
+                credential_version: 1,
+                previous_secret: None,
             },
             client: Client::new(),
             activity: ActivityTracker::default(),
@@ -3001,6 +3005,8 @@ mod tests {
             identity: Identity {
                 instance_id: "instance-test".to_string(),
                 secret: "secret-test".to_string(),
+                credential_version: 1,
+                previous_secret: None,
             },
             client: Client::new(),
             activity: ActivityTracker::default(),

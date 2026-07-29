@@ -7,6 +7,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    auth::AdminSessionGuard,
+    db::normalize_metric_timestamp,
     docker::{
         CAPABILITY as DOCKER_CAPABILITY, close_connection_docker, handle_docker_exec_event,
         handle_docker_log_chunk, handle_docker_log_closed, handle_docker_response,
@@ -26,6 +28,13 @@ use crate::{
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const MAX_AGENT_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_AGENT_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_STATUS_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_AGENT_ID_BYTES: usize = 128;
+const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Debug)]
 struct PendingHeartbeat {
@@ -108,8 +117,16 @@ pub async fn agent_socket(
                 match incoming {
                     Ok(Message::Text(text)) => {
                         last_inbound = Instant::now();
+                        if text.len() > MAX_AGENT_MESSAGE_BYTES {
+                            warn!(%instance_id, message_bytes = text.len(), "agent websocket text frame exceeded limit");
+                            break;
+                        }
                         match serde_json::from_str::<AgentInbound>(&text) {
                             Ok(message) => {
+                                if let Err(reason) = validate_agent_inbound(&message) {
+                                    warn!(%instance_id, %reason, "agent websocket message exceeded business limits");
+                                    break;
+                                }
                                 match message {
                                     AgentInbound::Pong { now } => {
                                         if let Some(sample) = accept_heartbeat_pong(
@@ -186,6 +203,135 @@ pub async fn agent_socket(
     close_connection_file_requests(&state, &instance_id, connection_id).await;
     close_connection_docker(&state, &instance_id, connection_id).await;
     info!(%instance_id, %connection_id, "agent websocket disconnected");
+}
+
+fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
+    let id = |value: &str| value.len() <= MAX_AGENT_ID_BYTES;
+    let status = |value: &str| value.len() <= MAX_STATUS_MESSAGE_BYTES;
+    match message {
+        AgentInbound::Pong { .. } => {}
+        AgentInbound::Metrics {
+            hostname,
+            os,
+            arch,
+            agent_version,
+            package_type,
+            native_arch,
+            docker_status,
+            ..
+        } => {
+            if hostname.len() > 255
+                || os.len() > 64
+                || arch.len() > 64
+                || agent_version.len() > 64
+                || package_type.as_ref().is_some_and(|value| value.len() > 64)
+                || native_arch.as_ref().is_some_and(|value| value.len() > 64)
+                || docker_status.as_ref().is_some_and(|value| {
+                    serde_json::to_vec(value)
+                        .map(|encoded| encoded.len() > MAX_STATUS_MESSAGE_BYTES)
+                        .unwrap_or(true)
+                })
+            {
+                return Err("metrics metadata too large");
+            }
+        }
+        AgentInbound::CommandResult { job_id, output, .. } => {
+            if !id(job_id) || output.len() > MAX_COMMAND_OUTPUT_BYTES {
+                return Err("command result too large");
+            }
+        }
+        AgentInbound::TerminalOpened { session_id }
+        | AgentInbound::DesktopOpened { session_id }
+        | AgentInbound::DockerExecOpened { session_id } => {
+            if !id(session_id) {
+                return Err("session identifier too large");
+            }
+        }
+        AgentInbound::TerminalOutput { session_id, data }
+        | AgentInbound::DockerExecOutput { session_id, data } => {
+            if !id(session_id) || data.len() > MAX_STREAM_CHUNK_BYTES {
+                return Err("stream output too large");
+            }
+        }
+        AgentInbound::TerminalClosed {
+            session_id, reason, ..
+        }
+        | AgentInbound::DockerExecClosed {
+            session_id, reason, ..
+        } => {
+            if !id(session_id) || reason.as_ref().is_some_and(|value| !status(value)) {
+                return Err("stream close message too large");
+            }
+        }
+        AgentInbound::DesktopClosed { session_id, reason } => {
+            if !id(session_id) || !status(reason) {
+                return Err("desktop close message too large");
+            }
+        }
+        AgentInbound::FileResponse {
+            request_id,
+            response,
+        } => {
+            if !id(request_id) || serialized_len_exceeds(response, MAX_AGENT_RESPONSE_BYTES) {
+                return Err("file response too large");
+            }
+        }
+        AgentInbound::DockerResponse {
+            request_id,
+            response,
+        } => {
+            if !id(request_id) || serialized_len_exceeds(response, MAX_AGENT_RESPONSE_BYTES) {
+                return Err("docker response too large");
+            }
+        }
+        AgentInbound::DockerLogChunk {
+            request_id,
+            data,
+            cursor,
+            ..
+        } => {
+            if !id(request_id)
+                || data.len() > MAX_STREAM_CHUNK_BYTES
+                || cursor.as_ref().is_some_and(|value| !status(value))
+            {
+                return Err("docker log chunk too large");
+            }
+        }
+        AgentInbound::DockerLogClosed { request_id, error } => {
+            if !id(request_id)
+                || error
+                    .as_ref()
+                    .is_some_and(|value| serialized_len_exceeds(value, MAX_STATUS_MESSAGE_BYTES))
+            {
+                return Err("docker log close message too large");
+            }
+        }
+        AgentInbound::UpdateStatus {
+            release_id,
+            artifact_id,
+            version,
+            retry_count,
+            status: update_status,
+            message,
+        } => {
+            if !id(release_id)
+                || !id(artifact_id)
+                || version.len() > 64
+                || !(0..=100).contains(retry_count)
+                || update_status.len() > 64
+                || message.as_ref().is_some_and(|value| !status(value))
+            {
+                return Err("update status too large");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn serialized_len_exceeds<T: serde::Serialize>(value: &T, max_bytes: usize) -> bool {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len() > max_bytes)
+        .unwrap_or(true)
 }
 
 async fn handle_agent_message(
@@ -393,6 +539,7 @@ async fn store_metrics(
     {
         return Ok(());
     }
+    let metric_timestamp = normalize_metric_timestamp(metrics.ts, now_ts())?;
     sqlx::query(
         r#"
         UPDATE instances
@@ -429,7 +576,7 @@ async fn store_metrics(
         "#,
     )
     .bind(instance_id)
-    .bind(metrics.ts)
+    .bind(metric_timestamp)
     .bind(metrics.cpu_percent)
     .bind(metrics.memory_used)
     .bind(metrics.memory_total)
@@ -494,6 +641,33 @@ mod tests {
         assert!(accept_heartbeat_pong(&mut pending, 41, sent_at).is_none());
         assert_eq!(pending.as_ref().map(|heartbeat| heartbeat.token), Some(42));
     }
+
+    #[test]
+    fn agent_inbound_business_limits_reject_oversized_outputs() {
+        let accepted = AgentInbound::TerminalOutput {
+            session_id: "session-1".to_string(),
+            data: "x".repeat(MAX_STREAM_CHUNK_BYTES),
+        };
+        assert!(validate_agent_inbound(&accepted).is_ok());
+
+        let oversized_stream = AgentInbound::TerminalOutput {
+            session_id: "session-1".to_string(),
+            data: "x".repeat(MAX_STREAM_CHUNK_BYTES + 1),
+        };
+        assert!(validate_agent_inbound(&oversized_stream).is_err());
+
+        let oversized_command = AgentInbound::CommandResult {
+            job_id: "job-1".to_string(),
+            exit_code: 0,
+            output: "x".repeat(MAX_COMMAND_OUTPUT_BYTES + 1),
+        };
+        assert!(validate_agent_inbound(&oversized_command).is_err());
+
+        let oversized_id = AgentInbound::DesktopOpened {
+            session_id: "x".repeat(MAX_AGENT_ID_BYTES + 1),
+        };
+        assert!(validate_agent_inbound(&oversized_id).is_err());
+    }
 }
 
 async fn send_terminal_event(
@@ -526,7 +700,14 @@ async fn send_terminal_event(
             .cloned()
     };
     if let Some(handle) = handle {
-        let _ = handle.tx.send(event);
+        if handle.tx.try_send(event).is_err() && !remove {
+            let mut sessions = state.terminal_sessions.write().await;
+            if sessions.get(session_id).is_some_and(|current| {
+                current.instance_id == instance_id && current.agent_connection_id == connection_id
+            }) {
+                sessions.remove(session_id);
+            }
+        }
     }
 }
 
@@ -536,7 +717,7 @@ async fn close_connection_terminals(state: &AppState, instance_id: &str, connect
         let matches =
             handle.instance_id == instance_id && handle.agent_connection_id == connection_id;
         if matches {
-            let _ = handle.tx.send(TerminalServerMessage::Closed {
+            let _ = handle.tx.try_send(TerminalServerMessage::Closed {
                 exit_code: None,
                 reason: Some("实例连接已断开".to_string()),
             });
@@ -549,6 +730,7 @@ pub async fn terminal_socket(
     state: AppState,
     instance_id: String,
     actor: String,
+    session_guard: AdminSessionGuard,
     socket: WebSocket,
 ) {
     let session_id = Uuid::new_v4().to_string();
@@ -577,7 +759,7 @@ pub async fn terminal_socket(
         error!(?error, "failed to create terminal session");
     }
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::channel(TERMINAL_EVENT_QUEUE_CAPACITY);
     state.terminal_sessions.write().await.insert(
         session_id.clone(),
         TerminalSessionHandle {
@@ -615,9 +797,21 @@ pub async fn terminal_socket(
         state.terminal_sessions.write().await.remove(&session_id);
         return;
     }
+    let authorization = session_guard.wait_until_invalid(state.clone());
+    tokio::pin!(authorization);
 
     loop {
         tokio::select! {
+            _ = &mut authorization => {
+                let _ = send_terminal_message(
+                    &mut sender,
+                    &TerminalServerMessage::Error {
+                        message: "管理员会话已失效".to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
             browser_message = receiver.next() => {
                 let Some(browser_message) = browser_message else {
                     break;

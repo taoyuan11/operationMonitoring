@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    auth::require_admin,
+    auth::{AdminSessionGuard, require_admin},
     db::{get_instance, write_action_log},
     error::{AppError, AppResult},
     models::{AgentOutbound, DesktopAgentWsQuery},
@@ -137,8 +137,16 @@ pub async fn admin_desktop_ws(
         ));
     }
 
+    let session_guard = admin.session_guard();
     Ok(ws.on_upgrade(move |socket| {
-        desktop_browser_socket(state, instance_id, admin.username, query.quality, socket)
+        desktop_browser_socket(
+            state,
+            instance_id,
+            admin.username,
+            session_guard,
+            query.quality,
+            socket,
+        )
     }))
 }
 
@@ -157,6 +165,7 @@ async fn desktop_browser_socket(
     state: AppState,
     instance_id: String,
     actor: String,
+    session_guard: AdminSessionGuard,
     quality: DesktopQuality,
     socket: WebSocket,
 ) {
@@ -286,10 +295,21 @@ async fn desktop_browser_socket(
     let mut helper_timeout = Box::pin(tokio::time::sleep(HELPER_JOIN_TIMEOUT));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let authorization = session_guard.wait_until_invalid(state.clone());
+    tokio::pin!(authorization);
     let mut reason = "browser_disconnected".to_string();
 
     loop {
         tokio::select! {
+            _ = &mut authorization => {
+                let _ = send_text(
+                    &mut sender,
+                    &json!({"type":"closed", "reason":"authorization_revoked"}).to_string(),
+                )
+                .await;
+                reason = "authorization_revoked".to_string();
+                break;
+            }
             incoming = receiver.next() => {
                 let Some(incoming) = incoming else { break; };
                 match incoming {

@@ -1,20 +1,25 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import { CircleAlert, X } from 'lucide-vue-next'
 
-withDefaults(defineProps<{
+const props = withDefaults(defineProps<{
   title: string
   message: string
   confirmLabel?: string
   tone?: 'warning' | 'danger'
+  confirmationText?: string
 }>(), {
   confirmLabel: '确认',
   tone: 'warning',
+  confirmationText: '',
 })
 
 defineEmits<{
   close: []
   confirm: []
 }>()
+
+const enteredConfirmation = ref('')
 </script>
 
 <template>
@@ -28,10 +33,24 @@ defineEmits<{
         <h2 id="confirm-title">{{ title }}</h2>
         <p id="confirm-message">{{ message }}</p>
       </div>
-      <div class="modal-actions">
-        <button class="text-button" type="button" autofocus @click="$emit('close')">取消</button>
-        <button :class="['confirm-button', tone]" type="button" @click="$emit('confirm')">{{ confirmLabel }}</button>
-      </div>
+      <label v-if="confirmationText" class="confirm-target-field">
+        <span>输入 <strong>{{ confirmationText }}</strong> 以确认目标</span>
+        <input
+          v-model="enteredConfirmation"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          autofocus
+        />
+      </label>
+      <form class="modal-actions" @submit.prevent="$emit('confirm')">
+        <button class="text-button" type="button" :autofocus="!confirmationText" @click="$emit('close')">取消</button>
+        <button
+          :class="['confirm-button', tone]"
+          type="submit"
+          :disabled="Boolean(props.confirmationText) && enteredConfirmation !== props.confirmationText"
+        >{{ confirmLabel }}</button>
+      </form>
     </section>
   </div>
 </template>

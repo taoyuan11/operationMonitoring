@@ -543,6 +543,11 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
     stop_and_delete_windows_service(SHORT_WINDOWS_SERVICE_NAME)?;
     copy_self(&binary)?;
     fs::create_dir_all(&data)?;
+    crate::windows_security::restrict_to_system_and_administrators(&data)?;
+    let identity_path = data.join("identity.json");
+    if identity_path.exists() {
+        crate::windows_security::restrict_to_system_and_administrators(&identity_path)?;
+    }
     private_file(
         data.join("install.json"),
         &serde_json::to_string_pretty(

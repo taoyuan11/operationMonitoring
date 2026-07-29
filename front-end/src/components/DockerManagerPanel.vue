@@ -143,6 +143,8 @@ const resourceRequests: Record<DockerView, number> = {
   system: 0,
 }
 let detailRequest = 0
+let composeValidationRequest = 0
+let composeActionValidationRequest = 0
 
 const createContainerForm = reactive({
   name: '',
@@ -247,6 +249,10 @@ watch(view, (_, previousView) => {
   void refreshCurrent()
 })
 watch(
+  () => createContainerForm.bindMounts,
+  () => { createContainerForm.confirmReadWriteBindMounts = false },
+)
+watch(
   () => props.instance.online,
   (online) => {
     if (!online) {
@@ -263,7 +269,11 @@ watch(
     () => composeForm.profiles,
     () => composeForm.services,
   ],
-  () => { composeValidation.value = null },
+  () => {
+    composeValidationRequest += 1
+    composeValidation.value = null
+    composeForm.confirmRisks = false
+  },
 )
 watch(
   [
@@ -273,6 +283,8 @@ watch(
     () => composeAction.services,
   ],
   () => {
+    composeActionValidationRequest += 1
+    composeActionValidationLoading.value = false
     composeActionValidation.value = null
     composeAction.confirmRisks = false
   },
@@ -719,12 +731,17 @@ function confirmDeleteVolume(volume: DockerVolume) {
 }
 
 async function validateCompose() {
+  const request = ++composeValidationRequest
   try {
     operationBusy.value = true
     errorMessage.value = ''
-    composeValidation.value = await validateDockerCompose(props.instance.id, composeRequest())
+    const validation = await validateDockerCompose(props.instance.id, composeRequest())
+    if (request === composeValidationRequest) {
+      composeValidation.value = validation
+      composeForm.confirmRisks = false
+    }
   } catch (error) {
-    errorMessage.value = errorText(error)
+    if (request === composeValidationRequest) errorMessage.value = errorText(error)
   } finally {
     operationBusy.value = false
   }
@@ -764,6 +781,8 @@ function openComposeAction(
   project: DockerComposeProject,
   action: 'pull' | 'up' | 'start' | 'stop' | 'restart' | 'down',
 ) {
+  composeActionValidationRequest += 1
+  composeActionValidationLoading.value = false
   Object.assign(composeAction, {
     project,
     action,
@@ -783,19 +802,24 @@ async function validateComposeProjectAction() {
     errorMessage.value = 'Compose 项目缺少可校验的主机配置文件路径'
     return
   }
+  const request = ++composeActionValidationRequest
   composeActionValidationLoading.value = true
   errorMessage.value = ''
   try {
-    composeActionValidation.value = await validateDockerCompose(props.instance.id, {
+    const validation = await validateDockerCompose(props.instance.id, {
       project_name: project.name,
       files: project.config_files,
       profiles: splitLines(composeAction.profiles),
       services: splitLines(composeAction.services),
     })
+    if (request === composeActionValidationRequest) {
+      composeActionValidation.value = validation
+      composeAction.confirmRisks = false
+    }
   } catch (error) {
-    errorMessage.value = errorText(error)
+    if (request === composeActionValidationRequest) errorMessage.value = errorText(error)
   } finally {
-    composeActionValidationLoading.value = false
+    if (request === composeActionValidationRequest) composeActionValidationLoading.value = false
   }
 }
 

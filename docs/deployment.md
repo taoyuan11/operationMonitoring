@@ -107,13 +107,15 @@ OM_ADMIN_PASSWORD=replace-with-a-long-random-bootstrap-password
 | --- | --- | --- |
 | `OM_DATABASE_URL` | 外部模式必填 | 仅由 `docker-compose.yml` 外部数据库模式读取；自带数据库文件固定使用 `postgres` 服务地址。 |
 | `OM_DATABASE_PASSWORD` | 两种模式均必填 | 自带模式用于初始化数据库；外部模式用于后端连接认证。 |
-| `OM_ADMIN_PASSWORD` | `admin123` | 仅在管理员表为空时用于一次性初始化；生产首次启动前必须替换。 |
+| `OM_ADMIN_PASSWORD` | 必填，无默认值 | 至少 16 字节，仅在管理员表为空时用于一次性初始化；Compose 启动时始终要求提供。 |
 | `POSTGRES_IMAGE` | `postgres:16-alpine` | 自带数据库镜像。不要在已有数据卷上直接跨大版本升级。 |
 | `POSTGRES_DB` | `operation_monitoring` | 自带数据库首次初始化的数据库名。 |
 | `POSTGRES_USER` | `operation_monitoring` | 自带数据库首次初始化的用户。 |
 | `OM_SECURE_COOKIES` | `false` | HTTPS/WSS 对外服务必须设为 `true`；本地 HTTP 调试保持 `false`。 |
+| `OM_TRUST_PROXY_HEADERS` | Compose 固定为 `true` | 登录限流使用代理传入的 `X-Real-IP`；仅可在后端无法被绕过代理直连时启用。 |
+| `OM_ALLOW_LEGACY_AGENT_WS_AUTH` | `false` | 仅在把旧 Agent 升级到 `0.1.19` 的维护窗口临时接受查询串认证。 |
 | `FRONTEND_PORT` | `13501` | 宿主机到前端容器 80 端口的映射。可写成 `127.0.0.1:13501`。 |
-| `BACKEND_PORT` | `13500` | 宿主机到后端容器 13500 端口的映射。生产可写成 `127.0.0.1:13500`。 |
+| `BACKEND_PORT` | `13500` | 后端仅映射到宿主机 `127.0.0.1`，供本机受控代理或诊断使用；远程 Agent 应连接前端代理地址。 |
 | `OM_AGENT_PACKAGE_MAX_BYTES` | `268435456` | 单个 Agent 更新包上限，默认 256 MiB。 |
 | `OM_FILE_TRANSFER_MAX_BYTES` | `1073741824` | 单个实例文件传输上限，默认 1 GiB。 |
 | `NGINX_CLIENT_MAX_BODY_SIZE` | `1g` | 前端 Nginx 请求体上限，必须不小于两个后端文件限制中的较大值。 |
@@ -158,11 +160,14 @@ docker compose -f docker-compose.with-db.yml logs -f
 
 ```dotenv
 FRONTEND_PORT=127.0.0.1:13501
-BACKEND_PORT=127.0.0.1:13500
+BACKEND_PORT=13500
 OM_SECURE_COOKIES=true
 ```
 
-反向代理必须把 HTTP、上传请求和 WebSocket 一起转发到 `http://127.0.0.1:13501`，保留原始 `Host`，并传递 `Upgrade`/`Connection` 标头。下面是 Nginx 主机配置的最小示例；证书路径和域名按实际环境替换：
+反向代理应把 `/api/` 和 `/uploads/` 直接转发到回环地址上的后端，将其他请求转发
+到前端。这样后端既能获得代理覆盖写入的真实客户端地址，又不会暴露受信任代理头
+接口。WebSocket 必须保留原始 `Host` 并传递 `Upgrade`/`Connection` 标头。下面是
+Nginx 主机配置的最小示例；证书路径和域名按实际环境替换：
 
 ```nginx
 map $http_upgrade $connection_upgrade {
@@ -178,8 +183,8 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/monitor.example.com/privkey.pem;
     client_max_body_size 1g;
 
-    location / {
-        proxy_pass http://127.0.0.1:13501;
+    location /api/ {
+        proxy_pass http://127.0.0.1:13500;
         proxy_http_version 1.1;
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -192,10 +197,27 @@ server {
         proxy_read_timeout 604800s;
         proxy_send_timeout 604800s;
     }
+
+    location /uploads/ {
+        proxy_pass http://127.0.0.1:13500;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_request_buffering off;
+        proxy_buffering off;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:13501;
+        proxy_set_header Host $http_host;
+    }
 }
 ```
 
-外部代理的 `client_max_body_size` 必须不小于 `NGINX_CLIENT_MAX_BODY_SIZE`。前端容器内部已经为 API 和上传关闭缓冲并配置长 WebSocket 超时，但外部代理仍必须保留这些设置。HTTPS 和 Cookie 配置修改后重新创建后端与前端容器：
+外部代理的 `client_max_body_size` 必须不小于 `NGINX_CLIENT_MAX_BODY_SIZE`，API 和上传
+路径也必须保持关闭缓冲及长 WebSocket 超时。HTTPS 和 Cookie 配置修改后重新创建
+后端与前端容器：
 
 ```bash
 docker compose -f docker-compose.with-db.yml up -d --force-recreate backend frontend
@@ -298,6 +320,18 @@ detached HEAD 方式切换到该版本。随后脚本拉取仅使用镜像的服
 文件上传和更新包下载。回滚代码前应确认新版本没有不可逆的数据结构变化；必要时先恢复升级前
 的 PostgreSQL 备份，再检出旧 TAG 并使用相同 Compose 文件重新构建镜像。
 
+### Agent 0.1.19 认证迁移
+
+Agent `0.1.19` 开始把 WebSocket 实例密钥放入 `Authorization` 请求头。升级包含该
+变更的后端时，旧 Agent 默认会被拒绝。要使用控制台自动更新完成滚动迁移：
+
+1. 在 `.env` 临时设置 `OM_ALLOW_LEGACY_AGENT_WS_AUTH=true`，升级并重建后端。
+2. 在控制台发布 `0.1.19` 或更高版本的各平台 Agent，让所有在线实例完成更新并重新连接。
+3. 确认实例版本和在线状态后，将该变量恢复为 `false`，再次重建后端。
+4. 检查后端不再出现旧查询串认证弃用警告，并按日志保留策略清理维护窗口中的代理访问日志。
+
+此开关不会回退新版 Agent；它只为旧连接增加临时兼容路径。不要长期启用。
+
 ## 9. 管理员认证恢复
 
 如果唯一管理员丢失所有 Authenticator，必须先停止正常后端，再使用同一 Compose 配置执行显式重置：
@@ -376,7 +410,8 @@ docker compose -f docker-compose.with-db.yml logs --tail=200 frontend
 docker compose -f docker-compose.with-db.yml up -d
 ```
 
-如果只希望本机反向代理访问，使用 `FRONTEND_PORT=127.0.0.1:13501` 和 `BACKEND_PORT=127.0.0.1:13500`。
+如果只希望本机反向代理访问，使用 `FRONTEND_PORT=127.0.0.1:13501`。
+`BACKEND_PORT` 只接受端口号，Compose 始终把它绑定到 `127.0.0.1`。
 
 ## 12. 停止和卸载
 

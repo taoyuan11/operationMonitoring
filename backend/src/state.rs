@@ -20,9 +20,11 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
-    pub admin_password: String,
+    pub admin_password: Option<String>,
     pub auth_cipher: Arc<AuthCipher>,
     pub secure_cookies: bool,
+    pub trust_proxy_headers: bool,
+    pub allow_legacy_agent_ws_auth: bool,
     pub upload_dir: PathBuf,
     pub update_dir: PathBuf,
     pub agent_package_max_bytes: usize,
@@ -48,6 +50,8 @@ impl AppState {
             admin_password: cli.admin_password,
             auth_cipher: Arc::new(auth_cipher),
             secure_cookies: cli.secure_cookies,
+            trust_proxy_headers: cli.trust_proxy_headers,
+            allow_legacy_agent_ws_auth: cli.allow_legacy_agent_ws_auth,
             upload_dir: cli.upload_dir,
             update_dir: cli.update_dir,
             agent_package_max_bytes: cli.agent_package_max_bytes,
@@ -73,7 +77,9 @@ pub struct AdminSession {
     pub user_id: String,
     pub username: String,
     pub device_id: String,
+    pub login_totp_counter: Option<i64>,
     pub expires_at: i64,
+    pub revoked_tx: watch::Sender<bool>,
 }
 
 #[derive(Clone, Default)]
@@ -96,7 +102,7 @@ pub struct AgentHandle {
 pub struct TerminalSessionHandle {
     pub instance_id: String,
     pub agent_connection_id: Uuid,
-    pub tx: mpsc::UnboundedSender<TerminalServerMessage>,
+    pub tx: mpsc::Sender<TerminalServerMessage>,
 }
 
 #[derive(Debug)]

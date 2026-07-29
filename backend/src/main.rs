@@ -30,7 +30,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use clap::Parser;
-use config::Cli;
+use config::{Cli, validate_bootstrap_password};
 use db::{cleanup_loop, connect_db, init_db};
 use error::AppResult;
 use files::{
@@ -49,7 +49,7 @@ use remote_desktop::{admin_desktop_ws, agent_desktop_ws, ensure_same_origin};
 use state::AppState;
 use std::{io::ErrorKind, path::Path};
 use tower_http::{cors::CorsLayer, services::ServeDir};
-use tracing::{info, warn};
+use tracing::info;
 use updates::{
     admin_agent_releases, admin_agent_update_attempts, admin_create_agent_release,
     admin_delete_agent_artifact, admin_delete_agent_release, admin_publish_agent_release,
@@ -89,8 +89,13 @@ async fn main() -> anyhow::Result<()> {
     let initialized: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_users")
         .fetch_one(&db)
         .await?;
-    if initialized == 0 && cli.admin_password == "admin123" {
-        warn!("using default bootstrap password; set OM_ADMIN_PASSWORD before initialization");
+    if initialized == 0 {
+        let bootstrap_password = cli.admin_password.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "OM_ADMIN_PASSWORD must be set before administrator authentication is initialized"
+            )
+        })?;
+        validate_bootstrap_password(bootstrap_password)?;
     }
     if initialized > 0 && cli.auth_secret_key.is_none() && !cli.auth_key_file.exists() {
         anyhow::bail!(
@@ -113,7 +118,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/bootstrap/enrollments/{id}/confirm",
             post(bootstrap_confirm),
         )
-        .route("/api/admin/login", post(admin_login))
+        .route(
+            "/api/admin/login",
+            post(admin_login).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         .route("/api/admin/logout", post(admin_logout))
         .route("/api/admin/me", get(admin_me))
         .route("/api/admin/users", get(admin_users))
@@ -235,8 +243,14 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/agent-update-attempts/{attempt_id}/retry",
             post(admin_retry_agent_update),
         )
-        .route("/api/agent/register", post(agent_register))
-        .route("/api/agent/report", post(agent_report))
+        .route(
+            "/api/agent/register",
+            post(agent_register).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/api/agent/report",
+            post(agent_report).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
         .route("/api/agent/ws", get(agent_ws))
         .route("/api/agent/desktop/ws", get(agent_desktop_ws))
         .route("/api/agent/update/manifest", get(agent_update_manifest))
@@ -268,7 +282,11 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!("backend listening on http://{}", bind);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

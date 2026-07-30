@@ -18,6 +18,9 @@ services:
       start_period: 10s
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    networks:
+      default:
+        ipv4_address: ${OM_POSTGRES_IP:-172.30.135.2}
     restart: unless-stopped
 
   backend:
@@ -30,20 +33,26 @@ services:
       OM_BIND: 0.0.0.0:13500
       OM_DATABASE_URL: postgresql://${POSTGRES_USER:-operation_monitoring}@postgres:5432/${POSTGRES_DB:-operation_monitoring}
       OM_DATABASE_PASSWORD: ${OM_DATABASE_PASSWORD:?set OM_DATABASE_PASSWORD}
-      OM_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:-admin123}
+      OM_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:?set OM_ADMIN_PASSWORD to a long random bootstrap password}
       OM_AUTH_KEY_FILE: /app/db/auth-secret.key
       OM_SECURE_COOKIES: ${OM_SECURE_COOKIES:-false}
+      OM_TRUST_PROXY_HEADERS: ${OM_TRUST_PROXY_HEADERS:-true}
+      OM_TRUSTED_PROXY_CIDRS: "${OM_TRUSTED_PROXY_CIDRS:-172.30.135.3/32}"
+      OM_ALLOW_LEGACY_AGENT_WS_AUTH: ${OM_ALLOW_LEGACY_AGENT_WS_AUTH:-false}
       OM_UPLOAD_DIR: /app/uploads
       OM_UPDATE_DIR: /app/updates
       OM_AGENT_PACKAGE_MAX_BYTES: ${OM_AGENT_PACKAGE_MAX_BYTES:-268435456}
       OM_FILE_TRANSFER_MAX_BYTES: ${OM_FILE_TRANSFER_MAX_BYTES:-1073741824}
       RUST_LOG: ${RUST_LOG:-backend=info,tower_http=info}
     ports:
-      - "${BACKEND_PORT:-13500}:13500"
+      - "127.0.0.1:${BACKEND_PORT:-13500}:13500"
     volumes:
       - backend-db:/app/db
       - backend-uploads:/app/uploads
       - backend-updates:/app/updates
+    networks:
+      default:
+        ipv4_address: ${OM_BACKEND_IP:-172.30.135.4}
     restart: unless-stopped
 
   frontend:
@@ -56,6 +65,9 @@ services:
       NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-1g}
     ports:
       - "${FRONTEND_PORT:-13501}:80"
+    networks:
+      default:
+        ipv4_address: ${OM_FRONTEND_PROXY_IP:-172.30.135.3}
     restart: unless-stopped
 
 volumes:
@@ -63,3 +75,9 @@ volumes:
   backend-db:
   backend-uploads:
   backend-updates:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${OM_COMPOSE_NETWORK_CIDR:-172.30.135.0/24}

@@ -1,10 +1,14 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use reqwest::{Url, redirect::Policy};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+};
 
 use crate::{
     activity::ActivityTracker,
@@ -52,9 +56,12 @@ pub async fn agent_ws_loop(
     identity: Identity,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    #[cfg(windows)]
+    let mut identity = identity;
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(30))
+        .redirect(agent_redirect_policy())
         .build()?;
     let activity = ActivityTracker::default();
     let update_manager = match UpdateManager::new(
@@ -75,15 +82,32 @@ pub async fn agent_ws_loop(
             _ = shutdown_requested(&mut shutdown) => return Ok(()),
             registration = register_once(&config, &identity, &http_client) => registration,
         };
-        match registration {
-            Ok(response) if response.disabled => {
+        let response = match registration {
+            Ok(response) => {
+                #[cfg(windows)]
+                crate::identity::complete_secret_rotation(
+                    config.identity_file.clone(),
+                    &mut identity,
+                )?;
+                response
+            }
+            Err(error) => {
+                crate::logging::error(format_args!("register before websocket failed: {error:#}"));
+                if wait_or_shutdown(Duration::from_secs(10), &mut shutdown).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        match response {
+            response if response.disabled => {
                 crate::logging::info(format_args!("websocket paused: instance disabled"));
                 if wait_or_shutdown(Duration::from_secs(10), &mut shutdown).await {
                     return Ok(());
                 }
                 continue;
             }
-            Ok(response) if !response.approved => {
+            response if !response.approved => {
                 crate::logging::info(format_args!(
                     "websocket waiting for approval: {}",
                     response.message
@@ -93,17 +117,10 @@ pub async fn agent_ws_loop(
                 }
                 continue;
             }
-            Ok(_) => {}
-            Err(error) => {
-                crate::logging::error(format_args!("register before websocket failed: {error:#}"));
-                if wait_or_shutdown(Duration::from_secs(10), &mut shutdown).await {
-                    return Ok(());
-                }
-                continue;
-            }
+            _ => {}
         }
 
-        let url = websocket_url(&config.server, &identity);
+        let request = websocket_request(&config.server, &identity)?;
         crate::logging::info(format_args!(
             "connecting websocket for instance {}",
             identity.instance_id
@@ -111,7 +128,7 @@ pub async fn agent_ws_loop(
         let connection = tokio::select! {
             biased;
             _ = shutdown_requested(&mut shutdown) => return Ok(()),
-            connection = connect_async(&url) => connection,
+            connection = connect_async(request) => connection,
         };
         match connection {
             Ok((stream, _)) => {
@@ -140,6 +157,29 @@ pub async fn agent_ws_loop(
             return Ok(());
         }
     }
+}
+
+fn agent_redirect_policy() -> Policy {
+    Policy::custom(|attempt| {
+        if attempt.previous().len() > 10 {
+            return attempt.error("too many agent HTTP redirects");
+        }
+        if attempt
+            .previous()
+            .first()
+            .is_some_and(|origin| same_origin(origin, attempt.url()))
+        {
+            attempt.follow()
+        } else {
+            attempt.error("cross-origin agent HTTP redirect refused")
+        }
+    })
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 async fn handle_agent_socket(
@@ -565,7 +605,10 @@ fn spawn_update_task(
     }
 }
 
-fn websocket_url(server: &str, identity: &Identity) -> String {
+fn websocket_request(
+    server: &str,
+    identity: &Identity,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     let trimmed = server.trim_end_matches('/');
     let base = if let Some(rest) = trimmed.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -582,10 +625,19 @@ fn websocket_url(server: &str, identity: &Identity) -> String {
         capabilities.push(DOCKER_CAPABILITY);
     }
     let capabilities = capabilities.join(",");
-    format!(
-        "{base}/api/agent/ws?instance_id={}&secret={}&capabilities={capabilities}",
-        identity.instance_id, identity.secret
-    )
+    let url = format!(
+        "{base}/api/agent/ws?instance_id={}&capabilities={capabilities}",
+        identity.instance_id
+    );
+    let mut request = url
+        .into_client_request()
+        .context("invalid agent websocket URL")?;
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {}", identity.secret))
+            .context("invalid agent authentication secret")?,
+    );
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -593,18 +645,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn websocket_url_advertises_file_manager_capability() {
-        let url = websocket_url(
+    fn websocket_request_keeps_secret_out_of_url_and_advertises_capabilities() {
+        let request = websocket_request(
             "https://monitor.example/",
             &Identity {
                 instance_id: "instance-1".to_string(),
                 secret: "secret-1".to_string(),
+                credential_version: 1,
+                previous_secret: None,
             },
-        );
+        )
+        .unwrap();
+        let url = request.uri().to_string();
         assert!(url.starts_with(
-            "wss://monitor.example/api/agent/ws?instance_id=instance-1&secret=secret-1&capabilities=file_manager_v1"
+            "wss://monitor.example/api/agent/ws?instance_id=instance-1&capabilities=file_manager_v1"
         ));
+        assert!(!url.contains("secret-1"));
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer secret-1"
+        );
         assert_eq!(url.contains(DESKTOP_CAPABILITY), cfg!(windows));
         assert_eq!(url.contains(DOCKER_CAPABILITY), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn authenticated_http_redirects_stay_on_the_original_origin() {
+        let origin = Url::parse("https://monitor.example/api/agent/update/manifest").unwrap();
+        assert!(same_origin(
+            &origin,
+            &Url::parse("https://monitor.example:443/other").unwrap()
+        ));
+        assert!(!same_origin(
+            &origin,
+            &Url::parse("https://downloads.example/package").unwrap()
+        ));
+        assert!(!same_origin(
+            &origin,
+            &Url::parse("https://monitor.example:8443/package").unwrap()
+        ));
+        assert!(!same_origin(
+            &origin,
+            &Url::parse("http://monitor.example/package").unwrap()
+        ));
     }
 }

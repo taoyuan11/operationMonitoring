@@ -1,6 +1,6 @@
 [package]
 name = "instanceEnd"
-version = "0.1.18"
+version = "0.1.20"
 edition = "2024"
 rust-version = "1.89"
 
@@ -42,6 +42,7 @@ windows = { version = "0.52", features = [
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Environment",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",

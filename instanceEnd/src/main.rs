@@ -15,6 +15,8 @@ mod remote_desktop;
 mod terminal;
 mod time;
 mod update;
+#[cfg(windows)]
+mod windows_security;
 mod ws;
 
 use anyhow::{Context, Result, bail};

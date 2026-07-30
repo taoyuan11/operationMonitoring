@@ -543,6 +543,11 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
     stop_and_delete_windows_service(SHORT_WINDOWS_SERVICE_NAME)?;
     copy_self(&binary)?;
     fs::create_dir_all(&data)?;
+    crate::windows_security::restrict_to_system_and_administrators(&data)?;
+    let identity_path = data.join("identity.json");
+    if identity_path.exists() {
+        crate::windows_security::restrict_to_system_and_administrators(&identity_path)?;
+    }
     private_file(
         data.join("install.json"),
         &serde_json::to_string_pretty(
@@ -1003,14 +1008,7 @@ fn windows_runas(action: &str, c: Option<&AgentConfig>) -> Result<()> {
         s.encode_wide().chain(Some(0)).collect()
     }
     let exe = wide(env::current_exe()?.as_os_str());
-    let args = if let Some(c) = c {
-        format!(
-            "{action} --yes --non-interactive --server \"{}\" --report-interval {}",
-            c.server, c.report_interval
-        )
-    } else {
-        format!("{action} --yes")
-    };
+    let args = windows_elevation_arguments(action, c);
     let verb = wide(OsStr::new("runas"));
     let args = wide(OsStr::new(&args));
     let mut info = SHELLEXECUTEINFOW {
@@ -1038,6 +1036,18 @@ fn windows_runas(action: &str, c: Option<&AgentConfig>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_elevation_arguments(action: &str, c: Option<&AgentConfig>) -> String {
+    if let Some(c) = c {
+        format!(
+            "{action} --yes --non-interactive --server \"{}\" --report-interval {} --log-max-bytes {} --log-history {}",
+            c.server, c.report_interval, c.log_max_bytes, c.log_history
+        )
+    } else {
+        format!("{action} --yes")
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -1069,7 +1079,11 @@ const MACOS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUB
 mod tests {
     #[cfg(windows)]
     use super::install_windows_command_entry;
-    use super::{migrate_path, update_windows_path, windows_command_paths_from_root};
+    use super::{
+        migrate_path, update_windows_path, windows_command_paths_from_root,
+        windows_elevation_arguments,
+    };
+    use crate::config::AgentConfig;
     use std::fs;
 
     #[test]
@@ -1096,6 +1110,25 @@ mod tests {
         );
         assert!(!legacy.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_elevation_preserves_log_rotation_options() {
+        let config = AgentConfig {
+            server: "https://monitor.example".to_string(),
+            identity_file: None,
+            report_interval: 9,
+            state_dir: None,
+            log_file: None,
+            log_max_bytes: 2_048,
+            log_history: 7,
+            update_dir: None,
+        };
+
+        assert_eq!(
+            windows_elevation_arguments("install", Some(&config)),
+            "install --yes --non-interactive --server \"https://monitor.example\" --report-interval 9 --log-max-bytes 2048 --log-history 7"
+        );
     }
 
     #[test]

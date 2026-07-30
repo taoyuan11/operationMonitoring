@@ -13,6 +13,8 @@ pub struct HealthResponse {
 pub struct AgentRegisterRequest {
     pub instance_id: String,
     pub secret: String,
+    #[serde(default)]
+    pub previous_secret: Option<String>,
     pub hostname: String,
     pub os: String,
     pub arch: String,
@@ -595,7 +597,8 @@ pub struct ListQuery {
 #[derive(Deserialize)]
 pub struct AgentWsQuery {
     pub instance_id: String,
-    pub secret: String,
+    #[serde(default)]
+    pub secret: Option<String>,
     #[serde(default)]
     pub capabilities: Option<String>,
 }

@@ -15,7 +15,7 @@ Keep protocol or model changes synchronized across the backend, agent, and front
 Run commands from the relevant module directory:
 
 ```bash
-cd backend && OM_ADMIN_PASSWORD=admin123 cargo run  # API on :13500
+cd backend && OM_ADMIN_PASSWORD=development-bootstrap-password cargo run  # API on :13500
 cd instanceEnd && cargo run -- log --server http://127.0.0.1:13500
 cd front-end && pnpm install && pnpm dev             # Vite dev server
 ```

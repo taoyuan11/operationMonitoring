@@ -6,12 +6,18 @@ use serde::{Deserialize, Serialize};
 pub struct Identity {
     pub instance_id: String,
     pub secret: String,
+    #[serde(default)]
+    pub credential_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentRegisterRequest {
     pub instance_id: String,
     pub secret: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_secret: Option<String>,
     pub hostname: String,
     pub os: String,
     pub arch: String,

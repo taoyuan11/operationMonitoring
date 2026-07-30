@@ -17,6 +17,7 @@ pub async fn register_once(
     let payload = AgentRegisterRequest {
         instance_id: identity.instance_id.clone(),
         secret: identity.secret.clone(),
+        previous_secret: identity.previous_secret.clone(),
         hostname: profile.hostname,
         os: profile.os,
         arch: profile.arch,

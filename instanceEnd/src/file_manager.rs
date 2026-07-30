@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -10,9 +10,12 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -28,6 +31,8 @@ use crate::{
 pub const CAPABILITY: &str = "file_manager_v1";
 pub const CHUNK_SIZE: usize = 256 * 1024;
 const TRANSFER_WINDOW: usize = 4;
+const MAX_CONTROL_REQUESTS: usize = 4;
+const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 const FRAME_KIND_FILE_CHUNK_V1: u8 = 1;
 const FRAME_HEADER_BYTES: usize = 1 + 16 + 8;
 
@@ -35,6 +40,7 @@ pub struct FileManager {
     outbound: mpsc::UnboundedSender<AgentInbound>,
     binary_outbound: mpsc::Sender<Vec<u8>>,
     activity: ActivityTracker,
+    control_slots: Arc<Semaphore>,
     transfers: HashMap<String, ActiveTransfer>,
 }
 
@@ -92,6 +98,7 @@ impl FileManager {
             outbound,
             binary_outbound,
             activity,
+            control_slots: Arc::new(Semaphore::new(MAX_CONTROL_REQUESTS)),
             transfers: HashMap::new(),
         }
     }
@@ -203,6 +210,14 @@ impl FileManager {
     }
 
     fn spawn_control_request(&self, request_id: String, request: FileRequest) {
+        let Ok(permit) = self.control_slots.clone().try_acquire_owned() else {
+            send_failure(
+                &self.outbound,
+                &request_id,
+                FileFailure::new(FileErrorCode::Busy, "文件操作并发数已达到上限，请稍后再试"),
+            );
+            return;
+        };
         let Some(activity_guard) = self.activity.try_enter() else {
             send_failure(
                 &self.outbound,
@@ -213,6 +228,7 @@ impl FileManager {
         };
         let outbound = self.outbound.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let result =
                 tokio::task::spawn_blocking(move || execute_control_request(request)).await;
             drop(activity_guard);
@@ -413,6 +429,15 @@ fn filesystem_roots() -> Vec<FileSystemRoot> {
 }
 
 fn list_directory(path: &str, offset: u64, limit: u64) -> Result<FileListing, FileFailure> {
+    list_directory_with_entry_limit(path, offset, limit, MAX_DIRECTORY_ENTRIES)
+}
+
+fn list_directory_with_entry_limit(
+    path: &str,
+    offset: u64,
+    limit: u64,
+    max_entries: usize,
+) -> Result<FileListing, FileFailure> {
     let path = absolute_path(path)?;
     let metadata = fs::metadata(&path).map_err(|error| io_failure(error, "读取目录失败"))?;
     if !metadata.is_dir() {
@@ -422,13 +447,17 @@ fn list_directory(path: &str, offset: u64, limit: u64) -> Result<FileListing, Fi
         ));
     }
 
-    let mut entries = fs::read_dir(&path)
-        .map_err(|error| io_failure(error, "读取目录失败"))?
-        .map(|entry| {
-            let entry = entry.map_err(|error| io_failure(error, "读取目录项失败"))?;
-            file_entry(entry.path())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&path).map_err(|error| io_failure(error, "读取目录失败"))? {
+        let entry = entry.map_err(|error| io_failure(error, "读取目录项失败"))?;
+        if entries.len() >= max_entries {
+            return Err(FileFailure::new(
+                FileErrorCode::TooLarge,
+                format!("目录条目数超过安全上限 {max_entries}"),
+            ));
+        }
+        entries.push(file_entry(entry.path())?);
+    }
     entries.sort_by(|left, right| {
         entry_sort_rank(&left.kind)
             .cmp(&entry_sort_rank(&right.kind))
@@ -565,7 +594,12 @@ fn move_path(
         fs::rename(&destination, backup)
             .map_err(|error| io_failure(error, "准备覆盖目标文件失败"))?;
     }
-    if let Err(error) = fs::rename(&source, &destination) {
+    let rename_result = if overwrite {
+        fs::rename(&source, &destination)
+    } else {
+        rename_without_replacement(&source, &destination)
+    };
+    if let Err(error) = rename_result {
         if let Some(backup) = &backup {
             let _ = fs::rename(backup, &destination);
         }
@@ -736,11 +770,18 @@ async fn commit_upload(
             .await
             .map_err(|error| io_failure(error, "准备覆盖目标文件失败"))?;
     }
-    if let Err(error) = tokio::fs::rename(temporary, target).await {
+    let rename_result = if overwrite {
+        tokio::fs::rename(temporary, target)
+            .await
+            .map_err(rename_failure)
+    } else {
+        rename_without_replacement_async(temporary, target).await
+    };
+    if let Err(error) = rename_result {
         if let Some(backup) = &backup {
             let _ = tokio::fs::rename(backup, target).await;
         }
-        return Err(rename_failure(error));
+        return Err(error);
     }
     if let Some(backup) = &backup {
         let _ = tokio::fs::remove_file(backup).await;
@@ -910,6 +951,78 @@ fn absolute_path(value: &str) -> Result<PathBuf, FileFailure> {
     Ok(path)
 }
 
+async fn rename_without_replacement_async(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), FileFailure> {
+    let source = source.to_owned();
+    let destination = destination.to_owned();
+    tokio::task::spawn_blocking(move || rename_without_replacement(&source, &destination))
+        .await
+        .map_err(|error| {
+            FileFailure::new(
+                FileErrorCode::Io,
+                format!("无覆盖移动任务异常结束：{error}"),
+            )
+        })?
+        .map_err(rename_failure)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn path_to_c_string(path: &Path) -> io::Result<CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "path contains a null byte"))
+}
+
+#[cfg(target_os = "linux")]
+fn rename_without_replacement(source: &Path, destination: &Path) -> io::Result<()> {
+    let source = path_to_c_string(source)?;
+    let destination = path_to_c_string(destination)?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_without_replacement(source: &Path, destination: &Path) -> io::Result<()> {
+    let source = path_to_c_string(source)?;
+    let destination = path_to_c_string(destination)?;
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_without_replacement(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn rename_without_replacement(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "atomic no-replace rename is unsupported on this platform",
+    ))
+}
+
 fn require_directory(value: &str) -> Result<PathBuf, FileFailure> {
     let path = absolute_path(value)?;
     let metadata = fs::metadata(&path).map_err(|error| io_failure(error, "读取目录失败"))?;
@@ -1071,6 +1184,47 @@ mod tests {
     }
 
     #[test]
+    fn rejects_directory_listings_above_the_entry_limit() {
+        let root = test_directory();
+        for name in ["one", "two", "three"] {
+            fs::write(root.join(name), b"data").unwrap();
+        }
+
+        let error = list_directory_with_entry_limit(root.to_str().unwrap(), 0, 200, 2)
+            .expect_err("listing should stop once the entry limit is exceeded");
+
+        assert_eq!(error.code, FileErrorCode::TooLarge);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_control_requests_when_all_slots_are_in_use() {
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        let (binary_tx, _binary_rx) = mpsc::channel(1);
+        let manager = FileManager::new(outbound_tx, binary_tx, ActivityTracker::default());
+        let _permits = (0..MAX_CONTROL_REQUESTS)
+            .map(|_| manager.control_slots.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+
+        manager.spawn_control_request("busy-request".to_string(), FileRequest::Roots);
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            message,
+            AgentInbound::FileResponse {
+                request_id,
+                response: FileResponse::Error {
+                    code: FileErrorCode::Busy,
+                    ..
+                },
+            } if request_id == "busy-request"
+        ));
+    }
+
+    #[test]
     fn refuses_root_deletion_and_directory_overwrite() {
         let root_path = filesystem_roots().remove(0).path;
         assert_eq!(
@@ -1099,6 +1253,22 @@ mod tests {
             .code,
             FileErrorCode::AlreadyExists
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_replace_rename_preserves_a_destination_created_after_preflight() {
+        let root = test_directory();
+        let source = root.join("source.txt");
+        let destination = root.join("destination.txt");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"destination").unwrap();
+
+        let error = rename_without_replacement(&source, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&destination).unwrap(), b"destination");
         fs::remove_dir_all(root).unwrap();
     }
 

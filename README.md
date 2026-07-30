@@ -105,7 +105,7 @@ PostgreSQL 默认只在 Compose 网络内开放。需要使用已有或托管 Po
 cd backend
 OM_DATABASE_URL='postgresql://operation_monitoring@127.0.0.1:5432/operation_monitoring' \
 OM_DATABASE_PASSWORD='<数据库密码>' \
-OM_ADMIN_PASSWORD=admin123 \
+OM_ADMIN_PASSWORD='development-bootstrap-password' \
 cargo run
 ```
 
@@ -116,6 +116,8 @@ cd front-end
 pnpm install
 pnpm dev
 ```
+
+开发服务器仅监听 `127.0.0.1`，默认访问地址为 `http://127.0.0.1:5173`。需要从其他设备调试时，应通过受控反向代理访问，不要将带管理能力的开发服务器直接暴露到公网。
 
 构建并在后台启动实例端：
 
@@ -370,10 +372,13 @@ Windows 路径含空格时需要加引号，例如 `om-agent update "C:\Temp\om-
 OM_BIND=127.0.0.1:13500
 OM_DATABASE_URL=postgresql://operation_monitoring@127.0.0.1:5432/operation_monitoring
 OM_DATABASE_PASSWORD=<数据库密码>
-OM_ADMIN_PASSWORD=admin123
+OM_ADMIN_PASSWORD=<至少16字节的随机初始化密码>
 OM_AUTH_KEY_FILE=auth/auth-secret.key
 # OM_AUTH_SECRET_KEY=<Base64 编码的 32 字节主密钥>
 OM_SECURE_COOKIES=false
+OM_TRUST_PROXY_HEADERS=false
+OM_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
+OM_ALLOW_LEGACY_AGENT_WS_AUTH=false
 OM_UPLOAD_DIR=uploads
 OM_UPDATE_DIR=updates
 OM_AGENT_PACKAGE_MAX_BYTES=268435456
@@ -388,9 +393,27 @@ OM_FILE_TRANSFER_MAX_BYTES=1073741824
 
 上述 URL 是后端进程直接启动时的默认值。`docker-compose.with-db.yml` 会自动改用 Compose 内网中的 `postgres` 服务；外部数据库用的 `docker-compose.yml` 则要求显式设置 `OM_DATABASE_URL` 和 `OM_DATABASE_PASSWORD`，避免错误连接到后端容器自身或使用空密码。
 
-`OM_ADMIN_PASSWORD` 仅在管理员表为空时有效，完成首位管理员绑定后即使仍保留该
-变量也会被忽略。`OM_SECURE_COOKIES` 在 HTTPS/WSS 生产部署中应设为 `true`；
+`OM_ADMIN_PASSWORD` 在管理员表为空时必须显式设置且至少包含 16 字节，且不能保留
+`.env.example` 中公开的占位值；完成首位管理员绑定后，直接启动后端时可以移除该变量。
+Compose 为避免误用始终要求提供它。
+`OM_SECURE_COOKIES` 在 HTTPS/WSS 生产部署中应设为 `true`；
 直接使用 HTTP 本地开发时保持 `false`。会话固定有效 7 天，后端重启会要求重新登录。
+
+`OM_TRUST_PROXY_HEADERS` 控制登录限流是否读取反向代理提供的 `X-Real-IP`；默认关闭。
+启用时，只有连接端地址命中 `OM_TRUSTED_PROXY_CIDRS` 中逗号分隔的 IP/CIDR 才会
+采信该请求头。应按实际代理网络配置最小范围，并确保客户端不能绕过代理直连后端。
+Compose 将后端宿主端口固定绑定到 `127.0.0.1`，并默认把 PostgreSQL、前端代理和
+后端分别固定为 `172.30.135.2`、`172.30.135.3` 和 `172.30.135.4`，后端只信任前端
+代理的 `/32` 地址。若该网段与现有网络冲突，必须同时调整 `OM_COMPOSE_NETWORK_CIDR`、
+`OM_POSTGRES_IP`、`OM_FRONTEND_PROXY_IP`、`OM_BACKEND_IP` 和
+`OM_TRUSTED_PROXY_CIDRS`，并确保三个服务地址互不相同且都位于所选网段内。
+登录限流会同时按来源地址和数据库中的真实管理员账号计数；不存在的用户名不会占用
+账号限流容量。
+
+Agent `0.1.19` 起通过 `Authorization` 请求头认证 WebSocket，实例密钥不再出现在
+URL。`OM_ALLOW_LEGACY_AGENT_WS_AUTH` 默认必须保持 `false`；它只用于升级旧 Agent
+的短暂维护窗口，启用期间后端会接受旧查询串认证并输出弃用警告。迁移完成后应立即
+关闭并重建后端。
 
 `OM_FILE_TRANSFER_MAX_BYTES` 限制单个远程上传或下载文件的大小，默认 1 GiB。反向代理的请求体上限必须不小于该值；Docker 前端默认将 `NGINX_CLIENT_MAX_BODY_SIZE` 设置为 `1g`，并关闭 API 请求与响应缓冲以保持流式传输。远程文件操作拥有与 Agent 服务进程相同的系统权限，生产环境应严格保护管理员账号和 TOTP 设备。
 

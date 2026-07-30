@@ -64,6 +64,7 @@ const editingReleaseId = ref<string | null>(null)
 const createReleaseFiles = ref<File[]>([])
 const createReleaseFileError = ref('')
 const createReleaseVersionSource = ref('')
+const createReleaseVersionConflict = ref(false)
 const createReleaseInputKey = ref(0)
 let uploadRowSequence = 0
 
@@ -295,23 +296,34 @@ function chooseCreateReleaseFiles(event: Event) {
   const packageFiles = validFiles.filter((file) => !file.name.toLowerCase().endsWith('.sha256'))
   const versionSources = packageFiles.length ? packageFiles : validFiles
   const detectedVersions = new Map<string, string>()
+  const unrecognizedVersionFiles: string[] = []
   for (const file of versionSources) {
     const version = inferVersionFromName(file.name)
-    if (version && !detectedVersions.has(version)) detectedVersions.set(version, file.name)
+    if (version) {
+      if (!detectedVersions.has(version)) detectedVersions.set(version, file.name)
+    } else {
+      unrecognizedVersionFiles.push(file.name)
+    }
   }
 
   createReleaseFiles.value = validFiles
   createReleaseVersionSource.value = ''
-  if (detectedVersions.size === 1) {
+  createReleaseVersionConflict.value = detectedVersions.size > 1
+    || (detectedVersions.size > 0 && unrecognizedVersionFiles.length > 0)
+  if (detectedVersions.size === 1 && !unrecognizedVersionFiles.length) {
     const [[version, source]] = [...detectedVersions]
     props.form.version = version
     createReleaseVersionSource.value = source
+  } else {
+    props.form.version = ''
   }
 
   if (selectedFiles.length !== validFiles.length) {
     createReleaseFileError.value = `${selectedFiles.length - validFiles.length} 个文件不是支持的更新包或 .sha256 文件`
   } else if (detectedVersions.size > 1) {
     createReleaseFileError.value = `检测到多个版本：${[...detectedVersions.keys()].join('、')}，请只选择同一版本的文件`
+  } else if (detectedVersions.size > 0 && unrecognizedVersionFiles.length) {
+    createReleaseFileError.value = `以下文件无法识别版本：${unrecognizedVersionFiles.join('、')}，请只选择能确认属于同一版本的文件`
   } else if (validFiles.length && detectedVersions.size === 0) {
     createReleaseFileError.value = '无法从文件名识别版本号，请手动填写后继续'
   } else {
@@ -320,6 +332,11 @@ function chooseCreateReleaseFiles(event: Event) {
 }
 
 function submitCreateRelease() {
+  if (createReleaseVersionConflict.value) return
+  if (!props.form.version.trim()) {
+    createReleaseFileError.value = '请输入 Agent 版本号'
+    return
+  }
   emit('createRelease', completeCreateRelease)
 }
 
@@ -335,6 +352,7 @@ function completeCreateRelease(releaseId: string) {
   createReleaseFiles.value = []
   createReleaseFileError.value = ''
   createReleaseVersionSource.value = ''
+  createReleaseVersionConflict.value = false
   createReleaseInputKey.value += 1
 }
 
@@ -574,7 +592,13 @@ function toggleRelease(releaseId: string) {
         </label>
         <label>
           <span>版本号</span>
-          <input v-model.trim="form.version" required placeholder="例如：1.4.0" autocomplete="off" />
+          <input
+            v-model.trim="form.version"
+            required
+            placeholder="例如：1.4.0"
+            autocomplete="off"
+            :disabled="createReleaseVersionConflict"
+          />
           <small v-if="createReleaseVersionSource" class="release-version-hint">
             已从 {{ createReleaseVersionSource }} 识别，可直接修改
           </small>
@@ -583,7 +607,11 @@ function toggleRelease(releaseId: string) {
           <span>发布说明 <i>可选</i></span>
           <textarea v-model.trim="form.notes" placeholder="本次更新内容"></textarea>
         </label>
-        <button class="primary-button" type="submit" :disabled="Boolean(operation)">
+        <button
+          class="primary-button"
+          type="submit"
+          :disabled="Boolean(operation) || createReleaseVersionConflict || !form.version.trim()"
+        >
           <LoaderCircle v-if="operation === 'creating'" class="spin" :size="16" />
           <Plus v-else :size="16" />
           {{ operation === 'creating' ? '正在创建' : '创建草稿' }}

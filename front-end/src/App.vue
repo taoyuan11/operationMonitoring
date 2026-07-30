@@ -10,7 +10,15 @@ import SummaryBand from './components/SummaryBand.vue'
 import TopBar from './components/TopBar.vue'
 import UserManagementPanel from './components/UserManagementPanel.vue'
 import { useMonitoringConsole } from './composables/useMonitoringConsole'
-import type { AdminTab, AgentRelease, AppPage, CommandRecord, Instance } from './types/domain'
+import type {
+  AdminTab,
+  AdminUser,
+  AgentRelease,
+  AppPage,
+  AuthenticatorDevice,
+  CommandRecord,
+  Instance,
+} from './types/domain'
 
 const TerminalModal = defineAsyncComponent(() => import('./components/TerminalModal.vue'))
 const RemoteDesktopModal = defineAsyncComponent(() => import('./components/RemoteDesktopModal.vue'))
@@ -26,6 +34,7 @@ const confirmation = ref<{
   message: string
   confirmLabel: string
   tone: 'warning' | 'danger'
+  confirmationText?: string
   action: () => void
 } | null>(null)
 
@@ -69,6 +78,7 @@ watch(
     }
     currentPage.value = 'home'
     selectedInstanceId.value = ''
+    confirmation.value = null
     if (window.location.hash && window.location.hash !== '#/') {
       window.history.replaceState(null, '', '#/')
     }
@@ -110,10 +120,11 @@ function openLogin() {
   loginOpen.value = true
 }
 
-function logout() {
+async function logout() {
+  const success = await consoleState.logout()
+  if (!success) return
   selectedInstanceId.value = ''
   navigate('home')
-  consoleState.logout()
 }
 
 function requestDisable(instance: Instance) {
@@ -202,6 +213,49 @@ function requestDeleteAgentRelease(release: AgentRelease) {
   }
 }
 
+function requestCancelAuthEnrollment(enrollmentId: string) {
+  const enrollment = consoleState.activeAuthEnrollment.value?.id === enrollmentId
+    ? consoleState.activeAuthEnrollment.value
+    : consoleState.authEnrollments.value.find((item) => item.id === enrollmentId)
+  if (!enrollment) return
+  const target = `${enrollment.username} · ${enrollment.device_name}`
+  confirmation.value = {
+    title: '取消认证设备注册',
+    message: `将取消 ${target} 的待确认注册，已生成的二维码将立即失效。`,
+    confirmLabel: '取消注册',
+    tone: 'danger',
+    confirmationText: target,
+    action: () => consoleState.cancelAuthEnrollment(enrollmentId),
+  }
+}
+
+function requestDeleteAdminUser(user: AdminUser) {
+  confirmation.value = {
+    title: '删除管理员',
+    message: `将永久删除 ${user.username}，并立即撤销该用户的全部会话和认证设备。`,
+    confirmLabel: '永久删除',
+    tone: 'danger',
+    confirmationText: user.username,
+    action: () => consoleState.deleteAdminUser(user),
+  }
+}
+
+function requestRevokeAuthenticatorDevice(device: AuthenticatorDevice) {
+  const user = consoleState.adminUsers.value.find((item) =>
+    item.devices.some((candidate) => candidate.id === device.id),
+  )
+  if (!user) return
+  const target = `${user.username} · ${device.name}`
+  confirmation.value = {
+    title: '撤销认证设备',
+    message: `将撤销 ${target}，通过该设备建立的会话会立即失效。`,
+    confirmLabel: '确认撤销',
+    tone: 'danger',
+    confirmationText: target,
+    action: () => consoleState.revokeAuthenticatorDevice(device.id),
+  }
+}
+
 function confirmAction() {
   const action = confirmation.value?.action
   confirmation.value = null
@@ -287,6 +341,7 @@ function confirmAction() {
 
           <AgentUpdatesPanel
             v-if="currentPage === 'updates'"
+            :key="`updates-${consoleState.adminResetKey.value}`"
             :instances="consoleState.instances.value"
             :releases="consoleState.agentReleases.value"
             :attempts="consoleState.agentUpdateAttempts.value"
@@ -304,6 +359,7 @@ function confirmAction() {
           />
           <UserManagementPanel
             v-else-if="currentPage === 'users'"
+            :key="`users-${consoleState.adminResetKey.value}`"
             :users="consoleState.adminUsers.value"
             :enrollments="consoleState.authEnrollments.value"
             :active-enrollment="consoleState.activeAuthEnrollment.value"
@@ -313,13 +369,14 @@ function confirmAction() {
             @create-user="consoleState.createUserEnrollment"
             @add-device="consoleState.createDeviceEnrollment"
             @confirm-enrollment="consoleState.confirmAuthEnrollment"
-            @cancel-enrollment="consoleState.cancelAuthEnrollment"
+            @cancel-enrollment="requestCancelAuthEnrollment"
             @set-enabled="consoleState.setAdminUserEnabled"
-            @delete-user="consoleState.deleteAdminUser"
-            @revoke-device="consoleState.revokeAuthenticatorDevice($event.id)"
+            @delete-user="requestDeleteAdminUser"
+            @revoke-device="requestRevokeAuthenticatorDevice"
           />
           <AdminPanel
             v-else
+            :key="`admin-${consoleState.adminResetKey.value}`"
             :admin-tab="activeAdminTab"
             :pending-instances="consoleState.pendingInstances.value"
             :commands="consoleState.commands.value"
@@ -378,7 +435,7 @@ function confirmAction() {
 
     <Transition name="modal" appear>
       <EditInstanceModal
-        v-if="consoleState.editInstance.value"
+        v-if="consoleState.editInstance.value && consoleState.isAdmin.value"
         :form="consoleState.editForm"
         @close="consoleState.closeEdit"
         @save="consoleState.saveEdit"
@@ -408,6 +465,7 @@ function confirmAction() {
         :message="confirmation.message"
         :confirm-label="confirmation.confirmLabel"
         :tone="confirmation.tone"
+        :confirmation-text="confirmation.confirmationText"
         @close="confirmation = null"
         @confirm="confirmAction"
       />

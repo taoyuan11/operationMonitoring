@@ -1,5 +1,5 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { api } from '../api/http'
+import { ApiError, api as rawApi } from '../api/http'
 import { getCountryOption } from '../data/countries'
 import { useAppearance } from './useAppearance'
 import type {
@@ -28,12 +28,19 @@ import type {
 import { average } from '../utils/format'
 
 type TrafficSnapshot = {
-  rx: number
-  tx: number
+  counters: Map<string, { rx: number; tx: number }>
   capturedAt: number
 }
 
 type AgentUpdateOperation = 'creating' | 'saving' | 'uploading' | 'publishing' | 'deleting' | 'retrying' | null
+
+function abortedRequestError() {
+  return new DOMException('Request superseded by a session change', 'AbortError')
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError'
+}
 
 export function useMonitoringConsole() {
   const appearance = useAppearance()
@@ -52,7 +59,8 @@ export function useMonitoringConsole() {
   const isAdmin = ref(false)
   const sessionReady = ref(false)
   const publicReady = ref(false)
-  const loading = ref(false)
+  const activeTaskCount = ref(0)
+  const loading = computed(() => activeTaskCount.value > 0)
   const refreshing = ref(false)
   const errorMessage = ref('')
   const viewMode = ref<ViewMode>('grid')
@@ -65,12 +73,23 @@ export function useMonitoringConsole() {
   const agentUpdateOperation = ref<AgentUpdateOperation>(null)
   const agentUpdateBusyId = ref('')
   const agentUpdateMessage = ref('')
+  const adminResetKey = ref(0)
   const trafficSnapshot = ref<TrafficSnapshot | null>(null)
   const networkRxRate = ref(0)
   const networkTxRate = ref(0)
   let publicPollTimer: number | null = null
   let clockTimer: number | null = null
   let publicRequestInFlight = false
+  let guardedRequest = 0
+  let publicDataRequest = 0
+  let appearanceRequest = 0
+  let sessionRequest = 0
+  let adminDataRequest = 0
+  let agentUpdatesRequest = 0
+  let usersRequest = 0
+  let sessionEpoch = 0
+  let adminAbortController = new AbortController()
+  const operationLocks = new Set<string>()
 
   const loginForm = reactive({
     username: '',
@@ -162,24 +181,121 @@ export function useMonitoringConsole() {
   onBeforeUnmount(() => {
     if (publicPollTimer !== null) window.clearInterval(publicPollTimer)
     if (clockTimer !== null) window.clearInterval(clockTimer)
+    invalidateAdminRequests()
   })
 
-  async function guarded(task: () => Promise<void>): Promise<boolean> {
-    loading.value = true
+  async function guarded(task: () => Promise<void>, operationKey?: string): Promise<boolean> {
+    if (operationKey && operationLocks.has(operationKey)) return false
+    if (operationKey) operationLocks.add(operationKey)
+    const request = ++guardedRequest
+    activeTaskCount.value += 1
     errorMessage.value = ''
     try {
       await task()
       return true
     } catch (error) {
-      errorMessage.value = error instanceof Error ? error.message : '操作失败'
+      if (request === guardedRequest && !isAbortError(error)) {
+        errorMessage.value = error instanceof Error ? error.message : '操作失败'
+      }
       return false
     } finally {
-      loading.value = false
+      activeTaskCount.value = Math.max(0, activeTaskCount.value - 1)
+      if (operationKey) operationLocks.delete(operationKey)
     }
   }
 
+  async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+    if (!path.startsWith('/api/admin')) return rawApi<T>(path, options)
+
+    const epoch = sessionEpoch
+    const controller = adminAbortController
+    let response: T
+    try {
+      response = await rawApi<T>(path, {
+        ...options,
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (
+        error instanceof ApiError
+        && error.status === 401
+        && isAdmin.value
+        && epoch === sessionEpoch
+        && !controller.signal.aborted
+      ) {
+        const session = await rawApi<{ authenticated: boolean }>('/api/admin/me', {
+          signal: controller.signal,
+        }).catch(() => null)
+        if (
+          session?.authenticated === false
+          && epoch === sessionEpoch
+          && !controller.signal.aborted
+        ) {
+          invalidateAdminRequests()
+          clearAdminState()
+        }
+      }
+      throw error
+    }
+    if (epoch !== sessionEpoch || controller.signal.aborted) throw abortedRequestError()
+    return response
+  }
+
+  function invalidateAdminRequests() {
+    adminAbortController.abort()
+    sessionEpoch += 1
+    adminAbortController = new AbortController()
+  }
+
+  function clearAdminState() {
+    terminalState.instance = null
+    remoteDesktopState.instance = null
+    editInstance.value = null
+    isAdmin.value = false
+    currentUser.value = null
+    pendingInstances.value = []
+    commands.value = []
+    jobs.value = []
+    logs.value = []
+    agentReleases.value = []
+    agentUpdateAttempts.value = []
+    adminUsers.value = []
+    authEnrollments.value = []
+    activeAuthEnrollment.value = null
+    loginForm.username = ''
+    loginForm.password = ''
+    loginForm.code = ''
+    userAuthForm.username = ''
+    userAuthForm.current_code = ''
+    userAuthForm.confirmation_code = ''
+    commandForm.name = ''
+    commandForm.command = ''
+    commandForm.confirm_text = ''
+    agentReleaseForm.version = ''
+    agentReleaseForm.notes = ''
+    editForm.name = ''
+    editForm.country_code = ''
+    editForm.country = ''
+    editForm.remark = ''
+    settingsForm.retention_days = 30
+    settingsForm.background_image_url = appearance.backgroundImageUrl.value
+    settingsForm.theme_mode = appearance.themeMode.value
+    settingsForm.accent_color = appearance.accentColor.value
+    adminTab.value = 'pending'
+    backgroundFileName.value = ''
+    backgroundOperation.value = null
+    backgroundMessage.value = ''
+    appearanceMessage.value = ''
+    agentUpdateOperation.value = null
+    agentUpdateBusyId.value = ''
+    agentUpdateMessage.value = ''
+    adminResetKey.value += 1
+  }
+
   async function loadPublic() {
+    const request = ++publicDataRequest
     const nextInstances = await api<Instance[]>('/api/public/instances')
+    if (request !== publicDataRequest) return
     updateNetworkRates(nextInstances)
     instances.value = nextInstances
   }
@@ -200,24 +316,33 @@ export function useMonitoringConsole() {
   }
 
   async function loadAppearance() {
+    const request = ++appearanceRequest
     const response = await api<AppearanceResponse>('/api/public/appearance')
+    if (request !== appearanceRequest) return
     appearance.applyAppearance(response)
   }
 
   async function checkSession() {
+    const request = ++sessionRequest
     const [status, me] = await Promise.all([
       api<{ mode: AuthMode }>('/api/admin/auth/status'),
       api<{ authenticated: boolean; user: SessionUser | null }>('/api/admin/me'),
     ])
+    if (request !== sessionRequest) return
     authMode.value = status.mode
     isAdmin.value = me.authenticated
     currentUser.value = me.user
     if (me.authenticated) {
       await loadAdminData()
+    } else {
+      invalidateAdminRequests()
+      clearAdminState()
     }
   }
 
   async function loadAdminData() {
+    const request = ++adminDataRequest
+    const userRequest = ++usersRequest
     const [pending, commandList, jobList, logList, settings, users] = await Promise.all([
       api<PendingInstance[]>('/api/admin/pending-instances'),
       api<CommandRecord[]>('/api/admin/commands'),
@@ -227,6 +352,7 @@ export function useMonitoringConsole() {
       api<AdminUsersResponse>('/api/admin/users'),
       loadAgentUpdates(),
     ])
+    if (request !== adminDataRequest) return
     pendingInstances.value = pending
     commands.value = commandList
     jobs.value = jobList
@@ -236,14 +362,16 @@ export function useMonitoringConsole() {
     settingsForm.background_image_url = settings.background_image_url
     settingsForm.theme_mode = settings.theme_mode
     settingsForm.accent_color = settings.accent_color
-    applyUsers(users)
+    if (userRequest === usersRequest) applyUsers(users)
   }
 
   async function loadAgentUpdates() {
+    const request = ++agentUpdatesRequest
     const [releases, attempts] = await Promise.all([
       api<AgentRelease[]>('/api/admin/agent-releases'),
       api<AgentUpdateAttempt[]>('/api/admin/agent-update-attempts'),
     ])
+    if (request !== agentUpdatesRequest) return
     agentUpdateAttempts.value = attempts
     agentReleases.value = releases.map((release) => ({
       ...release,
@@ -300,6 +428,7 @@ export function useMonitoringConsole() {
             method: 'POST',
             body: JSON.stringify({ username: loginForm.username, code: loginForm.code }),
           })
+      invalidateAdminRequests()
       isAdmin.value = true
       currentUser.value = response.user
       authMode.value = 'totp'
@@ -307,7 +436,7 @@ export function useMonitoringConsole() {
       loginForm.password = ''
       loginForm.code = ''
       await loadAdminData()
-    })
+    }, 'auth:login')
   }
 
   function restartBootstrap() {
@@ -317,37 +446,25 @@ export function useMonitoringConsole() {
   }
 
   function logout() {
-    guarded(async () => {
-      await api('/api/admin/logout', { method: 'POST' })
-      terminalState.instance = null
-      remoteDesktopState.instance = null
-      isAdmin.value = false
-      currentUser.value = null
-      pendingInstances.value = []
-      commands.value = []
-      jobs.value = []
-      logs.value = []
-      agentReleases.value = []
-      agentUpdateAttempts.value = []
-      adminUsers.value = []
-      authEnrollments.value = []
-      activeAuthEnrollment.value = null
-      agentUpdateMessage.value = ''
-    })
+    return guarded(async () => {
+      await rawApi('/api/admin/logout', { method: 'POST' })
+      invalidateAdminRequests()
+      clearAdminState()
+    }, 'auth:logout')
   }
 
   function approveInstance(id: string) {
     guarded(async () => {
       await api(`/api/admin/pending-instances/${id}/approve`, { method: 'POST' })
       await Promise.all([loadPublic(), loadAdminData()])
-    })
+    }, `pending:${id}`)
   }
 
   function rejectInstance(id: string) {
     guarded(async () => {
       await api(`/api/admin/pending-instances/${id}/reject`, { method: 'POST' })
       await loadAdminData()
-    })
+    }, `pending:${id}`)
   }
 
   function openEdit(instance: Instance) {
@@ -378,21 +495,21 @@ export function useMonitoringConsole() {
       })
       editInstance.value = null
       await loadPublic()
-    })
+    }, `instance:${id}`)
   }
 
   function disableInstance(instance: Instance) {
     guarded(async () => {
       await api(`/api/admin/instances/${instance.id}/disable`, { method: 'POST' })
       await loadPublic()
-    })
+    }, `instance:${instance.id}`)
   }
 
   function deleteInstance(instance: Instance) {
     guarded(async () => {
       await api(`/api/admin/instances/${instance.id}`, { method: 'DELETE' })
       await Promise.all([loadPublic(), loadAdminData()])
-    })
+    }, `instance:${instance.id}`)
   }
 
   function createCommand() {
@@ -405,14 +522,14 @@ export function useMonitoringConsole() {
       commandForm.command = ''
       commandForm.confirm_text = ''
       await loadAdminData()
-    })
+    }, 'command:create')
   }
 
   function removeCommand(command: CommandRecord) {
     guarded(async () => {
       await api(`/api/admin/commands/${command.id}`, { method: 'DELETE' })
       await loadAdminData()
-    })
+    }, `command:${command.id}`)
   }
 
   function runCommand(instance: Instance, command: CommandRecord) {
@@ -421,7 +538,7 @@ export function useMonitoringConsole() {
         method: 'POST',
       })
       await loadAdminData()
-    })
+    }, `run-command:${instance.id}:${command.id}`)
   }
 
   function saveSettings() {
@@ -431,7 +548,7 @@ export function useMonitoringConsole() {
         body: JSON.stringify({ retention_days: settingsForm.retention_days }),
       })
       await loadAdminData()
-    })
+    }, 'settings:retention')
   }
 
   function saveAppearance() {
@@ -448,7 +565,7 @@ export function useMonitoringConsole() {
       settingsForm.theme_mode = settings.theme_mode
       settingsForm.accent_color = settings.accent_color
       appearanceMessage.value = '外观设置已保存并应用'
-    })
+    }, 'settings:appearance')
   }
 
   function createUserEnrollment() {
@@ -545,7 +662,9 @@ export function useMonitoringConsole() {
   }
 
   async function loadUsers() {
-    applyUsers(await api<AdminUsersResponse>('/api/admin/users'))
+    const request = ++usersRequest
+    const users = await api<AdminUsersResponse>('/api/admin/users')
+    if (request === usersRequest) applyUsers(users)
   }
 
   function applyUsers(response: AdminUsersResponse) {
@@ -795,9 +914,16 @@ export function useMonitoringConsole() {
   }
 
   function updateNetworkRates(nextInstances: Instance[]) {
-    const nextSnapshot = {
-      rx: nextInstances.reduce((sum, item) => sum + (item.metrics?.network_rx || 0), 0),
-      tx: nextInstances.reduce((sum, item) => sum + (item.metrics?.network_tx || 0), 0),
+    const counters = new Map<string, { rx: number; tx: number }>()
+    for (const instance of nextInstances) {
+      if (!instance.metrics) continue
+      counters.set(instance.id, {
+        rx: instance.metrics.network_rx,
+        tx: instance.metrics.network_tx,
+      })
+    }
+    const nextSnapshot: TrafficSnapshot = {
+      counters,
       capturedAt: Date.now(),
     }
     const previous = trafficSnapshot.value
@@ -806,8 +932,17 @@ export function useMonitoringConsole() {
 
     const elapsedSeconds = (nextSnapshot.capturedAt - previous.capturedAt) / 1000
     if (elapsedSeconds <= 0) return
-    networkRxRate.value = Math.max(0, (nextSnapshot.rx - previous.rx) / elapsedSeconds)
-    networkTxRate.value = Math.max(0, (nextSnapshot.tx - previous.tx) / elapsedSeconds)
+
+    let receivedBytes = 0
+    let transmittedBytes = 0
+    for (const [instanceId, counters] of nextSnapshot.counters) {
+      const previousCounters = previous.counters.get(instanceId)
+      if (!previousCounters) continue
+      receivedBytes += Math.max(0, counters.rx - previousCounters.rx)
+      transmittedBytes += Math.max(0, counters.tx - previousCounters.tx)
+    }
+    networkRxRate.value = receivedBytes / elapsedSeconds
+    networkTxRate.value = transmittedBytes / elapsedSeconds
   }
 
   return {
@@ -842,6 +977,7 @@ export function useMonitoringConsole() {
     agentUpdateOperation,
     agentUpdateBusyId,
     agentUpdateMessage,
+    adminResetKey,
     currentTime,
     loginForm,
     userAuthForm,

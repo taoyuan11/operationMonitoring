@@ -42,6 +42,9 @@ type UploadStatus = 'queued' | 'uploading' | 'completed' | 'cancelled' | 'error'
 type UploadQueueItem = {
   id: string
   file: File
+  instanceId: string
+  parentPath: string
+  targetPath: string
   status: UploadStatus
   progress: number
   transferred: number
@@ -80,10 +83,13 @@ const processingUploads = ref(false)
 const activeUploadId = ref('')
 const activeUploadAbort = ref<(() => void) | null>(null)
 const uploadConflict = ref<{
-  fileName: string
+  targetPath: string
   resolve: (overwrite: boolean) => void
 } | null>(null)
 let disposed = false
+let rootsRequest = 0
+let pathRequest = 0
+let activeListAbort: AbortController | null = null
 
 const dialogOpen = computed(() => Boolean(dialog.value || uploadConflict.value))
 
@@ -103,6 +109,7 @@ onMounted(() => void loadRoots())
 
 onBeforeUnmount(() => {
   disposed = true
+  activeListAbort?.abort()
   for (const item of uploadQueue.value) {
     if (item.status === 'queued') item.status = 'cancelled'
   }
@@ -111,27 +118,39 @@ onBeforeUnmount(() => {
 })
 
 async function loadRoots() {
+  const request = ++rootsRequest
+  const instanceId = props.instance.id
+  pathRequest += 1
+  activeListAbort?.abort()
   loading.value = true
   errorMessage.value = ''
   listing.value = null
   try {
     const response = await api<FileRootsResponse>(
-      `/api/admin/instances/${encodeURIComponent(props.instance.id)}/files/roots`,
+      `/api/admin/instances/${encodeURIComponent(instanceId)}/files/roots`,
     )
+    if (request !== rootsRequest || instanceId !== props.instance.id) return
     roots.value = response.roots
     maxFileBytes.value = response.max_file_bytes
     const firstRoot = response.roots[0]?.path || ''
     selectedRoot.value = firstRoot
     if (firstRoot) await openPath(firstRoot)
   } catch (error) {
-    errorMessage.value = errorText(error)
+    if (request === rootsRequest && instanceId === props.instance.id) {
+      errorMessage.value = errorText(error)
+    }
   } finally {
-    loading.value = false
+    if (request === rootsRequest && instanceId === props.instance.id) loading.value = false
   }
 }
 
 async function openPath(path: string, append = false) {
   if (!path) return
+  const request = ++pathRequest
+  const instanceId = props.instance.id
+  activeListAbort?.abort()
+  const controller = new AbortController()
+  activeListAbort = controller
   loading.value = true
   errorMessage.value = ''
   try {
@@ -144,8 +163,10 @@ async function openPath(path: string, append = false) {
       limit: '200',
     })
     const response = await api<InstanceFileListing>(
-      `/api/admin/instances/${encodeURIComponent(props.instance.id)}/files?${params}`,
+      `/api/admin/instances/${encodeURIComponent(instanceId)}/files?${params}`,
+      { signal: controller.signal },
     )
+    if (request !== pathRequest || instanceId !== props.instance.id) return
     if (append && listing.value?.path === response.path) {
       listing.value = {
         ...response,
@@ -158,9 +179,14 @@ async function openPath(path: string, append = false) {
     currentPath.value = response.path
     selectedRoot.value = matchingRoot(response.path)
   } catch (error) {
-    errorMessage.value = errorText(error)
+    if (!controller.signal.aborted && request === pathRequest && instanceId === props.instance.id) {
+      errorMessage.value = errorText(error)
+    }
   } finally {
-    loading.value = false
+    if (request === pathRequest && instanceId === props.instance.id) {
+      activeListAbort = null
+      loading.value = false
+    }
   }
 }
 
@@ -287,10 +313,15 @@ function dropFiles(event: DragEvent) {
 
 function enqueueFiles(files: File[]) {
   errorMessage.value = ''
+  const instanceId = props.instance.id
+  const parentPath = currentPath.value
   for (const file of files) {
     const item: UploadQueueItem = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
       file,
+      instanceId,
+      parentPath,
+      targetPath: joinFilePath(parentPath, file.name),
       status: file.size <= maxFileBytes.value ? 'queued' : 'error',
       progress: 0,
       transferred: 0,
@@ -306,7 +337,7 @@ function enqueueFiles(files: File[]) {
 async function processUploadQueue() {
   if (processingUploads.value) return
   processingUploads.value = true
-  let uploaded = false
+  const completedDestinations = new Set<string>()
   try {
     let item = uploadQueue.value.find((candidate) => candidate.status === 'queued')
     while (item && !disposed) {
@@ -316,20 +347,20 @@ async function processUploadQueue() {
         await uploadQueueItem(item, false)
         item.status = 'completed'
         item.progress = 100
-        uploaded = true
+        completedDestinations.add(`${item.instanceId}\u0000${item.parentPath}`)
       } catch (error) {
         if (
           error instanceof UploadHttpError
           && error.status === 409
           && /存在|同名/.test(error.message)
         ) {
-          const overwrite = await requestUploadOverwrite(item.file.name)
+          const overwrite = await requestUploadOverwrite(item.targetPath)
           if (overwrite) {
             try {
               await uploadQueueItem(item, true)
               item.status = 'completed'
               item.progress = 100
-              uploaded = true
+              completedDestinations.add(`${item.instanceId}\u0000${item.parentPath}`)
             } catch (retryError) {
               setUploadFailure(item, retryError)
             }
@@ -347,7 +378,10 @@ async function processUploadQueue() {
     }
   } finally {
     processingUploads.value = false
-    if (uploaded && !disposed) await openPath(currentPath.value)
+    const visibleDestination = `${props.instance.id}\u0000${currentPath.value}`
+    if (!disposed && completedDestinations.has(visibleDestination)) {
+      await openPath(currentPath.value)
+    }
   }
 }
 
@@ -356,8 +390,8 @@ async function uploadQueueItem(item: UploadQueueItem, overwrite: boolean) {
   item.status = 'uploading'
   item.error = ''
   const handle = uploadInstanceFile(
-    props.instance.id,
-    currentPath.value,
+    item.instanceId,
+    item.parentPath,
     item.file,
     overwrite,
     (transferred, total) => {
@@ -394,9 +428,9 @@ function clearFinishedUploads() {
   )
 }
 
-function requestUploadOverwrite(fileName: string) {
+function requestUploadOverwrite(targetPath: string) {
   return new Promise<boolean>((resolve) => {
-    uploadConflict.value = { fileName, resolve }
+    uploadConflict.value = { targetPath, resolve }
   })
 }
 
@@ -441,6 +475,11 @@ function pathStartsWith(path: string, root: string) {
 
 function isWindowsPath(path: string) {
   return /^[a-z]:[\\/]/i.test(path)
+}
+
+function joinFilePath(parent: string, name: string) {
+  const separator = isWindowsPath(parent) ? '\\' : '/'
+  return `${parent.replace(/[\\/]$/, '')}${separator}${name}`
 }
 
 function buildBreadcrumbs(path: string) {
@@ -736,7 +775,7 @@ function buildBreadcrumbs(path: string) {
       <section class="file-dialog" role="alertdialog" aria-modal="true">
         <span class="file-dialog-icon danger"><AlertTriangle :size="22" /></span>
         <h3>目标文件已存在</h3>
-        <p class="file-delete-path">{{ uploadConflict.fileName }}</p>
+        <p class="file-delete-path">{{ uploadConflict.targetPath }}</p>
         <p class="file-dialog-warning">覆盖只会在新文件完整上传后执行。</p>
         <div class="file-dialog-actions">
           <button class="text-button" type="button" @click="resolveUploadOverwrite(false)">跳过</button>

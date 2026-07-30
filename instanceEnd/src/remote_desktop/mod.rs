@@ -21,6 +21,17 @@ pub const MAX_CONTROL_BYTES: usize = 16 * 1024;
 pub const MIN_JPEG_QUALITY: u8 = 25;
 pub const MAX_JPEG_QUALITY: u8 = 75;
 pub(super) const DATA_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const INPUT_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(super) async fn wait_for_input_release_ack(
+    ack_rx: &mut mpsc::Receiver<()>,
+    timeout: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, ack_rx.recv()).await,
+        Ok(Some(()))
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct DesktopOptions {
@@ -521,6 +532,20 @@ mod tests {
         let _ = finish_tx.send(());
         cleanup.await.unwrap();
         assert_eq!(activity.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn input_release_ack_wait_has_a_deadline() {
+        let (_ack_tx, mut ack_rx) = mpsc::channel(1);
+
+        let acknowledged = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_input_release_ack(&mut ack_rx, Duration::from_millis(10)),
+        )
+        .await
+        .expect("release ACK wait must not block past its deadline");
+
+        assert!(!acknowledged);
     }
 
     #[test]

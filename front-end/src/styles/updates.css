@@ -10,6 +10,8 @@
 .release-create-file-picker .file-button > span { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 3px; overflow: hidden; }
 .release-create-file-picker .file-button strong { max-width: 100%; overflow: hidden; color: var(--text-strong); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .release-create-file-picker .file-button small, .release-version-hint { color: #75817b; font-size: 10px; font-weight: 450; }
+.release-create-file-picker .file-button.dragging { color: #75d8ba; background: rgba(73, 200, 159, .09); border-color: rgba(73, 200, 159, .48); }
+.release-create-file-picker .file-button.dragging strong { color: #8edcc3; }
 .release-version-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .release-list { display: flex; min-width: 0; flex-direction: column; gap: 12px; }
@@ -83,9 +85,10 @@
 .artifact-file-picker .file-button > span, .artifact-checksum-picker .file-button > span { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 2px; overflow: hidden; }
 .artifact-file-picker .file-button strong, .artifact-checksum-picker .file-button strong { max-width: 100%; overflow: hidden; color: var(--text-strong); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .artifact-file-picker .file-button small, .artifact-checksum-picker .file-button small { color: #75817b; font-size: 10px; font-weight: 450; }
-.artifact-file-picker.dragging .file-button { color: #75d8ba; background: rgba(73, 200, 159, .09); border-color: rgba(73, 200, 159, .48); }
-.artifact-file-picker.dragging .file-button strong, .artifact-file-picker.selected .file-button strong { color: #8edcc3; }
-.artifact-file-picker.disabled .file-button { cursor: wait; opacity: .58; }
+.artifact-file-picker.dragging .file-button, .artifact-checksum-picker.dragging .file-button { color: #75d8ba; background: rgba(73, 200, 159, .09); border-color: rgba(73, 200, 159, .48); }
+.artifact-file-picker.dragging .file-button strong, .artifact-checksum-picker.dragging .file-button strong,
+.artifact-file-picker.selected .file-button strong, .artifact-checksum-picker.selected .file-button strong { color: #8edcc3; }
+.artifact-file-picker.disabled .file-button, .artifact-checksum-picker.disabled .file-button { cursor: wait; opacity: .58; }
 .artifact-file-error { color: var(--danger-text); font-size: 10px; font-weight: 500; }
 .artifact-upload-button { min-height: 42px; padding: 0 11px; white-space: nowrap; }
 .artifact-row-actions { display: flex; align-self: end; gap: 5px; margin-bottom: 4px; }

@@ -29,6 +29,7 @@ import type {
   AgentUpdateAttemptStatus,
   Instance,
 } from '../types/domain'
+import { inferArtifactTarget } from '../utils/agentArtifacts'
 import { formatBytes, formatTime } from '../utils/format'
 
 const props = defineProps<{
@@ -59,6 +60,8 @@ const batchDragActive = reactive<Record<string, boolean>>({})
 const batchInputKeys = reactive<Record<string, number>>({})
 const fileInputKeys = reactive<Record<string, number>>({})
 const checksumInputKeys = reactive<Record<string, number>>({})
+const fileDragDepths = reactive<Record<string, number>>({})
+const fileDragActive = reactive<Record<string, boolean>>({})
 const collapsedReleases = reactive<Record<string, boolean>>({})
 const editingReleaseId = ref<string | null>(null)
 const createReleaseFiles = ref<File[]>([])
@@ -66,6 +69,7 @@ const createReleaseFileError = ref('')
 const createReleaseVersionSource = ref('')
 const createReleaseVersionConflict = ref(false)
 const createReleaseInputKey = ref(0)
+const createReleaseDropKey = 'create-release'
 let uploadRowSequence = 0
 
 const nativeArchitecturesByOs: Record<string, string[]> = {
@@ -177,50 +181,70 @@ function changeArtifactOs(row: AgentArtifactUploadRow) {
 
 function changeArtifactArchitecture(row: AgentArtifactUploadRow) {
   row.inference = 'manual'
-  row.error = ''
+  row.error = row.file && !row.checksum_file ? '请选择同名 .sha256 校验文件' : ''
+}
+
+function uploadRowTargetError(row: AgentArtifactUploadRow) {
+  if (row.inference === 'needs_target' && !row.os) return '无法从文件名识别系统，请手动选择'
+  if (row.inference === 'needs_architecture' && !row.native_arch) return '无法从文件名识别架构，请手动选择'
+  return ''
 }
 
 function chooseArtifactFile(row: AgentArtifactUploadRow, event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
-  if (file) setUploadRowFile(row, file)
+  if (file) setUploadRowFile(row, file, true)
 }
 
-function setUploadRowFile(row: AgentArtifactUploadRow, file: File) {
-  const expectedExtension = artifactAccept(row)
+function setUploadRowFile(row: AgentArtifactUploadRow, file: File, inferTarget = false) {
+  const inferredTarget = inferTarget ? inferArtifactTarget(file.name) : null
+  const targetOs = inferredTarget?.os || row.os
+  const expectedExtension = targetOs === 'windows' ? '.exe' : '.bin'
   if (!file.name.toLowerCase().endsWith(expectedExtension)) {
-    row.file = null
+    if (!inferTarget) {
+      row.file = null
+      row.checksum_file = null
+      checksumInputKeys[row.id] = (checksumInputKeys[row.id] || 0) + 1
+    }
     row.error = `请选择 ${expectedExtension} 可执行文件`
     fileInputKeys[row.id] = (fileInputKeys[row.id] || 0) + 1
     return
+  }
+  if (inferredTarget?.os) {
+    row.os = inferredTarget.os
+    row.native_arch = inferredTarget.native_arch
+    row.inference = inferredTarget.inference
+  } else {
+    row.inference = 'manual'
   }
   row.file = file
   if (row.checksum_file && !checksumMatchesFile(file, row.checksum_file)) {
     row.checksum_file = null
     checksumInputKeys[row.id] = (checksumInputKeys[row.id] || 0) + 1
   }
-  row.error = row.checksum_file ? '' : '请选择同名 .sha256 校验文件'
-  row.inference = 'manual'
+  row.error = uploadRowTargetError(row)
+    || (row.checksum_file ? '' : '请选择同名 .sha256 校验文件')
 }
 
 function chooseChecksumFile(row: AgentArtifactUploadRow, event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
-  if (!file) return
+  if (file) setUploadRowChecksumFile(row, file)
+}
+
+function setUploadRowChecksumFile(row: AgentArtifactUploadRow, file: File) {
   if (!file.name.toLowerCase().endsWith('.sha256')) {
-    row.checksum_file = null
     row.error = '请选择 .sha256 校验文件'
     checksumInputKeys[row.id] = (checksumInputKeys[row.id] || 0) + 1
     return
   }
   if (row.file && !checksumMatchesFile(row.file, file)) {
-    row.checksum_file = null
     row.error = '校验文件名必须为可执行文件名加 .sha256'
     checksumInputKeys[row.id] = (checksumInputKeys[row.id] || 0) + 1
     return
   }
   row.checksum_file = file
-  row.error = row.file ? '' : '请先选择对应的可执行文件'
+  row.error = uploadRowTargetError(row) || (row.file ? '' : '请先选择对应的可执行文件')
 }
 
 function checksumMatchesFile(file: File, checksumFile: File) {
@@ -233,6 +257,7 @@ function addUploadRow(releaseId: string, os = 'linux', nativeArch = 'x86_64') {
 
 function removeUploadRow(releaseId: string, rowId: string) {
   const rows = artifactUploadRows[releaseId]
+  clearUploadRowDragState(rowId)
   if (rows.length <= 1) {
     rows[0].file = null
     rows[0].checksum_file = null
@@ -241,38 +266,6 @@ function removeUploadRow(releaseId: string, rowId: string) {
     return
   }
   artifactUploadRows[releaseId] = rows.filter((row) => row.id !== rowId)
-}
-
-function inferTargetFromName(fileName: string) {
-  const name = fileName.toLowerCase()
-  const os = name.endsWith('.exe')
-    ? 'windows'
-    : /macos|darwin|osx/.test(name)
-      ? 'macos'
-      : /linux/.test(name)
-        ? 'linux'
-        : ''
-  const detectedArchitecture = /x86_64[-_]musl/.test(name)
-    ? 'x86_64-musl'
-    : /aarch64|arm64/.test(name)
-    ? os === 'windows' || os === 'macos' ? 'arm64' : 'aarch64'
-    : /x86_64|amd64|x64/.test(name)
-      ? os === 'windows' ? 'x64' : 'x86_64'
-      : /armv?7|\barm\b/.test(name)
-        ? 'arm'
-        : /i[3-6]86|\bx86\b/.test(name)
-          ? 'x86'
-          : ''
-  const architecture = detectedArchitecture === 'arm' && (os === 'windows' || os === 'macos')
-    ? 'arm64'
-    : detectedArchitecture === 'x86' && os === 'macos'
-      ? 'x86_64'
-      : detectedArchitecture
-  return {
-    os,
-    native_arch: architecture,
-    inference: os && architecture ? 'matched' as const : os ? 'needs_architecture' as const : 'needs_target' as const,
-  }
 }
 
 function inferVersionFromName(fileName: string) {
@@ -288,7 +281,10 @@ function inferVersionFromName(fileName: string) {
 
 function chooseCreateReleaseFiles(event: Event) {
   const input = event.target as HTMLInputElement
-  const selectedFiles = Array.from(input.files || [])
+  setCreateReleaseFiles(Array.from(input.files || []))
+}
+
+function setCreateReleaseFiles(selectedFiles: File[]) {
   const validFiles = selectedFiles.filter((file) => {
     const name = file.name.toLowerCase()
     return name.endsWith('.bin') || name.endsWith('.exe') || name.endsWith('.sha256')
@@ -372,7 +368,7 @@ function assignBatchFiles(releaseId: string, files: File[]) {
     const pairedChecksum = checksumFiles.find((checksumFile) => checksumMatchesFile(file, checksumFile))
     const checksumRow = rows.find((row) => row.checksum_file && checksumMatchesFile(file, row.checksum_file))
     const availableRow = rows.find((row) => !row.file && !row.checksum_file)
-    const target = inferTargetFromName(file.name)
+    const target = inferArtifactTarget(file.name)
     const row = existingRow || checksumRow || availableRow || createUploadRow(target.os, target.native_arch || '')
     if (!artifactUploadRows[releaseId].includes(row)) artifactUploadRows[releaseId].push(row)
     row.os = target.os
@@ -399,7 +395,7 @@ function assignBatchFiles(releaseId: string, files: File[]) {
     }
     const checksumRow = rows.find((item) => !item.file && !item.checksum_file) || createUploadRow('', '')
     if (!artifactUploadRows[releaseId].includes(checksumRow)) artifactUploadRows[releaseId].push(checksumRow)
-    const target = inferTargetFromName(checksumFile.name.slice(0, -'.sha256'.length))
+    const target = inferArtifactTarget(checksumFile.name)
     checksumRow.os = target.os
     checksumRow.native_arch = target.native_arch
     checksumRow.inference = target.inference
@@ -415,7 +411,8 @@ function chooseBatchFiles(releaseId: string, event: Event) {
 }
 
 function batchDragEnter(releaseId: string, event: DragEvent) {
-  if (props.operation || !event.dataTransfer?.types.includes('Files')) return
+  if (props.operation || !hasDraggedFiles(event)) return
+  event.preventDefault()
   batchDragDepths[releaseId] += 1
   batchDragActive[releaseId] = true
 }
@@ -430,6 +427,91 @@ function dropBatchFiles(releaseId: string, event: DragEvent) {
   batchDragActive[releaseId] = false
   if (props.operation) return
   assignBatchFiles(releaseId, Array.from(event.dataTransfer?.files || []))
+}
+
+function uploadRowDropKey(rowId: string, kind: 'executable' | 'checksum') {
+  return `${rowId}:${kind}`
+}
+
+function hasDraggedFiles(event: DragEvent) {
+  return Array.from(event.dataTransfer?.types || []).includes('Files')
+}
+
+function fileDragOver(event: DragEvent) {
+  const transfer = event.dataTransfer
+  if (props.operation || !hasDraggedFiles(event)) {
+    if (transfer) transfer.dropEffect = 'none'
+    return
+  }
+  event.preventDefault()
+  if (transfer) transfer.dropEffect = 'copy'
+}
+
+function isFileDragActive(key: string) {
+  return Boolean(fileDragActive[key])
+}
+
+function fileDragEnter(key: string, event: DragEvent) {
+  if (props.operation || !hasDraggedFiles(event)) return
+  event.preventDefault()
+  fileDragDepths[key] = (fileDragDepths[key] || 0) + 1
+  fileDragActive[key] = true
+}
+
+function fileDragLeave(key: string) {
+  fileDragDepths[key] = Math.max(0, (fileDragDepths[key] || 0) - 1)
+  if (fileDragDepths[key] === 0) fileDragActive[key] = false
+}
+
+function resetFileDrag(key: string) {
+  fileDragDepths[key] = 0
+  fileDragActive[key] = false
+}
+
+function clearUploadRowDragState(rowId: string) {
+  for (const kind of ['executable', 'checksum'] as const) {
+    const key = uploadRowDropKey(rowId, kind)
+    delete fileDragDepths[key]
+    delete fileDragActive[key]
+  }
+}
+
+function dropCreateReleaseFiles(event: DragEvent) {
+  resetFileDrag(createReleaseDropKey)
+  if (props.operation) return
+  const files = Array.from(event.dataTransfer?.files || [])
+  if (files.length) setCreateReleaseFiles(files)
+}
+
+function dropArtifactFile(row: AgentArtifactUploadRow, event: DragEvent) {
+  resetFileDrag(uploadRowDropKey(row.id, 'executable'))
+  if (props.operation) return
+  const files = Array.from(event.dataTransfer?.files || [])
+  const executableFiles = files.filter((file) => /\.(?:bin|exe)$/i.test(file.name))
+  if (executableFiles.length !== 1) {
+    row.error = executableFiles.length
+      ? '单个目标一次只能拖入一个可执行文件，多个目标请使用批量添加'
+      : '请拖入 .bin 或 .exe 可执行文件'
+    return
+  }
+  const [file] = executableFiles
+  setUploadRowFile(row, file, true)
+  const checksum = files.find((candidate) => checksumMatchesFile(file, candidate))
+  if (row.file === file && checksum) setUploadRowChecksumFile(row, checksum)
+}
+
+function dropChecksumFile(row: AgentArtifactUploadRow, event: DragEvent) {
+  resetFileDrag(uploadRowDropKey(row.id, 'checksum'))
+  if (props.operation) return
+  const checksumFiles = Array.from(event.dataTransfer?.files || [])
+    .filter((file) => file.name.toLowerCase().endsWith('.sha256'))
+  if (checksumFiles.length !== 1) {
+    row.error = checksumFiles.length
+      ? '一次只能拖入一个 SHA-256 校验文件'
+      : '请拖入 .sha256 校验文件'
+    return
+  }
+  setUploadRowChecksumFile(row, checksumFiles[0])
 }
 
 function uploadTargetKey(target: AgentArtifactTarget) {
@@ -493,6 +575,7 @@ function submitArtifacts(release: AgentRelease, onlyRowId?: string) {
 
 function applyUploadResult(releaseId: string, result: AgentArtifactUploadResult) {
   const failed = new Map(result.failures.map((failure) => [failure.row_id, failure.message]))
+  for (const rowId of result.succeeded_row_ids) clearUploadRowDragState(rowId)
   const rows = uploadRowsFor(releaseId)
     .filter((row) => !result.succeeded_row_ids.includes(row.id))
   for (const row of rows) {
@@ -571,10 +654,18 @@ function toggleRelease(releaseId: string) {
       <form class="release-create-form" @submit.prevent="submitCreateRelease">
         <label class="release-create-file-picker">
           <span>更新文件 <i>用于识别版本</i></span>
-          <span class="file-button" :class="{ disabled: operation }" :title="createReleaseFiles.map((file) => file.name).join('\n')">
+          <span
+            class="file-button"
+            :class="{ dragging: isFileDragActive(createReleaseDropKey), disabled: operation }"
+            :title="createReleaseFiles.map((file) => file.name).join('\n')"
+            @dragenter="fileDragEnter(createReleaseDropKey, $event)"
+            @dragleave="fileDragLeave(createReleaseDropKey)"
+            @dragover="fileDragOver"
+            @drop.prevent="dropCreateReleaseFiles"
+          >
             <Upload :size="17" />
             <span>
-              <strong>{{ createReleaseFileSummary }}</strong>
+              <strong>{{ isFileDragActive(createReleaseDropKey) ? '松开即可添加文件' : createReleaseFileSummary }}</strong>
               <small>可同时选择 .bin/.exe 及同名 .sha256</small>
             </span>
             <input
@@ -791,9 +882,9 @@ function toggleRelease(releaseId: string) {
                   'artifact-batch-picker',
                   { dragging: batchDragActive[release.id], disabled: operation },
                 ]"
-                @dragenter.prevent="batchDragEnter(release.id, $event)"
-                @dragleave.prevent="batchDragLeave(release.id)"
-                @dragover.prevent
+                @dragenter="batchDragEnter(release.id, $event)"
+                @dragleave="batchDragLeave(release.id)"
+                @dragover="fileDragOver"
                 @drop.prevent="dropBatchFiles(release.id, $event)"
               >
                 <Upload :size="17" />
@@ -854,7 +945,20 @@ function toggleRelease(releaseId: string) {
                     </option>
                   </select>
                 </label>
-                <label class="artifact-file-picker">
+                <label
+                  :class="[
+                    'artifact-file-picker',
+                    {
+                      dragging: isFileDragActive(uploadRowDropKey(row.id, 'executable')),
+                      selected: row.file,
+                      disabled: operation,
+                    },
+                  ]"
+                  @dragenter="fileDragEnter(uploadRowDropKey(row.id, 'executable'), $event)"
+                  @dragleave="fileDragLeave(uploadRowDropKey(row.id, 'executable'))"
+                  @dragover="fileDragOver"
+                  @drop.prevent="dropArtifactFile(row, $event)"
+                >
                   <span>可执行文件</span>
                   <span class="file-button" :title="row.file?.name">
                     <Upload :size="17" />
@@ -871,7 +975,20 @@ function toggleRelease(releaseId: string) {
                     />
                   </span>
                 </label>
-                <label class="artifact-checksum-picker">
+                <label
+                  :class="[
+                    'artifact-checksum-picker',
+                    {
+                      dragging: isFileDragActive(uploadRowDropKey(row.id, 'checksum')),
+                      selected: row.checksum_file,
+                      disabled: operation,
+                    },
+                  ]"
+                  @dragenter="fileDragEnter(uploadRowDropKey(row.id, 'checksum'), $event)"
+                  @dragleave="fileDragLeave(uploadRowDropKey(row.id, 'checksum'))"
+                  @dragover="fileDragOver"
+                  @drop.prevent="dropChecksumFile(row, $event)"
+                >
                   <span>SHA-256 文件</span>
                   <span class="file-button" :title="row.checksum_file?.name">
                     <FileArchive :size="17" />

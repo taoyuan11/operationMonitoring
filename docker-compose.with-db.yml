@@ -18,6 +18,9 @@ services:
       start_period: 10s
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    networks:
+      default:
+        ipv4_address: ${OM_POSTGRES_IP:-172.30.135.2}
     restart: unless-stopped
 
   backend:
@@ -47,6 +50,9 @@ services:
       - backend-db:/app/db
       - backend-uploads:/app/uploads
       - backend-updates:/app/updates
+    networks:
+      default:
+        ipv4_address: ${OM_BACKEND_IP:-172.30.135.4}
     restart: unless-stopped
 
   frontend:

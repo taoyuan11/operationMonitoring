@@ -402,9 +402,11 @@ Compose 为避免误用始终要求提供它。
 `OM_TRUST_PROXY_HEADERS` 控制登录限流是否读取反向代理提供的 `X-Real-IP`；默认关闭。
 启用时，只有连接端地址命中 `OM_TRUSTED_PROXY_CIDRS` 中逗号分隔的 IP/CIDR 才会
 采信该请求头。应按实际代理网络配置最小范围，并确保客户端不能绕过代理直连后端。
-Compose 将后端宿主端口固定绑定到 `127.0.0.1`，并默认把前端代理固定为
-`172.30.135.3`、只信任该 `/32` 地址。若该网段与现有网络冲突，可同时调整
-`OM_COMPOSE_NETWORK_CIDR`、`OM_FRONTEND_PROXY_IP` 和 `OM_TRUSTED_PROXY_CIDRS`。
+Compose 将后端宿主端口固定绑定到 `127.0.0.1`，并默认把 PostgreSQL、前端代理和
+后端分别固定为 `172.30.135.2`、`172.30.135.3` 和 `172.30.135.4`，后端只信任前端
+代理的 `/32` 地址。若该网段与现有网络冲突，必须同时调整 `OM_COMPOSE_NETWORK_CIDR`、
+`OM_POSTGRES_IP`、`OM_FRONTEND_PROXY_IP`、`OM_BACKEND_IP` 和
+`OM_TRUSTED_PROXY_CIDRS`，并确保三个服务地址互不相同且都位于所选网段内。
 登录限流会同时按来源地址和数据库中的真实管理员账号计数；不存在的用户名不会占用
 账号限流容量。
 

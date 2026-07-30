@@ -26,6 +26,9 @@ services:
       - backend-db:/app/db
       - backend-uploads:/app/uploads
       - backend-updates:/app/updates
+    networks:
+      default:
+        ipv4_address: ${OM_BACKEND_IP:-172.30.135.4}
     restart: unless-stopped
 
   frontend:

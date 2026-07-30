@@ -113,6 +113,11 @@ OM_ADMIN_PASSWORD=replace-with-a-long-random-bootstrap-password
 | `POSTGRES_USER` | `operation_monitoring` | 自带数据库首次初始化的用户。 |
 | `OM_SECURE_COOKIES` | `false` | HTTPS/WSS 对外服务必须设为 `true`；本地 HTTP 调试保持 `false`。 |
 | `OM_TRUST_PROXY_HEADERS` | Compose 固定为 `true` | 登录限流使用代理传入的 `X-Real-IP`；仅可在后端无法被绕过代理直连时启用。 |
+| `OM_COMPOSE_NETWORK_CIDR` | `172.30.135.0/24` | Compose 专用网络；与现有网络冲突时必须连同三个服务 IP 一起调整。 |
+| `OM_POSTGRES_IP` | `172.30.135.2` | 自带数据库模式中的 PostgreSQL 固定地址。 |
+| `OM_FRONTEND_PROXY_IP` | `172.30.135.3` | 前端代理固定地址，必须与 `OM_TRUSTED_PROXY_CIDRS` 的单地址网段一致。 |
+| `OM_BACKEND_IP` | `172.30.135.4` | 后端固定地址，不得与 PostgreSQL 或前端代理重复。 |
+| `OM_TRUSTED_PROXY_CIDRS` | `172.30.135.3/32` | Compose 后端仅从此前端代理地址采信客户端来源头。 |
 | `OM_ALLOW_LEGACY_AGENT_WS_AUTH` | `false` | 仅在把旧 Agent 升级到 `0.1.19` 的维护窗口临时接受查询串认证。 |
 | `FRONTEND_PORT` | `13501` | 宿主机到前端容器 80 端口的映射。可写成 `127.0.0.1:13501`。 |
 | `BACKEND_PORT` | `13500` | 后端仅映射到宿主机 `127.0.0.1`，供本机受控代理或诊断使用；远程 Agent 应连接前端代理地址。 |
@@ -412,6 +417,11 @@ docker compose -f docker-compose.with-db.yml up -d
 
 如果只希望本机反向代理访问，使用 `FRONTEND_PORT=127.0.0.1:13501`。
 `BACKEND_PORT` 只接受端口号，Compose 始终把它绑定到 `127.0.0.1`。
+
+如果 Docker 报错 `failed to set up container networking: Address already in use`，说明
+Compose 内部服务 IP 冲突，而不是宿主机端口冲突。确认 `OM_POSTGRES_IP`、
+`OM_FRONTEND_PROXY_IP` 和 `OM_BACKEND_IP` 互不相同且位于
+`OM_COMPOSE_NETWORK_CIDR` 内；修改后重新创建相关容器即可，不能通过删除数据卷处理。
 
 ## 12. 停止和卸载
 

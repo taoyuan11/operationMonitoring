@@ -33,10 +33,12 @@ validate_compose_file() {
 
 ensure_environment_file() {
   if [ -f "$ROOT/.env" ]; then
+    chmod 600 "$ROOT/.env"
     return
   fi
 
   [ -f "$ROOT/.env.example" ] || die "Neither .env nor .env.example exists in $ROOT"
+  umask 077
   cp "$ROOT/.env.example" "$ROOT/.env"
   chmod 600 "$ROOT/.env"
   printf '%s\n' \

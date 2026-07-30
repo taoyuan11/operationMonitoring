@@ -6,7 +6,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection, PgPool};
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -25,7 +28,7 @@ use crate::{
 const AUTH_FAILURE_LIMIT: u32 = 5;
 const AUTH_WINDOW_SECONDS: i64 = 5 * 60;
 const AUTH_BLOCK_SECONDS: i64 = 5 * 60;
-const MAX_AUTH_ATTEMPT_KEYS: usize = 4_096;
+const MAX_AUTH_SOURCE_KEYS: usize = 4_096;
 
 #[derive(Serialize)]
 pub struct AuthStatusResponse {
@@ -172,7 +175,7 @@ pub async fn bootstrap_start(
     Json(payload): Json<BootstrapStartRequest>,
 ) -> AppResult<Response> {
     let attempt_key = bootstrap_attempt_key(&state, &headers, peer_addr.ip(), "start");
-    ensure_attempt_allowed(&state, &attempt_key).await?;
+    ensure_source_attempt_allowed(&state, &attempt_key).await?;
     if auth_initialized(&state.db).await? {
         return Err(AppError::new(StatusCode::CONFLICT, "管理员认证已经初始化"));
     }
@@ -181,11 +184,11 @@ pub async fn bootstrap_start(
         .as_deref()
         .is_some_and(|password| bool::from(password.as_bytes().ct_eq(payload.password.as_bytes())));
     if !password_matches {
-        record_auth_failure(&state, &attempt_key).await;
+        record_source_auth_failure(&state, &attempt_key).await;
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "初始化凭据错误"));
     }
     let (username, normalized) = validate_username(&payload.username)?;
-    clear_auth_failures(&state, &attempt_key).await;
+    clear_source_auth_failures(&state, &attempt_key).await;
     remove_expired_enrollments(&state.db).await?;
 
     let secret = generate_totp_secret();
@@ -231,7 +234,7 @@ pub async fn bootstrap_confirm(
     Json(payload): Json<ConfirmEnrollmentRequest>,
 ) -> AppResult<Response> {
     let attempt_key = bootstrap_attempt_key(&state, &headers, peer_addr.ip(), "confirm");
-    ensure_attempt_allowed(&state, &attempt_key).await?;
+    ensure_source_attempt_allowed(&state, &attempt_key).await?;
     if auth_initialized(&state.db).await? {
         return Err(AppError::new(StatusCode::CONFLICT, "管理员认证已经初始化"));
     }
@@ -243,7 +246,7 @@ pub async fn bootstrap_confirm(
         return Err(AppError::bad_request("二维码已过期，请重新开始初始化"));
     }
     let Some(totp_counter) = verify_enrollment_code(&state, &enrollment, &payload.code)? else {
-        record_auth_failure(&state, &attempt_key).await;
+        record_source_auth_failure(&state, &attempt_key).await;
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "验证码错误"));
     };
 
@@ -293,7 +296,7 @@ pub async fn bootstrap_confirm(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    clear_auth_failures(&state, &attempt_key).await;
+    clear_source_auth_failures(&state, &attempt_key).await;
     write_action_log(
         &state.db,
         &enrollment.username,
@@ -324,15 +327,15 @@ pub async fn admin_login(
             "请先使用默认密码完成管理员初始化",
         ));
     }
-    let attempt_key = format!(
+    let source_attempt_key = format!(
         "login:{}",
         login_client_ip(&state, &headers, peer_addr.ip())
     );
-    ensure_attempt_allowed(&state, &attempt_key).await?;
+    ensure_source_attempt_allowed(&state, &source_attempt_key).await?;
     let normalized = match validate_username(&payload.username) {
         Ok((_, normalized)) => normalized,
         Err(_) => {
-            record_auth_failure(&state, &attempt_key).await;
+            record_source_auth_failure(&state, &source_attempt_key).await;
             return Err(AppError::new(
                 StatusCode::UNAUTHORIZED,
                 "用户名或验证码错误",
@@ -345,21 +348,25 @@ pub async fn admin_login(
     .bind(&normalized)
     .fetch_optional(&state.db)
     .await?;
-    let authenticated = if let Some(user) = user.filter(|user| user.enabled == 1) {
-        verify_user_code(&state, &user.id, &payload.code)
-            .await?
-            .map(|(device, counter)| (user, device, counter))
-    } else {
-        None
-    };
-    let Some((user, device, counter)) = authenticated else {
-        record_auth_failure(&state, &attempt_key).await;
+    let Some(user) = user.filter(|user| user.enabled == 1) else {
+        record_source_auth_failure(&state, &source_attempt_key).await;
         return Err(AppError::new(
             StatusCode::UNAUTHORIZED,
             "用户名或验证码错误",
         ));
     };
-    clear_auth_failures(&state, &attempt_key).await;
+    let account_attempt_key = format!("login:{}", user.id);
+    ensure_account_attempt_allowed(&state, &account_attempt_key).await?;
+    let Some((device, counter)) = verify_user_code(&state, &user.id, &payload.code).await? else {
+        record_source_auth_failure(&state, &source_attempt_key).await;
+        record_account_auth_failure(&state, &account_attempt_key).await;
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "用户名或验证码错误",
+        ));
+    };
+    clear_source_auth_failures(&state, &source_attempt_key).await;
+    clear_account_auth_failures(&state, &account_attempt_key).await;
     write_action_log(&state.db, &user.username, "login", &user.id, "管理员登录").await?;
     session_response(&state, user.id, user.username, device.id, Some(counter)).await
 }
@@ -828,7 +835,7 @@ async fn create_enrollment(
 
 async fn verify_step_up(state: &AppState, principal: &AdminPrincipal, code: &str) -> AppResult<()> {
     let key = format!("step-up:{}", principal.user_id);
-    ensure_attempt_allowed(state, &key).await?;
+    ensure_account_attempt_allowed(state, &key).await?;
     let verified_with_new_counter = verify_user_code(state, &principal.user_id, code)
         .await?
         .is_some();
@@ -839,13 +846,13 @@ async fn verify_step_up(state: &AppState, principal: &AdminPrincipal, code: &str
         consume_login_counter_for_step_up(state, principal, code).await?
     };
     if !verified {
-        record_auth_failure(state, &key).await;
+        record_account_auth_failure(state, &key).await;
         return Err(AppError::new(
             StatusCode::UNAUTHORIZED,
             "当前管理员验证码错误",
         ));
     }
-    clear_auth_failures(state, &key).await;
+    clear_account_auth_failures(state, &key).await;
     Ok(())
 }
 
@@ -1070,9 +1077,20 @@ fn no_store_json<T: Serialize>(payload: T) -> AppResult<Response> {
     Ok(response)
 }
 
-async fn ensure_attempt_allowed(state: &AppState, key: &str) -> AppResult<()> {
+async fn ensure_source_attempt_allowed(state: &AppState, key: &str) -> AppResult<()> {
+    ensure_attempt_allowed_in(&state.auth_source_attempts, key).await
+}
+
+async fn ensure_account_attempt_allowed(state: &AppState, key: &str) -> AppResult<()> {
+    ensure_attempt_allowed_in(&state.auth_account_attempts, key).await
+}
+
+async fn ensure_attempt_allowed_in(
+    attempts: &tokio::sync::RwLock<HashMap<String, crate::state::AuthAttempt>>,
+    key: &str,
+) -> AppResult<()> {
     let now = now_ts();
-    let mut attempts = state.auth_attempts.write().await;
+    let mut attempts = attempts.write().await;
     prune_auth_attempts(&mut attempts, now);
     if attempts
         .get(key)
@@ -1086,18 +1104,41 @@ async fn ensure_attempt_allowed(state: &AppState, key: &str) -> AppResult<()> {
     Ok(())
 }
 
-async fn record_auth_failure(state: &AppState, key: &str) {
+async fn record_source_auth_failure(state: &AppState, key: &str) {
+    record_auth_failure_in(&state.auth_source_attempts, key, Some(MAX_AUTH_SOURCE_KEYS)).await;
+}
+
+async fn record_account_auth_failure(state: &AppState, key: &str) {
+    record_auth_failure_in(&state.auth_account_attempts, key, None).await;
+}
+
+async fn record_auth_failure_in(
+    attempts: &tokio::sync::RwLock<HashMap<String, crate::state::AuthAttempt>>,
+    key: &str,
+    max_keys: Option<usize>,
+) {
     let now = now_ts();
-    let mut attempts = state.auth_attempts.write().await;
+    let mut attempts = attempts.write().await;
     prune_auth_attempts(&mut attempts, now);
-    if !attempts.contains_key(key)
-        && attempts.len() >= MAX_AUTH_ATTEMPT_KEYS
-        && let Some(oldest) = attempts
+    record_auth_failure_locked(&mut attempts, key, now, max_keys);
+}
+
+fn record_auth_failure_locked(
+    attempts: &mut HashMap<String, crate::state::AuthAttempt>,
+    key: &str,
+    now: i64,
+    max_keys: Option<usize>,
+) {
+    if !attempts.contains_key(key) && max_keys.is_some_and(|limit| attempts.len() >= limit) {
+        let oldest_unblocked = attempts
             .iter()
+            .filter(|(_, attempt)| attempt.blocked_until <= now)
             .min_by_key(|(_, attempt)| attempt.window_started_at)
-            .map(|(key, _)| key.clone())
-    {
-        attempts.remove(&oldest);
+            .map(|(key, _)| key.clone());
+        let Some(oldest_unblocked) = oldest_unblocked else {
+            return;
+        };
+        attempts.remove(&oldest_unblocked);
     }
     let attempt = attempts.entry(key.to_string()).or_default();
     if attempt.window_started_at == 0 || now - attempt.window_started_at > AUTH_WINDOW_SECONDS {
@@ -1111,21 +1152,27 @@ async fn record_auth_failure(state: &AppState, key: &str) {
     }
 }
 
-async fn clear_auth_failures(state: &AppState, key: &str) {
-    state.auth_attempts.write().await.remove(key);
+async fn clear_source_auth_failures(state: &AppState, key: &str) {
+    state.auth_source_attempts.write().await.remove(key);
 }
 
-fn prune_auth_attempts(
-    attempts: &mut std::collections::HashMap<String, crate::state::AuthAttempt>,
-    now: i64,
-) {
+async fn clear_account_auth_failures(state: &AppState, key: &str) {
+    state.auth_account_attempts.write().await.remove(key);
+}
+
+fn prune_auth_attempts(attempts: &mut HashMap<String, crate::state::AuthAttempt>, now: i64) {
     attempts.retain(|_, attempt| {
         attempt.blocked_until > now || now - attempt.window_started_at <= AUTH_WINDOW_SECONDS
     });
 }
 
 fn login_client_ip(state: &AppState, headers: &HeaderMap, peer_ip: IpAddr) -> IpAddr {
-    resolved_client_ip(state.trust_proxy_headers, headers, peer_ip)
+    resolved_client_ip(
+        state.trust_proxy_headers,
+        &state.trusted_proxy_cidrs,
+        headers,
+        peer_ip,
+    )
 }
 
 fn bootstrap_attempt_key(
@@ -1136,16 +1183,26 @@ fn bootstrap_attempt_key(
 ) -> String {
     format!(
         "bootstrap:{phase}:{}",
-        resolved_client_ip(state.trust_proxy_headers, headers, peer_ip)
+        resolved_client_ip(
+            state.trust_proxy_headers,
+            &state.trusted_proxy_cidrs,
+            headers,
+            peer_ip,
+        )
     )
 }
 
 pub(crate) fn resolved_client_ip(
     trust_proxy_headers: bool,
+    trusted_proxy_cidrs: &[ipnet::IpNet],
     headers: &HeaderMap,
     peer_ip: IpAddr,
 ) -> IpAddr {
-    if !trust_proxy_headers {
+    if !trust_proxy_headers
+        || !trusted_proxy_cidrs
+            .iter()
+            .any(|network| network.contains(&peer_ip))
+    {
         return peer_ip;
     }
     headers
@@ -1171,14 +1228,67 @@ mod tests {
     };
 
     #[test]
-    fn login_source_only_trusts_configured_proxy_header() {
+    fn login_source_only_trusts_headers_from_configured_proxy_networks() {
         let peer_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let untrusted_peer_ip: IpAddr = "192.0.2.1".parse().unwrap();
         let forwarded_ip: IpAddr = "203.0.113.8".parse().unwrap();
+        let trusted_proxy_cidrs = ["127.0.0.0/8".parse().unwrap()];
         let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", "203.0.113.8".parse().unwrap());
 
-        assert_eq!(resolved_client_ip(false, &headers, peer_ip), peer_ip);
-        assert_eq!(resolved_client_ip(true, &headers, peer_ip), forwarded_ip);
+        assert_eq!(
+            resolved_client_ip(false, &trusted_proxy_cidrs, &headers, peer_ip),
+            peer_ip
+        );
+        assert_eq!(resolved_client_ip(true, &[], &headers, peer_ip), peer_ip);
+        assert_eq!(
+            resolved_client_ip(true, &trusted_proxy_cidrs, &headers, untrusted_peer_ip),
+            untrusted_peer_ip
+        );
+        assert_eq!(
+            resolved_client_ip(true, &trusted_proxy_cidrs, &headers, peer_ip),
+            forwarded_ip
+        );
+    }
+
+    #[test]
+    fn login_failures_count_against_source_and_account_dimensions() {
+        let now = now_ts();
+        let mut source_attempts = HashMap::new();
+        let mut account_attempts = HashMap::new();
+
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            record_auth_failure_locked(
+                &mut source_attempts,
+                "login:192.0.2.1",
+                now,
+                Some(MAX_AUTH_SOURCE_KEYS),
+            );
+            record_auth_failure_locked(&mut account_attempts, "login:user-id", now, None);
+        }
+
+        for (attempts, key) in [
+            (&source_attempts, "login:192.0.2.1"),
+            (&account_attempts, "login:user-id"),
+        ] {
+            let attempt = attempts.get(key).expect("rate-limit dimension exists");
+            assert_eq!(attempt.failures, AUTH_FAILURE_LIMIT);
+            assert_eq!(attempt.blocked_until, now + AUTH_BLOCK_SECONDS);
+        }
+    }
+
+    #[test]
+    fn source_capacity_never_evicts_a_blocked_entry() {
+        let now = 10_000;
+        let mut attempts = HashMap::new();
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            record_auth_failure_locked(&mut attempts, "blocked-source", now, Some(1));
+        }
+
+        record_auth_failure_locked(&mut attempts, "new-source", now, Some(1));
+
+        assert!(attempts.contains_key("blocked-source"));
+        assert!(!attempts.contains_key("new-source"));
     }
 
     #[test]
@@ -1227,6 +1337,7 @@ mod tests {
                 auth_key_file: PathBuf::from("unused-test-auth-key"),
                 secure_cookies: false,
                 trust_proxy_headers: false,
+                trusted_proxy_cidrs: Vec::new(),
                 allow_legacy_agent_ws_auth: false,
                 reset_admin_auth: false,
                 confirm_reset_admin_auth: None,

@@ -1,8 +1,8 @@
-use std::{str::FromStr, time::Duration};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use axum::http::StatusCode;
 use sqlx::{
-    PgPool,
+    Executor, FromRow, PgPool, Postgres,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use tracing::error;
@@ -22,6 +22,13 @@ const MAX_PENDING_INSTANCES: i64 = 1_000;
 const MAX_PENDING_INSTANCES_PER_SOURCE: i64 = 50;
 const PENDING_INSTANCE_MAX_AGE: i64 = 7 * 24 * 60 * 60;
 const PENDING_INSTANCE_TOUCH_INTERVAL: i64 = 5;
+
+#[derive(FromRow)]
+struct InstanceMetricRecord {
+    instance_id: String,
+    #[sqlx(flatten)]
+    metric: MetricRecord,
+}
 
 pub async fn connect_db(database_url: &str, password: Option<&str>) -> anyhow::Result<PgPool> {
     let mut options = PgConnectOptions::from_str(database_url)?;
@@ -299,11 +306,24 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             status TEXT NOT NULL,
             requested_by TEXT NOT NULL,
             created_at BIGINT NOT NULL,
+            started_at BIGINT,
             completed_at BIGINT,
             output TEXT NOT NULL DEFAULT '',
-            exit_code BIGINT
+            exit_code BIGINT,
+            agent_connection_id TEXT
         );
         "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("ALTER TABLE command_jobs ADD COLUMN IF NOT EXISTS started_at BIGINT")
+        .execute(db)
+        .await?;
+    sqlx::query("ALTER TABLE command_jobs ADD COLUMN IF NOT EXISTS agent_connection_id TEXT")
+        .execute(db)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_command_jobs_running_started ON command_jobs(status, started_at) WHERE status = 'running'",
     )
     .execute(db)
     .await?;
@@ -548,6 +568,18 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
     }
 
     ensure_bigint_columns(db).await?;
+    let now = now_ts();
+    sqlx::query(
+        r#"
+        UPDATE command_jobs
+        SET status = 'failed', completed_at = $1, exit_code = -1,
+            output = '后端服务重启，命令任务已终止'
+        WHERE status IN ('queued', 'running')
+        "#,
+    )
+    .bind(now)
+    .execute(db)
+    .await?;
 
     Ok(())
 }
@@ -587,7 +619,7 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
         ("commands", &["enabled", "created_at"][..]),
         (
             "command_jobs",
-            &["created_at", "completed_at", "exit_code"][..],
+            &["created_at", "started_at", "completed_at", "exit_code"][..],
         ),
         ("ssh_sessions", &["started_at", "ended_at"][..]),
         ("desktop_sessions", &["started_at", "ended_at"][..]),
@@ -1025,6 +1057,33 @@ pub async fn latest_metric(db: &PgPool, instance_id: &str) -> AppResult<Option<M
     Ok(metric)
 }
 
+pub async fn latest_metrics(
+    db: &PgPool,
+    instance_ids: &[String],
+) -> AppResult<HashMap<String, MetricRecord>> {
+    if instance_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, InstanceMetricRecord>(
+        r#"
+        SELECT DISTINCT ON (instance_id)
+               instance_id, ts, cpu_percent, memory_used, memory_total, disk_used, disk_total,
+               network_rx, network_tx, gpu_percent, gpu_memory_used, gpu_memory_total,
+               uptime_seconds, load_average, latency_ms
+        FROM metrics
+        WHERE instance_id = ANY($1)
+        ORDER BY instance_id, ts DESC
+        "#,
+    )
+    .bind(instance_ids)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.instance_id, row.metric))
+        .collect())
+}
+
 pub fn normalize_metric_timestamp(timestamp: i64, received_at: i64) -> AppResult<i64> {
     if timestamp <= 0 || received_at <= 0 {
         return Err(AppError::bad_request("指标时间戳无效"));
@@ -1116,13 +1175,16 @@ pub async fn cleanup_loop(state: AppState) {
     }
 }
 
-pub async fn write_action_log(
-    db: &PgPool,
+pub async fn write_action_log<'e, E>(
+    executor: E,
     actor: &str,
     action: &str,
     target: &str,
     detail: &str,
-) -> AppResult<()> {
+) -> AppResult<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(
         "INSERT INTO action_logs(id, actor, action, target, detail, created_at) VALUES($1, $2, $3, $4, $5, $6)",
     )
@@ -1132,7 +1194,7 @@ pub async fn write_action_log(
     .bind(target)
     .bind(detail)
     .bind(now_ts())
-    .execute(db)
+    .execute(executor)
     .await?;
     Ok(())
 }

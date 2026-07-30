@@ -45,6 +45,7 @@ use handlers::{
     admin_upload_background_image, agent_register, agent_report, agent_ws, health,
     public_appearance, public_instances, public_metrics,
 };
+use jobs::command_timeout_loop;
 use remote_desktop::{admin_desktop_ws, agent_desktop_ws, ensure_same_origin};
 use state::AppState;
 use std::{io::ErrorKind, path::Path};
@@ -278,6 +279,10 @@ async fn main() -> anyhow::Result<()> {
     let update_timeout_state = state.clone();
     tokio::spawn(async move {
         update_timeout_loop(update_timeout_state).await;
+    });
+    let command_timeout_state = state.clone();
+    tokio::spawn(async move {
+        command_timeout_loop(command_timeout_state).await;
     });
 
     let listener = tokio::net::TcpListener::bind(bind).await?;

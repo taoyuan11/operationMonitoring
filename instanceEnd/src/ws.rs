@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use reqwest::{Url, redirect::Policy};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
@@ -60,6 +61,7 @@ pub async fn agent_ws_loop(
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(30))
+        .redirect(agent_redirect_policy())
         .build()?;
     let activity = ActivityTracker::default();
     let update_manager = match UpdateManager::new(
@@ -155,6 +157,29 @@ pub async fn agent_ws_loop(
             return Ok(());
         }
     }
+}
+
+fn agent_redirect_policy() -> Policy {
+    Policy::custom(|attempt| {
+        if attempt.previous().len() > 10 {
+            return attempt.error("too many agent HTTP redirects");
+        }
+        if attempt
+            .previous()
+            .first()
+            .is_some_and(|origin| same_origin(origin, attempt.url()))
+        {
+            attempt.follow()
+        } else {
+            attempt.error("cross-origin agent HTTP redirect refused")
+        }
+    })
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 async fn handle_agent_socket(
@@ -642,5 +667,26 @@ mod tests {
         );
         assert_eq!(url.contains(DESKTOP_CAPABILITY), cfg!(windows));
         assert_eq!(url.contains(DOCKER_CAPABILITY), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn authenticated_http_redirects_stay_on_the_original_origin() {
+        let origin = Url::parse("https://monitor.example/api/agent/update/manifest").unwrap();
+        assert!(same_origin(
+            &origin,
+            &Url::parse("https://monitor.example:443/other").unwrap()
+        ));
+        assert!(!same_origin(
+            &origin,
+            &Url::parse("https://downloads.example/package").unwrap()
+        ));
+        assert!(!same_origin(
+            &origin,
+            &Url::parse("https://monitor.example:8443/package").unwrap()
+        ));
+        assert!(!same_origin(
+            &origin,
+            &Url::parse("http://monitor.example/package").unwrap()
+        ));
     }
 }

@@ -604,6 +604,41 @@ pub async fn offer_update_on_connect(state: &AppState, instance_id: &str) {
     notify_instance(state, instance_id).await;
 }
 
+pub async fn record_connection_update_status(
+    state: &AppState,
+    instance_id: &str,
+    connection_id: Uuid,
+    release_id: &str,
+    artifact_id: &str,
+    version: &str,
+    retry_count: i64,
+    status: &str,
+    message: Option<&str>,
+) -> AppResult<bool> {
+    let agents = state.agents.read().await;
+    if !agents
+        .get(instance_id)
+        .is_some_and(|agent| agent.connection_id == connection_id)
+    {
+        return Ok(false);
+    }
+
+    let result = record_update_status(
+        state,
+        instance_id,
+        release_id,
+        artifact_id,
+        version,
+        retry_count,
+        status,
+        message,
+    )
+    .await;
+    drop(agents);
+    result?;
+    Ok(true)
+}
+
 pub async fn record_update_status(
     state: &AppState,
     instance_id: &str,
@@ -627,10 +662,46 @@ pub async fn record_update_status(
             "Agent 更新状态信息过长",
         ));
     }
-    let completed_at = TERMINAL_ATTEMPT_STATUSES
-        .contains(&status)
-        .then_some(now_ts());
-    let result = sqlx::query(
+
+    let mut transaction = state.db.begin().await?;
+    let current_status = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT status
+        FROM agent_update_attempts
+        WHERE instance_id = $1 AND release_id = $2 AND artifact_id = $3 AND target_version = $4
+          AND retry_count = $5
+        FOR UPDATE
+        "#,
+    )
+    .bind(instance_id)
+    .bind(release_id)
+    .bind(artifact_id)
+    .bind(version)
+    .bind(retry_count)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Agent 更新任务不存在或信息不匹配"))?;
+    if current_status == status && TERMINAL_ATTEMPT_STATUSES.contains(&status) {
+        if status == "succeeded" {
+            sqlx::query("UPDATE instances SET agent_version = $1 WHERE id = $2")
+                .bind(version)
+                .bind(instance_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        return Ok(());
+    }
+    if !update_status_transition_allowed(&current_status, status) {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "Agent 更新状态不允许回退或离开终态",
+        ));
+    }
+
+    let now = now_ts();
+    let completed_at = TERMINAL_ATTEMPT_STATUSES.contains(&status).then_some(now);
+    sqlx::query(
         r#"
         UPDATE agent_update_attempts
         SET status = $1, message = $2, updated_at = $3, completed_at = $4
@@ -640,28 +711,23 @@ pub async fn record_update_status(
     )
     .bind(status)
     .bind(message)
-    .bind(now_ts())
+    .bind(now)
     .bind(completed_at)
     .bind(instance_id)
     .bind(release_id)
     .bind(artifact_id)
     .bind(version)
     .bind(retry_count)
-    .execute(&state.db)
+    .execute(&mut *transaction)
     .await?;
-    if result.rows_affected() != 1 {
-        return Err(AppError::new(
-            StatusCode::NOT_FOUND,
-            "Agent 更新任务不存在或信息不匹配",
-        ));
-    }
     if status == "succeeded" {
         sqlx::query("UPDATE instances SET agent_version = $1 WHERE id = $2")
             .bind(version)
             .bind(instance_id)
-            .execute(&state.db)
+            .execute(&mut *transaction)
             .await?;
     }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -1119,6 +1185,29 @@ fn valid_agent_status(status: &str) -> bool {
             | "rollback_succeeded"
             | "failed"
     )
+}
+
+fn update_status_transition_allowed(current: &str, next: &str) -> bool {
+    if TERMINAL_ATTEMPT_STATUSES.contains(&current) {
+        return current == next;
+    }
+    if TERMINAL_ATTEMPT_STATUSES.contains(&next) {
+        return true;
+    }
+
+    let progress = |status| match status {
+        "pending" => Some(0),
+        "waiting" => Some(1),
+        "downloading" => Some(2),
+        "verifying" => Some(3),
+        "waiting_idle" => Some(4),
+        "installing" => Some(5),
+        "awaiting_restart" => Some(6),
+        _ => None,
+    };
+    progress(current)
+        .zip(progress(next))
+        .is_some_and(|(current, next)| next >= current)
 }
 
 async fn get_release(state: &AppState, release_id: &str) -> AppResult<AgentReleaseRecord> {
@@ -1702,6 +1791,7 @@ mod tests {
                 auth_key_file: root.join("auth-secret.key"),
                 secure_cookies: false,
                 trust_proxy_headers: false,
+                trusted_proxy_cidrs: Vec::new(),
                 allow_legacy_agent_ws_auth: false,
                 reset_admin_auth: false,
                 confirm_reset_admin_auth: None,
@@ -1812,6 +1902,43 @@ mod tests {
         assert!(!version_is_newer(&release, "1.10.0"));
         assert!(!version_is_newer(&release, "2.0.0"));
         assert!(version_is_newer(&release, "legacy"));
+    }
+
+    #[test]
+    fn update_attempt_statuses_only_move_forward_or_to_a_terminal_state() {
+        let progress = [
+            "pending",
+            "waiting",
+            "downloading",
+            "verifying",
+            "waiting_idle",
+            "installing",
+            "awaiting_restart",
+        ];
+        for (index, current) in progress.iter().enumerate() {
+            assert!(update_status_transition_allowed(current, current));
+            for next in progress.iter().skip(index) {
+                assert!(update_status_transition_allowed(current, next));
+            }
+            for previous in progress.iter().take(index) {
+                assert!(!update_status_transition_allowed(current, previous));
+            }
+            for terminal in TERMINAL_ATTEMPT_STATUSES {
+                assert!(update_status_transition_allowed(current, terminal));
+            }
+        }
+
+        for terminal in TERMINAL_ATTEMPT_STATUSES {
+            assert!(update_status_transition_allowed(terminal, terminal));
+            assert!(!update_status_transition_allowed(terminal, "waiting"));
+            for other in TERMINAL_ATTEMPT_STATUSES {
+                if terminal != other {
+                    assert!(!update_status_transition_allowed(terminal, other));
+                }
+            }
+        }
+        assert!(!update_status_transition_allowed("unknown", "waiting"));
+        assert!(!update_status_transition_allowed("waiting", "unknown"));
     }
 
     #[test]
@@ -2167,6 +2294,85 @@ mod tests {
         )
         .await
         .expect("current generation status is accepted");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn terminal_update_status_cannot_regress_and_version_is_committed() {
+        let state = test_state().await;
+        insert_instance(
+            &state,
+            "terminal-state-agent",
+            "ubuntu",
+            "standalone",
+            "amd64",
+        )
+        .await;
+        insert_release(&state, "6.0.0", "standalone", "amd64").await;
+        let instance = get_instance(&state.db, "terminal-state-agent")
+            .await
+            .expect("load instance");
+        let offer = find_update_for_instance(&state, &instance)
+            .await
+            .expect("find update")
+            .expect("matching update");
+
+        record_update_status(
+            &state,
+            &instance.id,
+            &offer.release_id,
+            &offer.artifact_id,
+            &offer.version,
+            0,
+            "succeeded",
+            Some("installed"),
+        )
+        .await
+        .expect("record success");
+        let regression = record_update_status(
+            &state,
+            &instance.id,
+            &offer.release_id,
+            &offer.artifact_id,
+            &offer.version,
+            0,
+            "waiting",
+            Some("late stale status"),
+        )
+        .await
+        .expect_err("terminal attempt must not regress");
+        assert_eq!(regression.status, StatusCode::CONFLICT);
+        record_update_status(
+            &state,
+            &instance.id,
+            &offer.release_id,
+            &offer.artifact_id,
+            &offer.version,
+            0,
+            "succeeded",
+            Some("duplicate terminal status"),
+        )
+        .await
+        .expect("duplicate terminal status is idempotent");
+
+        let (status, message, completed_at) =
+            sqlx::query_as::<_, (String, String, Option<i64>)>(
+                "SELECT status, message, completed_at FROM agent_update_attempts WHERE instance_id = $1",
+            )
+            .bind(&instance.id)
+            .fetch_one(&state.db)
+            .await
+            .expect("load terminal attempt");
+        assert_eq!(status, "succeeded");
+        assert_eq!(message, "installed");
+        assert!(completed_at.is_some());
+        let agent_version: String =
+            sqlx::query_scalar("SELECT agent_version FROM instances WHERE id = $1")
+                .bind(&instance.id)
+                .fetch_one(&state.db)
+                .await
+                .expect("load committed agent version");
+        assert_eq!(agent_version, offer.version);
     }
 
     #[tokio::test]

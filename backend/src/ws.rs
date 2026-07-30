@@ -10,19 +10,19 @@ use crate::{
     auth::AdminSessionGuard,
     db::normalize_metric_timestamp,
     docker::{
-        CAPABILITY as DOCKER_CAPABILITY, close_connection_docker, handle_docker_exec_event,
-        handle_docker_log_chunk, handle_docker_log_closed, handle_docker_response,
-        update_current_docker_status,
+        CAPABILITY as DOCKER_CAPABILITY, cancel_instance_docker, close_connection_docker,
+        handle_docker_exec_event, handle_docker_log_chunk, handle_docker_log_closed,
+        handle_docker_response, update_current_docker_status,
     },
     error::AppResult,
     files::{close_connection_file_requests, handle_agent_file_binary, handle_agent_file_response},
-    jobs::complete_command_job,
+    jobs::{complete_command_job, fail_connection_command_jobs},
     models::{
         AgentInbound, AgentOutbound, MetricPayload, TerminalClientMessage, TerminalServerMessage,
     },
     remote_desktop::{close_connection_desktops, desktop_agent_closed, desktop_agent_opened},
     state::{AgentHandle, AppState, TerminalSessionHandle},
-    updates::{confirm_update_version, offer_update_on_connect, record_update_status},
+    updates::{confirm_update_version, offer_update_on_connect, record_connection_update_status},
     utils::now_ts,
 };
 
@@ -52,20 +52,49 @@ pub async fn agent_socket(
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentOutbound>();
     let (binary_tx, mut binary_rx) = mpsc::channel::<Vec<u8>>(4);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     let docker_capable = capabilities
         .iter()
         .any(|capability| capability == DOCKER_CAPABILITY);
-    state.agents.write().await.insert(
+    let replaced = state.agents.write().await.insert(
         instance_id.clone(),
         AgentHandle {
             connection_id,
             tx,
             binary_tx,
+            shutdown_tx,
             capabilities,
             docker_status: Default::default(),
         },
     );
+    if let Some(replaced) = replaced {
+        replaced.shutdown_tx.send_replace(true);
+        if let Err(error) =
+            fail_connection_command_jobs(&state, &instance_id, replaced.connection_id).await
+        {
+            warn!(?error, %instance_id, connection_id = %replaced.connection_id, "failed to close replaced agent command jobs");
+        }
+        close_connection_terminals(&state, &instance_id, replaced.connection_id).await;
+        close_connection_desktops(&state, &instance_id, replaced.connection_id).await;
+        close_connection_file_requests(&state, &instance_id, replaced.connection_id).await;
+        close_connection_docker(&state, &instance_id, replaced.connection_id).await;
+    }
+    let authorized = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM instances WHERE id = $1 AND approved = 1 AND disabled = 0)",
+    )
+    .bind(&instance_id)
+    .fetch_one(&state.db)
+    .await;
+    if !authorized.as_ref().is_ok_and(|authorized| *authorized) {
+        warn!(?authorized, %instance_id, %connection_id, "closing unauthorized agent websocket after upgrade");
+        remove_current_agent(&state, &instance_id, connection_id).await;
+        close_connection_terminals(&state, &instance_id, connection_id).await;
+        close_connection_desktops(&state, &instance_id, connection_id).await;
+        close_connection_file_requests(&state, &instance_id, connection_id).await;
+        close_connection_docker(&state, &instance_id, connection_id).await;
+        return;
+    }
     if !docker_capable
         && let Err(error) =
             update_current_docker_status(&state, &instance_id, connection_id, None).await
@@ -89,6 +118,11 @@ pub async fn agent_socket(
 
     loop {
         tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
             outbound = rx.recv() => {
                 let Some(outbound) = outbound else {
                     break;
@@ -189,20 +223,44 @@ pub async fn agent_socket(
         }
     }
 
-    let mut agents = state.agents.write().await;
-    if agents
-        .get(&instance_id)
-        .is_some_and(|handle| handle.connection_id == connection_id)
-    {
-        agents.remove(&instance_id);
+    remove_current_agent(&state, &instance_id, connection_id).await;
+
+    if let Err(error) = fail_connection_command_jobs(&state, &instance_id, connection_id).await {
+        warn!(?error, %instance_id, %connection_id, "failed to close disconnected agent command jobs");
     }
-    drop(agents);
 
     close_connection_terminals(&state, &instance_id, connection_id).await;
     close_connection_desktops(&state, &instance_id, connection_id).await;
     close_connection_file_requests(&state, &instance_id, connection_id).await;
     close_connection_docker(&state, &instance_id, connection_id).await;
     info!(%instance_id, %connection_id, "agent websocket disconnected");
+}
+
+async fn remove_current_agent(state: &AppState, instance_id: &str, connection_id: Uuid) {
+    let mut agents = state.agents.write().await;
+    if agents
+        .get(instance_id)
+        .is_some_and(|handle| handle.connection_id == connection_id)
+    {
+        agents.remove(instance_id);
+    }
+}
+
+pub async fn revoke_instance_connection(state: &AppState, instance_id: &str) {
+    let agent = state.agents.write().await.remove(instance_id);
+    let Some(agent) = agent else {
+        cancel_instance_docker(state, instance_id, None).await;
+        return;
+    };
+    agent.shutdown_tx.send_replace(true);
+    if let Err(error) = fail_connection_command_jobs(state, instance_id, agent.connection_id).await
+    {
+        warn!(?error, %instance_id, connection_id = %agent.connection_id, "failed to close revoked agent command jobs");
+    }
+    close_connection_terminals(state, instance_id, agent.connection_id).await;
+    close_connection_desktops(state, instance_id, agent.connection_id).await;
+    close_connection_file_requests(state, instance_id, agent.connection_id).await;
+    cancel_instance_docker(state, instance_id, Some(&agent)).await;
 }
 
 fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
@@ -376,7 +434,18 @@ async fn handle_agent_message(
             exit_code,
             output,
         } => {
-            complete_command_job(state, &job_id, exit_code, &output).await?;
+            if !complete_command_job(
+                state,
+                &job_id,
+                instance_id,
+                connection_id,
+                exit_code,
+                &output,
+            )
+            .await?
+            {
+                warn!(%instance_id, %connection_id, %job_id, "ignored unmatched or terminal command result");
+            }
         }
         AgentInbound::TerminalOpened { session_id } => {
             send_terminal_event(
@@ -499,9 +568,10 @@ async fn handle_agent_message(
             status,
             message,
         } => {
-            record_update_status(
+            if !record_connection_update_status(
                 state,
                 instance_id,
+                connection_id,
                 &release_id,
                 &artifact_id,
                 &version,
@@ -509,7 +579,10 @@ async fn handle_agent_message(
                 &status,
                 message.as_deref(),
             )
-            .await?;
+            .await?
+            {
+                warn!(%instance_id, %connection_id, %release_id, %artifact_id, "ignored update status from stale agent connection");
+            }
         }
     }
     Ok(())
@@ -620,6 +693,27 @@ fn accept_heartbeat_pong(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_shutdown_survives_active_agent_handle_clones() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (binary_tx, _binary_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = AgentHandle {
+            connection_id: Uuid::new_v4(),
+            tx,
+            binary_tx,
+            shutdown_tx,
+            capabilities: Vec::new(),
+            docker_status: Default::default(),
+        };
+        let active_session_handle = handle.clone();
+
+        handle.shutdown_tx.send_replace(true);
+
+        assert!(*shutdown_rx.borrow());
+        assert!(*active_session_handle.shutdown_tx.borrow());
+    }
 
     #[test]
     fn matching_pong_returns_millisecond_latency_and_clears_pending_heartbeat() {

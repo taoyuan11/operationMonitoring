@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
+use ipnet::IpNet;
 use sqlx::PgPool;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -24,13 +25,15 @@ pub struct AppState {
     pub auth_cipher: Arc<AuthCipher>,
     pub secure_cookies: bool,
     pub trust_proxy_headers: bool,
+    pub trusted_proxy_cidrs: Vec<IpNet>,
     pub allow_legacy_agent_ws_auth: bool,
     pub upload_dir: PathBuf,
     pub update_dir: PathBuf,
     pub agent_package_max_bytes: usize,
     pub file_transfer_max_bytes: usize,
     pub sessions: Arc<RwLock<HashMap<String, AdminSession>>>,
-    pub auth_attempts: Arc<RwLock<HashMap<String, AuthAttempt>>>,
+    pub auth_source_attempts: Arc<RwLock<HashMap<String, AuthAttempt>>>,
+    pub auth_account_attempts: Arc<RwLock<HashMap<String, AuthAttempt>>>,
     pub agents: Arc<RwLock<HashMap<String, AgentHandle>>>,
     pub terminal_sessions: Arc<RwLock<HashMap<String, TerminalSessionHandle>>>,
     pub file_requests: Arc<RwLock<HashMap<String, PendingFileRequest>>>,
@@ -51,13 +54,15 @@ impl AppState {
             auth_cipher: Arc::new(auth_cipher),
             secure_cookies: cli.secure_cookies,
             trust_proxy_headers: cli.trust_proxy_headers,
+            trusted_proxy_cidrs: cli.trusted_proxy_cidrs,
             allow_legacy_agent_ws_auth: cli.allow_legacy_agent_ws_auth,
             upload_dir: cli.upload_dir,
             update_dir: cli.update_dir,
             agent_package_max_bytes: cli.agent_package_max_bytes,
             file_transfer_max_bytes: cli.file_transfer_max_bytes,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            auth_attempts: Arc::new(RwLock::new(HashMap::new())),
+            auth_source_attempts: Arc::new(RwLock::new(HashMap::new())),
+            auth_account_attempts: Arc::new(RwLock::new(HashMap::new())),
             agents: Arc::new(RwLock::new(HashMap::new())),
             terminal_sessions: Arc::new(RwLock::new(HashMap::new())),
             file_requests: Arc::new(RwLock::new(HashMap::new())),
@@ -94,6 +99,7 @@ pub struct AgentHandle {
     pub connection_id: Uuid,
     pub tx: mpsc::UnboundedSender<AgentOutbound>,
     pub binary_tx: mpsc::Sender<Vec<u8>>,
+    pub shutdown_tx: watch::Sender<bool>,
     pub capabilities: Vec<String>,
     pub docker_status: Arc<RwLock<Option<DockerStatus>>>,
 }

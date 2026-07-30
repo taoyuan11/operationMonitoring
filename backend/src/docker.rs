@@ -3758,6 +3758,7 @@ mod tests {
                 auth_key_file: PathBuf::from("unused-test-auth-key"),
                 secure_cookies: false,
                 trust_proxy_headers: false,
+                trusted_proxy_cidrs: Vec::new(),
                 allow_legacy_agent_ws_auth: false,
                 reset_admin_auth: false,
                 confirm_reset_admin_auth: None,

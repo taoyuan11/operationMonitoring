@@ -377,6 +377,7 @@ OM_AUTH_KEY_FILE=auth/auth-secret.key
 # OM_AUTH_SECRET_KEY=<Base64 编码的 32 字节主密钥>
 OM_SECURE_COOKIES=false
 OM_TRUST_PROXY_HEADERS=false
+OM_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
 OM_ALLOW_LEGACY_AGENT_WS_AUTH=false
 OM_UPLOAD_DIR=uploads
 OM_UPDATE_DIR=updates
@@ -392,15 +393,20 @@ OM_FILE_TRANSFER_MAX_BYTES=1073741824
 
 上述 URL 是后端进程直接启动时的默认值。`docker-compose.with-db.yml` 会自动改用 Compose 内网中的 `postgres` 服务；外部数据库用的 `docker-compose.yml` 则要求显式设置 `OM_DATABASE_URL` 和 `OM_DATABASE_PASSWORD`，避免错误连接到后端容器自身或使用空密码。
 
-`OM_ADMIN_PASSWORD` 在管理员表为空时必须显式设置且至少包含 16 字节；完成首位
-管理员绑定后，直接启动后端时可以移除该变量。Compose 为避免误用始终要求提供它。
+`OM_ADMIN_PASSWORD` 在管理员表为空时必须显式设置且至少包含 16 字节，且不能保留
+`.env.example` 中公开的占位值；完成首位管理员绑定后，直接启动后端时可以移除该变量。
+Compose 为避免误用始终要求提供它。
 `OM_SECURE_COOKIES` 在 HTTPS/WSS 生产部署中应设为 `true`；
 直接使用 HTTP 本地开发时保持 `false`。会话固定有效 7 天，后端重启会要求重新登录。
 
-`OM_TRUST_PROXY_HEADERS` 控制登录限流是否从受信任反向代理提供的 `X-Real-IP`
-读取客户端地址。只有后端端口无法被客户端绕过代理直接访问时才能启用，否则攻击者
-可以伪造来源地址。Compose 已启用该选项，并将后端宿主端口固定绑定到
-`127.0.0.1`；外部访问应通过前端 Nginx 或受控反向代理进入。
+`OM_TRUST_PROXY_HEADERS` 控制登录限流是否读取反向代理提供的 `X-Real-IP`；默认关闭。
+启用时，只有连接端地址命中 `OM_TRUSTED_PROXY_CIDRS` 中逗号分隔的 IP/CIDR 才会
+采信该请求头。应按实际代理网络配置最小范围，并确保客户端不能绕过代理直连后端。
+Compose 将后端宿主端口固定绑定到 `127.0.0.1`，并默认把前端代理固定为
+`172.30.135.3`、只信任该 `/32` 地址。若该网段与现有网络冲突，可同时调整
+`OM_COMPOSE_NETWORK_CIDR`、`OM_FRONTEND_PROXY_IP` 和 `OM_TRUSTED_PROXY_CIDRS`。
+登录限流会同时按来源地址和数据库中的真实管理员账号计数；不存在的用户名不会占用
+账号限流容量。
 
 Agent `0.1.19` 起通过 `Authorization` 请求头认证 WebSocket，实例密钥不再出现在
 URL。`OM_ALLOW_LEGACY_AGENT_WS_AUTH` 默认必须保持 `false`；它只用于升级旧 Agent

@@ -1,6 +1,9 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
+use ipnet::IpNet;
+
+const EXAMPLE_BOOTSTRAP_PASSWORD: &str = "replace-with-a-long-random-bootstrap-password";
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Operation Monitoring backend")]
@@ -25,6 +28,13 @@ pub struct Cli {
     pub secure_cookies: bool,
     #[arg(long, env = "OM_TRUST_PROXY_HEADERS", default_value_t = false)]
     pub trust_proxy_headers: bool,
+    #[arg(
+        long,
+        env = "OM_TRUSTED_PROXY_CIDRS",
+        value_delimiter = ',',
+        default_value = "127.0.0.1/32,::1/128"
+    )]
+    pub trusted_proxy_cidrs: Vec<IpNet>,
     #[arg(long, env = "OM_ALLOW_LEGACY_AGENT_WS_AUTH", default_value_t = false)]
     pub allow_legacy_agent_ws_auth: bool,
     #[arg(long, default_value_t = false)]
@@ -62,17 +72,50 @@ pub fn validate_bootstrap_password(password: &str) -> anyhow::Result<()> {
     if password.chars().any(char::is_control) {
         anyhow::bail!("OM_ADMIN_PASSWORD must not contain control characters");
     }
+    if password.trim() == EXAMPLE_BOOTSTRAP_PASSWORD {
+        anyhow::bail!("OM_ADMIN_PASSWORD must not use the public example value");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_bootstrap_password;
+    use clap::Parser;
+
+    use super::{Cli, EXAMPLE_BOOTSTRAP_PASSWORD, validate_bootstrap_password};
 
     #[test]
     fn bootstrap_password_requires_a_long_explicit_value() {
         assert!(validate_bootstrap_password("admin123").is_err());
         assert!(validate_bootstrap_password("long-random-passphrase").is_ok());
         assert!(validate_bootstrap_password("contains\ncontrol-value").is_err());
+        assert!(validate_bootstrap_password(EXAMPLE_BOOTSTRAP_PASSWORD).is_err());
+        assert!(validate_bootstrap_password(&format!("  {EXAMPLE_BOOTSTRAP_PASSWORD}  ")).is_err());
+    }
+
+    #[test]
+    fn trusted_proxy_networks_parse_as_a_comma_separated_list() {
+        let cli = Cli::try_parse_from([
+            "backend",
+            "--trusted-proxy-cidrs",
+            "127.0.0.1/32,2001:db8::/32",
+        ])
+        .expect("parse trusted proxy networks");
+
+        assert_eq!(cli.trusted_proxy_cidrs.len(), 2);
+        assert!(
+            cli.trusted_proxy_cidrs[0].contains(
+                &"127.0.0.1"
+                    .parse::<std::net::IpAddr>()
+                    .expect("loopback IP")
+            )
+        );
+        assert!(
+            cli.trusted_proxy_cidrs[1].contains(
+                &"2001:db8::1"
+                    .parse::<std::net::IpAddr>()
+                    .expect("IPv6 address")
+            )
+        );
     }
 }

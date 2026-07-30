@@ -97,9 +97,9 @@ use windows::{
 
 use super::{
     AdaptiveSettings, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl, DesktopOpenRequest,
-    DesktopOptions, FrameHeader, MAX_CONTROL_BYTES, MAX_FRAME_BYTES, MAX_JPEG_QUALITY,
-    MIN_JPEG_QUALITY, absolute_pointer_coordinate, dom_code_to_vk, dom_code_uses_extended_key,
-    error_reason, scaled_dimensions,
+    DesktopOptions, FrameHeader, INPUT_RELEASE_ACK_TIMEOUT, MAX_CONTROL_BYTES, MAX_FRAME_BYTES,
+    MAX_JPEG_QUALITY, MIN_JPEG_QUALITY, absolute_pointer_coordinate, dom_code_to_vk,
+    dom_code_uses_extended_key, error_reason, scaled_dimensions, wait_for_input_release_ack,
 };
 use crate::{config::AgentConfig, models::AgentInbound};
 
@@ -388,17 +388,10 @@ async fn relay(
         .await
         .is_ok()
     {
-        match tokio::time::timeout(Duration::from_secs(2), ack_rx.recv()).await {
-            Ok(_) => {}
-            Err(_) => {
-                // SendInput cannot release keys on Winlogon/UAC desktops. Keep this session's
-                // ActivityGuard and helper alive until Default returns and the release ACK is
-                // received, so an update cannot race a helper that still owns pressed input.
-                crate::logging::info(format_args!(
-                    "desktop helper input release is pending until the default desktop returns"
-                ));
-                let _ = ack_rx.recv().await;
-            }
+        if !wait_for_input_release_ack(&mut ack_rx, INPUT_RELEASE_ACK_TIMEOUT).await {
+            crate::logging::error(format_args!(
+                "desktop helper did not acknowledge input release before the cleanup deadline"
+            ));
         }
     }
     reader.abort();

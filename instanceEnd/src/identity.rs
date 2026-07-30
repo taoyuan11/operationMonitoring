@@ -50,7 +50,7 @@ pub fn load_or_create_identity(path: Option<PathBuf>) -> Result<Identity> {
         Ok(mut file) => {
             file.write_all(serde_json::to_string_pretty(&identity)?.as_bytes())?;
             file.sync_all()?;
-            protect_system_identity_file(&path)?;
+            protect_identity_file(&path)?;
             Ok(identity)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -76,19 +76,25 @@ fn prepare_identity_location(path: &std::path::Path) -> Result<()> {
             crate::windows_security::restrict_to_system_and_administrators(parent)?;
         }
     }
-    protect_system_identity_file(path)
+    protect_identity_file(path)
 }
 
-fn protect_system_identity_file(_path: &std::path::Path) -> Result<()> {
+fn protect_identity_file(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    if path.exists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
     #[cfg(windows)]
-    if is_system_identity_path(_path) && _path.exists() {
-        crate::windows_security::restrict_to_system_and_administrators(_path)?;
+    if is_system_identity_path(path) && path.exists() {
+        crate::windows_security::restrict_to_system_and_administrators(path)?;
     }
     Ok(())
 }
 
 fn finish_loaded_identity(path: &std::path::Path, identity: Identity) -> Result<Identity> {
-    protect_system_identity_file(path)?;
+    protect_identity_file(path)?;
     #[cfg(windows)]
     if is_system_identity_path(path) && identity.credential_version < CURRENT_CREDENTIAL_VERSION {
         return rotate_system_identity(path, identity);
@@ -220,6 +226,29 @@ mod tests {
 
         load_or_create_identity(Some(path.clone())).unwrap();
 
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn repairs_permissions_on_an_existing_identity() {
+        let directory = std::env::temp_dir().join(format!("om-agent-identity-{}", Uuid::new_v4()));
+        let path = directory.join("identity.json");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            &path,
+            r#"{"instance_id":"existing-instance","secret":"existing-secret"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let identity = load_or_create_identity(Some(path.clone())).unwrap();
+
+        assert_eq!(identity.instance_id, "existing-instance");
+        assert_eq!(identity.secret, "existing-secret");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

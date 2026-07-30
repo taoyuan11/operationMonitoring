@@ -18,10 +18,9 @@ use crate::{
     auth::require_admin,
     db::{
         approve_pending_instance, get_instance, get_instance_optional, instance_summary,
-        latest_metric, normalize_metric_timestamp, register_or_touch_pending, retention_days,
-        setting_value, write_action_log,
+        latest_metric, latest_metrics, normalize_metric_timestamp, register_or_touch_pending,
+        retention_days, setting_value, write_action_log,
     },
-    docker::cancel_instance_docker,
     error::{AppError, AppResult},
     jobs::{create_command_job, dispatch_command},
     models::{
@@ -35,7 +34,7 @@ use crate::{
     state::AppState,
     updates::confirm_update_version,
     utils::{non_empty_or, now_ts},
-    ws::{MAX_AGENT_MESSAGE_BYTES, agent_socket, terminal_socket},
+    ws::{MAX_AGENT_MESSAGE_BYTES, agent_socket, revoke_instance_connection, terminal_socket},
 };
 
 const BACKGROUND_SETTING_KEY: &str = "background_image_path";
@@ -81,11 +80,17 @@ pub async fn public_instances(
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE approved = 1 AND disabled = 0
-        ORDER BY LOWER(name) ASC
+        ORDER BY LOWER(name) ASC, id ASC
         "#,
     )
     .fetch_all(&state.db)
     .await?;
+
+    let instance_ids = records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let mut metrics_by_instance = latest_metrics(&state.db, &instance_ids).await?;
 
     let connected = state
         .agents
@@ -96,7 +101,7 @@ pub async fn public_instances(
         .collect::<std::collections::HashMap<_, _>>();
     let mut summaries = Vec::with_capacity(records.len());
     for record in records {
-        let metrics = latest_metric(&state.db, &record.id).await?;
+        let metrics = metrics_by_instance.remove(&record.id);
         let capabilities = connected.get(&record.id).cloned().map(|capabilities| {
             capabilities
                 .into_iter()
@@ -388,20 +393,24 @@ pub async fn admin_disable_instance(
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
 
-    sqlx::query("UPDATE instances SET disabled = 1 WHERE id = $1")
+    let mut transaction = state.db.begin().await?;
+    let updated = sqlx::query("UPDATE instances SET disabled = 1 WHERE id = $1")
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *transaction)
         .await?;
-    let agent = state.agents.write().await.remove(&id);
-    cancel_instance_docker(&state, &id, agent.as_ref()).await;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "实例不存在"));
+    }
     write_action_log(
-        &state.db,
+        &mut *transaction,
         &admin.username,
         "disable_instance",
         &id,
         "停用实例",
     )
     .await?;
+    transaction.commit().await?;
+    revoke_instance_connection(&state, &id).await;
 
     Ok(Json(AgentRegisterResponse {
         approved: true,
@@ -417,32 +426,40 @@ pub async fn admin_delete_instance(
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
 
-    sqlx::query("UPDATE instances SET disabled = 1 WHERE id = $1")
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
-    let agent = state.agents.write().await.remove(&id);
-    cancel_instance_docker(&state, &id, agent.as_ref()).await;
+    let mut transaction = state.db.begin().await?;
+    let instance_exists =
+        sqlx::query_scalar::<_, String>("SELECT id FROM instances WHERE id = $1 FOR UPDATE")
+            .bind(&id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+    if instance_exists.is_none() {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "实例不存在"));
+    }
     sqlx::query("DELETE FROM metrics WHERE instance_id = $1")
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *transaction)
         .await?;
     sqlx::query("DELETE FROM command_jobs WHERE instance_id = $1")
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *transaction)
         .await?;
-    sqlx::query("DELETE FROM instances WHERE id = $1")
+    let deleted = sqlx::query("DELETE FROM instances WHERE id = $1")
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *transaction)
         .await?;
+    if deleted.rows_affected() != 1 {
+        return Err(AppError::new(StatusCode::CONFLICT, "实例状态已发生变化"));
+    }
     write_action_log(
-        &state.db,
+        &mut *transaction,
         &admin.username,
         "delete_instance",
         &id,
         "删除实例和历史指标",
     )
     .await?;
+    transaction.commit().await?;
+    revoke_instance_connection(&state, &id).await;
 
     Ok(Json(AgentRegisterResponse {
         approved: false,
@@ -906,6 +923,7 @@ pub async fn agent_register(
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let source_key = agent_registration_source_key(resolved_client_ip(
         state.trust_proxy_headers,
+        &state.trusted_proxy_cidrs,
         &headers,
         peer.ip(),
     ));
@@ -954,6 +972,7 @@ pub async fn agent_report(
     };
     let source_key = agent_registration_source_key(resolved_client_ip(
         state.trust_proxy_headers,
+        &state.trusted_proxy_cidrs,
         &headers,
         peer.ip(),
     ));

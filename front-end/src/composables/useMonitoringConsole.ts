@@ -28,8 +28,7 @@ import type {
 import { average } from '../utils/format'
 
 type TrafficSnapshot = {
-  rx: number
-  tx: number
+  counters: Map<string, { rx: number; tx: number }>
   capturedAt: number
 }
 
@@ -74,6 +73,7 @@ export function useMonitoringConsole() {
   const agentUpdateOperation = ref<AgentUpdateOperation>(null)
   const agentUpdateBusyId = ref('')
   const agentUpdateMessage = ref('')
+  const adminResetKey = ref(0)
   const trafficSnapshot = ref<TrafficSnapshot | null>(null)
   const networkRxRate = ref(0)
   const networkTxRate = ref(0)
@@ -250,6 +250,7 @@ export function useMonitoringConsole() {
   function clearAdminState() {
     terminalState.instance = null
     remoteDesktopState.instance = null
+    editInstance.value = null
     isAdmin.value = false
     currentUser.value = null
     pendingInstances.value = []
@@ -261,7 +262,34 @@ export function useMonitoringConsole() {
     adminUsers.value = []
     authEnrollments.value = []
     activeAuthEnrollment.value = null
+    loginForm.username = ''
+    loginForm.password = ''
+    loginForm.code = ''
+    userAuthForm.username = ''
+    userAuthForm.current_code = ''
+    userAuthForm.confirmation_code = ''
+    commandForm.name = ''
+    commandForm.command = ''
+    commandForm.confirm_text = ''
+    agentReleaseForm.version = ''
+    agentReleaseForm.notes = ''
+    editForm.name = ''
+    editForm.country_code = ''
+    editForm.country = ''
+    editForm.remark = ''
+    settingsForm.retention_days = 30
+    settingsForm.background_image_url = appearance.backgroundImageUrl.value
+    settingsForm.theme_mode = appearance.themeMode.value
+    settingsForm.accent_color = appearance.accentColor.value
+    adminTab.value = 'pending'
+    backgroundFileName.value = ''
+    backgroundOperation.value = null
+    backgroundMessage.value = ''
+    appearanceMessage.value = ''
+    agentUpdateOperation.value = null
+    agentUpdateBusyId.value = ''
     agentUpdateMessage.value = ''
+    adminResetKey.value += 1
   }
 
   async function loadPublic() {
@@ -418,10 +446,10 @@ export function useMonitoringConsole() {
   }
 
   function logout() {
-    invalidateAdminRequests()
-    clearAdminState()
-    guarded(async () => {
+    return guarded(async () => {
       await rawApi('/api/admin/logout', { method: 'POST' })
+      invalidateAdminRequests()
+      clearAdminState()
     }, 'auth:logout')
   }
 
@@ -886,9 +914,16 @@ export function useMonitoringConsole() {
   }
 
   function updateNetworkRates(nextInstances: Instance[]) {
-    const nextSnapshot = {
-      rx: nextInstances.reduce((sum, item) => sum + (item.metrics?.network_rx || 0), 0),
-      tx: nextInstances.reduce((sum, item) => sum + (item.metrics?.network_tx || 0), 0),
+    const counters = new Map<string, { rx: number; tx: number }>()
+    for (const instance of nextInstances) {
+      if (!instance.metrics) continue
+      counters.set(instance.id, {
+        rx: instance.metrics.network_rx,
+        tx: instance.metrics.network_tx,
+      })
+    }
+    const nextSnapshot: TrafficSnapshot = {
+      counters,
       capturedAt: Date.now(),
     }
     const previous = trafficSnapshot.value
@@ -897,8 +932,17 @@ export function useMonitoringConsole() {
 
     const elapsedSeconds = (nextSnapshot.capturedAt - previous.capturedAt) / 1000
     if (elapsedSeconds <= 0) return
-    networkRxRate.value = Math.max(0, (nextSnapshot.rx - previous.rx) / elapsedSeconds)
-    networkTxRate.value = Math.max(0, (nextSnapshot.tx - previous.tx) / elapsedSeconds)
+
+    let receivedBytes = 0
+    let transmittedBytes = 0
+    for (const [instanceId, counters] of nextSnapshot.counters) {
+      const previousCounters = previous.counters.get(instanceId)
+      if (!previousCounters) continue
+      receivedBytes += Math.max(0, counters.rx - previousCounters.rx)
+      transmittedBytes += Math.max(0, counters.tx - previousCounters.tx)
+    }
+    networkRxRate.value = receivedBytes / elapsedSeconds
+    networkTxRate.value = transmittedBytes / elapsedSeconds
   }
 
   return {
@@ -933,6 +977,7 @@ export function useMonitoringConsole() {
     agentUpdateOperation,
     agentUpdateBusyId,
     agentUpdateMessage,
+    adminResetKey,
     currentTime,
     loginForm,
     userAuthForm,

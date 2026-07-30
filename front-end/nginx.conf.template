@@ -11,6 +11,8 @@ server {
     index index.html;
 
     client_max_body_size ${NGINX_CLIENT_MAX_BODY_SIZE};
+    add_header Content-Security-Policy "frame-ancestors 'none'" always;
+    add_header X-Frame-Options "DENY" always;
 
     location /api/ {
         proxy_pass http://backend:13500;

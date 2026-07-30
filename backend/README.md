@@ -25,13 +25,15 @@ OM_DATABASE_URL='postgresql://operation_monitoring@127.0.0.1:5432/operation_moni
 OM_DATABASE_PASSWORD='<数据库密码>' \
 OM_ADMIN_PASSWORD='development-bootstrap-password' \
 OM_TRUST_PROXY_HEADERS=false \
+OM_TRUSTED_PROXY_CIDRS='127.0.0.1/32,::1/128' \
 OM_ALLOW_LEGACY_AGENT_WS_AUTH=false \
 cargo run
 ```
 
 接口默认监听 `0.0.0.0:13500`，健康检查地址为 `http://127.0.0.1:13500/api/health`。
 只有后端无法被客户端绕过反向代理直接访问时，才可设置
-`OM_TRUST_PROXY_HEADERS=true` 以使用代理提供的 `X-Real-IP` 进行登录限流。
+`OM_TRUST_PROXY_HEADERS=true`。连接来源还必须命中 `OM_TRUSTED_PROXY_CIDRS` 中
+逗号分隔的 CIDR，后端才会使用代理提供的 `X-Real-IP` 进行登录限流。
 `OM_ALLOW_LEGACY_AGENT_WS_AUTH` 仅可在将旧 Agent 升级到 `0.1.19` 的维护窗口临时
 启用，平时必须保持关闭，避免实例密钥重新进入 URL 和代理日志。
 

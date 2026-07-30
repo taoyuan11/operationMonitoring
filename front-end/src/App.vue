@@ -78,6 +78,7 @@ watch(
     }
     currentPage.value = 'home'
     selectedInstanceId.value = ''
+    confirmation.value = null
     if (window.location.hash && window.location.hash !== '#/') {
       window.history.replaceState(null, '', '#/')
     }
@@ -119,10 +120,11 @@ function openLogin() {
   loginOpen.value = true
 }
 
-function logout() {
+async function logout() {
+  const success = await consoleState.logout()
+  if (!success) return
   selectedInstanceId.value = ''
   navigate('home')
-  consoleState.logout()
 }
 
 function requestDisable(instance: Instance) {
@@ -339,6 +341,7 @@ function confirmAction() {
 
           <AgentUpdatesPanel
             v-if="currentPage === 'updates'"
+            :key="`updates-${consoleState.adminResetKey.value}`"
             :instances="consoleState.instances.value"
             :releases="consoleState.agentReleases.value"
             :attempts="consoleState.agentUpdateAttempts.value"
@@ -356,6 +359,7 @@ function confirmAction() {
           />
           <UserManagementPanel
             v-else-if="currentPage === 'users'"
+            :key="`users-${consoleState.adminResetKey.value}`"
             :users="consoleState.adminUsers.value"
             :enrollments="consoleState.authEnrollments.value"
             :active-enrollment="consoleState.activeAuthEnrollment.value"
@@ -372,6 +376,7 @@ function confirmAction() {
           />
           <AdminPanel
             v-else
+            :key="`admin-${consoleState.adminResetKey.value}`"
             :admin-tab="activeAdminTab"
             :pending-instances="consoleState.pendingInstances.value"
             :commands="consoleState.commands.value"
@@ -430,7 +435,7 @@ function confirmAction() {
 
     <Transition name="modal" appear>
       <EditInstanceModal
-        v-if="consoleState.editInstance.value"
+        v-if="consoleState.editInstance.value && consoleState.isAdmin.value"
         :form="consoleState.editForm"
         @close="consoleState.closeEdit"
         @save="consoleState.saveEdit"

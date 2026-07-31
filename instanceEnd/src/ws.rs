@@ -1,24 +1,27 @@
-use std::time::Duration;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Url, redirect::Policy};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+    connect_async_with_config,
+    tungstenite::{
+        Message, client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig,
+    },
 };
 
 use crate::{
     activity::ActivityTracker,
     command::execute_tracked_command,
-    config::AgentConfig,
+    config::{AgentConfig, ServerEndpoint},
     docker::{CAPABILITY as DOCKER_CAPABILITY, DockerManager},
     file_manager::{CAPABILITY as FILE_MANAGER_CAPABILITY, FileManager},
     http::register_once,
     metrics::MetricsCollector,
     models::{AgentInbound, AgentOutbound, Identity, UpdateOffer, UpdateStatus},
+    outbound::AgentEventSender,
     profile::host_profile,
     remote_desktop::{CAPABILITY as DESKTOP_CAPABILITY, DesktopManager, DesktopOpenRequest},
     terminal::TerminalManager,
@@ -26,6 +29,11 @@ use crate::{
 };
 
 const MANIFEST_INTERVAL: Duration = Duration::from_secs(60);
+const AGENT_EVENT_QUEUE_CAPACITY: usize = 128;
+const TERMINAL_STREAM_QUEUE_CAPACITY: usize = 128;
+const MAX_CONCURRENT_COMMANDS: usize = 4;
+const MAX_SERVER_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum SocketOutcome {
     Disconnected,
@@ -76,6 +84,7 @@ pub async fn agent_ws_loop(
             None
         }
     };
+    let command_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_COMMANDS));
     loop {
         let registration = tokio::select! {
             biased;
@@ -128,7 +137,15 @@ pub async fn agent_ws_loop(
         let connection = tokio::select! {
             biased;
             _ = shutdown_requested(&mut shutdown) => return Ok(()),
-            connection = connect_async(request) => connection,
+            connection = connect_async_with_config(
+                request,
+                Some(
+                    WebSocketConfig::default()
+                        .max_message_size(Some(MAX_SERVER_MESSAGE_BYTES))
+                        .max_frame_size(Some(MAX_SERVER_MESSAGE_BYTES)),
+                ),
+                false,
+            ) => connection,
         };
         match connection {
             Ok((stream, _)) => {
@@ -138,6 +155,7 @@ pub async fn agent_ws_loop(
                     &config,
                     &identity,
                     activity.clone(),
+                    command_slots.clone(),
                     update_manager.clone(),
                     &mut shutdown,
                 )
@@ -189,14 +207,20 @@ async fn handle_agent_socket(
     config: &AgentConfig,
     _identity: &Identity,
     activity: ActivityTracker,
+    command_slots: Arc<Semaphore>,
     update_manager: Option<UpdateManager>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<SocketOutcome> {
     let (mut write, mut read) = stream.split();
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<AgentInbound>();
+    let (outbound_tx, mut outbound_rx, mut outbound_failed_rx) =
+        AgentEventSender::channel(AGENT_EVENT_QUEUE_CAPACITY);
+    let (terminal_stream_tx, mut terminal_stream_rx, mut terminal_stream_failed_rx) =
+        AgentEventSender::channel(TERMINAL_STREAM_QUEUE_CAPACITY);
     let (binary_tx, mut binary_rx) = mpsc::channel(4);
-    let (docker_stream_tx, mut docker_stream_rx) = mpsc::channel(8);
-    let mut terminals = TerminalManager::new(outbound_tx.clone(), activity.clone());
+    let (docker_stream_tx, mut docker_stream_rx, mut docker_stream_failed_rx) =
+        AgentEventSender::channel(8);
+    let mut terminals =
+        TerminalManager::new(outbound_tx.clone(), terminal_stream_tx, activity.clone());
     let mut files = FileManager::new(outbound_tx.clone(), binary_tx, activity.clone());
     let mut desktops = DesktopManager::new(config.clone(), activity.clone(), outbound_tx.clone());
     let mut docker = DockerManager::new(
@@ -215,7 +239,7 @@ async fn handle_agent_socket(
     manifest_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut docker_probe_interval = tokio::time::interval(MANIFEST_INTERVAL);
     docker_probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let (update_event_tx, mut update_event_rx) = mpsc::unbounded_channel();
+    let (update_event_tx, mut update_event_rx) = mpsc::channel(1);
     let mut active_update: Option<ActiveUpdate> = None;
     let capability = update_capability();
 
@@ -233,9 +257,26 @@ async fn handle_agent_socket(
     let result: Result<SocketOutcome> = async {
         let outcome = loop {
             tokio::select! {
-            biased;
             _ = shutdown_requested(shutdown) => {
                 break SocketOutcome::Shutdown;
+            }
+            _ = outbound_failed(&mut outbound_failed_rx) => {
+                crate::logging::error(format_args!(
+                    "agent event queue overflowed or closed; reconnecting websocket"
+                ));
+                break SocketOutcome::Disconnected;
+            }
+            _ = outbound_failed(&mut docker_stream_failed_rx) => {
+                crate::logging::error(format_args!(
+                    "docker stream queue overflowed or closed; reconnecting websocket"
+                ));
+                break SocketOutcome::Disconnected;
+            }
+            _ = outbound_failed(&mut terminal_stream_failed_rx) => {
+                crate::logging::error(format_args!(
+                    "terminal stream queue closed; reconnecting websocket"
+                ));
+                break SocketOutcome::Disconnected;
             }
             changed = draining_updates.changed() => {
                 if changed.is_ok() && *draining_updates.borrow_and_update() {
@@ -343,20 +384,47 @@ async fn handle_agent_socket(
                     break SocketOutcome::Disconnected;
                 };
                 let payload = serde_json::to_string(&outbound)?;
-                write.send(Message::Text(payload.into())).await?;
+                send_with_deadline(
+                    SOCKET_SEND_TIMEOUT,
+                    write.send(Message::Text(payload.into())),
+                )
+                .await
+                .context("failed to send agent websocket text event")?;
+            }
+            outbound = terminal_stream_rx.recv() => {
+                let Some(outbound) = outbound else {
+                    break SocketOutcome::Disconnected;
+                };
+                let payload = serde_json::to_string(&outbound)?;
+                send_with_deadline(
+                    SOCKET_SEND_TIMEOUT,
+                    write.send(Message::Text(payload.into())),
+                )
+                .await
+                .context("failed to send agent websocket terminal stream event")?;
             }
             outbound = docker_stream_rx.recv() => {
                 let Some(outbound) = outbound else {
                     break SocketOutcome::Disconnected;
                 };
                 let payload = serde_json::to_string(&outbound)?;
-                write.send(Message::Text(payload.into())).await?;
+                send_with_deadline(
+                    SOCKET_SEND_TIMEOUT,
+                    write.send(Message::Text(payload.into())),
+                )
+                .await
+                .context("failed to send agent websocket stream event")?;
             }
             binary = binary_rx.recv() => {
                 let Some(binary) = binary else {
                     break SocketOutcome::Disconnected;
                 };
-                write.send(Message::Binary(binary.into())).await?;
+                send_with_deadline(
+                    SOCKET_SEND_TIMEOUT,
+                    write.send(Message::Binary(binary.into())),
+                )
+                .await
+                .context("failed to send agent websocket binary event")?;
             }
             incoming = read.next() => {
                 let Some(incoming) = incoming else {
@@ -370,20 +438,13 @@ async fn handle_agent_socket(
                                 outbound_tx.send(AgentInbound::Pong { now })?;
                             }
                             AgentOutbound::RunCommand { job_id, command } => {
-                                crate::logging::info(format_args!(
-                                    "running command job {job_id}: {command}"
-                                ));
-                                let command_outbound = outbound_tx.clone();
-                                let command_activity = activity.clone();
-                                tokio::spawn(async move {
-                                    let (exit_code, output) =
-                                        execute_tracked_command(&command, &command_activity).await;
-                                    let _ = command_outbound.send(AgentInbound::CommandResult {
-                                        job_id,
-                                        exit_code,
-                                        output,
-                                    });
-                                });
+                                dispatch_command_job(
+                                    job_id,
+                                    command,
+                                    &command_slots,
+                                    &activity,
+                                    &outbound_tx,
+                                );
                             }
                             AgentOutbound::TerminalOpen { session_id, cols, rows } => {
                                 terminals.open(session_id, cols, rows);
@@ -460,6 +521,9 @@ async fn handle_agent_socket(
                                 size_bytes,
                                 package_type,
                                 native_arch,
+                                target_os,
+                                signature_key_id,
+                                signature,
                                 retry_count,
                             } => {
                                 let offer = UpdateOffer {
@@ -471,6 +535,9 @@ async fn handle_agent_socket(
                                     size_bytes,
                                     package_type,
                                     native_arch,
+                                    target_os,
+                                    signature_key_id,
+                                    signature,
                                     retry_count,
                                 };
                                 if active_update.is_none() {
@@ -531,7 +598,12 @@ async fn handle_agent_socket(
                     }
                     Message::Binary(data) => files.handle_binary(&data),
                     Message::Ping(data) => {
-                        write.send(Message::Pong(data)).await?;
+                        send_with_deadline(
+                            SOCKET_SEND_TIMEOUT,
+                            write.send(Message::Pong(data)),
+                        )
+                        .await
+                        .context("failed to send agent websocket pong")?;
                     }
                     Message::Close(_) => break SocketOutcome::Disconnected,
                     _ => {}
@@ -559,6 +631,38 @@ async fn handle_agent_socket(
     result
 }
 
+fn dispatch_command_job(
+    job_id: String,
+    command: String,
+    command_slots: &Arc<Semaphore>,
+    activity: &ActivityTracker,
+    outbound: &AgentEventSender,
+) {
+    let Ok(command_slot) = command_slots.clone().try_acquire_owned() else {
+        let _ = outbound.send(AgentInbound::CommandResult {
+            job_id,
+            exit_code: -1,
+            output: format!(
+                "command rejected because the concurrent command limit ({MAX_CONCURRENT_COMMANDS}) was reached"
+            ),
+        });
+        return;
+    };
+
+    crate::logging::info(format_args!("running command job {job_id}: {command}"));
+    let command_outbound = outbound.clone();
+    let command_activity = activity.clone();
+    tokio::spawn(async move {
+        let _command_slot = command_slot;
+        let (exit_code, output) = execute_tracked_command(&command, &command_activity).await;
+        let _ = command_outbound.send(AgentInbound::CommandResult {
+            job_id,
+            exit_code,
+            output,
+        });
+    });
+}
+
 async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
     if *shutdown.borrow() {
         return;
@@ -568,6 +672,28 @@ async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
             return;
         }
     }
+}
+
+async fn outbound_failed(failed: &mut watch::Receiver<bool>) {
+    if *failed.borrow() {
+        return;
+    }
+    while failed.changed().await.is_ok() {
+        if *failed.borrow_and_update() {
+            return;
+        }
+    }
+}
+
+async fn send_with_deadline<F, E>(timeout: Duration, send: F) -> Result<()>
+where
+    F: Future<Output = Result<(), E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(timeout, send)
+        .await
+        .context("agent websocket send timed out")?
+        .map_err(anyhow::Error::new)
 }
 
 async fn wait_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
@@ -581,8 +707,8 @@ async fn wait_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<boo
 fn spawn_update_task(
     manager: UpdateManager,
     offer: UpdateOffer,
-    outbound: mpsc::UnboundedSender<AgentInbound>,
-    events: mpsc::UnboundedSender<UpdateTaskEvent>,
+    outbound: AgentEventSender,
+    events: mpsc::Sender<UpdateTaskEvent>,
 ) -> ActiveUpdate {
     let artifact_id = offer.artifact_id.clone();
     let task_artifact_id = artifact_id.clone();
@@ -596,7 +722,7 @@ fn spawn_update_task(
                 artifact_id: task_artifact_id,
             },
         };
-        let _ = events.send(event);
+        let _ = events.send(event).await;
     });
     ActiveUpdate {
         artifact_id,
@@ -609,14 +735,7 @@ fn websocket_request(
     server: &str,
     identity: &Identity,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
-    let trimmed = server.trim_end_matches('/');
-    let base = if let Some(rest) = trimmed.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        format!("ws://{trimmed}")
-    };
+    let endpoint = ServerEndpoint::parse(server)?;
     let mut capabilities = vec![FILE_MANAGER_CAPABILITY];
     if cfg!(windows) {
         capabilities.push(DESKTOP_CAPABILITY);
@@ -625,11 +744,12 @@ fn websocket_request(
         capabilities.push(DOCKER_CAPABILITY);
     }
     let capabilities = capabilities.join(",");
-    let url = format!(
-        "{base}/api/agent/ws?instance_id={}&capabilities={capabilities}",
-        identity.instance_id
-    );
+    let mut url = endpoint.websocket_url("api/agent/ws")?;
+    url.query_pairs_mut()
+        .append_pair("instance_id", &identity.instance_id)
+        .append_pair("capabilities", &capabilities);
     let mut request = url
+        .as_str()
         .into_client_request()
         .context("invalid agent websocket URL")?;
     request.headers_mut().insert(
@@ -670,6 +790,24 @@ mod tests {
     }
 
     #[test]
+    fn websocket_request_supports_http_and_encodes_query_values() {
+        let request = websocket_request(
+            "HTTP://monitor.example/prefix/",
+            &Identity {
+                instance_id: "instance with spaces".to_string(),
+                secret: "secret-1".to_string(),
+                credential_version: 1,
+                previous_secret: None,
+            },
+        )
+        .unwrap();
+
+        assert!(request.uri().to_string().starts_with(
+            "ws://monitor.example/prefix/api/agent/ws?instance_id=instance+with+spaces"
+        ));
+    }
+
+    #[test]
     fn authenticated_http_redirects_stay_on_the_original_origin() {
         let origin = Url::parse("https://monitor.example/api/agent/update/manifest").unwrap();
         assert!(same_origin(
@@ -687,6 +825,49 @@ mod tests {
         assert!(!same_origin(
             &origin,
             &Url::parse("http://monitor.example/package").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn event_queue_overflow_wakes_the_socket_disconnect_waiter() {
+        let (outbound, _inbound, mut failed) = AgentEventSender::channel(1);
+        outbound.send(AgentInbound::Pong { now: 1 }).unwrap();
+        assert!(outbound.send(AgentInbound::Pong { now: 2 }).is_err());
+
+        tokio::time::timeout(Duration::from_millis(100), outbound_failed(&mut failed))
+            .await
+            .expect("overflow notification should wake the socket loop");
+    }
+
+    #[tokio::test]
+    async fn websocket_send_deadline_rejects_a_stalled_write() {
+        let stalled = std::future::pending::<std::io::Result<()>>();
+
+        assert!(
+            send_with_deadline(Duration::from_millis(1), stalled)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn command_dispatch_rejects_work_when_all_slots_are_in_use() {
+        let (outbound, mut inbound, _failed) = AgentEventSender::channel(1);
+        dispatch_command_job(
+            "job-overflow".to_string(),
+            "true".to_string(),
+            &Arc::new(Semaphore::new(0)),
+            &ActivityTracker::default(),
+            &outbound,
+        );
+
+        assert!(matches!(
+            inbound.recv().await,
+            Some(AgentInbound::CommandResult {
+                job_id,
+                exit_code: -1,
+                output,
+            }) if job_id == "job-overflow" && output.contains("concurrent command limit")
         ));
     }
 }

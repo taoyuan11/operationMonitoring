@@ -818,7 +818,7 @@ export function useMonitoringConsole() {
     return runAgentUpdateTask('deleting', release.id, async () => {
       await api(`/api/admin/agent-releases/${release.id}`, { method: 'DELETE' })
       await loadAgentUpdates()
-    }, '更新草稿已删除')
+    }, release.status === 'published' ? `${release.version} 已永久删除` : '更新草稿已删除')
   }
 
   function retryAgentUpdateAttempt(attempt: AgentUpdateAttempt) {

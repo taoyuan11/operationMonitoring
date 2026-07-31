@@ -5,7 +5,7 @@ use std::{
 
 use axum::{
     extract::{
-        Path, Query, State,
+        ConnectInfo, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
@@ -27,6 +27,7 @@ use crate::{
     db::{get_instance, write_action_log},
     error::{AppError, AppResult},
     models::{AgentOutbound, DesktopAgentWsQuery},
+    request_security::{ensure_same_origin, request_scheme},
     state::{AppState, DesktopSessionHandle},
     utils::now_ts,
 };
@@ -105,12 +106,13 @@ impl DesktopQuality {
 
 pub async fn admin_desktop_ws(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Path(instance_id): Path<String>,
     Query(query): Query<DesktopBrowserWsQuery>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
-    ensure_same_origin(&headers, state.secure_cookies)?;
+    ensure_same_origin(&headers, request_scheme(&state, &headers, peer_addr.ip())?)?;
     let admin = require_admin(&state, &headers).await?;
     let instance = get_instance(&state.db, &instance_id).await?;
     if instance.disabled == 1 {
@@ -138,16 +140,19 @@ pub async fn admin_desktop_ws(
     }
 
     let session_guard = admin.session_guard();
-    Ok(ws.on_upgrade(move |socket| {
-        desktop_browser_socket(
-            state,
-            instance_id,
-            admin.username,
-            session_guard,
-            query.quality,
-            socket,
-        )
-    }))
+    Ok(ws
+        .max_message_size(CONTROL_MESSAGE_MAX_BYTES)
+        .max_frame_size(CONTROL_MESSAGE_MAX_BYTES)
+        .on_upgrade(move |socket| {
+            desktop_browser_socket(
+                state,
+                instance_id,
+                admin.username,
+                session_guard,
+                query.quality,
+                socket,
+            )
+        }))
 }
 
 pub async fn agent_desktop_ws(
@@ -158,7 +163,10 @@ pub async fn agent_desktop_ws(
 ) -> AppResult<Response> {
     let token = bearer_token(&headers)?;
     claim_agent_data_channel(&state, &query.session_id, token).await?;
-    Ok(ws.on_upgrade(move |socket| desktop_agent_socket(state, query.session_id, socket)))
+    Ok(ws
+        .max_message_size(FRAME_MAX_BYTES)
+        .max_frame_size(FRAME_MAX_BYTES)
+        .on_upgrade(move |socket| desktop_agent_socket(state, query.session_id, socket)))
 }
 
 async fn desktop_browser_socket(
@@ -428,13 +436,11 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
         .get(&session_id)
         .cloned();
     let Some(handle) = handle else {
-        let mut socket = socket;
-        let _ = socket.close().await;
+        close_socket(socket).await;
         return;
     };
     let Some(mut input_rx) = handle.agent_input_rx.lock().await.take() else {
-        let mut socket = socket;
-        let _ = socket.close().await;
+        close_socket(socket).await;
         end_desktop_session(&state, &session_id, "duplicate_agent_data_channel").await;
         return;
     };
@@ -474,7 +480,7 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
                                 }
                             }
                             Err((code, message)) => {
-                                let _ = handle.browser_tx.send(server_error(code, message)).await;
+                                try_send_browser_error(&handle.browser_tx, code, message);
                                 reason = "invalid_agent_message".to_string();
                                 break;
                             }
@@ -483,7 +489,7 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
                     Ok(Message::Binary(frame)) => {
                         last_inbound = Instant::now();
                         if let Err((code, message)) = validate_frame(&frame) {
-                            let _ = handle.browser_tx.send(server_error(code, message)).await;
+                            try_send_browser_error(&handle.browser_tx, code, message);
                             reason = "invalid_frame".to_string();
                             break;
                         }
@@ -651,27 +657,6 @@ async fn end_desktop_session(state: &AppState, session_id: &str, reason: &str) {
     {
         warn!(?error, %session_id, "failed to write desktop end action log");
     }
-}
-
-pub(crate) fn ensure_same_origin(headers: &HeaderMap, secure: bool) -> AppResult<()> {
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| AppError::new(StatusCode::FORBIDDEN, "缺少 Origin 请求头"))?;
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| AppError::new(StatusCode::FORBIDDEN, "缺少 Host 请求头"))?;
-    let uri = origin
-        .parse::<axum::http::Uri>()
-        .map_err(|_| AppError::new(StatusCode::FORBIDDEN, "Origin 无效"))?;
-    let expected_scheme = if secure { "https" } else { "http" };
-    let valid_scheme = uri.scheme_str() == Some(expected_scheme);
-    let origin_host = uri.authority().map(|authority| authority.as_str());
-    if !valid_scheme || !origin_host.is_some_and(|value| value.eq_ignore_ascii_case(host)) {
-        return Err(AppError::new(StatusCode::FORBIDDEN, "拒绝跨站请求"));
-    }
-    Ok(())
 }
 
 fn bearer_token(headers: &HeaderMap) -> AppResult<&str> {
@@ -874,6 +859,14 @@ fn server_error(code: &str, message: &str) -> String {
     json!({"type":"error", "code":code, "message":message}).to_string()
 }
 
+fn try_send_browser_error(sender: &mpsc::Sender<String>, code: &str, message: &str) {
+    let _ = sender.try_send(server_error(code, message));
+}
+
+async fn close_socket(mut socket: WebSocket) {
+    let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket.close()).await;
+}
+
 async fn send_single_message(mut socket: WebSocket, message: String) {
     let _ = tokio::time::timeout(
         SOCKET_SEND_TIMEOUT,
@@ -1026,28 +1019,20 @@ mod tests {
         assert_eq!(message_reason(r#"{"type":"closed"}"#), None);
     }
 
-    #[test]
-    fn same_origin_requires_matching_host() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "console.example.com".parse().unwrap());
-        headers.insert(
-            header::ORIGIN,
-            "https://console.example.com".parse().unwrap(),
-        );
-        assert!(ensure_same_origin(&headers, true).is_ok());
+    #[tokio::test]
+    async fn browser_error_notification_does_not_wait_for_a_full_queue() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send("queued-control-message".to_string())
+            .await
+            .unwrap();
 
-        headers.insert(
-            header::ORIGIN,
-            "http://console.example.com".parse().unwrap(),
-        );
-        assert!(ensure_same_origin(&headers, true).is_err());
-        assert!(ensure_same_origin(&headers, false).is_ok());
+        try_send_browser_error(&sender, "invalid_frame", "invalid frame");
 
-        headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
-        assert!(ensure_same_origin(&headers, true).is_err());
-        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
-        assert!(ensure_same_origin(&headers, true).is_err());
-        headers.remove(header::ORIGIN);
-        assert!(ensure_same_origin(&headers, true).is_err());
+        assert_eq!(
+            receiver.recv().await.as_deref(),
+            Some("queued-control-message")
+        );
+        assert!(receiver.try_recv().is_err());
     }
 }

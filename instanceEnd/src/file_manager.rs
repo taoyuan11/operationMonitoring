@@ -26,6 +26,7 @@ use crate::{
         AgentInbound, FileEntry, FileEntryKind, FileErrorCode, FileListing, FileRequest,
         FileResponse, FileSystemRoot,
     },
+    outbound::AgentEventSender,
 };
 
 pub const CAPABILITY: &str = "file_manager_v1";
@@ -37,7 +38,7 @@ const FRAME_KIND_FILE_CHUNK_V1: u8 = 1;
 const FRAME_HEADER_BYTES: usize = 1 + 16 + 8;
 
 pub struct FileManager {
-    outbound: mpsc::UnboundedSender<AgentInbound>,
+    outbound: AgentEventSender,
     binary_outbound: mpsc::Sender<Vec<u8>>,
     activity: ActivityTracker,
     control_slots: Arc<Semaphore>,
@@ -90,7 +91,7 @@ impl Drop for UploadCleanup {
 
 impl FileManager {
     pub fn new(
-        outbound: mpsc::UnboundedSender<AgentInbound>,
+        outbound: AgentEventSender,
         binary_outbound: mpsc::Sender<Vec<u8>>,
         activity: ActivityTracker,
     ) -> Self {
@@ -639,7 +640,7 @@ async fn run_upload(
     expected_size: u64,
     overwrite: bool,
     mut events: mpsc::Receiver<UploadEvent>,
-    outbound: &mpsc::UnboundedSender<AgentInbound>,
+    outbound: &AgentEventSender,
 ) -> Result<(), FileFailure> {
     let parent = require_directory_async(&parent).await?;
     validate_name(&name)?;
@@ -794,7 +795,7 @@ async fn run_download(
     path: String,
     max_bytes: u64,
     mut acknowledgements: mpsc::Receiver<u64>,
-    outbound: &mpsc::UnboundedSender<AgentInbound>,
+    outbound: &AgentEventSender,
     binary_outbound: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), FileFailure> {
     let path = absolute_path(&path)?;
@@ -1129,22 +1130,14 @@ fn io_failure(error: std::io::Error, context: &str) -> FileFailure {
     FileFailure::new(code, format!("{context}：{error}"))
 }
 
-fn send_response(
-    outbound: &mpsc::UnboundedSender<AgentInbound>,
-    request_id: &str,
-    response: FileResponse,
-) {
+fn send_response(outbound: &AgentEventSender, request_id: &str, response: FileResponse) {
     let _ = outbound.send(AgentInbound::FileResponse {
         request_id: request_id.to_string(),
         response,
     });
 }
 
-fn send_failure(
-    outbound: &mpsc::UnboundedSender<AgentInbound>,
-    request_id: &str,
-    failure: FileFailure,
-) {
+fn send_failure(outbound: &AgentEventSender, request_id: &str, failure: FileFailure) {
     send_response(
         outbound,
         request_id,
@@ -1199,7 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_control_requests_when_all_slots_are_in_use() {
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, mut outbound_rx, _failed) = AgentEventSender::channel(32);
         let (binary_tx, _binary_rx) = mpsc::channel(1);
         let manager = FileManager::new(outbound_tx, binary_tx, ActivityTracker::default());
         let _permits = (0..MAX_CONTROL_REQUESTS)
@@ -1295,7 +1288,7 @@ mod tests {
         let second = b"final-chunk".to_vec();
         let expected_size = (first.len() + second.len()) as u64;
         let (event_tx, event_rx) = mpsc::channel(TRANSFER_WINDOW);
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, mut outbound_rx, _failed) = AgentEventSender::channel(32);
         let task_request_id = request_id.clone();
         let task_root = display_path(&root);
         let task = tokio::spawn(async move {
@@ -1374,7 +1367,7 @@ mod tests {
         let root = test_directory();
         let request_id = Uuid::new_v4().to_string();
         let (event_tx, event_rx) = mpsc::channel(TRANSFER_WINDOW);
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, mut outbound_rx, _failed) = AgentEventSender::channel(32);
         let task_request_id = request_id.clone();
         let task_root = display_path(&root);
         let task = tokio::spawn(async move {
@@ -1424,7 +1417,7 @@ mod tests {
         let request_id = Uuid::new_v4().to_string();
         let (ack_tx, ack_rx) = mpsc::channel(TRANSFER_WINDOW);
         let (binary_tx, mut binary_rx) = mpsc::channel(TRANSFER_WINDOW);
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, mut outbound_rx, _failed) = AgentEventSender::channel(32);
         let task_request_id = request_id.clone();
         let task_path = display_path(&path);
         let task = tokio::spawn(async move {

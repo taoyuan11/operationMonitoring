@@ -226,82 +226,84 @@ function openInstance(instance: Instance) {
       </div>
     </Transition>
 
-    <Transition name="content" mode="out-in">
-      <div v-if="instances.length === 0" key="empty" class="empty-state">
-        <span class="empty-icon"><Server :size="28" /></span>
-        <strong>暂无已接入节点</strong>
-        <span>{{ isAdmin ? '请前往“接入审核”页面处理新节点申请。' : '节点通过管理员审核并完成接入后会显示在这里。' }}</span>
-      </div>
-
-      <div v-else-if="filteredInstances.length === 0" key="filtered-empty" class="empty-state filtered-empty">
-        <span class="empty-icon"><Search :size="28" /></span>
-        <strong>没有符合条件的节点</strong>
-        <span>尝试更换关键词或状态筛选条件。</span>
-        <button
-          class="text-button"
-          type="button"
-          title="重置筛选条件"
-          aria-label="重置节点筛选条件"
-          @click="resetFilters"
-        >
-          <RotateCcw :size="14" />重置筛选
-        </button>
-      </div>
-
-      <TransitionGroup v-else key="instances" name="instance" tag="div" :class="['instance-list', viewMode]">
-      <article
-        v-for="instance in filteredInstances"
-        :key="instance.id"
-        :class="['instance-card', { offline: !instance.online, clickable: true }]"
-        role="button"
-        tabindex="0"
-        :aria-label="`查看节点 ${instanceName(instance)} 的详情`"
-        @click="openInstance(instance)"
-        @keydown.enter="openInstance(instance)"
-        @keydown.space.prevent="openInstance(instance)"
-      >
-        <header class="instance-main">
-          <div class="instance-identity">
-            <OperatingSystemLogo class="server-icon" :os="instance.os" />
-            <div>
-              <div class="title-line">
-                <h3 :title="instanceName(instance)">{{ instanceName(instance) }}</h3>
-                <span :class="['status-badge', { online: instance.online }]">
-                  <i></i>{{ instance.online ? '在线' : '离线' }}
-                </span>
-              </div>
-              <p class="instance-location">
-                <span>
-                  <CountryFlag :code="instance.country_code" :name="instanceCountry(instance)" />
-                  {{ instanceCountry(instance) }}
-                </span>
-                <span>{{ instance.os }}/{{ instance.arch }}</span>
-              </p>
-            </div>
-          </div>
-        </header>
-
-        <div class="metrics">
-          <div :class="['metric', metricLevel(instance.metrics?.cpu_percent)]">
-            <div class="metric-label"><span><Cpu :size="15" />CPU</span><strong>{{ formatPercent(instance.metrics?.cpu_percent) }}</strong></div>
-            <i v-if="isKnownMetric(instance.metrics?.cpu_percent)"><b :style="{ width: `${metricWidth(instance.metrics?.cpu_percent)}%` }"></b></i>
-            <small v-else class="metric-unavailable">未检测到可用数据</small>
-          </div>
-          <div :class="['metric', metricLevel(memoryPercent(instance))]">
-            <div class="metric-label"><span><MemoryStick :size="15" />内存</span><strong>{{ formatPercent(memoryPercent(instance)) }}</strong></div>
-            <i v-if="isKnownMetric(memoryPercent(instance))"><b :style="{ width: `${metricWidth(memoryPercent(instance))}%` }"></b></i>
-            <small v-if="isKnownMetric(memoryPercent(instance))">{{ formatBytes(instance.metrics?.memory_used) }} / {{ formatBytes(instance.metrics?.memory_total) }}</small>
-            <small v-else class="metric-unavailable">未检测到可用数据</small>
-          </div>
-          <div :class="['metric', metricLevel(diskPercent(instance))]">
-            <div class="metric-label"><span><HardDrive :size="15" />磁盘</span><strong>{{ formatPercent(diskPercent(instance)) }}</strong></div>
-            <i v-if="isKnownMetric(diskPercent(instance))"><b :style="{ width: `${metricWidth(diskPercent(instance))}%` }"></b></i>
-            <small v-if="isKnownMetric(diskPercent(instance))">{{ formatBytes(instance.metrics?.disk_used) }} / {{ formatBytes(instance.metrics?.disk_total) }}</small>
-            <small v-else class="metric-unavailable">未检测到可用数据</small>
-          </div>
+    <div class="instance-results">
+      <Transition name="content" mode="out-in">
+        <div v-if="instances.length === 0" key="empty" class="empty-state">
+          <span class="empty-icon"><Server :size="28" /></span>
+          <strong>暂无已接入节点</strong>
+          <span>{{ isAdmin ? '请前往“接入审核”页面处理新节点申请。' : '节点通过管理员审核并完成接入后会显示在这里。' }}</span>
         </div>
-      </article>
-      </TransitionGroup>
-    </Transition>
+
+        <div v-else-if="filteredInstances.length === 0" key="filtered-empty" class="empty-state filtered-empty">
+          <span class="empty-icon"><Search :size="28" /></span>
+          <strong>没有符合条件的节点</strong>
+          <span>尝试更换关键词或状态筛选条件。</span>
+          <button
+            class="text-button"
+            type="button"
+            title="重置筛选条件"
+            aria-label="重置节点筛选条件"
+            @click="resetFilters"
+          >
+            <RotateCcw :size="14" />重置筛选
+          </button>
+        </div>
+
+        <TransitionGroup v-else key="instances" name="instance" tag="div" :class="['instance-list', viewMode]">
+          <article
+            v-for="instance in filteredInstances"
+            :key="instance.id"
+            :class="['instance-card', { offline: !instance.online, clickable: true }]"
+            role="button"
+            tabindex="0"
+            :aria-label="`查看节点 ${instanceName(instance)} 的详情`"
+            @click="openInstance(instance)"
+            @keydown.enter="openInstance(instance)"
+            @keydown.space.prevent="openInstance(instance)"
+          >
+            <header class="instance-main">
+              <div class="instance-identity">
+                <OperatingSystemLogo class="server-icon" :os="instance.os" />
+                <div>
+                  <div class="title-line">
+                    <h3 :title="instanceName(instance)">{{ instanceName(instance) }}</h3>
+                    <span :class="['status-badge', { online: instance.online }]">
+                      <i></i>{{ instance.online ? '在线' : '离线' }}
+                    </span>
+                  </div>
+                  <p class="instance-location">
+                    <span>
+                      <CountryFlag :code="instance.country_code" :name="instanceCountry(instance)" />
+                      {{ instanceCountry(instance) }}
+                    </span>
+                    <span>{{ instance.os }}/{{ instance.arch }}</span>
+                  </p>
+                </div>
+              </div>
+            </header>
+
+            <div class="metrics">
+              <div :class="['metric', metricLevel(instance.metrics?.cpu_percent)]">
+                <div class="metric-label"><span><Cpu :size="15" />CPU</span><strong>{{ formatPercent(instance.metrics?.cpu_percent) }}</strong></div>
+                <i v-if="isKnownMetric(instance.metrics?.cpu_percent)"><b :style="{ width: `${metricWidth(instance.metrics?.cpu_percent)}%` }"></b></i>
+                <small v-else class="metric-unavailable">未检测到可用数据</small>
+              </div>
+              <div :class="['metric', metricLevel(memoryPercent(instance))]">
+                <div class="metric-label"><span><MemoryStick :size="15" />内存</span><strong>{{ formatPercent(memoryPercent(instance)) }}</strong></div>
+                <i v-if="isKnownMetric(memoryPercent(instance))"><b :style="{ width: `${metricWidth(memoryPercent(instance))}%` }"></b></i>
+                <small v-if="isKnownMetric(memoryPercent(instance))">{{ formatBytes(instance.metrics?.memory_used) }} / {{ formatBytes(instance.metrics?.memory_total) }}</small>
+                <small v-else class="metric-unavailable">未检测到可用数据</small>
+              </div>
+              <div :class="['metric', metricLevel(diskPercent(instance))]">
+                <div class="metric-label"><span><HardDrive :size="15" />磁盘</span><strong>{{ formatPercent(diskPercent(instance)) }}</strong></div>
+                <i v-if="isKnownMetric(diskPercent(instance))"><b :style="{ width: `${metricWidth(diskPercent(instance))}%` }"></b></i>
+                <small v-if="isKnownMetric(diskPercent(instance))">{{ formatBytes(instance.metrics?.disk_used) }} / {{ formatBytes(instance.metrics?.disk_total) }}</small>
+                <small v-else class="metric-unavailable">未检测到可用数据</small>
+              </div>
+            </div>
+          </article>
+        </TransitionGroup>
+      </Transition>
+    </div>
   </section>
 </template>

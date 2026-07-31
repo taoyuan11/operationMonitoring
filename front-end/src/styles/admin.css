@@ -1,4 +1,4 @@
-.management-page { display: flex; min-width: 0; flex-direction: column; gap: 24px; }
+.management-page { display: flex; min-width: 0; min-height: 0; flex-direction: column; gap: 24px; overflow: hidden; }
 
 .page-header {
   display: grid;
@@ -7,6 +7,7 @@
   gap: 14px;
   padding: 0 0 20px;
   border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
 }
 .page-heading-icon { display: inline-flex; width: 42px; height: 42px; align-items: center; justify-content: center; color: var(--accent-strong); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 6px; }
 .page-heading-icon.purple { color: #b9b2df; background: rgba(169, 164, 223, 0.09); border-color: rgba(169, 164, 223, 0.17); }
@@ -17,11 +18,16 @@
 .page-header p { color: var(--muted); font-size: 13px; line-height: 1.5; }
 .page-count { display: inline-flex; min-height: 30px; align-items: center; padding: 0 10px; color: var(--muted-strong); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 5px; font-size: 12px; white-space: nowrap; }
 
-.admin-page-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
+.admin-page-grid { display: grid; min-height: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; flex: 1; overflow-x: hidden; overflow-y: auto; padding-right: 6px; padding-bottom: 36px; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .commands-layout { grid-template-columns: minmax(300px, .72fr) minmax(380px, 1.28fr); }
 .settings-layout { grid-template-columns: minmax(420px, 1.35fr) minmax(280px, .65fr); }
 .appearance-settings-card { grid-column: 1 / -1; }
 .admin-content-card { min-width: 0; padding: 20px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+.admin-list-card { display: flex; min-height: 0; flex: 1; flex-direction: column; overflow: hidden; }
+.admin-list-card > .card-heading { flex: 0 0 auto; }
+.admin-list-card > .approval-list,
+.admin-list-card > .logs-table { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.admin-list-card > .page-empty { min-height: 0; flex: 1; }
 .user-management-layout { align-items: stretch; }
 .active-enrollment-card { display: flex; flex-direction: column; }
 .enrollment-qr { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 15px; color: #17201c; background: #fff; border-radius: 7px; text-align: center; }
@@ -83,7 +89,7 @@
 
 .logs-table { overflow-x: auto; }
 .logs-table-head, .logs-table-row { display: grid; grid-template-columns: minmax(120px, .5fr) minmax(280px, 1.5fr) minmax(140px, .6fr) minmax(175px, .7fr); align-items: center; gap: 16px; min-width: 760px; padding: 0 15px; }
-.logs-table-head { min-height: 38px; color: var(--muted); background: var(--panel-soft); border-bottom: 1px solid var(--line); font-size: 11px; font-weight: 700; }
+.logs-table-head { position: sticky; top: 0; z-index: 2; min-height: 38px; color: var(--muted); background: var(--panel-soft); border-bottom: 1px solid var(--line); font-size: 11px; font-weight: 700; }
 .logs-table-row { min-height: 52px; border-bottom: 1px solid var(--line); }
 .logs-table-row:last-child { border-bottom: 0; }
 .logs-table-row strong { color: var(--text-strong); font-size: 12px; }

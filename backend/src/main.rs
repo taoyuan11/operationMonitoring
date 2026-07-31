@@ -9,7 +9,9 @@ mod handlers;
 mod jobs;
 mod models;
 mod remote_desktop;
+mod request_security;
 mod state;
+mod update_signature;
 mod updates;
 mod utils;
 mod ws;
@@ -23,7 +25,7 @@ use admin_auth::{
 use auth::load_auth_cipher;
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::{HeaderMap, Method},
     middleware::{self, Next},
     response::Response,
@@ -46,11 +48,13 @@ use handlers::{
     health, public_appearance, public_device_profile, public_instances, public_metrics,
 };
 use jobs::command_timeout_loop;
-use remote_desktop::{admin_desktop_ws, agent_desktop_ws, ensure_same_origin};
+use remote_desktop::{admin_desktop_ws, agent_desktop_ws};
+use request_security::{RequestScheme, ensure_same_origin, request_scheme};
 use state::AppState;
 use std::{io::ErrorKind, path::Path};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing::info;
+use update_signature::load_update_signer;
 use updates::{
     admin_agent_releases, admin_agent_update_attempts, admin_create_agent_release,
     admin_delete_agent_artifact, admin_delete_agent_release, admin_publish_agent_release,
@@ -105,9 +109,22 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let auth_cipher = load_auth_cipher(cli.auth_secret_key.as_deref(), &cli.auth_key_file)?;
+    let update_signer = load_update_signer(
+        cli.update_signing_key_file
+            .as_deref()
+            .filter(|path| !path.as_os_str().is_empty()),
+        &cli.update_signing_key_id,
+    )?;
+    if let Some(signer) = update_signer.as_ref() {
+        info!(
+            key_id = signer.key_id(),
+            public_key = signer.public_key_base64(),
+            "agent update signing enabled"
+        );
+    }
 
     let upload_dir = cli.upload_dir.clone();
-    let state = AppState::new(db, cli, auth_cipher);
+    let state = AppState::new(db, cli, auth_cipher, update_signer);
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/public/appearance", get(public_appearance))
@@ -305,27 +322,35 @@ async fn main() -> anyhow::Result<()> {
 
 async fn enforce_admin_write_origin(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<std::net::SocketAddr>,
     request: Request,
     next: Next,
 ) -> AppResult<Response> {
-    ensure_admin_write_origin(
-        request.method(),
-        request.uri().path(),
-        request.headers(),
-        state.secure_cookies,
-    )?;
+    if admin_write_requires_origin(request.method(), request.uri().path()) {
+        let scheme = request_scheme(&state, request.headers(), peer_addr.ip())?;
+        ensure_admin_write_origin(
+            request.method(),
+            request.uri().path(),
+            request.headers(),
+            scheme,
+        )?;
+    }
     Ok(next.run(request).await)
+}
+
+fn admin_write_requires_origin(method: &Method, path: &str) -> bool {
+    let safe_method = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+    path.starts_with("/api/admin/") && !safe_method
 }
 
 fn ensure_admin_write_origin(
     method: &Method,
     path: &str,
     headers: &HeaderMap,
-    secure: bool,
+    request_scheme: RequestScheme,
 ) -> AppResult<()> {
-    let safe_method = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
-    if path.starts_with("/api/admin/") && !safe_method {
-        ensure_same_origin(headers, secure)?;
+    if admin_write_requires_origin(method, path) {
+        ensure_same_origin(headers, request_scheme)?;
     }
     Ok(())
 }
@@ -368,6 +393,8 @@ mod tests {
     use super::{ensure_admin_write_origin, paths_overlap};
     use axum::http::{HeaderMap, Method, header};
     use std::path::Path;
+
+    use crate::request_security::RequestScheme;
 
     fn session_headers(host: &str, origin: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -412,7 +439,7 @@ mod tests {
                 &Method::POST,
                 "/api/admin/instances/agent/docker/containers/web/actions/start",
                 &missing,
-                true,
+                RequestScheme::Https,
             )
             .is_err()
         );
@@ -424,7 +451,7 @@ mod tests {
                 &Method::POST,
                 "/api/admin/instances/agent/docker/compose/projects/app/actions/down",
                 &cross_site,
-                true,
+                RequestScheme::Https,
             )
             .is_err()
         );
@@ -438,7 +465,7 @@ mod tests {
                 &Method::DELETE,
                 "/api/admin/instances/agent/docker/images/image",
                 &same_origin,
-                true,
+                RequestScheme::Https,
             )
             .is_ok()
         );
@@ -452,19 +479,38 @@ mod tests {
                 &Method::GET,
                 "/api/admin/instances/agent/docker/containers",
                 &session,
-                true,
+                RequestScheme::Https,
             )
             .is_ok()
         );
 
         assert!(
-            ensure_admin_write_origin(&Method::POST, "/api/admin/login", &HeaderMap::new(), true,)
-                .is_err()
+            ensure_admin_write_origin(
+                &Method::POST,
+                "/api/admin/login",
+                &HeaderMap::new(),
+                RequestScheme::Https,
+            )
+            .is_err()
         );
         let login = session_headers("console.example.com", Some("https://console.example.com"));
-        assert!(ensure_admin_write_origin(&Method::POST, "/api/admin/login", &login, true).is_ok());
         assert!(
-            ensure_admin_write_origin(&Method::POST, "/api/agent/report", &session, true,).is_ok()
+            ensure_admin_write_origin(
+                &Method::POST,
+                "/api/admin/login",
+                &login,
+                RequestScheme::Https,
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_admin_write_origin(
+                &Method::POST,
+                "/api/agent/report",
+                &session,
+                RequestScheme::Https,
+            )
+            .is_ok()
         );
     }
 }

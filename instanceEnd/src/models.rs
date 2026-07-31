@@ -454,6 +454,12 @@ pub struct UpdateOffer {
     pub size_bytes: i64,
     pub package_type: String,
     pub native_arch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     #[serde(default)]
     pub retry_count: i64,
 }
@@ -680,6 +686,12 @@ pub enum AgentOutbound {
         size_bytes: i64,
         package_type: String,
         native_arch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_os: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature_key_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
         #[serde(default)]
         retry_count: i64,
     },
@@ -853,6 +865,9 @@ mod tests {
             "size_bytes": 42,
             "package_type": "standalone",
             "native_arch": "arm64",
+            "target_os": "linux",
+            "signature_key_id": "release-v1",
+            "signature": "c2lnbmF0dXJl",
             "retry_count": 2
         });
 
@@ -861,16 +876,29 @@ mod tests {
             message,
             AgentOutbound::UpdateAvailable {
                 version,
+                target_os: Some(target_os),
+                signature_key_id: Some(signature_key_id),
                 retry_count: 2,
                 ..
             } if version == "1.2.3"
+                && target_os == "linux"
+                && signature_key_id == "release-v1"
         ));
 
         let mut legacy = value;
         legacy.as_object_mut().unwrap().remove("retry_count");
+        legacy.as_object_mut().unwrap().remove("target_os");
+        legacy.as_object_mut().unwrap().remove("signature_key_id");
+        legacy.as_object_mut().unwrap().remove("signature");
         assert!(matches!(
             serde_json::from_value::<AgentOutbound>(legacy).unwrap(),
-            AgentOutbound::UpdateAvailable { retry_count: 0, .. }
+            AgentOutbound::UpdateAvailable {
+                target_os: None,
+                signature_key_id: None,
+                signature: None,
+                retry_count: 0,
+                ..
+            }
         ));
     }
 

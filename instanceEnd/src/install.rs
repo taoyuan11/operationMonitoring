@@ -1,9 +1,7 @@
-use crate::{
-    config::AgentConfig,
-    lifecycle::{run_agent, stop_if_running},
-};
+#[cfg(not(windows))]
+use crate::lifecycle::run_agent;
+use crate::{config::AgentConfig, lifecycle::stop_if_running};
 use anyhow::{Context, Result, bail};
-use reqwest::Url;
 use std::{
     env, fs,
     io::{self, IsTerminal, Write},
@@ -36,7 +34,7 @@ pub fn install(mut config: AgentConfig, non_interactive: bool, yes: bool) -> Res
             bail!("installation cancelled");
         }
     }
-    validate_server(&config.server)?;
+    config.normalize_server()?;
     if !is_elevated() {
         return elevate("install", Some(&config));
     }
@@ -60,7 +58,8 @@ pub fn uninstall(config: AgentConfig, yes: bool) -> Result<()> {
     uninstall_elevated()
 }
 
-pub fn run_service(config: AgentConfig) -> Result<()> {
+pub fn run_service(mut config: AgentConfig) -> Result<()> {
+    config.normalize_server()?;
     #[cfg(windows)]
     {
         return windows_service_impl::run(config);
@@ -71,13 +70,6 @@ pub fn run_service(config: AgentConfig) -> Result<()> {
     }
 }
 
-fn validate_server(value: &str) -> Result<()> {
-    let url = Url::parse(value).context("invalid server URL")?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        bail!("server URL must be an absolute HTTP or HTTPS URL");
-    }
-    Ok(())
-}
 fn prompt_server(default: &str) -> Result<String> {
     loop {
         print!("Monitoring server URL [{default}]: ");
@@ -89,8 +81,8 @@ fn prompt_server(default: &str) -> Result<String> {
         } else {
             input.trim()
         };
-        match validate_server(selected) {
-            Ok(()) => return Ok(selected.to_owned()),
+        match crate::config::ServerEndpoint::parse(selected) {
+            Ok(endpoint) => return Ok(endpoint.normalized_server()),
             Err(error) => eprintln!("{error}"),
         }
     }

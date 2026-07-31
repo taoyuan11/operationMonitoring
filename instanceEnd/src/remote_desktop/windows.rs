@@ -18,8 +18,10 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
 };
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+    connect_async_with_config,
+    tungstenite::{
+        Message, client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig,
+    },
 };
 use uuid::Uuid;
 use windows::{
@@ -101,7 +103,7 @@ use super::{
     MAX_JPEG_QUALITY, MIN_JPEG_QUALITY, absolute_pointer_coordinate, dom_code_to_vk,
     dom_code_uses_extended_key, error_reason, scaled_dimensions, wait_for_input_release_ack,
 };
-use crate::{config::AgentConfig, models::AgentInbound};
+use crate::{config::AgentConfig, models::AgentInbound, outbound::AgentEventSender};
 
 const CREATE_NO_WINDOW_FLAG: u32 = 0x08000000;
 const PIPE_FRAME: u8 = 1;
@@ -112,6 +114,7 @@ const INTERNAL_STOPPED: &[u8] = b"stopped";
 const INTERNAL_FATAL_PREFIX: &[u8] = b"fatal:";
 const PIPE_MAX_PACKET: usize = MAX_FRAME_BYTES + 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 // WINSTA_ALL_ACCESS from winuser.h; windows 0.52 does not expose the aggregate constant.
@@ -132,7 +135,7 @@ const INPUT_DESKTOP_ACCESS: DESKTOP_ACCESS_FLAGS = DESKTOP_ACCESS_FLAGS(
 pub async fn run_session(
     config: AgentConfig,
     request: DesktopOpenRequest,
-    outbound: mpsc::UnboundedSender<AgentInbound>,
+    outbound: AgentEventSender,
     close: oneshot::Receiver<String>,
 ) -> Result<String> {
     let established = tokio::time::timeout(
@@ -184,7 +187,8 @@ async fn establish_session(
     };
     let mut child = spawn_helper(&options, target, config)?;
 
-    let mut ws_request = desktop_websocket_url(&config.server, &request.session_id)
+    let mut ws_request = desktop_websocket_url(config, &request.session_id)?
+        .as_str()
         .into_client_request()
         .context("invalid desktop websocket URL")?;
     ws_request.headers_mut().insert(
@@ -194,9 +198,17 @@ async fn establish_session(
     );
     let connected = tokio::try_join!(
         async {
-            connect_async(ws_request)
-                .await
-                .context("failed to connect desktop data websocket")
+            connect_async_with_config(
+                ws_request,
+                Some(
+                    WebSocketConfig::default()
+                        .max_message_size(Some(MAX_CONTROL_BYTES))
+                        .max_frame_size(Some(MAX_CONTROL_BYTES)),
+                ),
+                false,
+            )
+            .await
+            .context("failed to connect desktop data websocket")
         },
         async {
             pipe.connect()
@@ -338,7 +350,12 @@ async fn relay(
                         if text.len() > MAX_CONTROL_BYTES { bail!("desktop control message too large") }
                         serde_json::from_str::<DesktopControl>(&text)
                             .context("invalid desktop control message")?;
-                        write_packet(&mut pipe_write, PIPE_CONTROL, text.as_bytes()).await?;
+                        tokio::time::timeout(
+                            PIPE_WRITE_TIMEOUT,
+                            write_packet(&mut pipe_write, PIPE_CONTROL, text.as_bytes()),
+                        )
+                        .await
+                        .context("desktop helper pipe control write timed out")??;
                     }
                     Message::Ping(value) => {
                         tokio::time::timeout(
@@ -384,15 +401,23 @@ async fn relay(
 
     // Keep the reader alive while the helper drains input state. This prevents a queued JPEG
     // packet from filling the pipe and blocking the helper before it can receive the stop packet.
-    if write_packet(&mut pipe_write, PIPE_INTERNAL, INTERNAL_STOP)
-        .await
-        .is_ok()
+    match tokio::time::timeout(
+        PIPE_WRITE_TIMEOUT,
+        write_packet(&mut pipe_write, PIPE_INTERNAL, INTERNAL_STOP),
+    )
+    .await
     {
-        if !wait_for_input_release_ack(&mut ack_rx, INPUT_RELEASE_ACK_TIMEOUT).await {
-            crate::logging::error(format_args!(
-                "desktop helper did not acknowledge input release before the cleanup deadline"
-            ));
+        Ok(Ok(())) => {
+            if !wait_for_input_release_ack(&mut ack_rx, INPUT_RELEASE_ACK_TIMEOUT).await {
+                crate::logging::error(format_args!(
+                    "desktop helper did not acknowledge input release before the cleanup deadline"
+                ));
+            }
         }
+        Ok(Err(error)) => crate::logging::error(format_args!(
+            "failed to send the desktop helper stop packet: {error:#}"
+        )),
+        Err(_) => crate::logging::error(format_args!("desktop helper stop packet write timed out")),
     }
     reader.abort();
     result
@@ -1738,16 +1763,12 @@ fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
 
-fn desktop_websocket_url(server: &str, session_id: &str) -> String {
-    let trimmed = server.trim_end_matches('/');
-    let base = if let Some(rest) = trimmed.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        format!("ws://{trimmed}")
-    };
-    format!("{base}/api/agent/desktop/ws?session_id={session_id}")
+fn desktop_websocket_url(config: &AgentConfig, session_id: &str) -> Result<reqwest::Url> {
+    let mut url = config
+        .server_endpoint()?
+        .websocket_url("api/agent/desktop/ws")?;
+    url.query_pairs_mut().append_pair("session_id", session_id);
+    Ok(url)
 }
 
 fn validate_frame(frame: &[u8]) -> Result<()> {

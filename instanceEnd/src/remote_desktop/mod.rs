@@ -9,7 +9,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{activity::ActivityTracker, config::AgentConfig, models::AgentInbound};
+use crate::{
+    activity::ActivityTracker, config::AgentConfig, models::AgentInbound,
+    outbound::AgentEventSender,
+};
 
 #[cfg(windows)]
 mod windows;
@@ -22,6 +25,8 @@ pub const MIN_JPEG_QUALITY: u8 = 25;
 pub const MAX_JPEG_QUALITY: u8 = 75;
 pub(super) const DATA_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const INPUT_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_ABORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) async fn wait_for_input_release_ack(
     ack_rx: &mut mpsc::Receiver<()>,
@@ -58,7 +63,7 @@ pub struct DesktopOpenRequest {
 pub struct DesktopManager {
     config: AgentConfig,
     activity: ActivityTracker,
-    outbound: mpsc::UnboundedSender<AgentInbound>,
+    outbound: AgentEventSender,
     sessions: HashMap<String, ActiveDesktop>,
 }
 
@@ -68,11 +73,7 @@ struct ActiveDesktop {
 }
 
 impl DesktopManager {
-    pub fn new(
-        config: AgentConfig,
-        activity: ActivityTracker,
-        outbound: mpsc::UnboundedSender<AgentInbound>,
-    ) -> Self {
+    pub fn new(config: AgentConfig, activity: ActivityTracker, outbound: AgentEventSender) -> Self {
         Self {
             config,
             activity,
@@ -136,11 +137,13 @@ impl DesktopManager {
     pub async fn close_all(&mut self, reason: &str) {
         let sessions = self.request_close_all(reason);
         for (session_id, task) in sessions {
-            if let Err(error) = task.await {
-                crate::logging::error(format_args!(
-                    "remote desktop session {session_id} cleanup task failed: {error}"
-                ));
-            }
+            wait_for_session_cleanup(
+                &session_id,
+                task,
+                SESSION_CLEANUP_TIMEOUT,
+                SESSION_ABORT_TIMEOUT,
+            )
+            .await;
         }
     }
 
@@ -168,6 +171,38 @@ impl DesktopManager {
     }
 }
 
+async fn wait_for_session_cleanup(
+    session_id: &str,
+    mut task: JoinHandle<()>,
+    graceful_timeout: Duration,
+    abort_timeout: Duration,
+) {
+    match tokio::time::timeout(graceful_timeout, &mut task).await {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => {
+            crate::logging::error(format_args!(
+                "remote desktop session {session_id} cleanup task failed: {error}"
+            ));
+            return;
+        }
+        Err(_) => crate::logging::error(format_args!(
+            "remote desktop session {session_id} cleanup timed out; aborting it"
+        )),
+    }
+
+    task.abort();
+    match tokio::time::timeout(abort_timeout, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if error.is_cancelled() => {}
+        Ok(Err(error)) => crate::logging::error(format_args!(
+            "remote desktop session {session_id} abort failed: {error}"
+        )),
+        Err(_) => crate::logging::error(format_args!(
+            "remote desktop session {session_id} did not stop after abort"
+        )),
+    }
+}
+
 impl Drop for DesktopManager {
     fn drop(&mut self) {
         // JoinHandle::drop detaches the task. Sending first lets it complete the helper's
@@ -180,7 +215,7 @@ impl Drop for DesktopManager {
 async fn run_session(
     config: AgentConfig,
     request: DesktopOpenRequest,
-    outbound: mpsc::UnboundedSender<AgentInbound>,
+    outbound: AgentEventSender,
     close: oneshot::Receiver<String>,
 ) -> Result<String> {
     windows::run_session(config, request, outbound, close).await
@@ -190,7 +225,7 @@ async fn run_session(
 async fn run_session(
     _config: AgentConfig,
     _request: DesktopOpenRequest,
-    _outbound: mpsc::UnboundedSender<AgentInbound>,
+    _outbound: AgentEventSender,
     _close: oneshot::Receiver<String>,
 ) -> Result<String> {
     bail!("unsupported_platform")
@@ -461,7 +496,7 @@ mod tests {
     use super::*;
 
     fn test_manager(activity: ActivityTracker) -> DesktopManager {
-        let (outbound, _) = mpsc::unbounded_channel();
+        let (outbound, _, _failed) = AgentEventSender::channel(8);
         DesktopManager::new(
             AgentConfig {
                 server: "http://127.0.0.1:13500".to_string(),
@@ -531,6 +566,26 @@ mod tests {
 
         let _ = finish_tx.send(());
         cleanup.await.unwrap();
+        assert_eq!(activity.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stalled_session_cleanup_is_aborted_after_the_deadline() {
+        let activity = ActivityTracker::default();
+        let guard = activity.try_enter().unwrap();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        wait_for_session_cleanup(
+            "desktop-1",
+            task,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await;
+
         assert_eq!(activity.active_count(), 0);
     }
 

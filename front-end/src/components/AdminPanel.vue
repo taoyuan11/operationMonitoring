@@ -96,7 +96,7 @@ const previewTheme = computed(() =>
         <span class="page-count">{{ pendingInstances.length }} 个待处理</span>
       </header>
 
-      <div class="admin-content-card wide-card">
+      <div class="admin-content-card wide-card admin-list-card">
         <div class="card-heading">
           <div><h3>待审批节点</h3><p>节点在获得批准之前不会出现在公开实例列表中。</p></div>
         </div>
@@ -341,7 +341,7 @@ const previewTheme = computed(() =>
         <span class="page-count">最近 {{ Math.min(logs.length, 20) }} 条</span>
       </header>
 
-      <div class="admin-content-card wide-card">
+      <div class="admin-content-card wide-card admin-list-card">
         <div class="card-heading"><div><h3>管理操作记录</h3><p>按操作时间倒序显示。</p></div></div>
         <Transition name="content" mode="out-in">
           <div v-if="logs.length === 0" key="empty" class="page-empty">

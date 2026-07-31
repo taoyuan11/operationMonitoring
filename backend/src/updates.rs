@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::require_admin,
-    db::{get_instance, write_action_log},
+    db::{agent_secret_matches, get_instance, write_action_log},
     error::{AppError, AppResult},
     models::{
         AgentArtifactRecord, AgentOutbound, AgentReleaseCoverage, AgentReleaseDetail,
@@ -54,6 +54,7 @@ struct UpdateCandidate {
     release_id: String,
     version: String,
     artifact_id: String,
+    os: String,
     package_type: String,
     native_arch: String,
     sha256: String,
@@ -187,27 +188,71 @@ pub async fn admin_delete_agent_release(
     Path(release_id): Path<String>,
 ) -> AppResult<StatusCode> {
     let admin = require_admin(&state, &headers).await?;
-    require_draft_release(&state, &release_id).await?;
-    let deleted = sqlx::query("DELETE FROM agent_releases WHERE id = $1 AND status = 'draft'")
-        .bind(&release_id)
-        .execute(&state.db)
-        .await?;
-    if deleted.rows_affected() != 1 {
+    delete_agent_release(&state, &admin.username, &release_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_agent_release(state: &AppState, actor: &str, release_id: &str) -> AppResult<()> {
+    let mut transaction = state.db.begin().await?;
+    let release = sqlx::query_as::<_, AgentReleaseRecord>(
+        "SELECT id, version, notes, status, created_at, published_at FROM agent_releases WHERE id = $1 FOR UPDATE",
+    )
+    .bind(release_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Agent 版本不存在"))?;
+    let attempt_statuses = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM agent_update_attempts WHERE release_id = $1 FOR UPDATE",
+    )
+    .bind(release_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let active_attempts = attempt_statuses
+        .iter()
+        .filter(|status| !TERMINAL_ATTEMPT_STATUSES.contains(&status.as_str()))
+        .count();
+    if active_attempts > 0 {
         return Err(AppError::new(
             StatusCode::CONFLICT,
-            "已发布的 Agent 版本不能删除",
+            format!("该版本仍有 {active_attempts} 个实例更新未结束，完成后才能删除"),
         ));
     }
-    let _ = fs::remove_dir_all(state.update_dir.join(&release_id)).await;
+    let artifact_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_artifacts WHERE release_id = $1")
+            .bind(release_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+
+    let deleted = sqlx::query("DELETE FROM agent_releases WHERE id = $1")
+        .bind(release_id)
+        .execute(&mut *transaction)
+        .await?;
+    debug_assert_eq!(deleted.rows_affected(), 1);
+
+    let release_kind = if release.status == "published" {
+        "已发布"
+    } else {
+        "草稿"
+    };
     write_action_log(
-        &state.db,
-        &admin.username,
+        &mut *transaction,
+        actor,
         "delete_agent_release",
-        &release_id,
-        "删除 Agent 更新草稿",
+        release_id,
+        &format!(
+            "永久删除{release_kind} Agent 版本 {}、{artifact_count} 个可执行文件及 SHA-256 校验文件、{} 条实例更新记录",
+            release.version,
+            attempt_statuses.len()
+        ),
     )
     .await?;
-    Ok(StatusCode::NO_CONTENT)
+    transaction.commit().await?;
+
+    // The filesystem cannot participate in the database transaction. Once metadata and
+    // its audit record are committed, storage cleanup is best effort and cannot resurrect
+    // a release or make an orphaned artifact downloadable.
+    let _ = remove_release_storage(state, release_id).await;
+    Ok(())
 }
 
 pub async fn admin_upload_agent_artifact(
@@ -247,6 +292,7 @@ pub async fn admin_delete_agent_artifact(
         .filter(|artifact| artifact.release_id == release_id)
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Agent 可执行文件不存在"))?;
 
+    let mut transaction = state.db.begin().await?;
     let deleted = sqlx::query(
         r#"
         DELETE FROM agent_artifacts
@@ -255,7 +301,7 @@ pub async fn admin_delete_agent_artifact(
     )
     .bind(&artifact_id)
     .bind(&release_id)
-    .execute(&state.db)
+    .execute(&mut *transaction)
     .await?;
     if deleted.rows_affected() != 1 {
         return Err(AppError::new(
@@ -263,16 +309,18 @@ pub async fn admin_delete_agent_artifact(
             "已发布的可执行文件不能删除",
         ));
     }
-    remove_stored_file(&state, &artifact.storage_path).await;
-    remove_stored_file(&state, &format!("{}.sha256", artifact.storage_path)).await;
     write_action_log(
-        &state.db,
+        &mut *transaction,
         &admin.username,
         "delete_agent_artifact",
         &artifact_id,
         "删除 Agent 可执行文件及 SHA-256 校验文件",
     )
     .await?;
+    transaction.commit().await?;
+
+    remove_stored_file(&state, &artifact.storage_path).await;
+    remove_stored_file(&state, &format!("{}.sha256", artifact.storage_path)).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -373,10 +421,8 @@ pub async fn admin_publish_agent_release(
             notified_instance_ids.push(instance.id);
         }
     }
-    transaction.commit().await?;
-
     write_action_log(
-        &state.db,
+        &mut *transaction,
         &admin.username,
         "publish_agent_release",
         &release_id,
@@ -387,6 +433,8 @@ pub async fn admin_publish_agent_release(
         ),
     )
     .await?;
+    transaction.commit().await?;
+
     notify_instances(&state, notified_instance_ids).await;
     let published = get_release(&state, &release_id).await?;
     Ok(Json(load_release_detail(&state, published).await?))
@@ -1439,7 +1487,7 @@ async fn authenticate_agent_headers(
     let instance_id = agent_header(headers, "x-agent-id")?;
     let secret = agent_header(headers, "x-agent-secret")?;
     let instance = get_instance(&state.db, instance_id).await?;
-    if instance.secret != secret {
+    if !agent_secret_matches(&instance.secret, secret) {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
     }
     if instance.approved != 1 || instance.disabled == 1 {
@@ -1511,7 +1559,7 @@ async fn find_update_for_instance(
     {
         return Ok(None);
     }
-    Ok(Some(candidate_offer(candidate, retry_count)))
+    signed_offer(state, candidate_offer(candidate, retry_count)).map(Some)
 }
 
 async fn retried_offer_for_instance(
@@ -1555,20 +1603,30 @@ async fn retried_offer_for_instance(
         Version::parse(&candidate.version)
             .is_ok_and(|version| current.as_ref().is_none_or(|current| version > *current))
     });
-    Ok(candidate.map(|candidate| AgentUpdateOffer {
-        download_url: format!(
-            "/api/agent/update/artifacts/{}/download",
-            candidate.artifact_id
-        ),
-        release_id: candidate.release_id,
-        version: candidate.version,
-        artifact_id: candidate.artifact_id,
-        sha256: candidate.sha256,
-        size_bytes: candidate.size_bytes,
-        package_type: candidate.package_type,
-        native_arch: candidate.native_arch,
-        retry_count: candidate.retry_count,
-    }))
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    signed_offer(
+        state,
+        AgentUpdateOffer {
+            download_url: format!(
+                "/api/agent/update/artifacts/{}/download",
+                candidate.artifact_id
+            ),
+            release_id: candidate.release_id,
+            version: candidate.version,
+            artifact_id: candidate.artifact_id,
+            sha256: candidate.sha256,
+            size_bytes: candidate.size_bytes,
+            package_type: candidate.package_type,
+            native_arch: candidate.native_arch,
+            target_os: Some(candidate.os),
+            signature_key_id: None,
+            signature: None,
+            retry_count: candidate.retry_count,
+        },
+    )
+    .map(Some)
 }
 
 async fn select_update_candidate(
@@ -1583,7 +1641,7 @@ async fn select_update_candidate(
     }
     let candidates = sqlx::query_as::<_, UpdateCandidate>(
         r#"
-        SELECT r.id AS release_id, r.version, a.id AS artifact_id, a.package_type,
+        SELECT r.id AS release_id, r.version, a.id AS artifact_id, a.os, a.package_type,
                a.native_arch, a.sha256, a.size_bytes
         FROM agent_releases r
         JOIN agent_artifacts a ON a.release_id = r.id
@@ -1652,8 +1710,18 @@ fn candidate_offer(candidate: UpdateCandidate, retry_count: i64) -> AgentUpdateO
         size_bytes: candidate.size_bytes,
         package_type: candidate.package_type,
         native_arch: candidate.native_arch,
+        target_os: Some(candidate.os),
+        signature_key_id: None,
+        signature: None,
         retry_count,
     }
+}
+
+fn signed_offer(state: &AppState, mut offer: AgentUpdateOffer) -> AppResult<AgentUpdateOffer> {
+    if let Some(signer) = state.update_signer.as_deref() {
+        signer.sign_offer(&mut offer)?;
+    }
+    Ok(offer)
 }
 
 fn outbound_offer(offer: AgentUpdateOffer) -> AgentOutbound {
@@ -1666,6 +1734,9 @@ fn outbound_offer(offer: AgentUpdateOffer) -> AgentOutbound {
         size_bytes: offer.size_bytes,
         package_type: offer.package_type,
         native_arch: offer.native_arch,
+        target_os: offer.target_os,
+        signature_key_id: offer.signature_key_id,
+        signature: offer.signature,
         retry_count: offer.retry_count,
     }
 }
@@ -1732,6 +1803,25 @@ fn safe_storage_path(state: &AppState, relative: &str) -> AppResult<std::path::P
     Ok(state.update_dir.join(path))
 }
 
+async fn remove_release_storage(state: &AppState, release_id: &str) -> AppResult<()> {
+    let relative = FsPath::new(release_id);
+    if relative.components().count() != 1 {
+        return Err(AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Agent 版本存储路径无效",
+        ));
+    }
+    let path = safe_storage_path(state, release_id)?;
+    match fs::remove_dir_all(&path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            warn!(?error, path = %path.display(), "failed to remove agent release storage");
+            Err(error.into())
+        }
+    }
+}
+
 async fn remove_stored_file(state: &AppState, relative: &str) {
     let Ok(path) = safe_storage_path(state, relative) else {
         return;
@@ -1770,11 +1860,13 @@ mod tests {
     use crate::{auth::AuthCipher, config::Cli, db::init_db};
 
     async fn test_state() -> AppState {
+        let database_url = std::env::var("OM_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string());
         let db = PgPoolOptions::new()
             .max_connections(1)
-            .connect("postgresql://localhost/postgres")
+            .connect(&database_url)
             .await
-            .expect("connect in-memory database");
+            .expect("connect test database");
         init_db(&db).await.expect("initialize database");
         let root = std::env::temp_dir().join(format!("om-backend-update-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root)
@@ -1784,7 +1876,7 @@ mod tests {
             db,
             Cli {
                 bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
-                database_url: "postgresql://localhost/postgres".to_string(),
+                database_url,
                 database_password: None,
                 admin_password: Some("test-password-value".to_string()),
                 auth_secret_key: None,
@@ -1797,10 +1889,13 @@ mod tests {
                 confirm_reset_admin_auth: None,
                 upload_dir: root.join("uploads"),
                 update_dir: root.join("updates"),
+                update_signing_key_file: None,
+                update_signing_key_id: "default".to_string(),
                 agent_package_max_bytes: 1024 * 1024,
                 file_transfer_max_bytes: 1024 * 1024,
             },
             AuthCipher::from_key(&[7_u8; 32]).expect("create test auth cipher"),
+            None,
         )
     }
 
@@ -1862,6 +1957,108 @@ mod tests {
         .execute(&state.db)
         .await
         .expect("insert artifact");
+    }
+
+    struct StoredReleaseFixture {
+        release_id: String,
+        version: String,
+        artifact_id: String,
+        instance_id: String,
+        release_dir: std::path::PathBuf,
+    }
+
+    async fn insert_stored_release(
+        state: &AppState,
+        release_status: &str,
+        attempt_status: Option<&str>,
+    ) -> StoredReleaseFixture {
+        let release_id = Uuid::new_v4().to_string();
+        let artifact_id = Uuid::new_v4().to_string();
+        let instance_id = Uuid::new_v4().to_string();
+        let version_seed = Uuid::new_v4().as_u128();
+        let version = format!(
+            "{}.{}.{}",
+            version_seed >> 64,
+            (version_seed >> 32) & u32::MAX as u128,
+            version_seed & u32::MAX as u128
+        );
+        let published_at = (release_status == "published").then_some(1_i64);
+        sqlx::query(
+            "INSERT INTO agent_releases(id, version, status, created_at, published_at) VALUES($1, $2, $3, 1, $4)",
+        )
+        .bind(&release_id)
+        .bind(&version)
+        .bind(release_status)
+        .bind(published_at)
+        .execute(&state.db)
+        .await
+        .expect("insert release for deletion");
+
+        insert_instance(state, &instance_id, "linux", "standalone", "x86_64").await;
+        let storage_path = format!("{release_id}/{artifact_id}.bin");
+        sqlx::query(
+            r#"
+            INSERT INTO agent_artifacts(
+                id, release_id, os, package_type, native_arch, file_name, size_bytes,
+                sha256, storage_path, created_at, status, published_at
+            ) VALUES($1, $2, 'linux', 'standalone', 'x86_64', 'agent.bin', 7,
+                     'digest', $3, 1, $4, $5)
+            "#,
+        )
+        .bind(&artifact_id)
+        .bind(&release_id)
+        .bind(&storage_path)
+        .bind(release_status)
+        .bind(published_at)
+        .execute(&state.db)
+        .await
+        .expect("insert artifact for deletion");
+
+        if let Some(attempt_status) = attempt_status {
+            let completed_at = TERMINAL_ATTEMPT_STATUSES
+                .contains(&attempt_status)
+                .then_some(1_i64);
+            sqlx::query(
+                r#"
+                INSERT INTO agent_update_attempts(
+                    id, release_id, artifact_id, instance_id, from_version, target_version,
+                    status, created_at, updated_at, completed_at
+                ) VALUES($1, $2, $3, $4, '1.0.0', $5, $6, 1, 1, $7)
+                "#,
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&release_id)
+            .bind(&artifact_id)
+            .bind(&instance_id)
+            .bind(&version)
+            .bind(attempt_status)
+            .bind(completed_at)
+            .execute(&state.db)
+            .await
+            .expect("insert update attempt for deletion");
+        }
+
+        let release_dir = state.update_dir.join(&release_id);
+        fs::create_dir_all(&release_dir)
+            .await
+            .expect("create release storage");
+        fs::write(state.update_dir.join(&storage_path), b"program")
+            .await
+            .expect("write stored program");
+        fs::write(
+            state.update_dir.join(format!("{storage_path}.sha256")),
+            b"digest  agent.bin\n",
+        )
+        .await
+        .expect("write stored checksum");
+
+        StoredReleaseFixture {
+            release_id,
+            version,
+            artifact_id,
+            instance_id,
+            release_dir,
+        }
     }
 
     #[test]
@@ -1970,6 +2167,200 @@ mod tests {
                 .components()
                 .any(|component| !matches!(component, std::path::Component::Normal(_)))
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn deletes_published_release_storage_history_and_keeps_audit_log() {
+        let state = test_state().await;
+        let fixture = insert_stored_release(&state, "published", Some("succeeded")).await;
+
+        delete_agent_release(&state, "test-admin", &fixture.release_id)
+            .await
+            .expect("delete published release");
+
+        let release_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_releases WHERE id = $1")
+                .bind(&fixture.release_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("count releases");
+        let artifact_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_artifacts WHERE id = $1")
+                .bind(&fixture.artifact_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("count artifacts");
+        let attempt_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_update_attempts WHERE release_id = $1")
+                .bind(&fixture.release_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("count attempts");
+        assert_eq!((release_count, artifact_count, attempt_count), (0, 0, 0));
+        assert!(!fixture.release_dir.exists());
+
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail FROM action_logs WHERE action = 'delete_agent_release' AND target = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&fixture.release_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("load deletion audit log");
+        assert!(detail.contains(&fixture.version));
+        assert!(detail.contains("1 个可执行文件"));
+        assert!(detail.contains("1 条实例更新记录"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-agent-id",
+            fixture.instance_id.parse().expect("agent id header"),
+        );
+        headers.insert(
+            "x-agent-secret",
+            "secret".parse().expect("agent secret header"),
+        );
+        let error = match authorized_artifact_download(&state, &headers, &fixture.artifact_id).await
+        {
+            Ok(_) => panic!("deleted artifact must not remain downloadable"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn rejects_release_deletion_for_every_nonterminal_attempt_status() {
+        let state = test_state().await;
+        for status in [
+            "pending",
+            "waiting",
+            "downloading",
+            "verifying",
+            "waiting_idle",
+            "installing",
+            "awaiting_restart",
+        ] {
+            let fixture = insert_stored_release(&state, "published", Some(status)).await;
+            let error = delete_agent_release(&state, "test-admin", &fixture.release_id)
+                .await
+                .expect_err("active update must block release deletion");
+            assert_eq!(error.status, StatusCode::CONFLICT, "status {status}");
+            assert!(error.message.contains("1 个实例更新未结束"));
+
+            let release_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_releases WHERE id = $1")
+                    .bind(&fixture.release_id)
+                    .fetch_one(&state.db)
+                    .await
+                    .expect("count blocked release");
+            let attempt_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_update_attempts WHERE release_id = $1",
+            )
+            .bind(&fixture.release_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("count blocked attempt");
+            assert_eq!((release_count, attempt_count), (1, 1));
+            assert!(fixture.release_dir.exists());
+
+            sqlx::query(
+                "UPDATE agent_update_attempts SET status = 'failed', completed_at = 1 WHERE release_id = $1",
+            )
+            .bind(&fixture.release_id)
+            .execute(&state.db)
+            .await
+            .expect("finish blocked attempt for cleanup");
+            delete_agent_release(&state, "test-admin", &fixture.release_id)
+                .await
+                .expect("clean blocked release fixture");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn draft_deletion_tolerates_missing_storage_and_missing_release_is_not_found() {
+        let state = test_state().await;
+        let fixture = insert_stored_release(&state, "draft", None).await;
+        fs::remove_dir_all(&fixture.release_dir)
+            .await
+            .expect("remove fixture storage before deletion");
+
+        delete_agent_release(&state, "test-admin", &fixture.release_id)
+            .await
+            .expect("delete draft with already missing storage");
+        let error = delete_agent_release(&state, "test-admin", &fixture.release_id)
+            .await
+            .expect_err("deleted release must no longer exist");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn storage_cleanup_failure_does_not_roll_back_release_deletion() {
+        let state = test_state().await;
+        let fixture = insert_stored_release(&state, "draft", None).await;
+        fs::remove_dir_all(&fixture.release_dir)
+            .await
+            .expect("remove release directory before failure injection");
+        fs::write(&fixture.release_dir, b"not a directory")
+            .await
+            .expect("replace release directory with a file");
+
+        delete_agent_release(&state, "test-admin", &fixture.release_id)
+            .await
+            .expect("database deletion must survive storage cleanup failure");
+
+        let release_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_releases WHERE id = $1")
+                .bind(&fixture.release_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("count deleted releases");
+        let artifact_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_artifacts WHERE release_id = $1")
+                .bind(&fixture.release_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("count deleted artifacts");
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM action_logs WHERE action = 'delete_agent_release' AND target = $1",
+        )
+        .bind(&fixture.release_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("count committed audit records");
+
+        assert_eq!((release_count, artifact_count, audit_count), (0, 0, 1));
+        assert!(fixture.release_dir.is_file());
+        fs::remove_file(&fixture.release_dir)
+            .await
+            .expect("clean failure injection file");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn deleting_latest_release_leaves_the_next_published_candidate_available() {
+        let state = test_state().await;
+        let instance_id = Uuid::new_v4().to_string();
+        insert_instance(&state, &instance_id, "linux", "standalone", "amd64").await;
+        let version_seed = (Uuid::new_v4().as_u128() % 1_000_000_000) as u64 + 10_000;
+        let fallback_version = format!("{version_seed}.1.0");
+        let deleted_version = format!("{version_seed}.2.0");
+        insert_release(&state, &fallback_version, "standalone", "amd64").await;
+        insert_release(&state, &deleted_version, "standalone", "amd64").await;
+
+        delete_agent_release(&state, "test-admin", &format!("release-{deleted_version}"))
+            .await
+            .expect("delete latest release");
+        let instance = get_instance(&state.db, &instance_id)
+            .await
+            .expect("load candidate instance");
+        let offer = find_update_for_instance(&state, &instance)
+            .await
+            .expect("find fallback update")
+            .expect("fallback release remains available");
+        assert_eq!(offer.version, fallback_version);
     }
 
     #[tokio::test]

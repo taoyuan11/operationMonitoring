@@ -16,6 +16,7 @@ use crate::{
         AgentOutbound, DockerError, DockerResponse, DockerStatus, FileResponse,
         TerminalServerMessage,
     },
+    update_signature::UpdateSigner,
 };
 
 #[derive(Clone)]
@@ -29,6 +30,7 @@ pub struct AppState {
     pub allow_legacy_agent_ws_auth: bool,
     pub upload_dir: PathBuf,
     pub update_dir: PathBuf,
+    pub update_signer: Option<Arc<UpdateSigner>>,
     pub agent_package_max_bytes: usize,
     pub file_transfer_max_bytes: usize,
     pub sessions: Arc<RwLock<HashMap<String, AdminSession>>>,
@@ -47,7 +49,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: PgPool, cli: Cli, auth_cipher: AuthCipher) -> Self {
+    pub fn new(
+        db: PgPool,
+        cli: Cli,
+        auth_cipher: AuthCipher,
+        update_signer: Option<UpdateSigner>,
+    ) -> Self {
         Self {
             db,
             admin_password: cli.admin_password,
@@ -58,6 +65,7 @@ impl AppState {
             allow_legacy_agent_ws_auth: cli.allow_legacy_agent_ws_auth,
             upload_dir: cli.upload_dir,
             update_dir: cli.update_dir,
+            update_signer: update_signer.map(Arc::new),
             agent_package_max_bytes: cli.agent_package_max_bytes,
             file_transfer_max_bytes: cli.file_transfer_max_bytes,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -97,11 +105,43 @@ pub struct AuthAttempt {
 #[derive(Clone)]
 pub struct AgentHandle {
     pub connection_id: Uuid,
-    pub tx: mpsc::UnboundedSender<AgentOutbound>,
+    pub tx: AgentOutboundSender,
     pub binary_tx: mpsc::Sender<Vec<u8>>,
     pub shutdown_tx: watch::Sender<bool>,
     pub capabilities: Vec<String>,
     pub docker_status: Arc<RwLock<Option<DockerStatus>>>,
+}
+
+#[derive(Clone)]
+pub struct AgentOutboundSender {
+    tx: mpsc::Sender<AgentOutbound>,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+impl AgentOutboundSender {
+    pub fn channel(
+        capacity: usize,
+        shutdown_tx: watch::Sender<bool>,
+    ) -> (Self, mpsc::Receiver<AgentOutbound>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx, shutdown_tx }, rx)
+    }
+
+    pub fn send(&self, message: AgentOutbound) -> Result<(), AgentOutboundSendError> {
+        self.tx.try_send(message).map_err(|error| {
+            self.shutdown_tx.send_replace(true);
+            match error {
+                mpsc::error::TrySendError::Full(_) => AgentOutboundSendError::Full,
+                mpsc::error::TrySendError::Closed(_) => AgentOutboundSendError::Closed,
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentOutboundSendError {
+    Full,
+    Closed,
 }
 
 #[derive(Clone)]

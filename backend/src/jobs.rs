@@ -14,6 +14,7 @@ use crate::{
 
 const COMMAND_TIMEOUT_SECONDS: i64 = 60 * 60;
 const COMMAND_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_INFLIGHT_COMMANDS_PER_INSTANCE: i64 = 4;
 
 pub async fn create_command_job(
     state: &AppState,
@@ -36,6 +37,28 @@ pub async fn create_command_job(
         exit_code: None,
     };
 
+    let mut transaction = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(instance_id)
+        .execute(&mut *transaction)
+        .await?;
+    let inflight = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM command_jobs
+        WHERE instance_id = $1 AND status IN ('queued', 'running')
+        "#,
+    )
+    .bind(instance_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if inflight >= MAX_INFLIGHT_COMMANDS_PER_INSTANCE {
+        return Err(AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "实例正在执行的命令已达到上限",
+        ));
+    }
+
     sqlx::query(
         r#"
         INSERT INTO command_jobs(id, command_id, instance_id, command, status, requested_by,
@@ -53,8 +76,9 @@ pub async fn create_command_job(
     .bind(job.completed_at)
     .bind(&job.output)
     .bind(job.exit_code)
-    .execute(&state.db)
+    .execute(&mut *transaction)
     .await?;
+    transaction.commit().await?;
 
     Ok(job)
 }
@@ -265,12 +289,48 @@ fn command_timeout_cutoff(now: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, path::PathBuf};
+    use std::{env, net::SocketAddr, path::PathBuf};
 
     use sqlx::postgres::PgPoolOptions;
 
     use super::*;
     use crate::{auth::AuthCipher, config::Cli, db::init_db};
+
+    async fn test_state(max_connections: u32) -> AppState {
+        let database_url = env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string());
+        let db = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(&database_url)
+            .await
+            .expect("connect database");
+        init_db(&db).await.expect("initialize database");
+        AppState::new(
+            db,
+            Cli {
+                bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
+                database_url,
+                database_password: None,
+                admin_password: Some("test-bootstrap-password".to_string()),
+                auth_secret_key: None,
+                auth_key_file: PathBuf::from("unused-test-auth-key"),
+                secure_cookies: false,
+                trust_proxy_headers: false,
+                trusted_proxy_cidrs: Vec::new(),
+                allow_legacy_agent_ws_auth: false,
+                reset_admin_auth: false,
+                confirm_reset_admin_auth: None,
+                upload_dir: PathBuf::from("unused-uploads"),
+                update_dir: PathBuf::from("unused-updates"),
+                update_signing_key_file: None,
+                update_signing_key_id: "default".to_string(),
+                agent_package_max_bytes: 1024,
+                file_transfer_max_bytes: 1024,
+            },
+            AuthCipher::from_key(&[3_u8; 32]).expect("create auth cipher"),
+            None,
+        )
+    }
 
     #[test]
     fn command_completion_status_tracks_exit_code() {
@@ -288,34 +348,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn command_results_require_matching_running_job_connection() {
-        let db = PgPoolOptions::new()
-            .max_connections(1)
-            .connect("postgresql://localhost/postgres")
-            .await
-            .expect("connect database");
-        init_db(&db).await.expect("initialize database");
-        let state = AppState::new(
-            db,
-            Cli {
-                bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
-                database_url: "postgresql://localhost/postgres".to_string(),
-                database_password: None,
-                admin_password: Some("test-bootstrap-password".to_string()),
-                auth_secret_key: None,
-                auth_key_file: PathBuf::from("unused-test-auth-key"),
-                secure_cookies: false,
-                trust_proxy_headers: false,
-                trusted_proxy_cidrs: Vec::new(),
-                allow_legacy_agent_ws_auth: false,
-                reset_admin_auth: false,
-                confirm_reset_admin_auth: None,
-                upload_dir: PathBuf::from("unused-uploads"),
-                update_dir: PathBuf::from("unused-updates"),
-                agent_package_max_bytes: 1024,
-                file_transfer_max_bytes: 1024,
-            },
-            AuthCipher::from_key(&[3_u8; 32]).expect("create auth cipher"),
-        );
+        let state = test_state(1).await;
         let job_id = Uuid::new_v4().to_string();
         let terminal_job_id = Uuid::new_v4().to_string();
         let connection_id = Uuid::new_v4();
@@ -385,5 +418,52 @@ mod tests {
             .execute(&state.db)
             .await
             .expect("delete command jobs");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn concurrent_command_creation_enforces_the_per_instance_limit() {
+        let state = test_state(8).await;
+        let instance_id = format!("command-limit-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO instances(id, secret, name, first_seen) VALUES($1, 'secret', 'Command limit test', $2)",
+        )
+        .bind(&instance_id)
+        .bind(now_ts())
+        .execute(&state.db)
+        .await
+        .expect("insert test instance");
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let instance_id = instance_id.clone();
+            tasks.push(tokio::spawn(async move {
+                create_command_job(&state, None, &instance_id, "true", "test").await
+            }));
+        }
+
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for task in tasks {
+            match task.await.expect("join command creation") {
+                Ok(_) => accepted += 1,
+                Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => rejected += 1,
+                Err(error) => panic!("unexpected command creation error: {error:?}"),
+            }
+        }
+        assert_eq!(accepted, MAX_INFLIGHT_COMMANDS_PER_INSTANCE);
+        assert_eq!(rejected, 8 - MAX_INFLIGHT_COMMANDS_PER_INSTANCE);
+
+        sqlx::query("DELETE FROM command_jobs WHERE instance_id = $1")
+            .bind(&instance_id)
+            .execute(&state.db)
+            .await
+            .expect("delete command jobs");
+        sqlx::query("DELETE FROM instances WHERE id = $1")
+            .bind(&instance_id)
+            .execute(&state.db)
+            .await
+            .expect("delete test instance");
     }
 }

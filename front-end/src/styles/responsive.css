@@ -24,7 +24,14 @@
 
 @media (max-width: 760px) {
   .shell { padding: 0 12px; }
-  .page-stage { padding-bottom: 28px; }
+  .page-stage { display: block; overflow-y: auto; padding-bottom: 28px; scrollbar-gutter: auto; }
+  .dashboard-content, .dashboard-skeleton { height: auto; min-height: 100%; }
+  .page-stage-home .content-pane, .page-stage > .management-page { min-height: auto; overflow: visible; }
+  .page-stage-home .content-pane, .instance-results, .admin-page-grid, .release-list { flex: none; }
+  .instance-results, .admin-page-grid, .release-list { min-height: auto; overflow: visible; padding-right: 0; padding-bottom: 0; scrollbar-gutter: auto; }
+  .admin-list-card { min-height: auto; flex: none; overflow: visible; }
+  .admin-list-card > .approval-list { min-height: auto; flex: none; overflow: visible; scrollbar-gutter: auto; }
+  .admin-list-card > .logs-table { min-height: auto; flex: none; overflow-x: auto; overflow-y: visible; scrollbar-gutter: auto; }
   .topbar { grid-template-columns: 1fr auto; gap: 12px; min-height: 68px; padding: 10px 0; }
   .health-pill { display: none; }
   .top-actions { grid-column: 2; }
@@ -73,6 +80,17 @@
   .theme-mode-option { min-height: 60px; }
   .appearance-save-row { align-items: flex-start; flex-direction: column; }
   .terminal-screen { min-height: 320px; }
+}
+
+@media (min-width: 761px) and (max-height: 700px) {
+  .page-stage { display: block; overflow-y: auto; padding-bottom: 28px; scrollbar-gutter: stable; }
+  .dashboard-content, .dashboard-skeleton { height: auto; min-height: 100%; }
+  .page-stage-home .content-pane, .page-stage > .management-page { min-height: auto; overflow: visible; }
+  .page-stage-home .content-pane, .instance-results, .admin-page-grid, .release-list { flex: none; }
+  .instance-results, .admin-page-grid, .release-list { min-height: auto; overflow: visible; padding-right: 0; padding-bottom: 0; scrollbar-gutter: auto; }
+  .admin-list-card { min-height: auto; flex: none; overflow: visible; }
+  .admin-list-card > .approval-list { min-height: auto; flex: none; overflow: visible; scrollbar-gutter: auto; }
+  .admin-list-card > .logs-table { min-height: auto; flex: none; overflow-x: auto; overflow-y: visible; scrollbar-gutter: auto; }
 }
 
 @media (max-width: 520px) {

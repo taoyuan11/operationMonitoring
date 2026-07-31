@@ -28,7 +28,7 @@ onMounted(() => {
   terminal = new Terminal({
     cursorBlink: true,
     cursorStyle: 'block',
-    convertEol: false,
+    convertEol: true,
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
     fontSize: 13,
     scrollback: 10_000,
@@ -153,7 +153,9 @@ function decodeBase64(value: string) {
           <X :size="16" />
         </button>
       </header>
-      <div ref="terminalElement" class="terminal-screen docker-terminal-screen" aria-label="容器交互式终端"></div>
+      <div class="terminal-screen docker-terminal-screen" aria-label="容器交互式终端">
+        <div ref="terminalElement" class="terminal-screen-content"></div>
+      </div>
     </section>
   </div>
 </template>

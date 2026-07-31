@@ -1,6 +1,65 @@
 use std::path::PathBuf;
 
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use reqwest::Url;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerEndpoint {
+    base: Url,
+}
+
+impl ServerEndpoint {
+    pub fn parse(value: &str) -> Result<Self> {
+        let parsed = Url::parse(value.trim()).context("invalid server URL")?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            bail!("server URL must be an absolute HTTP or HTTPS URL");
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            bail!("server URL must not contain user information");
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            bail!("server URL must not contain a query or fragment");
+        }
+
+        let mut normalized = parsed.as_str().trim_end_matches('/').to_owned();
+        normalized.push('/');
+        Ok(Self {
+            base: Url::parse(&normalized).context("failed to normalize server URL")?,
+        })
+    }
+
+    pub fn normalized_server(&self) -> String {
+        self.base.as_str().trim_end_matches('/').to_owned()
+    }
+
+    pub fn http_url(&self, relative_path: &str) -> Result<Url> {
+        if relative_path.is_empty()
+            || relative_path.starts_with('/')
+            || relative_path.contains(['?', '#'])
+            || relative_path
+                .split('/')
+                .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        {
+            bail!("server API path must be relative");
+        }
+        self.base
+            .join(relative_path)
+            .context("failed to construct server API URL")
+    }
+
+    pub fn websocket_url(&self, relative_path: &str) -> Result<Url> {
+        let mut url = self.http_url(relative_path)?;
+        let scheme = if self.is_https() { "wss" } else { "ws" };
+        url.set_scheme(scheme)
+            .map_err(|_| anyhow::anyhow!("failed to construct server WebSocket URL"))?;
+        Ok(url)
+    }
+
+    pub fn is_https(&self) -> bool {
+        self.base.scheme() == "https"
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "om-agent", version, about = "Operation Monitoring agent")]
@@ -110,6 +169,15 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    pub fn server_endpoint(&self) -> Result<ServerEndpoint> {
+        ServerEndpoint::parse(&self.server)
+    }
+
+    pub fn normalize_server(&mut self) -> Result<()> {
+        self.server = self.server_endpoint()?.normalized_server();
+        Ok(())
+    }
+
     pub fn append_cli_args(&self, command: &mut std::process::Command) {
         command
             .arg("--server")
@@ -247,5 +315,39 @@ mod tests {
             cli.agent.update_dir,
             Some(PathBuf::from("/var/lib/om-agent/updates"))
         );
+    }
+
+    #[test]
+    fn normalizes_http_and_https_server_urls() {
+        let http = ServerEndpoint::parse(" HTTP://Monitor.Example:80/base/// ").unwrap();
+        assert_eq!(http.normalized_server(), "http://monitor.example/base");
+        assert_eq!(
+            http.http_url("api/agent/register").unwrap().as_str(),
+            "http://monitor.example/base/api/agent/register"
+        );
+        assert_eq!(
+            http.websocket_url("api/agent/ws").unwrap().as_str(),
+            "ws://monitor.example/base/api/agent/ws"
+        );
+
+        let https = ServerEndpoint::parse("HTTPS://monitor.example/root").unwrap();
+        assert!(https.is_https());
+        assert_eq!(
+            https.websocket_url("api/agent/ws").unwrap().as_str(),
+            "wss://monitor.example/root/api/agent/ws"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_credentialed_server_urls() {
+        for server in [
+            "monitor.example",
+            "ftp://monitor.example",
+            "https://user@monitor.example",
+            "https://monitor.example?path=/ignored",
+            "https://monitor.example/#fragment",
+        ] {
+            assert!(ServerEndpoint::parse(server).is_err(), "accepted {server}");
+        }
     }
 }

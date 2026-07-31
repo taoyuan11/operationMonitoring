@@ -111,14 +111,17 @@ OM_ADMIN_PASSWORD=replace-with-a-long-random-bootstrap-password
 | `POSTGRES_IMAGE` | `postgres:16-alpine` | 自带数据库镜像。不要在已有数据卷上直接跨大版本升级。 |
 | `POSTGRES_DB` | `operation_monitoring` | 自带数据库首次初始化的数据库名。 |
 | `POSTGRES_USER` | `operation_monitoring` | 自带数据库首次初始化的用户。 |
-| `OM_SECURE_COOKIES` | `false` | HTTPS/WSS 对外服务必须设为 `true`；本地 HTTP 调试保持 `false`。 |
-| `OM_TRUST_PROXY_HEADERS` | Compose 固定为 `true` | 登录限流使用代理传入的 `X-Real-IP`；仅可在后端无法被绕过代理直连时启用。 |
-| `OM_COMPOSE_NETWORK_CIDR` | `172.30.135.0/24` | Compose 专用网络；与现有网络冲突时必须连同三个服务 IP 一起调整。 |
+| `OM_SECURE_COOKIES` | `false` | 未收到可信代理协议头时的 Cookie/Origin 协议回退值；纯 HTTPS 入口设为 `true`。可信代理请求会按 `X-Forwarded-Proto` 动态处理。 |
+| `OM_TRUST_PROXY_HEADERS` | Compose 默认为 `true` | 登录限流和请求协议使用代理传入的 `X-Real-IP`、`X-Forwarded-Proto`；仅可在后端无法被绕过代理直连时启用。 |
+| `OM_COMPOSE_NETWORK_CIDR` | `172.30.135.0/24` | Compose 专用网络；与现有网络冲突时必须连同网关和三个服务 IP 一起调整。 |
+| `OM_COMPOSE_GATEWAY_IP` | `172.30.135.1` | Compose 网络固定网关；宿主机反向代理经此地址连接后端，Compose 会自动将其 `/32` 追加到可信代理列表。 |
 | `OM_POSTGRES_IP` | `172.30.135.2` | 自带数据库模式中的 PostgreSQL 固定地址。 |
-| `OM_FRONTEND_PROXY_IP` | `172.30.135.3` | 前端代理固定地址，必须与 `OM_TRUSTED_PROXY_CIDRS` 的单地址网段一致。 |
+| `OM_FRONTEND_PROXY_IP` | `172.30.135.3` | 前端代理固定地址，必须包含在 `OM_TRUSTED_PROXY_CIDRS` 中。 |
 | `OM_BACKEND_IP` | `172.30.135.4` | 后端固定地址，不得与 PostgreSQL 或前端代理重复。 |
-| `OM_TRUSTED_PROXY_CIDRS` | `172.30.135.3/32` | Compose 后端仅从此前端代理地址采信客户端来源头。 |
+| `OM_TRUSTED_PROXY_CIDRS` | `172.30.135.3/32` | 用户配置的可信代理网段；Compose 还会自动追加 `OM_COMPOSE_GATEWAY_IP/32` 以支持宿主机代理。 |
 | `OM_ALLOW_LEGACY_AGENT_WS_AUTH` | `false` | 仅在把旧 Agent 升级到 `0.1.19` 的维护窗口临时接受查询串认证。 |
+| `OM_UPDATE_SIGNING_KEY_FILE` | 空，禁用签名 | 容器内 Ed25519 私钥路径；HTTP 自动更新必须配置为 `/app/db/update-signing.key`。 |
+| `OM_UPDATE_SIGNING_KEY_ID` | `default` | 更新签名 key ID；必须与构建 Agent 时嵌入的 ID 一致。 |
 | `FRONTEND_PORT` | `13501` | 宿主机到前端容器 80 端口的映射。可写成 `127.0.0.1:13501`。 |
 | `BACKEND_PORT` | `13500` | 后端仅映射到宿主机 `127.0.0.1`，供本机受控代理或诊断使用；远程 Agent 应连接前端代理地址。 |
 | `OM_AGENT_PACKAGE_MAX_BYTES` | `268435456` | 单个 Agent 更新包上限，默认 256 MiB。 |
@@ -169,6 +172,12 @@ BACKEND_PORT=13500
 OM_SECURE_COOKIES=true
 ```
 
+`OM_SECURE_COOKIES=true` 是没有可信协议头时的安全回退值，并不会再禁用现有 HTTP
+入口。来自可信前端或宿主机代理的请求会按其覆盖写入的 `X-Forwarded-Proto` 分别校验
+`http`/`https` Origin，并只为 HTTPS 登录响应增加 `Secure`。因此同一后端可以同时服务
+HTTP/WS 和 HTTPS/WSS。两种入口使用不同名称的会话 Cookie，避免同一浏览器中的
+HTTPS Cookie 阻止 HTTP 登录 Cookie 写入；HTTP 仍只适合可信网络或本机维护。
+
 反向代理应把 `/api/` 和 `/uploads/` 直接转发到回环地址上的后端，将其他请求转发
 到前端。这样后端既能获得代理覆盖写入的真实客户端地址，又不会暴露受信任代理头
 接口。WebSocket 必须保留原始 `Host` 并传递 `Upgrade`/`Connection` 标头。下面是
@@ -194,7 +203,7 @@ server {
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_request_buffering off;
@@ -208,7 +217,7 @@ server {
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_request_buffering off;
         proxy_buffering off;
     }
@@ -235,7 +244,8 @@ Agent 的 `OM_SERVER` 使用完整的外部地址，例如 `https://monitor.exam
 默认自带数据库模式的业务表保存在 PostgreSQL 数据卷中；外部数据库模式的业务表由外部 PostgreSQL 负责持久化。Compose 卷保存以下内容：
 
 - `postgres-data`：自带 PostgreSQL 的完整数据目录；仅 `docker-compose.with-db.yml` 使用。
-- `backend-db`：默认保存 `/app/db/auth-secret.key`。这是加密 Authenticator 密钥所需的主密钥，不是业务数据库。
+- `backend-db`：默认保存 `/app/db/auth-secret.key`，启用更新签名后也保存
+  `/app/db/update-signing.key`。
 - `backend-uploads`：背景图片及上传资源。
 - `backend-updates`：Agent 更新包。
 
@@ -248,6 +258,59 @@ openssl rand -base64 32
 ```
 
 将输出作为 `OM_AUTH_SECRET_KEY` 写入 Secret 管理系统，并确保后续每次启动使用同一个值。密钥一旦丢失不能从数据库内容推导出来。
+
+### Agent 更新签名
+
+Agent `0.1.22` 起支持 Ed25519 更新签名。HTTP 自动更新必须启用签名；HTTPS 在 Agent
+未嵌入公钥时可以依赖 TLS，但正式产物仍建议嵌入公钥。为 Compose 的 `backend-db`
+卷创建私钥（命令在文件已存在时会拒绝覆盖）：
+
+```bash
+docker compose -f docker-compose.with-db.yml run --rm --no-deps \
+  --entrypoint sh backend -c \
+  'umask 077 && test ! -e /app/db/update-signing.key && head -c 32 /dev/urandom | base64 > /app/db/update-signing.key'
+```
+
+外部数据库模式把文件名改为 `docker-compose.yml`。随后在 `.env` 中启用该密钥：
+
+```dotenv
+OM_UPDATE_SIGNING_KEY_FILE=/app/db/update-signing.key
+OM_UPDATE_SIGNING_KEY_ID=release-v1
+```
+
+重建后端并从启动日志读取公钥：
+
+```bash
+docker compose -f docker-compose.with-db.yml up -d --force-recreate backend
+docker compose -f docker-compose.with-db.yml logs backend \
+  | grep 'agent update signing enabled'
+```
+
+日志中的 `public_key` 是标准 Base64 公钥。构建所有 Agent 产物时传入同一个 key ID：
+
+```bash
+cd instanceEnd
+OM_UPDATE_PUBLIC_KEY='<public_key>' \
+OM_UPDATE_PUBLIC_KEY_ID='release-v1' \
+./scripts/build-standalone.sh all
+```
+
+这两个 Agent 变量只在编译时读取。嵌入公钥的 Agent 会在 HTTP 和 HTTPS 下都拒绝
+未签名、密钥 ID 不匹配或元数据被篡改的更新。后端配置了私钥但文件缺失、权限允许
+组内或其他用户读取、内容无效时会拒绝启动。私钥必须随 `backend-db` 备份；丢失或
+直接更换后，已嵌入旧公钥的 Agent 将无法自动更新。当前版本只支持一个公钥，不要在
+没有过渡版本的情况下轮换签名密钥。
+
+直接运行后端时可在宿主机生成密钥，并将绝对路径传给后端：
+
+```bash
+umask 077
+openssl rand -base64 32 > /secure/path/update-signing.key
+chmod 600 /secure/path/update-signing.key
+OM_UPDATE_SIGNING_KEY_FILE=/secure/path/update-signing.key \
+OM_UPDATE_SIGNING_KEY_ID=release-v1 \
+cargo run
+```
 
 查看实际卷名：
 
@@ -324,6 +387,19 @@ detached HEAD 方式切换到该版本。随后脚本拉取仅使用镜像的服
 后端启动时会执行所需的表结构补齐。升级后检查健康接口、管理员登录、Agent WebSocket、
 文件上传和更新包下载。回滚代码前应确认新版本没有不可逆的数据结构变化；必要时先恢复升级前
 的 PostgreSQL 备份，再检出旧 TAG 并使用相同 Compose 文件重新构建镜像。
+
+### 从标签 0.1.2 升级
+
+仓库标签 `0.1.2` 中的 Agent 版本为 `0.1.20`，可直接连接并升级到当前版本。新增的
+`target_os`、`signature_key_id` 和 `signature` 都是可选 JSON 字段，旧 Agent 会忽略；
+实例身份、原始实例密钥和更新状态文件无需转换。当前后端首次启动会把数据库中的实例
+密钥转换为单向 verifier，旧 Agent 仍发送原密钥并可正常认证。这个数据库转换不支持
+旧后端读取，因此回滚到标签 `0.1.2` 时必须同时恢复升级前的 PostgreSQL 备份。
+
+`0.1.20` 本身没有更新验签代码，所以它通过纯 HTTP 执行的第一次远程升级无法验证
+Ed25519 签名，即使新后端已经附带签名字段也一样。该次升级必须通过 HTTPS 完成，或
+离线核对二进制后使用本地 `om-agent update`。升级到编译时嵌入公钥的 `0.1.22` 后，
+后续 HTTP 和 HTTPS 自动更新都会强制验签。
 
 ### Agent 0.1.19 认证迁移
 
@@ -405,7 +481,10 @@ docker compose -f docker-compose.with-db.yml logs --tail=200 frontend
 
 ### WebSocket 或远程桌面断开
 
-确认外部代理传递 `Upgrade` 和 `Connection` 标头、保留 `Host`，并将读写超时设置为至少数小时。远程桌面和终端生产环境必须使用 HTTPS/WSS；浏览器通过 HTTP 访问时不要启用 `OM_SECURE_COOKIES=true`。
+确认外部代理传递 `Upgrade` 和 `Connection` 标头、保留 `Host`、覆盖写入准确的
+`X-Forwarded-Proto`，并将读写超时设置为至少数小时。代理连接后端时显示的来源地址
+必须包含在有效的 `OM_TRUSTED_PROXY_CIDRS` 中。远程桌面和终端在不可信网络中必须
+使用 HTTPS/WSS；可信代理按每个请求选择协议，`OM_SECURE_COOKIES` 只作为回退值。
 
 ### 端口已被占用
 
@@ -419,7 +498,7 @@ docker compose -f docker-compose.with-db.yml up -d
 `BACKEND_PORT` 只接受端口号，Compose 始终把它绑定到 `127.0.0.1`。
 
 如果 Docker 报错 `failed to set up container networking: Address already in use`，说明
-Compose 内部服务 IP 冲突，而不是宿主机端口冲突。确认 `OM_POSTGRES_IP`、
+Compose 内部服务 IP 冲突，而不是宿主机端口冲突。确认 `OM_COMPOSE_GATEWAY_IP`、`OM_POSTGRES_IP`、
 `OM_FRONTEND_PROXY_IP` 和 `OM_BACKEND_IP` 互不相同且位于
 `OM_COMPOSE_NETWORK_CIDR` 内；修改后重新创建相关容器即可，不能通过删除数据卷处理。
 

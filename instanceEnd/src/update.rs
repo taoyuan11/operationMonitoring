@@ -13,19 +13,23 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use directories::ProjectDirs;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use fs2::{FileExt, available_space};
 use futures_util::StreamExt;
 use reqwest::Client;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncWriteExt, sync::mpsc};
+use tokio::io::AsyncWriteExt;
 
 use crate::{
     activity::ActivityTracker,
     config::AgentConfig,
+    http::{AGENT_CONTROL_HTTP_TIMEOUT, MAX_AGENT_JSON_RESPONSE_BYTES, bounded_json_response},
     models::{AgentInbound, Identity, UpdateOffer, UpdateStatus},
+    outbound::AgentEventSender,
     time::now_ts,
 };
 
@@ -50,6 +54,8 @@ const WINDOWS_FILE_REPLACE_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DISK_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CHECKSUM_FILE_BYTES: usize = 4096;
+const DEFAULT_UPDATE_SIGNATURE_KEY_ID: &str = "default";
+const UPDATE_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-update-v1";
 
 static UPDATE_CAPABILITY: OnceLock<UpdateCapability> = OnceLock::new();
 
@@ -279,6 +285,9 @@ pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
         size_bytes: i64::try_from(size_bytes).context("forced update package is too large")?,
         package_type: PackageType::Standalone.as_str().to_string(),
         native_arch: standalone_native_arch(),
+        target_os: Some(standalone_target_os().to_string()),
+        signature_key_id: None,
+        signature: None,
         retry_count: 0,
     };
 
@@ -422,20 +431,25 @@ impl UpdateManager {
     }
 
     pub async fn fetch_manifest(&self) -> Result<Option<UpdateOffer>> {
-        let url = format!(
-            "{}/api/agent/update/manifest",
-            self.config.server.trim_end_matches('/')
-        );
-        let manifest = self
+        let url = self
+            .config
+            .server_endpoint()?
+            .http_url("api/agent/update/manifest")?;
+        let response = self
             .client
             .get(url)
+            .timeout(AGENT_CONTROL_HTTP_TIMEOUT)
             .header(AGENT_ID_HEADER, &self.identity.instance_id)
             .header(AGENT_SECRET_HEADER, &self.identity.secret)
             .send()
             .await?
-            .error_for_status()?
-            .json::<UpdateManifest>()
-            .await?;
+            .error_for_status()?;
+        let manifest = bounded_json_response::<UpdateManifest>(
+            response,
+            MAX_AGENT_JSON_RESPONSE_BYTES,
+            "agent update manifest",
+        )
+        .await?;
         Ok(manifest.update)
     }
 
@@ -593,12 +607,22 @@ impl UpdateManager {
         self.activity.stop_draining();
     }
 
-    pub async fn prepare(
-        &self,
-        offer: UpdateOffer,
-        outbound: mpsc::UnboundedSender<AgentInbound>,
-    ) -> PrepareResult {
-        match self.prepare_inner(&offer, &outbound).await {
+    pub async fn prepare(&self, offer: UpdateOffer, outbound: AgentEventSender) -> PrepareResult {
+        let package_type = match self.validate_offer(&offer) {
+            Ok(package_type) => package_type,
+            Err(error) => {
+                self.activity.stop_draining();
+                let message = format!("{error:#}");
+                crate::logging::error(format_args!("rejected agent update offer: {message}"));
+                let _ = outbound.send(update_status_message(
+                    &offer,
+                    UpdateStatus::Failed,
+                    Some(message),
+                ));
+                return PrepareResult::Finished;
+            }
+        };
+        match self.prepare_inner(&offer, package_type, &outbound).await {
             Ok(result) => result,
             Err(error) => {
                 self.activity.stop_draining();
@@ -618,10 +642,10 @@ impl UpdateManager {
     async fn prepare_inner(
         &self,
         offer: &UpdateOffer,
-        outbound: &mpsc::UnboundedSender<AgentInbound>,
+        package_type: PackageType,
+        outbound: &AgentEventSender,
     ) -> Result<PrepareResult> {
         self.begin_attempt(offer)?;
-        let package_type = self.validate_offer(offer)?;
 
         let current_version = Version::parse(env!("CARGO_PKG_VERSION"))?;
         let target_version = Version::parse(&offer.version)
@@ -676,11 +700,7 @@ impl UpdateManager {
         Ok(PrepareResult::ReadyToApply)
     }
 
-    pub fn launch_prepared_update(
-        &self,
-        offer: &UpdateOffer,
-        outbound: &mpsc::UnboundedSender<AgentInbound>,
-    ) -> bool {
+    pub fn launch_prepared_update(&self, offer: &UpdateOffer, outbound: &AgentEventSender) -> bool {
         let result = (|| {
             let state = read_update_state(&self.paths.state_file)?;
             let package_path = state
@@ -744,6 +764,14 @@ impl UpdateManager {
                 offer.native_arch
             );
         }
+        let expected_os = standalone_target_os();
+        if let Some(target_os) = offer.target_os.as_deref()
+            && target_os != expected_os
+        {
+            bail!(
+                "target operating system mismatch: agent requires {expected_os}, offer is {target_os}"
+            );
+        }
         if offer.size_bytes <= 0 {
             bail!("update package size must be positive");
         }
@@ -753,11 +781,23 @@ impl UpdateManager {
         if offer.sha256.len() != 64 || !offer.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("update package SHA-256 is invalid");
         }
+        Version::parse(&offer.version)
+            .with_context(|| format!("invalid target version {}", offer.version))?;
+        if offer.artifact_id.is_empty()
+            || offer.artifact_id.len() > 128
+            || !offer
+                .artifact_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("update artifact ID is invalid");
+        }
         let expected_download_url =
             format!("/api/agent/update/artifacts/{}/download", offer.artifact_id);
         if offer.download_url != expected_download_url {
             bail!("update download URL must be an agent update API path");
         }
+        verify_update_signature_policy(offer, self.config.server_endpoint()?.is_https())?;
         offer.package_type.parse()
     }
 
@@ -788,11 +828,10 @@ impl UpdateManager {
         let temporary_path = self.paths.packages.join(format!("{basename}.part"));
         let _ = fs::remove_file(&temporary_path);
 
-        let url = format!(
-            "{}{}",
-            self.config.server.trim_end_matches('/'),
-            offer.download_url
-        );
+        let url = self
+            .config
+            .server_endpoint()?
+            .http_url(offer.download_url.trim_start_matches('/'))?;
         let response = self
             .client
             .get(url)
@@ -842,10 +881,10 @@ impl UpdateManager {
             .download_url
             .strip_suffix("/download")
             .context("update download URL has no download suffix")?;
-        let checksum_url = format!(
-            "{}{checksum_path}/checksum",
-            self.config.server.trim_end_matches('/'),
-        );
+        let checksum_url = self.config.server_endpoint()?.http_url(&format!(
+            "{}/checksum",
+            checksum_path.trim_start_matches('/')
+        ))?;
         let response = self
             .client
             .get(checksum_url)
@@ -897,7 +936,7 @@ impl UpdateManager {
         offer: &UpdateOffer,
         status: UpdateStatus,
         message: Option<String>,
-        outbound: &mpsc::UnboundedSender<AgentInbound>,
+        outbound: &AgentEventSender,
     ) -> Result<()> {
         let mut state = read_update_state(&self.paths.state_file)?;
         let attempt = state
@@ -943,7 +982,7 @@ impl UpdateManager {
         &self,
         offer: &UpdateOffer,
         message: Option<String>,
-        outbound: &mpsc::UnboundedSender<AgentInbound>,
+        outbound: &AgentEventSender,
     ) -> Result<()> {
         let mut state = read_update_state(&self.paths.state_file)?;
         let attempt = state
@@ -2032,6 +2071,118 @@ fn process_is_running(_pid: u32) -> bool {
     false
 }
 
+fn verify_update_signature_policy(offer: &UpdateOffer, server_is_https: bool) -> Result<()> {
+    let embedded_key = embedded_update_verifying_key()?;
+    verify_update_signature_policy_with_key(
+        offer,
+        server_is_https,
+        embedded_key
+            .as_ref()
+            .map(|(key_id, key)| (key_id.as_str(), key)),
+    )
+}
+
+fn verify_update_signature_policy_with_key(
+    offer: &UpdateOffer,
+    server_is_https: bool,
+    embedded_key: Option<(&str, &VerifyingKey)>,
+) -> Result<()> {
+    match embedded_key {
+        Some((key_id, verifying_key)) => verify_update_signature(offer, key_id, verifying_key),
+        None if server_is_https => Ok(()),
+        None => bail!(
+            "automatic updates over HTTP require an Ed25519 public key embedded with OM_UPDATE_PUBLIC_KEY"
+        ),
+    }
+}
+
+fn embedded_update_verifying_key() -> Result<Option<(String, VerifyingKey)>> {
+    let Some(encoded_key) = option_env!("OM_UPDATE_PUBLIC_KEY") else {
+        return Ok(None);
+    };
+    let key_bytes = BASE64_STANDARD
+        .decode(encoded_key.trim())
+        .context("embedded OM_UPDATE_PUBLIC_KEY is not valid Base64")?;
+    let key_bytes: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| anyhow!("embedded OM_UPDATE_PUBLIC_KEY must decode to 32 bytes"))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+        .context("embedded OM_UPDATE_PUBLIC_KEY is not a valid Ed25519 public key")?;
+    let key_id = option_env!("OM_UPDATE_PUBLIC_KEY_ID")
+        .unwrap_or(DEFAULT_UPDATE_SIGNATURE_KEY_ID)
+        .trim()
+        .to_string();
+    if !valid_signature_key_id(&key_id) {
+        bail!("embedded OM_UPDATE_PUBLIC_KEY_ID is invalid");
+    }
+    Ok(Some((key_id, verifying_key)))
+}
+
+fn verify_update_signature(
+    offer: &UpdateOffer,
+    expected_key_id: &str,
+    verifying_key: &VerifyingKey,
+) -> Result<()> {
+    let key_id = offer
+        .signature_key_id
+        .as_deref()
+        .context("signed update offer is missing signature_key_id")?;
+    if !valid_signature_key_id(key_id) || key_id != expected_key_id {
+        bail!("update signature key ID is not trusted");
+    }
+    let encoded_signature = offer
+        .signature
+        .as_deref()
+        .context("signed update offer is missing signature")?;
+    let signature_bytes = BASE64_STANDARD
+        .decode(encoded_signature)
+        .context("update signature is not valid Base64")?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .context("update signature must decode to 64 bytes")?;
+    let payload = update_signature_payload(offer)?;
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .context("update signature verification failed")
+}
+
+fn valid_signature_key_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn update_signature_payload(offer: &UpdateOffer) -> Result<String> {
+    let target_os = offer
+        .target_os
+        .as_deref()
+        .context("signed update offer is missing target_os")?;
+    for (name, value) in [
+        ("version", offer.version.as_str()),
+        ("target_os", target_os),
+        ("package_type", offer.package_type.as_str()),
+        ("native_arch", offer.native_arch.as_str()),
+        ("sha256", offer.sha256.as_str()),
+    ] {
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+        {
+            bail!("update signature field {name} is invalid");
+        }
+    }
+    Ok(format!(
+        "{UPDATE_SIGNATURE_DOMAIN}\nversion={}\ntarget_os={target_os}\npackage_type={}\nnative_arch={}\nsize_bytes={}\nsha256={}\n",
+        offer.version,
+        offer.package_type,
+        offer.native_arch,
+        offer.size_bytes,
+        offer.sha256.to_ascii_lowercase(),
+    ))
+}
+
 fn verify_download(
     offer: &UpdateOffer,
     package_type: PackageType,
@@ -2186,6 +2337,21 @@ fn standalone_native_arch() -> String {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         linux_standalone_native_arch(std::env::consts::ARCH, Path::new("/etc/openwrt_release"))
+    }
+}
+
+fn standalone_target_os() -> &'static str {
+    #[cfg(windows)]
+    {
+        return "windows";
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return "macos";
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        "linux"
     }
 }
 
@@ -2476,7 +2642,31 @@ fn is_update_privileged() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::{Signer, SigningKey};
+
     use super::*;
+
+    fn signed_test_offer() -> (UpdateOffer, SigningKey) {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let mut offer = UpdateOffer {
+            release_id: "release-signed".to_string(),
+            version: "1.2.3".to_string(),
+            artifact_id: "artifact-signed".to_string(),
+            download_url: "/api/agent/update/artifacts/artifact-signed/download".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 42,
+            package_type: "standalone".to_string(),
+            native_arch: standalone_native_arch(),
+            target_os: Some(standalone_target_os().to_string()),
+            signature_key_id: Some("release-v1".to_string()),
+            signature: None,
+            retry_count: 0,
+        };
+        let payload = update_signature_payload(&offer).unwrap();
+        offer.signature =
+            Some(BASE64_STANDARD.encode(signing_key.sign(payload.as_bytes()).to_bytes()));
+        (offer, signing_key)
+    }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
@@ -2514,6 +2704,116 @@ mod tests {
     }
 
     #[test]
+    fn verifies_domain_separated_update_signatures() {
+        let (offer, signing_key) = signed_test_offer();
+        let payload = update_signature_payload(&offer).unwrap();
+        assert_eq!(
+            payload,
+            format!(
+                "operation-monitoring-agent-update-v1\nversion=1.2.3\ntarget_os={}\npackage_type=standalone\nnative_arch={}\nsize_bytes=42\nsha256={}\n",
+                standalone_target_os(),
+                standalone_native_arch(),
+                "a".repeat(64)
+            )
+        );
+        verify_update_signature(&offer, "release-v1", &signing_key.verifying_key()).unwrap();
+
+        let mut tampered = offer.clone();
+        tampered.sha256 = "b".repeat(64);
+        assert!(
+            verify_update_signature(&tampered, "release-v1", &signing_key.verifying_key()).is_err()
+        );
+        assert!(
+            verify_update_signature(&offer, "other-key", &signing_key.verifying_key()).is_err()
+        );
+    }
+
+    #[test]
+    fn requires_a_pinned_key_for_http_automatic_updates() {
+        let (offer, signing_key) = signed_test_offer();
+        assert!(verify_update_signature_policy_with_key(&offer, true, None).is_ok());
+        assert!(verify_update_signature_policy_with_key(&offer, false, None).is_err());
+        assert!(
+            verify_update_signature_policy_with_key(
+                &offer,
+                false,
+                Some(("release-v1", &signing_key.verifying_key()))
+            )
+            .is_ok()
+        );
+
+        let mut unsigned = offer;
+        unsigned.signature = None;
+        assert!(
+            verify_update_signature_policy_with_key(
+                &unsigned,
+                true,
+                Some(("release-v1", &signing_key.verifying_key()))
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_offers_before_persisting_update_state() {
+        let directory =
+            std::env::temp_dir().join(format!("om-update-invalid-offer-{}", uuid::Uuid::new_v4()));
+        let config = AgentConfig {
+            server: "https://monitor.example".to_string(),
+            identity_file: None,
+            report_interval: 5,
+            state_dir: None,
+            log_file: None,
+            log_max_bytes: 10 * 1024 * 1024,
+            log_history: 3,
+            update_dir: Some(directory.clone()),
+        };
+        let paths = UpdatePaths::from_config(&config).unwrap();
+        paths.prepare().unwrap();
+        let manager = UpdateManager {
+            config,
+            identity: Identity {
+                instance_id: "invalid-offer-test".to_string(),
+                secret: "secret-test".to_string(),
+                credential_version: 1,
+                previous_secret: None,
+            },
+            client: Client::new(),
+            activity: ActivityTracker::default(),
+            capability: UpdateCapability {
+                package_type: Some("standalone".to_string()),
+                native_arch: Some(standalone_native_arch()),
+                update_privileged: true,
+            },
+            paths: paths.clone(),
+        };
+        let (mut offer, _) = signed_test_offer();
+        offer.artifact_id = "../invalid".to_string();
+        offer.download_url = "/api/agent/update/artifacts/../invalid/download".to_string();
+        let (outbound, mut events, _failed) = AgentEventSender::channel(4);
+
+        assert!(matches!(
+            manager.prepare(offer, outbound).await,
+            PrepareResult::Finished
+        ));
+        assert!(
+            read_update_state(&paths.state_file)
+                .unwrap()
+                .attempt
+                .is_none()
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentInbound::UpdateStatus {
+                status: UpdateStatus::Failed,
+                ..
+            })
+        ));
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn parses_forced_update_package_versions() {
         assert_eq!(
             parse_agent_package_version("om-agent 1.2.3\n").unwrap(),
@@ -2545,6 +2845,9 @@ mod tests {
             size_bytes: package.len() as i64,
             package_type: "standalone".to_string(),
             native_arch: standalone_native_arch(),
+            target_os: Some(standalone_target_os().to_string()),
+            signature_key_id: None,
+            signature: None,
             retry_count: 0,
         };
         let downloaded = DownloadedPackage {
@@ -2616,6 +2919,9 @@ mod tests {
             size_bytes: 6,
             package_type: "standalone".to_string(),
             native_arch: "arm64".to_string(),
+            target_os: Some(standalone_target_os().to_string()),
+            signature_key_id: None,
+            signature: None,
             retry_count: 0,
         };
         let previous = CachedPackage {
@@ -2652,7 +2958,7 @@ mod tests {
             "a socket drop before updater launch must remain retryable"
         );
 
-        let (outbound, mut inbound) = mpsc::unbounded_channel();
+        let (outbound, mut inbound, _failed) = AgentEventSender::channel(32);
         manager
             .mark_handoff_started(&offer, Some("handoff started".to_string()), &outbound)
             .unwrap();
@@ -2823,6 +3129,9 @@ mod tests {
                 size_bytes: 17,
                 package_type: "standalone".to_string(),
                 native_arch: standalone_native_arch(),
+                target_os: Some(standalone_target_os().to_string()),
+                signature_key_id: None,
+                signature: None,
                 retry_count: 0,
             },
             package_path: source.clone(),
@@ -2872,6 +3181,9 @@ mod tests {
             size_bytes: 6,
             package_type: "standalone".to_string(),
             native_arch: "arm64".to_string(),
+            target_os: Some(standalone_target_os().to_string()),
+            signature_key_id: None,
+            signature: None,
             retry_count: 0,
         };
         let mut new_offer = old_offer.clone();
@@ -3040,6 +3352,9 @@ mod tests {
             size_bytes: 6,
             package_type: "standalone".to_string(),
             native_arch: "arm64".to_string(),
+            target_os: Some(standalone_target_os().to_string()),
+            signature_key_id: None,
+            signature: None,
             retry_count: 0,
         };
         write_update_state(

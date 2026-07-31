@@ -1,4 +1,6 @@
 .updates-page { gap: 20px; }
+.updates-page > .update-feedback,
+.updates-page > .release-create-card { flex: 0 0 auto; }
 .update-feedback { display: inline-flex; width: fit-content; align-items: center; gap: 7px; margin: -4px 0 2px; padding: 9px 11px; color: var(--success-text); background: rgba(73, 200, 159, .08); border: 1px solid rgba(73, 200, 159, .18); border-radius: 6px; font-size: 12px; }
 
 .release-create-card { padding: 19px 20px; }
@@ -14,7 +16,8 @@
 .release-create-file-picker .file-button.dragging strong { color: #8edcc3; }
 .release-version-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.release-list { display: flex; min-width: 0; flex-direction: column; gap: 12px; }
+.release-list { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; gap: 12px; overflow-x: hidden; overflow-y: auto; padding-right: 6px; padding-bottom: 36px; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.release-list-heading, .update-empty, .update-release-card { flex: 0 0 auto; }
 .release-list-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; padding: 7px 2px 2px; }
 .release-list-heading > div { display: flex; flex-direction: column; gap: 4px; }
 .release-list-heading h3 { color: var(--text-strong); font-size: 16px; font-weight: 660; }
@@ -35,6 +38,7 @@
 .release-status.published { color: var(--success-text); background: rgba(73, 200, 159, .1); }
 .release-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 7px; }
 .release-actions time { max-width: 190px; overflow: hidden; color: #78837e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.release-delete-control { display: inline-flex; flex: 0 0 auto; }
 .release-publish-button { min-height: 36px; padding: 0 11px; font-size: 12px; }
 .release-collapse-button svg { transition: transform .18s ease; }
 .release-collapse-button.expanded svg { transform: rotate(180deg); }

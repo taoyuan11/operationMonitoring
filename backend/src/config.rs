@@ -45,6 +45,10 @@ pub struct Cli {
     pub upload_dir: PathBuf,
     #[arg(long, env = "OM_UPDATE_DIR", default_value = "updates")]
     pub update_dir: PathBuf,
+    #[arg(long, env = "OM_UPDATE_SIGNING_KEY_FILE")]
+    pub update_signing_key_file: Option<PathBuf>,
+    #[arg(long, env = "OM_UPDATE_SIGNING_KEY_ID", default_value = "default")]
+    pub update_signing_key_id: String,
     #[arg(
         long,
         env = "OM_AGENT_PACKAGE_MAX_BYTES",

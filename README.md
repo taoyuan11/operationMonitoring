@@ -93,7 +93,7 @@ Windows 网页终端优先使用 ConPTY。Windows Server 2016 没有系统级 Co
 - 后端 API：`http://localhost:13500`
 - 健康检查：`http://localhost:13500/api/health`
 
-首次初始化只使用一次 `OM_ADMIN_PASSWORD` 创建管理员；登录后需绑定 Authenticator 并使用 TOTP。生产环境应通过 HTTPS/WSS 访问，将 `OM_SECURE_COOKIES` 设为 `true`，并按部署场景限制宿主机端口暴露。实例端通常连接前端代理地址，前端会转发 API、上传和 WebSocket。
+首次初始化只使用一次 `OM_ADMIN_PASSWORD` 创建管理员；登录后需绑定 Authenticator 并使用 TOTP。生产环境应通过 HTTPS/WSS 访问，将 `OM_SECURE_COOKIES` 设为 `true` 作为协议回退，并按部署场景限制宿主机端口暴露。可信代理提供 `X-Forwarded-Proto` 时，后端会按每个请求分别支持 HTTP/WS 和 HTTPS/WSS。实例端通常连接前端代理地址，前端会转发 API、上传和 WebSocket。
 
 PostgreSQL 默认只在 Compose 网络内开放。需要使用已有或托管 PostgreSQL 时，改用 `docker-compose.yml`，并同时显式设置 `OM_DATABASE_URL` 和 `OM_DATABASE_PASSWORD`。Compose 项目名固定为 `operation-monitoring`，详细的两种数据库模式、反向代理、备份恢复、升级、管理员认证恢复和排障步骤见[Docker Compose 部署指南](docs/deployment.md)。
 
@@ -245,6 +245,21 @@ om-agent uninstall --yes # 无人值守
 
 打包前先修改 `instanceEnd/Cargo.toml` 中的版本号，并同步 `Cargo.lock`。Cargo 二进制名称固定为 `om-agent`。
 
+Agent `0.1.22` 起支持 Ed25519 更新签名。用于 HTTP 自动更新的正式产物必须在编译时
+嵌入后端对应的公钥；同一公钥也会让 HTTPS 更新强制验签：
+
+```bash
+cd instanceEnd
+OM_UPDATE_PUBLIC_KEY='<后端启动日志中的 Base64 公钥>' \
+OM_UPDATE_PUBLIC_KEY_ID='release-v1' \
+./scripts/build-standalone.sh <rust-target> <linux|windows|macos> <native-architecture>
+```
+
+`OM_UPDATE_PUBLIC_KEY` 和 `OM_UPDATE_PUBLIC_KEY_ID` 是编译期参数，不是 Agent 运行时
+配置。未嵌入公钥的 Agent 只允许通过 HTTPS 自动更新；嵌入公钥后，HTTP 和 HTTPS
+都会要求后端使用匹配的密钥签名。后端签名密钥的生成和 Compose 配置见
+[部署指南](docs/deployment.md#agent-更新签名)。
+
 在 Linux 或 macOS 的 Bash 环境中，可以构建单个目标，也可以依次构建全部 10 个支持目标：
 
 ```bash
@@ -351,7 +366,15 @@ om-agent uninstall
 5. 原生架构必须与 Agent 上报值一致，例如 Linux `x86_64`/`aarch64`、Windows `x64`/`arm64`、macOS `arm64`/`x86_64`。
 6. 检查覆盖率后发布版本；后端不会构建、转换或重命名上传内容。
 
+草稿和已发布版本都可以从控制台永久删除。已发布版本仍有实例处于等待、下载、校验、安装或等待重连状态时，后端会拒绝删除；全部更新进入成功、已回滚或失败终态后才可继续。删除会同时清除该版本的所有可执行文件、`.sha256` 校验文件、产物元数据和实例更新记录，仅保留管理员操作日志，且无法恢复。已经安装该版本的实例不会自动回退；删除只会停止后续分发，符合条件的实例仍可能收到其他已发布的更高版本。
+
 Agent 会流式下载文件，校验大小、平台文件签名和 SHA-256，等待快捷命令与终端会话结束，再通过独立 updater 替换已安装程序并重启服务。新版本未能在健康检查期限内连接后端时，updater 会恢复上一版本可执行文件。自动更新要求 Agent 由 `install` 命令以系统服务方式安装并以管理员权限运行；直接通过 `start` 或 `log` 启动的开发实例不会声明自动更新能力。
+
+从仓库标签 `0.1.2`（Agent `0.1.20`）可以直接升级到当前协议：旧 Agent 会忽略新增的
+签名字段，实例 ID、原始实例密钥和更新状态文件也保持兼容。历史版本本身不具备验签
+代码，因此它通过纯 HTTP 执行的第一次远程升级无法获得签名保护；这一次必须使用
+HTTPS，或离线核对产物后执行本地 `om-agent update`。升级到嵌入公钥的 `0.1.22`
+后，后续 HTTP 与 HTTPS 自动更新都可验证签名。
 
 自动更新无法使用时，可先通过实例文件管理上传匹配系统与架构的新 Agent，再从前端终端或命令执行器调用本地强制更新：
 
@@ -392,6 +415,8 @@ OM_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
 OM_ALLOW_LEGACY_AGENT_WS_AUTH=false
 OM_UPLOAD_DIR=uploads
 OM_UPDATE_DIR=updates
+# OM_UPDATE_SIGNING_KEY_FILE=/absolute/path/update-signing.key
+OM_UPDATE_SIGNING_KEY_ID=default
 OM_AGENT_PACKAGE_MAX_BYTES=268435456
 OM_FILE_TRANSFER_MAX_BYTES=1073741824
 ```
@@ -407,17 +432,24 @@ OM_FILE_TRANSFER_MAX_BYTES=1073741824
 `OM_ADMIN_PASSWORD` 在管理员表为空时必须显式设置且至少包含 16 字节，且不能保留
 `.env.example` 中公开的占位值；完成首位管理员绑定后，直接启动后端时可以移除该变量。
 Compose 为避免误用始终要求提供它。
-`OM_SECURE_COOKIES` 在 HTTPS/WSS 生产部署中应设为 `true`；
-直接使用 HTTP 本地开发时保持 `false`。会话固定有效 7 天，后端重启会要求重新登录。
+`OM_SECURE_COOKIES` 是请求未经过可信协议代理时的回退值，在 HTTPS/WSS 生产部署中
+应设为 `true`，直接使用 HTTP 本地开发时保持 `false`。连接端命中可信代理网段且代理
+覆盖写入 `X-Forwarded-Proto` 时，后端会按当前请求动态校验 Origin，并只在 HTTPS
+登录响应中增加 `Secure`。HTTP 与 HTTPS 使用不同名称的会话 Cookie，因此同一部署和
+同一浏览器可同时保留 HTTP/WS 和 HTTPS/WSS。会话固定有效 7 天，后端重启会要求
+重新登录。
 
-`OM_TRUST_PROXY_HEADERS` 控制登录限流是否读取反向代理提供的 `X-Real-IP`；默认关闭。
+`OM_TRUST_PROXY_HEADERS` 控制登录限流和协议判定是否读取反向代理提供的
+`X-Real-IP`、`X-Forwarded-Proto`；默认关闭。
 启用时，只有连接端地址命中 `OM_TRUSTED_PROXY_CIDRS` 中逗号分隔的 IP/CIDR 才会
 采信该请求头。应按实际代理网络配置最小范围，并确保客户端不能绕过代理直连后端。
 Compose 将后端宿主端口固定绑定到 `127.0.0.1`，并默认把 PostgreSQL、前端代理和
-后端分别固定为 `172.30.135.2`、`172.30.135.3` 和 `172.30.135.4`，后端只信任前端
-代理的 `/32` 地址。若该网段与现有网络冲突，必须同时调整 `OM_COMPOSE_NETWORK_CIDR`、
+后端分别固定为 `172.30.135.2`、`172.30.135.3` 和 `172.30.135.4`，网络网关固定为
+`172.30.135.1`。后端信任前端代理地址，Compose 还会自动追加网关 `/32`，供宿主机
+反向代理安全传递客户端地址和协议。若该网段与现有网络冲突，必须同时调整
+`OM_COMPOSE_NETWORK_CIDR`、`OM_COMPOSE_GATEWAY_IP`、
 `OM_POSTGRES_IP`、`OM_FRONTEND_PROXY_IP`、`OM_BACKEND_IP` 和
-`OM_TRUSTED_PROXY_CIDRS`，并确保三个服务地址互不相同且都位于所选网段内。
+`OM_TRUSTED_PROXY_CIDRS`，并确保网关和三个服务地址互不相同且都位于所选网段内。
 登录限流会同时按来源地址和数据库中的真实管理员账号计数；不存在的用户名不会占用
 账号限流容量。
 
@@ -425,6 +457,12 @@ Agent `0.1.19` 起通过 `Authorization` 请求头认证 WebSocket，实例密�
 URL。`OM_ALLOW_LEGACY_AGENT_WS_AUTH` 默认必须保持 `false`；它只用于升级旧 Agent
 的短暂维护窗口，启用期间后端会接受旧查询串认证并输出弃用警告。迁移完成后应立即
 关闭并重建后端。
+
+`OM_UPDATE_SIGNING_KEY_FILE` 指向只允许文件所有者读取的 Base64 编码 32 字节 Ed25519
+私钥。设置后，后端会对 HTTP 清单和 WebSocket 推送中的更新元数据签名，并在启动日志
+中输出可嵌入 Agent 的公钥。`OM_UPDATE_SIGNING_KEY_ID` 必须与构建 Agent 时的
+`OM_UPDATE_PUBLIC_KEY_ID` 一致。未配置签名器时，旧 Agent 和未嵌入公钥的 HTTPS
+Agent 仍可更新，但嵌入公钥的 Agent 会拒绝所有未签名更新。
 
 `OM_FILE_TRANSFER_MAX_BYTES` 限制单个远程上传或下载文件的大小，默认 1 GiB。反向代理的请求体上限必须不小于该值；Docker 前端默认将 `NGINX_CLIENT_MAX_BODY_SIZE` 设置为 `1g`，并关闭 API 请求与响应缓冲以保持流式传输。远程文件操作拥有与 Agent 服务进程相同的系统权限，生产环境应严格保护管理员账号和 TOTP 设备。
 

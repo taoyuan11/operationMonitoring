@@ -11,7 +11,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        Path, Query, State,
+        ConnectInfo, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode},
@@ -37,7 +37,7 @@ use crate::{
         DockerResponse, DockerRestartPolicy, DockerStatus, DockerStatusState,
         DockerVolumeCreateSpec, TerminalClientMessage, TerminalServerMessage,
     },
-    remote_desktop::ensure_same_origin,
+    request_security::{ensure_same_origin, request_scheme},
     state::{
         AgentHandle, AppState, DockerExecSessionHandle, DockerLogEvent, DockerLogStreamHandle,
         DockerRequestFailure, PendingDockerRequest,
@@ -53,6 +53,7 @@ const MAX_PENDING_REQUESTS_PER_INSTANCE: usize = 8;
 const MAX_STREAMS_PER_INSTANCE: usize = 2;
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
 const STREAM_BUFFER: usize = 64;
+const MAX_DOCKER_CLIENT_MESSAGE_BYTES: usize = 128 * 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn router() -> Router<AppState> {
@@ -134,7 +135,6 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn require_docker_write_admin(state: &AppState, headers: &HeaderMap) -> AppResult<String> {
-    ensure_same_origin(headers, state.secure_cookies)?;
     Ok(require_admin(state, headers).await?.username)
 }
 
@@ -2899,27 +2899,31 @@ async fn acquire_stream_slot(
 
 async fn admin_container_logs_ws(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<std::net::SocketAddr>,
     Path((instance_id, container)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<DockerLogsQuery>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
-    ensure_same_origin(&headers, state.secure_cookies)?;
+    ensure_same_origin(&headers, request_scheme(&state, &headers, peer_addr.ip())?)?;
     let admin = require_admin(&state, &headers).await?;
     manageable_agent(&state, &instance_id).await?;
     let permit = acquire_stream_slot(&state, &instance_id).await?;
     let session_guard = admin.session_guard();
-    Ok(ws.on_upgrade(move |socket| {
-        docker_logs_socket(
-            state,
-            instance_id,
-            container,
-            session_guard,
-            query,
-            socket,
-            permit,
-        )
-    }))
+    Ok(ws
+        .max_message_size(MAX_DOCKER_CLIENT_MESSAGE_BYTES)
+        .max_frame_size(MAX_DOCKER_CLIENT_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            docker_logs_socket(
+                state,
+                instance_id,
+                container,
+                session_guard,
+                query,
+                socket,
+                permit,
+            )
+        }))
 }
 
 async fn docker_logs_socket(
@@ -3109,12 +3113,13 @@ fn docker_log_terminal_message(event: &DockerLogEvent) -> Value {
 
 async fn admin_container_exec_ws(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<std::net::SocketAddr>,
     Path((instance_id, container)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<DockerExecQuery>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
-    ensure_same_origin(&headers, state.secure_cookies)?;
+    ensure_same_origin(&headers, request_scheme(&state, &headers, peer_addr.ip())?)?;
     let admin = require_admin(&state, &headers).await?;
     manageable_agent(&state, &instance_id).await?;
     if !matches!(query.shell.as_str(), "/bin/sh" | "/bin/bash" | "/bin/ash") {
@@ -3123,18 +3128,21 @@ async fn admin_container_exec_ws(
     let permit = acquire_stream_slot(&state, &instance_id).await?;
     let actor = admin.username.clone();
     let session_guard = admin.session_guard();
-    Ok(ws.on_upgrade(move |socket| {
-        docker_exec_socket(
-            state,
-            instance_id,
-            container,
-            actor,
-            session_guard,
-            query,
-            socket,
-            permit,
-        )
-    }))
+    Ok(ws
+        .max_message_size(MAX_DOCKER_CLIENT_MESSAGE_BYTES)
+        .max_frame_size(MAX_DOCKER_CLIENT_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            docker_exec_socket(
+                state,
+                instance_id,
+                container,
+                actor,
+                session_guard,
+                query,
+                socket,
+                permit,
+            )
+        }))
 }
 
 async fn docker_exec_socket(
@@ -3405,6 +3413,7 @@ mod tests {
             DockerComposeConfigSummary, DockerComposeServiceSummary, DockerPortProtocol,
             DockerStatusState,
         },
+        request_security::RequestScheme,
     };
 
     fn origin_headers(host: &str, origin: Option<&str>) -> HeaderMap {
@@ -3418,8 +3427,11 @@ mod tests {
 
     #[test]
     fn docker_websockets_require_an_origin() {
-        let error = ensure_same_origin(&origin_headers("console.example.com", None), true)
-            .expect_err("missing Origin must be rejected before authentication");
+        let error = ensure_same_origin(
+            &origin_headers("console.example.com", None),
+            RequestScheme::Https,
+        )
+        .expect_err("missing Origin must be rejected before authentication");
         assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
@@ -3427,10 +3439,10 @@ mod tests {
     fn docker_websockets_reject_wrong_scheme_or_host() {
         let wrong_scheme =
             origin_headers("console.example.com", Some("http://console.example.com"));
-        assert!(ensure_same_origin(&wrong_scheme, true).is_err());
+        assert!(ensure_same_origin(&wrong_scheme, RequestScheme::Https).is_err());
 
         let wrong_host = origin_headers("console.example.com", Some("https://evil.example"));
-        assert!(ensure_same_origin(&wrong_host, true).is_err());
+        assert!(ensure_same_origin(&wrong_host, RequestScheme::Https).is_err());
     }
 
     #[test]
@@ -3439,10 +3451,10 @@ mod tests {
             "console.example.com:13500",
             Some("https://console.example.com:13500"),
         );
-        assert!(ensure_same_origin(&secure, true).is_ok());
+        assert!(ensure_same_origin(&secure, RequestScheme::Https).is_ok());
 
         let insecure = origin_headers("127.0.0.1:13500", Some("http://127.0.0.1:13500"));
-        assert!(ensure_same_origin(&insecure, false).is_ok());
+        assert!(ensure_same_origin(&insecure, RequestScheme::Http).is_ok());
     }
 
     #[tokio::test]
@@ -3777,10 +3789,13 @@ mod tests {
                 confirm_reset_admin_auth: None,
                 upload_dir: PathBuf::from("unused-uploads"),
                 update_dir: PathBuf::from("unused-updates"),
+                update_signing_key_file: None,
+                update_signing_key_id: "default".to_string(),
                 agent_package_max_bytes: 1024,
                 file_transfer_max_bytes: 1024,
             },
             AuthCipher::from_key(&[5_u8; 32]).expect("create auth cipher"),
+            None,
         );
         let suffix = Uuid::new_v4();
         let instance_id = format!("docker-audit-{suffix}");

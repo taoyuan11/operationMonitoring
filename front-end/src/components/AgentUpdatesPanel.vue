@@ -96,6 +96,12 @@ const attemptStatusText: Record<AgentUpdateAttemptStatus, string> = {
   failed: '失败',
 }
 
+const terminalAttemptStatuses = new Set<AgentUpdateAttemptStatus>([
+  'succeeded',
+  'rollback_succeeded',
+  'failed',
+])
+
 const publishedCount = computed(() => props.releases.filter((release) => release.status === 'published').length)
 const instancesById = computed(() => new Map(props.instances.map((instance) => [instance.id, instance])))
 const createReleaseFileSummary = computed(() => {
@@ -606,6 +612,20 @@ function attemptsFor(release: AgentRelease) {
     : props.attempts.filter((attempt) => attempt.release_id === release.id)
 }
 
+function activeAttemptCount(release: AgentRelease) {
+  return attemptsFor(release).filter((attempt) => !terminalAttemptStatuses.has(attempt.status)).length
+}
+
+function deleteReleaseTitle(release: AgentRelease) {
+  const activeCount = activeAttemptCount(release)
+  if (activeCount > 0) return `仍有 ${activeCount} 个实例更新未结束，暂不能删除`
+  return release.status === 'published' ? '永久删除已发布版本' : '删除草稿'
+}
+
+function deleteReleaseLabel(release: AgentRelease) {
+  return `${deleteReleaseTitle(release)}：Agent ${release.version}`
+}
+
 function draftArtifactCount(release: AgentRelease) {
   return release.artifacts.filter((artifact) => artifact.status === 'draft').length
 }
@@ -756,17 +776,19 @@ function toggleRelease(releaseId: string) {
               >
                 <Pencil :size="15" />
               </button>
+            </template>
+            <span class="release-delete-control" :title="deleteReleaseTitle(release)">
               <button
                 class="icon-button danger"
                 type="button"
-                title="删除草稿"
-                :aria-label="`删除 Agent ${release.version} 草稿`"
-                :disabled="Boolean(operation)"
+                :aria-label="deleteReleaseLabel(release)"
+                :disabled="Boolean(operation) || activeAttemptCount(release) > 0"
                 @click="$emit('deleteRelease', release)"
               >
-                <Trash2 :size="15" />
+                <LoaderCircle v-if="isBusy(release.id) && operation === 'deleting'" class="spin" :size="15" />
+                <Trash2 v-else :size="15" />
               </button>
-            </template>
+            </span>
             <button
               v-if="draftArtifactCount(release) > 0"
               class="primary-button release-publish-button"

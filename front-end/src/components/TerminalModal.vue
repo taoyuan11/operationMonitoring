@@ -26,7 +26,7 @@ onMounted(() => {
   terminal = new Terminal({
     cursorBlink: true,
     cursorStyle: 'block',
-    convertEol: false,
+    convertEol: true,
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
     fontSize: 14,
     scrollback: 10_000,
@@ -173,7 +173,9 @@ type TerminalServerMessage =
           <X :size="17" />
         </button>
       </div>
-      <div ref="terminalElement" class="terminal-screen" aria-label="交互式终端"></div>
+      <div class="terminal-screen" aria-label="交互式终端">
+        <div ref="terminalElement" class="terminal-screen-content"></div>
+      </div>
     </section>
   </div>
 </template>

@@ -18,6 +18,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub fn start(config: &AgentConfig) -> Result<()> {
+    config.server_endpoint()?;
     let paths = RuntimePaths::from_config(config)?;
     paths.prepare()?;
 
@@ -181,7 +182,8 @@ pub async fn follow_logs(config: &AgentConfig) -> Result<()> {
     }
 }
 
-pub async fn run_agent(config: AgentConfig) -> Result<()> {
+pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
+    config.normalize_server()?;
     let paths = RuntimePaths::from_config(&config)?;
     paths.prepare()?;
     let guard = RuntimeGuard::acquire(paths)?;

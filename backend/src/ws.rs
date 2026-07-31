@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -21,7 +24,7 @@ use crate::{
         AgentInbound, AgentOutbound, MetricPayload, TerminalClientMessage, TerminalServerMessage,
     },
     remote_desktop::{close_connection_desktops, desktop_agent_closed, desktop_agent_opened},
-    state::{AgentHandle, AppState, TerminalSessionHandle},
+    state::{AgentHandle, AgentOutboundSender, AppState, TerminalSessionHandle},
     updates::{confirm_update_version, offer_update_on_connect, record_connection_update_status},
     utils::now_ts,
 };
@@ -34,7 +37,10 @@ const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_STATUS_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_AGENT_ID_BYTES: usize = 128;
+const AGENT_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 128;
+const MAX_TERMINAL_SESSIONS_PER_INSTANCE: usize = 8;
+const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct PendingHeartbeat {
@@ -50,9 +56,10 @@ pub async fn agent_socket(
 ) {
     let connection_id = Uuid::new_v4();
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<AgentOutbound>();
-    let (binary_tx, mut binary_rx) = mpsc::channel::<Vec<u8>>(4);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (tx, mut rx) =
+        AgentOutboundSender::channel(AGENT_OUTBOUND_QUEUE_CAPACITY, shutdown_tx.clone());
+    let (binary_tx, mut binary_rx) = mpsc::channel::<Vec<u8>>(4);
 
     let docker_capable = capabilities
         .iter()
@@ -129,7 +136,10 @@ pub async fn agent_socket(
                 };
                 match serde_json::to_string(&outbound) {
                     Ok(text) => {
-                        if sender.send(Message::Text(text.into())).await.is_err() {
+                        if socket_send_with_timeout(sender.send(Message::Text(text.into())))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -140,7 +150,10 @@ pub async fn agent_socket(
                 let Some(outbound) = outbound else {
                     break;
                 };
-                if sender.send(Message::Binary(outbound.into())).await.is_err() {
+                if socket_send_with_timeout(sender.send(Message::Binary(outbound.into())))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -212,7 +225,10 @@ pub async fn agent_socket(
                 let Ok(text) = serde_json::to_string(&ping) else {
                     continue;
                 };
-                if sender.send(Message::Text(text.into())).await.is_err() {
+                if socket_send_with_timeout(sender.send(Message::Text(text.into())))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 pending_heartbeat = Some(PendingHeartbeat {
@@ -696,9 +712,9 @@ mod tests {
 
     #[test]
     fn explicit_shutdown_survives_active_agent_handle_clones() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let (binary_tx, _binary_rx) = mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (tx, _rx) = AgentOutboundSender::channel(1, shutdown_tx.clone());
+        let (binary_tx, _binary_rx) = mpsc::channel(1);
         let handle = AgentHandle {
             connection_id: Uuid::new_v4(),
             tx,
@@ -713,6 +729,52 @@ mod tests {
 
         assert!(*shutdown_rx.borrow());
         assert!(*active_session_handle.shutdown_tx.borrow());
+    }
+
+    #[test]
+    fn agent_control_queue_rejects_messages_at_capacity() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (tx, mut rx) = AgentOutboundSender::channel(1, shutdown_tx);
+
+        assert!(tx.send(AgentOutbound::Ping { now: 1 }).is_ok());
+        assert_eq!(
+            tx.send(AgentOutbound::Ping { now: 2 }),
+            Err(crate::state::AgentOutboundSendError::Full)
+        );
+        assert!(matches!(rx.try_recv(), Ok(AgentOutbound::Ping { now: 1 })));
+        assert!(*shutdown_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn websocket_sends_are_bounded_by_a_timeout() {
+        let pending_send = std::future::pending::<Result<(), ()>>();
+
+        assert!(
+            send_with_timeout(Duration::from_millis(1), pending_send)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_session_limit_only_counts_the_target_instance() {
+        let below_limit = vec!["instance-a"; MAX_TERMINAL_SESSIONS_PER_INSTANCE - 1];
+        assert!(!terminal_session_limit_reached(
+            below_limit.iter().copied(),
+            "instance-a"
+        ));
+
+        let mut at_limit = below_limit;
+        at_limit.push("instance-b");
+        assert!(!terminal_session_limit_reached(
+            at_limit.iter().copied(),
+            "instance-a"
+        ));
+        at_limit.push("instance-a");
+        assert!(terminal_session_limit_reached(
+            at_limit.iter().copied(),
+            "instance-a"
+        ));
     }
 
     #[test]
@@ -793,16 +855,58 @@ async fn send_terminal_event(
             })
             .cloned()
     };
-    if let Some(handle) = handle {
-        if handle.tx.try_send(event).is_err() && !remove {
+    let Some(handle) = handle else {
+        return;
+    };
+    if handle.tx.try_send(event).is_err() && !remove {
+        let removed = {
             let mut sessions = state.terminal_sessions.write().await;
             if sessions.get(session_id).is_some_and(|current| {
                 current.instance_id == instance_id && current.agent_connection_id == connection_id
             }) {
-                sessions.remove(session_id);
+                sessions.remove(session_id).is_some()
+            } else {
+                false
             }
+        };
+        if removed {
+            warn!(%instance_id, %connection_id, %session_id, "terminal browser event queue overflowed");
+            close_agent_terminal(state, instance_id, connection_id, session_id).await;
         }
     }
+}
+
+async fn close_agent_terminal(
+    state: &AppState,
+    instance_id: &str,
+    connection_id: Uuid,
+    session_id: &str,
+) {
+    let agent = state
+        .agents
+        .read()
+        .await
+        .get(instance_id)
+        .filter(|agent| agent.connection_id == connection_id)
+        .cloned();
+    if let Some(agent) = agent {
+        send_terminal_agent_message(
+            &agent,
+            AgentOutbound::TerminalClose {
+                session_id: session_id.to_string(),
+            },
+        );
+    }
+}
+
+fn send_terminal_agent_message(agent: &AgentHandle, message: AgentOutbound) -> bool {
+    if agent.tx.send(message).is_ok() {
+        return true;
+    }
+
+    warn!(connection_id = %agent.connection_id, "agent control queue unavailable during terminal operation");
+    agent.shutdown_tx.send_replace(true);
+    false
 }
 
 async fn close_connection_terminals(state: &AppState, instance_id: &str, connection_id: Uuid) {
@@ -854,25 +958,45 @@ pub async fn terminal_socket(
     }
 
     let (event_tx, mut event_rx) = mpsc::channel(TERMINAL_EVENT_QUEUE_CAPACITY);
-    state.terminal_sessions.write().await.insert(
-        session_id.clone(),
-        TerminalSessionHandle {
-            instance_id: instance_id.clone(),
-            agent_connection_id: agent.connection_id,
-            tx: event_tx,
-        },
-    );
+    let terminal_limit_reached = {
+        let mut sessions = state.terminal_sessions.write().await;
+        let limit_reached = terminal_session_limit_reached(
+            sessions.values().map(|handle| handle.instance_id.as_str()),
+            &instance_id,
+        );
+        if !limit_reached {
+            sessions.insert(
+                session_id.clone(),
+                TerminalSessionHandle {
+                    instance_id: instance_id.clone(),
+                    agent_connection_id: agent.connection_id,
+                    tx: event_tx,
+                },
+            );
+        }
+        limit_reached
+    };
+    if terminal_limit_reached {
+        mark_terminal_session_ended(&state, &session_id).await;
+        send_single_terminal_message(
+            socket,
+            TerminalServerMessage::Error {
+                message: "该实例的终端会话已达到上限".to_string(),
+            },
+        )
+        .await;
+        return;
+    }
 
-    if agent
-        .tx
-        .send(AgentOutbound::TerminalOpen {
+    if !send_terminal_agent_message(
+        &agent,
+        AgentOutbound::TerminalOpen {
             session_id: session_id.clone(),
             cols: 80,
             rows: 24,
-        })
-        .is_err()
-    {
-        state.terminal_sessions.write().await.remove(&session_id);
+        },
+    ) {
+        finish_terminal_session(&state, &agent, &session_id).await;
         send_single_terminal_message(
             socket,
             TerminalServerMessage::Error {
@@ -888,7 +1012,7 @@ pub async fn terminal_socket(
         .await
         .is_err()
     {
-        state.terminal_sessions.write().await.remove(&session_id);
+        finish_terminal_session(&state, &agent, &session_id).await;
         return;
     }
     let authorization = session_guard.wait_until_invalid(state.clone());
@@ -913,20 +1037,33 @@ pub async fn terminal_socket(
                 match browser_message {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<TerminalClientMessage>(&text) {
-                            Ok(TerminalClientMessage::Input { data }) => {
-                                if agent.tx.send(AgentOutbound::TerminalInput {
-                                    session_id: session_id.clone(),
-                                    data,
-                                }).is_err() {
+                            Ok(TerminalClientMessage::Input { data })
+                                if data.len() <= MAX_STREAM_CHUNK_BYTES => {
+                                if !send_terminal_agent_message(
+                                    &agent,
+                                    AgentOutbound::TerminalInput {
+                                        session_id: session_id.clone(),
+                                        data,
+                                    },
+                                ) {
                                     break;
                                 }
                             }
+                            Ok(TerminalClientMessage::Input { .. }) => {
+                                warn!(%instance_id, %session_id, "terminal browser input exceeded limit");
+                                break;
+                            }
                             Ok(TerminalClientMessage::Resize { cols, rows }) => {
-                                let _ = agent.tx.send(AgentOutbound::TerminalResize {
-                                    session_id: session_id.clone(),
-                                    cols: cols.clamp(2, 500),
-                                    rows: rows.clamp(1, 300),
-                                });
+                                if !send_terminal_agent_message(
+                                    &agent,
+                                    AgentOutbound::TerminalResize {
+                                        session_id: session_id.clone(),
+                                        cols: cols.clamp(2, 500),
+                                        rows: rows.clamp(1, 300),
+                                    },
+                                ) {
+                                    break;
+                                }
                             }
                             Err(error) => warn!(?error, "invalid browser terminal message"),
                         }
@@ -947,29 +1084,69 @@ pub async fn terminal_socket(
         }
     }
 
-    state.terminal_sessions.write().await.remove(&session_id);
-    let _ = agent.tx.send(AgentOutbound::TerminalClose {
-        session_id: session_id.clone(),
-    });
+    finish_terminal_session(&state, &agent, &session_id).await;
+    let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, sender.close()).await;
+}
+
+async fn finish_terminal_session(state: &AppState, agent: &AgentHandle, session_id: &str) {
+    state.terminal_sessions.write().await.remove(session_id);
+    send_terminal_agent_message(
+        agent,
+        AgentOutbound::TerminalClose {
+            session_id: session_id.to_string(),
+        },
+    );
+    mark_terminal_session_ended(state, session_id).await;
+}
+
+async fn mark_terminal_session_ended(state: &AppState, session_id: &str) {
     let _ = sqlx::query("UPDATE ssh_sessions SET ended_at = $1 WHERE id = $2")
         .bind(now_ts())
-        .bind(&session_id)
+        .bind(session_id)
         .execute(&state.db)
         .await;
 }
 
+fn terminal_session_limit_reached<'a>(
+    instance_ids: impl Iterator<Item = &'a str>,
+    instance_id: &str,
+) -> bool {
+    instance_ids
+        .filter(|current| *current == instance_id)
+        .take(MAX_TERMINAL_SESSIONS_PER_INSTANCE)
+        .count()
+        >= MAX_TERMINAL_SESSIONS_PER_INSTANCE
+}
+
 async fn send_single_terminal_message(mut socket: WebSocket, event: TerminalServerMessage) {
     if let Ok(text) = serde_json::to_string(&event) {
-        let _ = socket.send(Message::Text(text.into())).await;
+        let _ = socket_send_with_timeout(socket.send(Message::Text(text.into()))).await;
     }
-    let _ = socket.close().await;
+    let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket.close()).await;
 }
 
 async fn send_terminal_message(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     event: &TerminalServerMessage,
-) -> Result<(), axum::Error> {
+) -> Result<(), ()> {
     let text = serde_json::to_string(event)
         .unwrap_or_else(|_| r#"{"type":"error","message":"终端消息序列化失败"}"#.to_string());
-    sender.send(Message::Text(text.into())).await
+    socket_send_with_timeout(sender.send(Message::Text(text.into()))).await
+}
+
+async fn socket_send_with_timeout<F, E>(send: F) -> Result<(), ()>
+where
+    F: Future<Output = Result<(), E>>,
+{
+    send_with_timeout(SOCKET_SEND_TIMEOUT, send).await
+}
+
+async fn send_with_timeout<F, E>(timeout: Duration, send: F) -> Result<(), ()>
+where
+    F: Future<Output = Result<(), E>>,
+{
+    tokio::time::timeout(timeout, send)
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
 }

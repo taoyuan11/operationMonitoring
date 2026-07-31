@@ -1,10 +1,12 @@
 use std::{collections::HashMap, net::IpAddr, str::FromStr, time::Duration};
 
 use axum::http::StatusCode;
+use sha2::{Digest, Sha256};
 use sqlx::{
     Executor, FromRow, PgPool, Postgres,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use subtle::ConstantTimeEq;
 use tracing::error;
 use uuid::Uuid;
 
@@ -28,6 +30,7 @@ const MAX_DEVICE_GPUS: usize = 16;
 const MAX_DEVICE_DISKS: usize = 32;
 const MAX_DEVICE_INTERFACES: usize = 32;
 const MAX_DEVICE_INTERFACE_ADDRESSES: usize = 16;
+const AGENT_SECRET_VERIFIER_PREFIX: &str = "v1$sha256$";
 
 #[derive(FromRow)]
 struct InstanceMetricRecord {
@@ -267,6 +270,7 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
     .await?;
 
     ensure_capability_columns(db, "pending_instances").await?;
+    migrate_agent_secret_verifiers(db).await?;
 
     sqlx::query(
         r#"
@@ -752,6 +756,7 @@ pub async fn register_or_touch_pending(
     source_key: &str,
 ) -> AppResult<()> {
     validate_agent_registration(payload)?;
+    let secret_verifier = agent_secret_verifier(&payload.secret);
     let mut tx = db.begin().await?;
     let mut instance = sqlx::query_as::<_, InstanceRecord>(
         r#"
@@ -819,7 +824,7 @@ pub async fn register_or_touch_pending(
             WHERE id = $10
             "#,
         )
-        .bind(&payload.secret)
+        .bind(&secret_verifier)
         .bind(&payload.hostname)
         .bind(&payload.os)
         .bind(&payload.arch)
@@ -851,7 +856,7 @@ pub async fn register_or_touch_pending(
             WHERE id = $10 AND (secret != $1 OR last_seen <= $11)
             "#,
         )
-        .bind(&payload.secret)
+        .bind(&secret_verifier)
         .bind(&payload.hostname)
         .bind(&payload.os)
         .bind(&payload.arch)
@@ -907,7 +912,7 @@ pub async fn register_or_touch_pending(
             "#,
         )
         .bind(&payload.instance_id)
-        .bind(&payload.secret)
+        .bind(&secret_verifier)
         .bind(&payload.hostname)
         .bind(&payload.os)
         .bind(&payload.arch)
@@ -1052,7 +1057,55 @@ fn valid_mac_address(value: &str) -> bool {
 }
 
 fn agent_secret_is_authorized(current_secret: &str, payload: &AgentRegisterRequest) -> bool {
-    payload.secret == current_secret || payload.previous_secret.as_deref() == Some(current_secret)
+    agent_secret_matches(current_secret, &payload.secret)
+        || payload
+            .previous_secret
+            .as_deref()
+            .is_some_and(|secret| agent_secret_matches(current_secret, secret))
+}
+
+pub fn agent_secret_verifier(secret: &str) -> String {
+    format!(
+        "{AGENT_SECRET_VERIFIER_PREFIX}{:x}",
+        Sha256::digest(secret.as_bytes())
+    )
+}
+
+pub fn agent_secret_matches(stored: &str, presented: &str) -> bool {
+    if let Some(expected) = agent_secret_digest(stored) {
+        let actual = format!("{:x}", Sha256::digest(presented.as_bytes()));
+        return bool::from(expected.as_bytes().ct_eq(actual.as_bytes()));
+    }
+    bool::from(stored.as_bytes().ct_eq(presented.as_bytes()))
+}
+
+fn agent_secret_digest(stored: &str) -> Option<&str> {
+    stored
+        .strip_prefix(AGENT_SECRET_VERIFIER_PREFIX)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+async fn migrate_agent_secret_verifiers(db: &PgPool) -> anyhow::Result<()> {
+    for table in ["instances", "pending_instances"] {
+        let rows =
+            sqlx::query_as::<_, (String, String)>(&format!("SELECT id, secret FROM {table}"))
+                .fetch_all(db)
+                .await?;
+        for (id, secret) in rows {
+            if agent_secret_digest(&secret).is_some() {
+                continue;
+            }
+            sqlx::query(&format!(
+                "UPDATE {table} SET secret = $1 WHERE id = $2 AND secret = $3"
+            ))
+            .bind(agent_secret_verifier(&secret))
+            .bind(id)
+            .bind(secret)
+            .execute(db)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_agent_identifier(value: &str) -> AppResult<()> {
@@ -1534,19 +1587,27 @@ mod tests {
     fn secret_rotation_requires_the_current_secret() {
         let mut payload = registration_payload();
         payload.secret = "new-agent-secret".to_string();
-        assert!(!agent_secret_is_authorized(
-            "current-agent-secret",
-            &payload
-        ));
+        let current = agent_secret_verifier("current-agent-secret");
+        assert!(!agent_secret_is_authorized(&current, &payload));
 
         payload.previous_secret = Some("wrong-agent-secret".to_string());
-        assert!(!agent_secret_is_authorized(
-            "current-agent-secret",
-            &payload
-        ));
+        assert!(!agent_secret_is_authorized(&current, &payload));
 
         payload.previous_secret = Some("current-agent-secret".to_string());
-        assert!(agent_secret_is_authorized("current-agent-secret", &payload));
+        assert!(agent_secret_is_authorized(&current, &payload));
+    }
+
+    #[test]
+    fn agent_secret_verifiers_are_versioned_and_constant_time_comparable() {
+        let verifier = agent_secret_verifier("550e8400-e29b-41d4-a716-446655440001");
+        assert!(verifier.starts_with(AGENT_SECRET_VERIFIER_PREFIX));
+        assert!(!verifier.contains("550e8400"));
+        assert!(agent_secret_matches(
+            &verifier,
+            "550e8400-e29b-41d4-a716-446655440001"
+        ));
+        assert!(!agent_secret_matches(&verifier, "different-secret"));
+        assert!(agent_secret_matches("legacy-secret", "legacy-secret"));
     }
 
     #[test]
@@ -1673,7 +1734,7 @@ mod tests {
                 .fetch_one(&db)
                 .await
                 .expect("load pending secret");
-        assert_eq!(stored_secret, original.secret);
+        assert_eq!(stored_secret, agent_secret_verifier(&original.secret));
     }
 
     #[tokio::test]
@@ -1719,6 +1780,8 @@ mod tests {
         let record = get_instance(&db, "old")
             .await
             .expect("load migrated instance");
+        assert_ne!(record.secret, "secret");
+        assert!(agent_secret_matches(&record.secret, "secret"));
         assert_eq!(record.region, "上海");
         assert_eq!(record.country_code, "");
         assert_eq!(record.country, "");

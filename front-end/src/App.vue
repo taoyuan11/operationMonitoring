@@ -203,6 +203,17 @@ function requestPublishAgentRelease(release: AgentRelease) {
 }
 
 function requestDeleteAgentRelease(release: AgentRelease) {
+  if (release.status === 'published') {
+    confirmation.value = {
+      title: '永久删除已发布版本',
+      message: `将永久删除 Agent ${release.version}、${release.artifacts.length} 个已上传程序文件及其 SHA-256 校验文件，以及 ${release.attempts.length} 条实例更新记录。已安装此版本的实例不会回退，此操作无法恢复。`,
+      confirmLabel: '永久删除版本',
+      tone: 'danger',
+      confirmationText: release.version,
+      action: () => consoleState.deleteAgentRelease(release),
+    }
+    return
+  }
   confirmation.value = {
     title: '删除更新草稿',
     message: `将删除 ${release.version} 及其已上传的可执行文件，此操作无法恢复。`,
@@ -292,7 +303,7 @@ function confirmAction() {
     </Transition>
 
     <Transition name="page" mode="out-in">
-      <section :key="currentPage" class="page-stage">
+      <section :key="currentPage" :class="['page-stage', `page-stage-${currentPage}`]">
         <template v-if="currentPage === 'home'">
           <Transition name="content" mode="out-in">
             <div

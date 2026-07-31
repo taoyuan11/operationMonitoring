@@ -17,10 +17,10 @@ use crate::{
     admin_auth::resolved_client_ip,
     auth::require_admin,
     db::{
-        approve_pending_instance, get_instance, get_instance_optional, instance_agent_metadata,
-        instance_capabilities, instance_summary, latest_metric, latest_metrics,
-        normalize_metric_timestamp, register_or_touch_pending, retention_days, setting_value,
-        upsert_agent_capabilities, upsert_agent_device_profile, write_action_log,
+        agent_secret_matches, approve_pending_instance, get_instance, get_instance_optional,
+        instance_agent_metadata, instance_capabilities, instance_summary, latest_metric,
+        latest_metrics, normalize_metric_timestamp, register_or_touch_pending, retention_days,
+        setting_value, upsert_agent_capabilities, upsert_agent_device_profile, write_action_log,
     },
     error::{AppError, AppResult},
     jobs::{create_command_job, dispatch_command},
@@ -32,7 +32,7 @@ use crate::{
         PublicDeviceProfile, PublicDeviceProfileResponse, SettingsRequest, SettingsResponse,
         ThemeMode, UpdateInstanceRequest,
     },
-    remote_desktop::ensure_same_origin,
+    request_security::{ensure_same_origin, request_scheme},
     state::AppState,
     updates::confirm_update_version,
     utils::{non_empty_or, now_ts},
@@ -45,6 +45,7 @@ const ACCENT_COLOR_SETTING_KEY: &str = "accent_color";
 const DEFAULT_ACCENT_COLOR: &str = "#3bbf9b";
 const BACKGROUND_DIR: &str = "backgrounds";
 const MAX_BACKGROUND_BYTES: usize = 5 * 1024 * 1024;
+const MAX_TERMINAL_CLIENT_MESSAGE_BYTES: usize = 128 * 1024;
 const DEFAULT_METRICS_RANGE_SECONDS: i64 = 60 * 60;
 const MAX_PUBLIC_METRICS_RANGE_SECONDS: i64 = 31 * 24 * 60 * 60;
 const MAX_PUBLIC_METRICS_FUTURE_SECONDS: i64 = 5 * 60;
@@ -1106,7 +1107,7 @@ pub async fn agent_register(
         }));
     };
 
-    if instance.secret != payload.secret {
+    if !agent_secret_matches(&instance.secret, &payload.secret) {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
     }
 
@@ -1165,7 +1166,7 @@ pub async fn agent_report(
         }));
     };
 
-    if instance.secret != payload.secret {
+    if !agent_secret_matches(&instance.secret, &payload.secret) {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
     }
     upsert_agent_device_profile(
@@ -1253,7 +1254,7 @@ pub async fn agent_ws(
         query.secret.as_deref(),
         state.allow_legacy_agent_ws_auth,
     )?;
-    if instance.secret != presented_secret {
+    if !agent_secret_matches(&instance.secret, presented_secret) {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
     }
     if instance.disabled == 1 {
@@ -1305,17 +1306,21 @@ fn parse_reported_capabilities(value: Option<&str>) -> AppResult<Option<Vec<Stri
 
 pub async fn admin_terminal_ws(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(instance_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
-    ensure_same_origin(&headers, state.secure_cookies)?;
+    ensure_same_origin(&headers, request_scheme(&state, &headers, peer_addr.ip())?)?;
     let admin = require_admin(&state, &headers).await?;
     get_instance(&state.db, &instance_id).await?;
     let session_guard = admin.session_guard();
-    Ok(ws.on_upgrade(move |socket| {
-        terminal_socket(state, instance_id, admin.username, session_guard, socket)
-    }))
+    Ok(ws
+        .max_message_size(MAX_TERMINAL_CLIENT_MESSAGE_BYTES)
+        .max_frame_size(MAX_TERMINAL_CLIENT_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            terminal_socket(state, instance_id, admin.username, session_guard, socket)
+        }))
 }
 
 fn agent_websocket_secret<'a>(

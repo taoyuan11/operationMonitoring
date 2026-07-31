@@ -56,6 +56,21 @@ cargo check
 
 提交代码时应同时包含 `Cargo.toml` 和 `Cargo.lock` 的对应修改。
 
+### 2.2 嵌入更新验签公钥
+
+Agent `0.1.22` 起使用编译期公钥验证后端更新元数据。HTTP 自动更新的发布产物必须
+设置这两个环境变量；HTTPS 发布也建议设置，以同时获得 TLS 和更新签名保护：
+
+```bash
+export OM_UPDATE_PUBLIC_KEY='<后端启动日志中的 Base64 公钥>'
+export OM_UPDATE_PUBLIC_KEY_ID='release-v1'
+```
+
+构建脚本会把变量传给 Cargo，并将其固定在所有产物中。公钥必须是标准 Base64 编码的
+32 字节 Ed25519 公钥，key ID 必须与后端 `OM_UPDATE_SIGNING_KEY_ID` 完全一致。不要把
+后端私钥放入构建环境或 Agent 二进制。更换公钥需要先发布同时信任新密钥的过渡版本；
+当前版本只支持一个嵌入公钥，不能直接无缝轮换。
+
 ### 2.2 安装 Rust
 
 Linux/macOS 推荐使用 rustup：
@@ -447,7 +462,8 @@ om-agent --version
 7. Windows `.exe` 使用 Authenticode 签名。
 8. macOS 二进制使用 Developer ID 签名并完成公证。
 9. 上传更新时，操作系统、架构标识、版本号和 standalone 类型填写正确。
-10. 不提交 `dist/` 产物、密码、`.env`、数据库、日志或实例身份文件。
+10. HTTP 自动更新产物已嵌入正确的 `OM_UPDATE_PUBLIC_KEY` 和 key ID。
+11. 不提交 `dist/` 产物、密码、私钥、`.env`、数据库、日志或实例身份文件。
 
 SHA-256 只能验证文件完整性，不能替代 Windows 或 macOS 的平台代码签名。
 

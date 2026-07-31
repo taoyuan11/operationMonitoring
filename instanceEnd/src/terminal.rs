@@ -1,14 +1,17 @@
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::{
+        Arc,
+        mpsc::{self, RecvTimeoutError},
+    },
     thread,
     time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::Semaphore;
 
 #[cfg(windows)]
 use anyhow::Context as _;
@@ -28,7 +31,18 @@ use windows::{
     core::{s, w},
 };
 
-use crate::{activity::ActivityTracker, models::AgentInbound};
+use crate::{
+    activity::ActivityTracker, models::AgentInbound, outbound::AgentEventSender,
+    pty_io::PtyInputWriter,
+};
+
+const MAX_TERMINAL_SESSIONS: usize = 8;
+const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+const TERMINAL_CONTROL_QUEUE_CAPACITY: usize = 128;
+const TERMINAL_WRITE_QUEUE_CAPACITY: usize = 16;
+const TERMINAL_PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(windows, test))]
+const TERMINAL_PIPE_QUEUE_CAPACITY: usize = 64;
 
 enum TerminalControl {
     Input(Vec<u8>),
@@ -37,25 +51,37 @@ enum TerminalControl {
 }
 
 pub struct TerminalManager {
-    sessions: HashMap<String, mpsc::Sender<TerminalControl>>,
-    outbound: tokio_mpsc::UnboundedSender<AgentInbound>,
+    sessions: HashMap<String, mpsc::SyncSender<TerminalControl>>,
+    session_slots: Arc<Semaphore>,
+    outbound: AgentEventSender,
+    stream_outbound: AgentEventSender,
     activity: ActivityTracker,
 }
 
 impl TerminalManager {
     pub fn new(
-        outbound: tokio_mpsc::UnboundedSender<AgentInbound>,
+        outbound: AgentEventSender,
+        stream_outbound: AgentEventSender,
         activity: ActivityTracker,
     ) -> Self {
         Self {
             sessions: HashMap::new(),
+            session_slots: Arc::new(Semaphore::new(MAX_TERMINAL_SESSIONS)),
             outbound,
+            stream_outbound,
             activity,
         }
     }
 
     pub fn open(&mut self, session_id: String, cols: u16, rows: u16) {
-        self.close(&session_id);
+        if self.sessions.contains_key(&session_id) {
+            let _ = self.outbound.send(AgentInbound::TerminalClosed {
+                session_id,
+                exit_code: None,
+                reason: Some("终端会话已存在".to_string()),
+            });
+            return;
+        }
         let Some(activity_guard) = self.activity.try_enter() else {
             let _ = self.outbound.send(AgentInbound::TerminalClosed {
                 session_id,
@@ -64,52 +90,90 @@ impl TerminalManager {
             });
             return;
         };
-        let (control_tx, control_rx) = mpsc::channel();
-        self.sessions.insert(session_id.clone(), control_tx);
-        let outbound = self.outbound.clone();
-        thread::spawn(move || {
-            let _activity_guard = activity_guard;
-            run_terminal(session_id, cols, rows, control_rx, outbound);
-        });
-    }
-
-    pub fn input(&self, session_id: &str, encoded_data: &str) {
-        let Some(session) = self.sessions.get(session_id) else {
+        let Ok(session_slot) = self.session_slots.clone().try_acquire_owned() else {
+            let _ = self.outbound.send(AgentInbound::TerminalClosed {
+                session_id,
+                exit_code: None,
+                reason: Some("终端会话数量已达到上限".to_string()),
+            });
             return;
         };
-        match STANDARD.decode(encoded_data) {
-            Ok(data) => {
-                let _ = session.send(TerminalControl::Input(data));
+        let (control_tx, control_rx) = mpsc::sync_channel(TERMINAL_CONTROL_QUEUE_CAPACITY);
+        let stream_outbound = self.stream_outbound.clone();
+        let worker_session_id = session_id.clone();
+        let worker = thread::Builder::new().spawn(move || {
+            let _activity_guard = activity_guard;
+            let _session_slot = session_slot;
+            run_terminal(worker_session_id, cols, rows, control_rx, stream_outbound);
+        });
+        match worker {
+            Ok(_) => {
+                self.sessions.insert(session_id, control_tx);
             }
             Err(error) => {
                 let _ = self.outbound.send(AgentInbound::TerminalClosed {
-                    session_id: session_id.to_string(),
+                    session_id,
                     exit_code: None,
-                    reason: Some(format!("终端输入编码无效: {error}")),
+                    reason: Some(format!("无法创建终端线程: {error}")),
                 });
             }
         }
     }
 
-    pub fn resize(&self, session_id: &str, cols: u16, rows: u16) {
-        if let Some(session) = self.sessions.get(session_id) {
-            let _ = session.send(TerminalControl::Resize {
+    pub fn input(&mut self, session_id: &str, encoded_data: &str) {
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        if encoded_data.len() > MAX_TERMINAL_INPUT_BYTES {
+            self.fail_session(session_id, "终端输入过大");
+            return;
+        }
+        match STANDARD.decode(encoded_data) {
+            Ok(data) => {
+                if session.try_send(TerminalControl::Input(data)).is_err() {
+                    self.fail_session(session_id, "终端输入队列拥塞");
+                }
+            }
+            Err(error) => {
+                self.fail_session(session_id, &format!("终端输入编码无效: {error}"));
+            }
+        }
+    }
+
+    pub fn resize(&mut self, session_id: &str, cols: u16, rows: u16) {
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        if session
+            .try_send(TerminalControl::Resize {
                 cols: cols.clamp(2, 500),
                 rows: rows.clamp(1, 300),
-            });
+            })
+            .is_err()
+        {
+            self.fail_session(session_id, "终端控制队列拥塞");
         }
     }
 
     pub fn close(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
-            let _ = session.send(TerminalControl::Close);
+            let _ = session.try_send(TerminalControl::Close);
         }
     }
 
     pub fn close_all(&mut self) {
         for (_, session) in self.sessions.drain() {
-            let _ = session.send(TerminalControl::Close);
+            let _ = session.try_send(TerminalControl::Close);
         }
+    }
+
+    fn fail_session(&mut self, session_id: &str, reason: &str) {
+        self.sessions.remove(session_id);
+        let _ = self.outbound.send(AgentInbound::TerminalClosed {
+            session_id: session_id.to_string(),
+            exit_code: None,
+            reason: Some(reason.to_string()),
+        });
     }
 }
 
@@ -118,19 +182,19 @@ fn run_terminal(
     cols: u16,
     rows: u16,
     control_rx: mpsc::Receiver<TerminalControl>,
-    outbound: tokio_mpsc::UnboundedSender<AgentInbound>,
+    stream_outbound: AgentEventSender,
 ) {
     if let Err(error) = run_terminal_inner(
         &session_id,
         cols.clamp(2, 500),
         rows.clamp(1, 300),
         control_rx,
-        outbound.clone(),
+        stream_outbound.clone(),
     ) {
         crate::logging::error(format_args!(
             "terminal session {session_id} failed: {error:#}"
         ));
-        let _ = outbound.send(AgentInbound::TerminalClosed {
+        let _ = stream_outbound.blocking_send(AgentInbound::TerminalClosed {
             session_id,
             exit_code: None,
             reason: Some(format!("无法启动交互式终端: {error:#}")),
@@ -143,74 +207,107 @@ fn run_terminal_inner(
     cols: u16,
     rows: u16,
     control_rx: mpsc::Receiver<TerminalControl>,
-    outbound: tokio_mpsc::UnboundedSender<AgentInbound>,
+    stream_outbound: AgentEventSender,
 ) -> anyhow::Result<()> {
-    let mut terminal = open_terminal(cols, rows)?;
-    let mut reader = terminal.reader;
-    let mut writer = terminal.writer;
+    let RunningTerminal {
+        mut process,
+        master,
+        mut reader,
+        writer,
+    } = open_terminal(cols, rows)?;
+    let input_writer =
+        match PtyInputWriter::spawn(writer, TERMINAL_WRITE_QUEUE_CAPACITY, "om-terminal-input") {
+            Ok(writer) => writer,
+            Err(error) => {
+                let _ = process.terminate();
+                return Err(error.into());
+            }
+        };
+
+    if let Err(error) = stream_outbound.blocking_send(AgentInbound::TerminalOpened {
+        session_id: session_id.to_string(),
+    }) {
+        let _ = process.terminate();
+        return Err(error.into());
+    }
 
     let reader_session_id = session_id.to_string();
-    let reader_outbound = outbound.clone();
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let data = STANDARD.encode(&buffer[..count]);
-                    if reader_outbound
-                        .send(AgentInbound::TerminalOutput {
-                            session_id: reader_session_id.clone(),
-                            data,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
+    let reader_outbound = stream_outbound.clone();
+    let reader_task = thread::spawn(move || {
+        forward_terminal_output(&mut reader, reader_session_id, reader_outbound)
     });
 
-    outbound.send(AgentInbound::TerminalOpened {
-        session_id: session_id.to_string(),
-    })?;
-
     let (exit_code, reason) = loop {
+        if let Some(error) = input_writer.take_failure() {
+            break (process.terminate(), Some(format!("写入终端失败: {error}")));
+        }
         match control_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(TerminalControl::Input(data)) => {
-                if let Err(error) = writer.write_all(&data).and_then(|_| writer.flush()) {
-                    break (None, Some(format!("写入终端失败: {error}")));
+                if let Err(error) = input_writer.try_write(data) {
+                    break (
+                        process.terminate(),
+                        Some(format!("终端输入写入失败: {error}")),
+                    );
                 }
             }
             Ok(TerminalControl::Resize { cols, rows }) => {
-                if let Err(error) = terminal.master.resize(cols, rows) {
-                    break (None, Some(format!("调整终端大小失败: {error}")));
+                if let Err(error) = master.resize(cols, rows) {
+                    break (
+                        process.terminate(),
+                        Some(format!("调整终端大小失败: {error}")),
+                    );
                 }
             }
             Ok(TerminalControl::Close) => {
-                break (terminal.process.kill_and_wait(), None);
+                break (process.terminate(), None);
             }
             Err(RecvTimeoutError::Timeout) => {
-                if let Some(exit_code) = terminal.process.try_wait_code()? {
+                if let Some(exit_code) = process.try_wait_code()? {
                     break (Some(exit_code), None);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                let _ = terminal.process.kill_and_wait();
-                break (None, Some("终端控制通道已关闭".to_string()));
+                break (process.terminate(), Some("终端控制通道已关闭".to_string()));
             }
         }
     };
 
-    let _ = outbound.send(AgentInbound::TerminalClosed {
+    drop(input_writer);
+    drop(master);
+    drop(reader_task);
+    let _ = stream_outbound.blocking_send(AgentInbound::TerminalClosed {
         session_id: session_id.to_string(),
         exit_code,
         reason,
     });
     Ok(())
+}
+
+fn forward_terminal_output<R: Read>(
+    reader: &mut R,
+    session_id: String,
+    outbound: AgentEventSender,
+) {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let data = STANDARD.encode(&buffer[..count]);
+                if outbound
+                    .blocking_send(AgentInbound::TerminalOutput {
+                        session_id: session_id.clone(),
+                        data,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 struct RunningTerminal {
@@ -239,23 +336,52 @@ impl TerminalProcess {
         }
     }
 
-    fn kill_and_wait(&mut self) -> Option<i64> {
+    fn terminate(&mut self) -> Option<i64> {
+        if let Ok(Some(exit_code)) = self.try_wait_code() {
+            return Some(exit_code);
+        }
+        let pid = match self {
+            Self::Pty(child) => child.process_id(),
+            #[cfg(windows)]
+            Self::Pipe(child) => Some(child.id()),
+        };
+        if let Some(pid) = pid {
+            terminate_terminal_process_group(pid);
+        }
         match self {
             Self::Pty(child) => {
                 let _ = child.kill();
-                child.wait().ok().map(|status| status.exit_code() as i64)
             }
             #[cfg(windows)]
             Self::Pipe(child) => {
                 let _ = child.kill();
-                child
-                    .wait()
-                    .ok()
-                    .map(|status| status.code().unwrap_or(-1) as i64)
+            }
+        }
+
+        let deadline = std::time::Instant::now() + TERMINAL_PROCESS_EXIT_TIMEOUT;
+        loop {
+            match self.try_wait_code() {
+                Ok(Some(exit_code)) => return Some(exit_code),
+                Ok(None) | Err(_) if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => return None,
             }
         }
     }
 }
+
+#[cfg(unix)]
+fn terminate_terminal_process_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        unsafe {
+            let _ = libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_terminal_process_group(_pid: u32) {}
 
 enum TerminalMaster {
     Pty(Box<dyn portable_pty::MasterPty + Send>),
@@ -385,7 +511,7 @@ fn merged_pipe_reader(
     stdout: std::process::ChildStdout,
     stderr: std::process::ChildStderr,
 ) -> Box<dyn Read + Send> {
-    let (chunks_tx, chunks_rx) = mpsc::channel();
+    let (chunks_tx, chunks_rx) = mpsc::sync_channel(TERMINAL_PIPE_QUEUE_CAPACITY);
     forward_pipe(stdout, chunks_tx.clone());
     forward_pipe(stderr, chunks_tx);
     Box::new(PipeReader {
@@ -396,7 +522,7 @@ fn merged_pipe_reader(
 }
 
 #[cfg(windows)]
-fn forward_pipe<R>(mut reader: R, chunks_tx: mpsc::Sender<Vec<u8>>)
+fn forward_pipe<R>(mut reader: R, chunks_tx: mpsc::SyncSender<Vec<u8>>)
 where
     R: Read + Send + 'static,
 {
@@ -471,7 +597,10 @@ fn interactive_shell() -> CommandBuilder {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        io::Cursor,
+        time::{Duration, Instant},
+    };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -479,8 +608,10 @@ mod tests {
 
     #[test]
     fn interactive_terminal_keeps_context_and_utf8_bytes() {
-        let (outbound, mut inbound) = tokio_mpsc::unbounded_channel();
-        let mut manager = TerminalManager::new(outbound, ActivityTracker::default());
+        let (outbound, mut control_events, _failed) = AgentEventSender::channel(32);
+        let (stream_outbound, mut inbound, _stream_failed) = AgentEventSender::channel(32);
+        let mut manager =
+            TerminalManager::new(outbound, stream_outbound, ActivityTracker::default());
         let session_id = "terminal-test".to_string();
         manager.open(session_id.clone(), 80, 24);
 
@@ -500,10 +631,10 @@ mod tests {
                 }
                 Ok(AgentInbound::TerminalClosed { .. }) => break,
                 Ok(_) => {}
-                Err(tokio_mpsc::error::TryRecvError::Empty) => {
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                     thread::sleep(Duration::from_millis(20));
                 }
-                Err(tokio_mpsc::error::TryRecvError::Disconnected) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
 
@@ -515,11 +646,12 @@ mod tests {
             output.contains("/"),
             "shell context did not change: {output}"
         );
+        assert!(control_events.try_recv().is_err());
     }
 
     #[test]
     fn pipe_reader_preserves_all_merged_output_across_small_reads() {
-        let (chunks, received) = mpsc::channel();
+        let (chunks, received) = mpsc::sync_channel(TERMINAL_PIPE_QUEUE_CAPACITY);
         chunks.send(b"stdout-".to_vec()).unwrap();
         chunks.send(Vec::new()).unwrap();
         chunks.send(b"stderr".to_vec()).unwrap();
@@ -541,5 +673,133 @@ mod tests {
         }
 
         assert_eq!(output, b"stdout-stderr");
+    }
+
+    #[test]
+    fn terminal_output_waits_for_queue_capacity_without_disconnect() {
+        let payload = vec![b'x'; 32 * 1024];
+        let (outbound, mut inbound, failed) = AgentEventSender::channel(1);
+        let worker = thread::spawn(move || {
+            forward_terminal_output(
+                &mut Cursor::new(payload),
+                "backpressure".to_string(),
+                outbound,
+            );
+        });
+        thread::sleep(Duration::from_millis(20));
+
+        assert!(!*failed.borrow());
+        let first = inbound.blocking_recv().expect("first terminal output");
+        let second = inbound.blocking_recv().expect("second terminal output");
+        worker.join().unwrap();
+        assert!(!*failed.borrow());
+        assert!(matches!(first, AgentInbound::TerminalOutput { .. }));
+        assert!(matches!(second, AgentInbound::TerminalOutput { .. }));
+    }
+
+    #[test]
+    fn blocked_terminal_input_does_not_prevent_session_shutdown() {
+        let activity = ActivityTracker::default();
+        let (outbound, _control_events, _failed) = AgentEventSender::channel(128);
+        let (stream_outbound, mut inbound, _stream_failed) = AgentEventSender::channel(128);
+        let mut manager = TerminalManager::new(outbound, stream_outbound, activity.clone());
+        let session_id = "blocked-input".to_string();
+        manager.open(session_id.clone(), 80, 24);
+
+        let opened_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match inbound.try_recv() {
+                Ok(AgentInbound::TerminalOpened { .. }) => break,
+                Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    if Instant::now() < opened_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                event => panic!("terminal did not open: {event:?}"),
+            }
+        }
+
+        manager.input(&session_id, &STANDARD.encode(b"sleep 60\n"));
+        thread::sleep(Duration::from_millis(100));
+        let input = STANDARD.encode(vec![b'x'; 32 * 1024]);
+        for _ in 0..64 {
+            manager.input(&session_id, &input);
+        }
+        manager.close_all();
+
+        let close_deadline = Instant::now() + Duration::from_secs(5);
+        let mut closed = false;
+        while Instant::now() < close_deadline {
+            match inbound.try_recv() {
+                Ok(AgentInbound::TerminalClosed { .. }) => {
+                    closed = true;
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        assert!(closed, "blocked terminal session did not close");
+        let activity_deadline = Instant::now() + Duration::from_secs(1);
+        while activity.active_count() != 0 && Instant::now() < activity_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(activity.active_count(), 0);
+    }
+
+    #[test]
+    fn terminal_manager_rejects_sessions_above_the_limit() {
+        let (outbound, mut inbound, _failed) = AgentEventSender::channel(32);
+        let mut manager =
+            TerminalManager::new(outbound.clone(), outbound, ActivityTracker::default());
+        let mut slots = Vec::new();
+
+        for _ in 0..MAX_TERMINAL_SESSIONS {
+            slots.push(
+                manager
+                    .session_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("test should acquire every configured terminal slot"),
+            );
+        }
+
+        manager.open("overflow".to_string(), 80, 24);
+
+        assert!(manager.sessions.is_empty());
+        assert!(matches!(
+            inbound.try_recv(),
+            Ok(AgentInbound::TerminalClosed {
+                session_id,
+                exit_code: None,
+                reason: Some(reason),
+            }) if session_id == "overflow" && reason.contains("上限")
+        ));
+        drop(slots);
+    }
+
+    #[test]
+    fn terminal_manager_closes_a_session_when_its_control_queue_is_full() {
+        let (outbound, mut inbound, _failed) = AgentEventSender::channel(32);
+        let mut manager =
+            TerminalManager::new(outbound.clone(), outbound, ActivityTracker::default());
+        let (control, _receiver) = mpsc::sync_channel(1);
+        control.try_send(TerminalControl::Close).unwrap();
+        manager.sessions.insert("congested".to_string(), control);
+
+        manager.resize("congested", 100, 40);
+
+        assert!(!manager.sessions.contains_key("congested"));
+        assert!(matches!(
+            inbound.try_recv(),
+            Ok(AgentInbound::TerminalClosed {
+                session_id,
+                exit_code: None,
+                reason: Some(reason),
+            }) if session_id == "congested" && reason.contains("拥塞")
+        ));
     }
 }

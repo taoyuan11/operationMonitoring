@@ -27,6 +27,7 @@ use crate::{
 };
 
 pub const SESSION_COOKIE: &str = "om_session";
+pub const SECURE_SESSION_COOKIE: &str = "__Secure-om_session";
 pub const SESSION_MAX_AGE: i64 = 7 * 24 * 3600;
 pub const ENROLLMENT_MAX_AGE: i64 = 10 * 60;
 const SESSION_REVALIDATE_INTERVAL: Duration = Duration::from_secs(15);
@@ -410,16 +411,63 @@ async fn admin_session_is_valid(state: &AppState, guard: &AdminSessionGuard) -> 
 }
 
 pub fn session_token(headers: &HeaderMap) -> Option<String> {
-    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookie.split(';').find_map(|part| {
-        let (name, value) = part.trim().split_once('=')?;
-        (name == SESSION_COOKIE).then(|| value.to_string())
-    })
+    session_tokens(headers).into_iter().next()
+}
+
+pub fn session_tokens(headers: &HeaderMap) -> Vec<String> {
+    let mut tokens = Vec::with_capacity(2);
+    let Some(cookie) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return tokens;
+    };
+    let mut secure_token = None;
+    let mut http_token = None;
+    for part in cookie.split(';') {
+        let Some((name, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        if name == SECURE_SESSION_COOKIE && !value.is_empty() {
+            secure_token = Some(value.to_string());
+        }
+        if name == SESSION_COOKIE && !value.is_empty() {
+            http_token = Some(value.to_string());
+        }
+    }
+    if let Some(token) = secure_token {
+        tokens.push(token);
+    }
+    if let Some(token) = http_token {
+        if !tokens.iter().any(|known| known == &token) {
+            tokens.push(token);
+        }
+    }
+    tokens
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_session_cookie_takes_precedence_over_http_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "om_session=http-token; __Secure-om_session=https-token"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(session_token(&headers).as_deref(), Some("https-token"));
+        assert_eq!(
+            session_tokens(&headers),
+            ["https-token".to_string(), "http-token".to_string()]
+        );
+
+        headers.insert(header::COOKIE, "om_session=http-token".parse().unwrap());
+        assert_eq!(session_token(&headers).as_deref(), Some("http-token"));
+    }
 
     #[test]
     fn revoking_a_session_notifies_existing_guards() {

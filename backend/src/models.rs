@@ -525,6 +525,7 @@ pub enum DockerResponse {
 #[derive(Serialize, FromRow)]
 pub struct InstanceRecord {
     pub id: String,
+    #[serde(skip)]
     pub secret: String,
     pub name: String,
     pub region: String,
@@ -817,6 +818,12 @@ pub struct AgentUpdateOffer {
     pub size_bytes: i64,
     pub package_type: String,
     pub native_arch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     #[serde(default)]
     pub retry_count: i64,
 }
@@ -1047,6 +1054,12 @@ pub enum AgentOutbound {
         size_bytes: i64,
         package_type: String,
         native_arch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_os: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature_key_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
         #[serde(default)]
         retry_count: i64,
     },

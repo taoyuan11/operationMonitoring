@@ -15,12 +15,14 @@ use uuid::Uuid;
 
 use crate::{
     auth::{
-        AdminPrincipal, ENROLLMENT_MAX_AGE, SESSION_COOKIE, SESSION_MAX_AGE, generate_totp_secret,
-        insert_session, otpauth_uri, require_admin, revoke_device_sessions, revoke_session,
-        revoke_user_sessions, session_token, validate_username, verify_totp_counter,
+        AdminPrincipal, ENROLLMENT_MAX_AGE, SECURE_SESSION_COOKIE, SESSION_COOKIE, SESSION_MAX_AGE,
+        generate_totp_secret, insert_session, otpauth_uri, require_admin, revoke_device_sessions,
+        revoke_session, revoke_user_sessions, session_tokens, validate_username,
+        verify_totp_counter,
     },
     db::write_action_log,
     error::{AppError, AppResult},
+    request_security::request_scheme,
     state::AppState,
     utils::now_ts,
 };
@@ -233,6 +235,7 @@ pub async fn bootstrap_confirm(
     Path(enrollment_id): Path<String>,
     Json(payload): Json<ConfirmEnrollmentRequest>,
 ) -> AppResult<Response> {
+    let secure_cookie = request_scheme(&state, &headers, peer_addr.ip())?.is_secure();
     let attempt_key = bootstrap_attempt_key(&state, &headers, peer_addr.ip(), "confirm");
     ensure_source_attempt_allowed(&state, &attempt_key).await?;
     if auth_initialized(&state.db).await? {
@@ -311,6 +314,7 @@ pub async fn bootstrap_confirm(
         enrollment.username,
         device_id,
         Some(totp_counter),
+        secure_cookie,
     )
     .await
 }
@@ -321,6 +325,7 @@ pub async fn admin_login(
     headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> AppResult<Response> {
+    let secure_cookie = request_scheme(&state, &headers, peer_addr.ip())?.is_secure();
     if !auth_initialized(&state.db).await? {
         return Err(AppError::new(
             StatusCode::CONFLICT,
@@ -368,14 +373,22 @@ pub async fn admin_login(
     clear_source_auth_failures(&state, &source_attempt_key).await;
     clear_account_auth_failures(&state, &account_attempt_key).await;
     write_action_log(&state.db, &user.username, "login", &user.id, "管理员登录").await?;
-    session_response(&state, user.id, user.username, device.id, Some(counter)).await
+    session_response(
+        &state,
+        user.id,
+        user.username,
+        device.id,
+        Some(counter),
+        secure_cookie,
+    )
+    .await
 }
 
 pub async fn admin_logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    if let Some(token) = session_token(&headers) {
+    for token in session_tokens(&headers) {
         revoke_session(&state, &token).await;
     }
     let mut response = Json(MeResponse {
@@ -386,6 +399,12 @@ pub async fn admin_logout(
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_static("om_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_static(
+            "__Secure-om_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure",
+        ),
     );
     Ok(response)
 }
@@ -1038,6 +1057,7 @@ async fn session_response(
     username: String,
     device_id: String,
     login_totp_counter: Option<i64>,
+    secure_cookie: bool,
 ) -> AppResult<Response> {
     let token = Uuid::new_v4().to_string();
     insert_session(
@@ -1057,16 +1077,24 @@ async fn session_response(
         },
     })
     .into_response();
-    let secure = if state.secure_cookies { "; Secure" } else { "" };
-    let cookie = format!(
-        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE}{secure}"
-    );
+    let cookie = session_cookie(&token, secure_cookie);
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie)
             .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "Cookie 生成失败"))?,
     );
     Ok(response)
+}
+
+fn session_cookie(token: &str, secure_cookie: bool) -> String {
+    let (cookie_name, secure) = if secure_cookie {
+        (SECURE_SESSION_COOKIE, "; Secure")
+    } else {
+        (SESSION_COOKIE, "")
+    };
+    format!(
+        "{cookie_name}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE}{secure}"
+    )
 }
 
 fn no_store_json<T: Serialize>(payload: T) -> AppResult<Response> {
@@ -1228,6 +1256,17 @@ mod tests {
     };
 
     #[test]
+    fn session_cookies_use_distinct_names_for_http_and_https() {
+        let http = session_cookie("http-token", false);
+        assert!(http.starts_with("om_session=http-token;"));
+        assert!(!http.contains("; Secure"));
+
+        let https = session_cookie("https-token", true);
+        assert!(https.starts_with("__Secure-om_session=https-token;"));
+        assert!(https.contains("; Secure"));
+    }
+
+    #[test]
     fn login_source_only_trusts_headers_from_configured_proxy_networks() {
         let peer_ip: IpAddr = "127.0.0.1".parse().unwrap();
         let untrusted_peer_ip: IpAddr = "192.0.2.1".parse().unwrap();
@@ -1343,10 +1382,13 @@ mod tests {
                 confirm_reset_admin_auth: None,
                 upload_dir: PathBuf::from("unused-uploads"),
                 update_dir: PathBuf::from("unused-updates"),
+                update_signing_key_file: None,
+                update_signing_key_id: "default".to_string(),
                 agent_package_max_bytes: 1024,
                 file_transfer_max_bytes: 1024,
             },
             AuthCipher::from_key(&[9_u8; 32]).expect("create cipher"),
+            None,
         )
     }
 

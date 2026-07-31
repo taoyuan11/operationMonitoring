@@ -1,6 +1,6 @@
 [package]
 name = "instanceEnd"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2024"
 rust-version = "1.89"
 
@@ -13,6 +13,7 @@ anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 directories = "6.0"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 futures-util = "0.3"
 fs2 = "0.4"
 hostname = "0.4"

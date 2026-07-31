@@ -38,6 +38,8 @@ use crate::{
         DockerNetworkCreateSpec, DockerPortProtocol, DockerRequest, DockerResponse,
         DockerRestartPolicy, DockerStatus, DockerStatusState, DockerVolumeCreateSpec,
     },
+    outbound::AgentEventSender,
+    pty_io::PtyInputWriter,
     time::now_ts,
     update::docker_protected_update_root,
 };
@@ -52,6 +54,9 @@ const MAX_CONTROL_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_ERROR_OUTPUT: usize = 64 * 1024;
 const MAX_ERROR_MESSAGE: usize = 2 * 1024;
 const LOG_CHUNK_SIZE: usize = 16 * 1024;
+const MAX_EXEC_INPUT_BYTES: usize = 64 * 1024;
+const EXEC_CONTROL_QUEUE_CAPACITY: usize = 128;
+const EXEC_WRITE_QUEUE_CAPACITY: usize = 16;
 const MIN_DOCKER_MAJOR: u64 = 20;
 const MIN_DOCKER_MINOR: u64 = 10;
 
@@ -60,8 +65,8 @@ pub fn supported() -> bool {
 }
 
 pub struct DockerManager {
-    outbound: mpsc::UnboundedSender<AgentInbound>,
-    stream_outbound: mpsc::Sender<AgentInbound>,
+    outbound: AgentEventSender,
+    stream_outbound: AgentEventSender,
     activity: ActivityTracker,
     runner: DockerRunner,
     status: Arc<Mutex<Option<DockerStatus>>>,
@@ -77,8 +82,8 @@ pub struct DockerManager {
 impl DockerManager {
     pub fn new(
         config: &AgentConfig,
-        outbound: mpsc::UnboundedSender<AgentInbound>,
-        stream_outbound: mpsc::Sender<AgentInbound>,
+        outbound: AgentEventSender,
+        stream_outbound: AgentEventSender,
         activity: ActivityTracker,
     ) -> Self {
         let stream_slots = Arc::new(Semaphore::new(2));
@@ -301,7 +306,7 @@ impl DockerManager {
             )
             .await;
             let _ = stream_outbound
-                .send(AgentInbound::DockerLogClosed {
+                .send_async(AgentInbound::DockerLogClosed {
                     request_id: task_request_id,
                     error: result.err(),
                 })
@@ -2894,41 +2899,19 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     text
 }
 
-fn send_response(
-    outbound: &mpsc::UnboundedSender<AgentInbound>,
-    request_id: String,
-    response: DockerResponse,
-) {
+fn send_response(outbound: &AgentEventSender, request_id: String, response: DockerResponse) {
     let _ = outbound.send(AgentInbound::DockerResponse {
         request_id,
         response,
     });
 }
 
-fn send_error(
-    outbound: &mpsc::UnboundedSender<AgentInbound>,
-    request_id: String,
-    error: DockerError,
-) {
+fn send_error(outbound: &AgentEventSender, request_id: String, error: DockerError) {
     send_response(outbound, request_id, DockerResponse::Error { error });
 }
 
-fn send_stream_event(outbound: &mpsc::Sender<AgentInbound>, event: AgentInbound) {
-    match outbound.try_send(event) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-        Err(mpsc::error::TrySendError::Full(event)) => {
-            let outbound = outbound.clone();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = outbound.send(event).await;
-                });
-            } else {
-                thread::spawn(move || {
-                    let _ = outbound.blocking_send(event);
-                });
-            }
-        }
-    }
+fn send_stream_event(outbound: &AgentEventSender, event: AgentInbound) {
+    let _ = outbound.send(event);
 }
 
 async fn stream_logs(
@@ -2938,7 +2921,7 @@ async fn stream_logs(
     tail: u32,
     follow: bool,
     since: Option<&str>,
-    outbound: &mpsc::Sender<AgentInbound>,
+    outbound: &AgentEventSender,
 ) -> Result<(), DockerError> {
     let stream = stream_logs_inner(runner, request_id, container, tail, follow, since, outbound);
     if follow {
@@ -2963,7 +2946,7 @@ async fn stream_logs_inner(
     tail: u32,
     follow: bool,
     since: Option<&str>,
-    outbound: &mpsc::Sender<AgentInbound>,
+    outbound: &AgentEventSender,
 ) -> Result<(), DockerError> {
     let args = docker_log_args(container, tail, follow, since);
 
@@ -3008,7 +2991,7 @@ async fn stream_logs_inner(
         }
         let data = String::from_utf8_lossy(&chunk.data).into_owned();
         outbound
-            .send(AgentInbound::DockerLogChunk {
+            .send_async(AgentInbound::DockerLogChunk {
                 request_id: request_id.to_string(),
                 sequence,
                 data,
@@ -3209,13 +3192,13 @@ impl PtyChildGuard {
         }
     }
 
-    fn close_interactive_shell(&mut self, writer: &mut dyn Write) -> Option<i64> {
+    fn close_interactive_shell(&mut self, writer: &PtyInputWriter) -> Option<i64> {
         if self.reaped {
             return None;
         }
-        let _ = writer
-            .write_all(b"\x03exit 0\r")
-            .and_then(|_| writer.flush());
+        if writer.try_write(b"\x03exit 0\r".to_vec()).is_err() {
+            return self.terminate();
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
             match self.try_wait_code() {
@@ -3238,13 +3221,13 @@ impl Drop for PtyChildGuard {
 }
 
 struct ActiveDockerExec {
-    control: std_mpsc::Sender<DockerExecControl>,
+    control: std_mpsc::SyncSender<DockerExecControl>,
     active: Arc<AtomicBool>,
 }
 
 struct DockerExecManager {
     binary: OsString,
-    stream_outbound: mpsc::Sender<AgentInbound>,
+    stream_outbound: AgentEventSender,
     activity: ActivityTracker,
     stream_slots: Arc<Semaphore>,
     sessions: HashMap<String, ActiveDockerExec>,
@@ -3253,7 +3236,7 @@ struct DockerExecManager {
 impl DockerExecManager {
     fn new(
         binary: OsString,
-        stream_outbound: mpsc::Sender<AgentInbound>,
+        stream_outbound: AgentEventSender,
         activity: ActivityTracker,
         stream_slots: Arc<Semaphore>,
     ) -> Self {
@@ -3291,7 +3274,7 @@ impl DockerExecManager {
             );
             return;
         };
-        let (control, controls) = std_mpsc::channel();
+        let (control, controls) = std_mpsc::sync_channel(EXEC_CONTROL_QUEUE_CAPACITY);
         let active = Arc::new(AtomicBool::new(true));
         self.sessions.insert(
             session_id.clone(),
@@ -3333,42 +3316,55 @@ impl DockerExecManager {
     }
 
     fn input(&mut self, session_id: &str, encoded_data: &str) {
+        if encoded_data.len() > MAX_EXEC_INPUT_BYTES {
+            self.fail_session(session_id, "Docker terminal input exceeded the size limit");
+            return;
+        }
         let decoded = STANDARD.decode(encoded_data);
         match (self.sessions.get(session_id), decoded) {
             (Some(session), Ok(data)) => {
-                let _ = session.control.send(DockerExecControl::Input(data));
+                if session
+                    .control
+                    .try_send(DockerExecControl::Input(data))
+                    .is_err()
+                {
+                    self.fail_session(session_id, "Docker terminal input queue overflowed");
+                }
             }
             (Some(_), Err(error)) => {
-                if let Some(session) = self.sessions.remove(session_id) {
-                    let _ = session
-                        .control
-                        .send(DockerExecControl::CloseWithReason(format!(
-                            "Invalid Docker terminal input encoding: {error}"
-                        )));
-                }
+                self.fail_session(
+                    session_id,
+                    &format!("Invalid Docker terminal input encoding: {error}"),
+                );
             }
             (None, _) => {}
         }
     }
 
-    fn resize(&self, session_id: &str, cols: u16, rows: u16) {
+    fn resize(&mut self, session_id: &str, cols: u16, rows: u16) {
         if let Some(session) = self.sessions.get(session_id) {
-            let _ = session.control.send(DockerExecControl::Resize {
-                cols: cols.clamp(2, 500),
-                rows: rows.clamp(1, 300),
-            });
+            if session
+                .control
+                .try_send(DockerExecControl::Resize {
+                    cols: cols.clamp(2, 500),
+                    rows: rows.clamp(1, 300),
+                })
+                .is_err()
+            {
+                self.fail_session(session_id, "Docker terminal control queue overflowed");
+            }
         }
     }
 
     fn close(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
-            let _ = session.control.send(DockerExecControl::Close);
+            let _ = session.control.try_send(DockerExecControl::Close);
         }
     }
 
     fn close_all(&mut self) {
         for (_, session) in self.sessions.drain() {
-            let _ = session.control.send(DockerExecControl::Close);
+            let _ = session.control.try_send(DockerExecControl::Close);
         }
     }
 
@@ -3376,8 +3372,18 @@ impl DockerExecManager {
         for (_, session) in self.sessions.drain() {
             let _ = session
                 .control
-                .send(DockerExecControl::CloseWithReason(reason.to_string()));
+                .try_send(DockerExecControl::CloseWithReason(reason.to_string()));
         }
+    }
+
+    fn fail_session(&mut self, session_id: &str, reason: &str) {
+        let Some(session) = self.sessions.remove(session_id) else {
+            return;
+        };
+        let _ = session
+            .control
+            .try_send(DockerExecControl::CloseWithReason(reason.to_string()));
+        self.closed(session_id.to_string(), None, Some(reason.to_string()));
     }
 
     fn prune(&mut self) {
@@ -3415,7 +3421,7 @@ fn run_docker_exec(
     cols: u16,
     rows: u16,
     controls: std_mpsc::Receiver<DockerExecControl>,
-    stream_outbound: &mpsc::Sender<AgentInbound>,
+    stream_outbound: &AgentEventSender,
 ) -> anyhow::Result<(Option<i64>, Option<String>)> {
     let pair = native_pty_system().openpty(PtySize {
         rows,
@@ -3433,7 +3439,11 @@ fn run_docker_exec(
     let mut child = PtyChildGuard::new(child);
     drop(slave);
     let mut reader = master.try_clone_reader()?;
-    let mut writer = master.take_writer()?;
+    let input_writer = PtyInputWriter::spawn(
+        master.take_writer()?,
+        EXEC_WRITE_QUEUE_CAPACITY,
+        "om-docker-exec-input",
+    )?;
 
     stream_outbound.blocking_send(AgentInbound::DockerExecOpened {
         session_id: session_id.to_string(),
@@ -3463,12 +3473,18 @@ fn run_docker_exec(
     });
 
     let outcome = loop {
+        if let Some(error) = input_writer.take_failure() {
+            break (
+                child.terminate(),
+                Some(format!("Failed to write terminal: {error}")),
+            );
+        }
         match controls.recv_timeout(Duration::from_millis(100)) {
             Ok(DockerExecControl::Input(data)) => {
-                if let Err(error) = writer.write_all(&data).and_then(|_| writer.flush()) {
+                if let Err(error) = input_writer.try_write(data) {
                     break (
                         child.terminate(),
-                        Some(format!("Failed to write terminal: {error}")),
+                        Some(format!("Failed to queue terminal input: {error}")),
                     );
                 }
             }
@@ -3486,10 +3502,10 @@ fn run_docker_exec(
                 }
             }
             Ok(DockerExecControl::Close) => {
-                break (child.close_interactive_shell(&mut writer), None);
+                break (child.close_interactive_shell(&input_writer), None);
             }
             Ok(DockerExecControl::CloseWithReason(reason)) => {
-                break (child.close_interactive_shell(&mut writer), Some(reason));
+                break (child.close_interactive_shell(&input_writer), Some(reason));
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => match child.try_wait_code() {
                 Ok(Some(exit_code)) => break (Some(exit_code), None),
@@ -3503,15 +3519,15 @@ fn run_docker_exec(
             },
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 break (
-                    child.close_interactive_shell(&mut writer),
+                    child.close_interactive_shell(&input_writer),
                     Some("Docker terminal control channel closed".to_string()),
                 );
             }
         }
     };
-    drop(writer);
+    drop(input_writer);
     drop(master);
-    let _ = reader_task.join();
+    drop(reader_task);
     Ok(outcome)
 }
 
@@ -4071,7 +4087,7 @@ esac
 
         let activity = ActivityTracker::default();
         activity.start_draining();
-        let (stream_outbound, mut inbound) = mpsc::channel(1);
+        let (stream_outbound, mut inbound, _failed) = AgentEventSender::channel(1);
         let mut exec = DockerExecManager::new(
             "docker".into(),
             stream_outbound,
@@ -4089,6 +4105,39 @@ esac
             inbound.try_recv().unwrap(),
             AgentInbound::DockerExecClosed { reason: Some(reason), .. }
                 if reason.contains("update")
+        ));
+    }
+
+    #[test]
+    fn docker_exec_closes_a_session_when_its_control_queue_is_full() {
+        let activity = ActivityTracker::default();
+        let (stream_outbound, mut inbound, _failed) = AgentEventSender::channel(4);
+        let mut exec = DockerExecManager::new(
+            "docker".into(),
+            stream_outbound,
+            activity,
+            Arc::new(Semaphore::new(2)),
+        );
+        let (control, _controls) = std_mpsc::sync_channel(1);
+        control.try_send(DockerExecControl::Close).unwrap();
+        exec.sessions.insert(
+            "congested".to_string(),
+            ActiveDockerExec {
+                control,
+                active: Arc::new(AtomicBool::new(true)),
+            },
+        );
+
+        exec.resize("congested", 100, 40);
+
+        assert!(!exec.sessions.contains_key("congested"));
+        assert!(matches!(
+            inbound.try_recv(),
+            Ok(AgentInbound::DockerExecClosed {
+                session_id,
+                exit_code: None,
+                reason: Some(reason),
+            }) if session_id == "congested" && reason.contains("overflowed")
         ));
     }
 
@@ -4115,9 +4164,9 @@ esac
         assert_eq!(format_published_host_ip("::1"), "[::1]");
     }
 
-    #[tokio::test]
-    async fn stream_close_is_queued_after_buffered_data() {
-        let (outbound, mut inbound) = mpsc::channel(1);
+    #[test]
+    fn stream_close_is_queued_after_buffered_data() {
+        let (outbound, mut inbound, failed) = AgentEventSender::channel(2);
         outbound
             .send(AgentInbound::DockerLogChunk {
                 request_id: "logs-1".to_string(),
@@ -4125,7 +4174,6 @@ esac
                 data: "first\n".to_string(),
                 cursor: None,
             })
-            .await
             .unwrap();
         send_stream_event(
             &outbound,
@@ -4136,14 +4184,44 @@ esac
         );
 
         assert!(matches!(
-            inbound.recv().await,
-            Some(AgentInbound::DockerLogChunk { .. })
+            inbound.try_recv(),
+            Ok(AgentInbound::DockerLogChunk { .. })
         ));
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), inbound.recv())
-                .await
-                .unwrap(),
-            Some(AgentInbound::DockerLogClosed { .. })
+            inbound.try_recv(),
+            Ok(AgentInbound::DockerLogClosed { .. })
+        ));
+        assert!(!*failed.borrow());
+    }
+
+    #[test]
+    fn full_stream_queue_requests_reconnect_without_a_waiting_sender() {
+        let (outbound, mut inbound, failed) = AgentEventSender::channel(1);
+        outbound
+            .send(AgentInbound::DockerLogChunk {
+                request_id: "logs-1".to_string(),
+                sequence: 0,
+                data: "first\n".to_string(),
+                cursor: None,
+            })
+            .unwrap();
+
+        send_stream_event(
+            &outbound,
+            AgentInbound::DockerLogClosed {
+                request_id: "logs-1".to_string(),
+                error: None,
+            },
+        );
+
+        assert!(*failed.borrow());
+        assert!(matches!(
+            inbound.try_recv(),
+            Ok(AgentInbound::DockerLogChunk { .. })
+        ));
+        assert!(matches!(
+            inbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
         ));
     }
 
@@ -4302,8 +4380,8 @@ esac
     #[tokio::test]
     async fn update_draining_aborts_long_running_docker_logs() {
         let activity = ActivityTracker::default();
-        let (outbound, _responses) = mpsc::unbounded_channel();
-        let (stream_outbound, mut streams) = mpsc::channel(4);
+        let (outbound, _responses, _failed) = AgentEventSender::channel(32);
+        let (stream_outbound, mut streams, _stream_failed) = AgentEventSender::channel(4);
         let mut manager =
             DockerManager::new(&test_config(), outbound, stream_outbound, activity.clone());
         let guard = activity.try_enter().unwrap();
@@ -4340,7 +4418,7 @@ esac
         let directory = TestDirectory::new();
         let binary = directory.fake_docker("exec /bin/sh");
         let activity = ActivityTracker::default();
-        let (stream_outbound, mut streams) = mpsc::channel(8);
+        let (stream_outbound, mut streams, _stream_failed) = AgentEventSender::channel(8);
         let mut exec = DockerExecManager::new(
             binary.into_os_string(),
             stream_outbound,
@@ -4380,6 +4458,58 @@ esac
             if activity.active_count() == 0 {
                 break;
             }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(activity.active_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_docker_exec_input_does_not_prevent_session_shutdown() {
+        let directory = TestDirectory::new();
+        let binary = directory.fake_docker("sleep 60");
+        let activity = ActivityTracker::default();
+        let (stream_outbound, mut streams, _stream_failed) = AgentEventSender::channel(128);
+        let mut exec = DockerExecManager::new(
+            binary.into_os_string(),
+            stream_outbound,
+            activity.clone(),
+            Arc::new(Semaphore::new(2)),
+        );
+
+        exec.open(
+            "exec-blocked".to_string(),
+            "web".to_string(),
+            "/bin/sh".to_string(),
+            80,
+            24,
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), streams.recv())
+                .await
+                .unwrap(),
+            Some(AgentInbound::DockerExecOpened { .. })
+        ));
+
+        let input = STANDARD.encode(vec![b'x'; 32 * 1024]);
+        for _ in 0..64 {
+            exec.input("exec-blocked", &input);
+        }
+        exec.close_all();
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    streams.recv().await,
+                    Some(AgentInbound::DockerExecClosed { .. })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "blocked Docker exec session did not close");
+        let activity_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while activity.active_count() != 0 && tokio::time::Instant::now() < activity_deadline {
             tokio::task::yield_now().await;
         }
         assert_eq!(activity.active_count(), 0);

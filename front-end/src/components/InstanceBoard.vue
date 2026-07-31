@@ -114,7 +114,7 @@ function resetFilters() {
 }
 
 function openInstance(instance: Instance) {
-  if (props.isAdmin) emit('open', instance)
+  emit('open', instance)
 }
 </script>
 
@@ -252,10 +252,10 @@ function openInstance(instance: Instance) {
       <article
         v-for="instance in filteredInstances"
         :key="instance.id"
-        :class="['instance-card', { offline: !instance.online, clickable: isAdmin }]"
-        :role="isAdmin ? 'button' : undefined"
-        :tabindex="isAdmin ? 0 : undefined"
-        :aria-label="isAdmin ? `打开节点 ${instanceName(instance)} 的详情与操作面板` : undefined"
+        :class="['instance-card', { offline: !instance.online, clickable: true }]"
+        role="button"
+        tabindex="0"
+        :aria-label="`查看节点 ${instanceName(instance)} 的详情`"
         @click="openInstance(instance)"
         @keydown.enter="openInstance(instance)"
         @keydown.space.prevent="openInstance(instance)"

@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "instanceEnd"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "base64",
@@ -725,6 +725,7 @@ dependencies = [
  "hostname",
  "image",
  "libc",
+ "network-interface",
  "portable-pty",
  "reqwest",
  "semver",
@@ -842,6 +843,18 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "network-interface"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ddcb8865ad3d9950f22f42ffa0ef0aecbfbf191867b3122413602b0a360b2a6"
+dependencies = [
+ "cc",
+ "libc",
+ "thiserror 2.0.18",
+ "winapi",
 ]
 
 [[package]]

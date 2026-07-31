@@ -21,7 +21,6 @@ const props = withDefaults(defineProps<{
   points: MetricChartPoint[]
   from: number
   to: number
-  bucketSeconds: number
   color: string
   loading: boolean
   valueType?: ValueType
@@ -67,22 +66,12 @@ const coordinates = computed<ChartCoordinate[]>(() => {
 })
 
 const linePaths = computed(() => {
-  const paths: string[] = []
-  let current = ''
-  let previous: ChartCoordinate | null = null
-  const gapLimit = Math.max(props.bucketSeconds * 2.5, 60)
-
-  for (const point of coordinates.value) {
-    if (!previous || point.ts - previous.ts > gapLimit) {
-      if (current) paths.push(current)
-      current = `M ${point.x.toFixed(2)} ${point.y.toFixed(2)}`
-    } else {
-      current += ` L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`
-    }
-    previous = point
-  }
-  if (current) paths.push(current)
-  return paths
+  if (!coordinates.value.length) return []
+  return [coordinates.value
+    .map((point, index) =>
+      `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`,
+    )
+    .join(' ')]
 })
 
 const activePoint = computed(() => {

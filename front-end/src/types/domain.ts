@@ -39,6 +39,82 @@ export type Instance = {
   metrics: Metric | null
 }
 
+export type PublicDeviceGpuInfo = {
+  name: string
+  memory_total: number | null
+}
+
+export type PublicDeviceProfile = {
+  schema_version: number
+  collected_at: number
+  os_name: string
+  os_version: string
+  architecture: string
+  cpu_model: string
+  physical_cores: number | null
+  logical_cores: number
+  memory_total: number
+  storage_total: number
+  gpus: PublicDeviceGpuInfo[]
+}
+
+export type PublicDeviceProfileResponse = {
+  profile: PublicDeviceProfile | null
+  updated_at: number | null
+}
+
+export type DeviceSystemInfo = {
+  os_name: string
+  os_version: string
+  kernel_version: string
+  architecture: string
+}
+
+export type DeviceCpuInfo = {
+  model: string
+  vendor: string
+  physical_cores: number | null
+  logical_cores: number
+  frequency_mhz: number | null
+}
+
+export type DeviceGpuInfo = PublicDeviceGpuInfo & {
+  vendor: string
+}
+
+export type DeviceDiskInfo = {
+  name: string
+  mount_point: string
+  file_system: string
+  kind: string
+  total_bytes: number
+}
+
+export type DeviceNetworkInterface = {
+  name: string
+  mac_address: string | null
+  ipv4: string[]
+  ipv6: string[]
+}
+
+export type DeviceProfile = {
+  schema_version: number
+  collected_at: number
+  system: DeviceSystemInfo
+  cpu: DeviceCpuInfo
+  memory_total: number
+  storage_total: number
+  gpus: DeviceGpuInfo[]
+  disks: DeviceDiskInfo[]
+  network_interfaces: DeviceNetworkInterface[]
+}
+
+export type AdminDeviceProfileResponse = {
+  profile: DeviceProfile | null
+  observed_ip: string | null
+  updated_at: number | null
+}
+
 export type PendingInstance = {
   id: string
   hostname: string

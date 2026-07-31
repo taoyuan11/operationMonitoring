@@ -390,7 +390,17 @@ async fn docker_status_response(
     .bind(instance_id)
     .fetch_optional(&state.db)
     .await?;
-    Ok(offline_docker_status_response(row.as_ref()))
+    let protocol_supported: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM instance_agent_metadata WHERE instance_id = $1 AND POSITION(',' || $2::TEXT || ',' IN ',' || capabilities || ',') > 0)",
+    )
+    .bind(instance_id)
+    .bind(CAPABILITY)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(offline_docker_status_response(
+        row.as_ref(),
+        protocol_supported,
+    ))
 }
 
 fn online_docker_status_response(
@@ -420,7 +430,10 @@ fn online_docker_status_response(
     }
 }
 
-fn offline_docker_status_response(row: Option<&DockerStatusRow>) -> DockerStatusResponse {
+fn offline_docker_status_response(
+    row: Option<&DockerStatusRow>,
+    protocol_supported: bool,
+) -> DockerStatusResponse {
     let status = row
         .map(|row| row.status.clone())
         .unwrap_or_else(|| "unknown".to_string());
@@ -428,7 +441,7 @@ fn offline_docker_status_response(row: Option<&DockerStatusRow>) -> DockerStatus
 
     DockerStatusResponse {
         status,
-        protocol_supported: false,
+        protocol_supported,
         installed,
         manageable: false,
         online: false,
@@ -3946,7 +3959,7 @@ mod tests {
             diagnostic: "daemon is unavailable".to_string(),
             checked_at: 456,
         };
-        let status = offline_docker_status_response(Some(&row));
+        let status = offline_docker_status_response(Some(&row), false);
         assert_eq!(status.status, "daemon_unreachable");
         assert!(status.installed);
         assert!(!status.online);
@@ -3958,7 +3971,7 @@ mod tests {
 
     #[test]
     fn cleared_docker_status_stays_unknown_after_disconnect() {
-        let status = offline_docker_status_response(None);
+        let status = offline_docker_status_response(None, false);
         assert_eq!(status.status, "unknown");
         assert!(!status.online);
         assert!(!status.protocol_supported);

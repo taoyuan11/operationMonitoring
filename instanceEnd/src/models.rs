@@ -27,6 +27,62 @@ pub struct AgentRegisterRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_arch: Option<String>,
     pub update_privileged: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_profile: Option<DeviceProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceProfile {
+    pub schema_version: u32,
+    pub collected_at: i64,
+    pub system: DeviceSystemInfo,
+    pub cpu: DeviceCpuInfo,
+    pub memory_total: i64,
+    pub storage_total: i64,
+    pub gpus: Vec<DeviceGpuInfo>,
+    pub disks: Vec<DeviceDiskInfo>,
+    pub network_interfaces: Vec<DeviceNetworkInterface>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceSystemInfo {
+    pub os_name: String,
+    pub os_version: String,
+    pub kernel_version: String,
+    pub architecture: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceCpuInfo {
+    pub model: String,
+    pub vendor: String,
+    pub physical_cores: Option<u32>,
+    pub logical_cores: u32,
+    pub frequency_mhz: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceGpuInfo {
+    pub name: String,
+    pub vendor: String,
+    pub memory_total: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceDiskInfo {
+    pub name: String,
+    pub mount_point: String,
+    pub file_system: String,
+    pub kind: String,
+    pub total_bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceNetworkInterface {
+    pub name: String,
+    pub mac_address: Option<String>,
+    pub ipv4: Vec<String>,
+    pub ipv6: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -736,6 +792,54 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn registration_device_profile_is_optional_and_versioned() {
+        let mut request = AgentRegisterRequest {
+            instance_id: "instance-1".to_string(),
+            secret: "secret-1".to_string(),
+            previous_secret: None,
+            hostname: "host-1".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            agent_version: "0.1.21".to_string(),
+            package_type: Some("standalone".to_string()),
+            native_arch: Some("x86_64".to_string()),
+            update_privileged: Some(true),
+            device_profile: None,
+        };
+        let legacy_shape = serde_json::to_value(&request).unwrap();
+        assert!(legacy_shape.get("device_profile").is_none());
+
+        request.device_profile = Some(DeviceProfile {
+            schema_version: 1,
+            collected_at: 100,
+            system: DeviceSystemInfo {
+                os_name: "Linux".to_string(),
+                os_version: "6.8".to_string(),
+                kernel_version: "6.8.0".to_string(),
+                architecture: "x86_64".to_string(),
+            },
+            cpu: DeviceCpuInfo {
+                model: "Example CPU".to_string(),
+                vendor: "Example".to_string(),
+                physical_cores: Some(4),
+                logical_cores: 8,
+                frequency_mhz: Some(3_200),
+            },
+            memory_total: 1024,
+            storage_total: 2048,
+            gpus: Vec::new(),
+            disks: Vec::new(),
+            network_interfaces: Vec::new(),
+        });
+        let current_shape = serde_json::to_value(&request).unwrap();
+        assert_eq!(current_shape["device_profile"]["schema_version"], 1);
+        assert_eq!(
+            current_shape["device_profile"]["cpu"]["model"],
+            "Example CPU"
+        );
+    }
 
     #[test]
     fn update_offer_matches_the_backend_websocket_shape() {

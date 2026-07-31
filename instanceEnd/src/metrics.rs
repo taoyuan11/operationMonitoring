@@ -180,6 +180,11 @@ fn aggregate_disk_metrics(disks: &[DiskSample]) -> (i64, i64) {
     aggregate_standard_disk_metrics(disks, cfg!(target_os = "macos"))
 }
 
+pub(crate) fn aggregate_disk_total(disks: &Disks) -> i64 {
+    let samples = disks.iter().map(disk_sample).collect::<Vec<_>>();
+    aggregate_disk_metrics(&samples).1
+}
+
 #[cfg(any(not(target_os = "linux"), test))]
 fn aggregate_standard_disk_metrics(
     disks: &[DiskSample],

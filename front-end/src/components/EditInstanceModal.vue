@@ -142,7 +142,7 @@ function submit() {
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="$emit('close')" @keydown.esc="$emit('close')">
+  <div class="modal-backdrop">
     <form class="modal" role="dialog" aria-modal="true" aria-labelledby="edit-instance-title" @submit.prevent="submit">
       <header class="modal-header">
         <div class="modal-title"><span><Pencil :size="18" /></span><div><h2 id="edit-instance-title">编辑节点</h2><p>更新公开显示的节点信息</p></div></div>

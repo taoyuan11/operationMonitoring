@@ -171,7 +171,6 @@ function requestRunCommand(instance: Instance, command: CommandRecord) {
 }
 
 function openInstance(instance: Instance) {
-  if (!consoleState.isAdmin.value) return
   selectedInstanceId.value = instance.id
 }
 
@@ -405,8 +404,9 @@ function confirmAction() {
 
     <Transition name="modal" appear>
       <InstanceDetailModal
-        v-if="selectedInstance && consoleState.isAdmin.value"
+        v-if="selectedInstance"
         :instance="selectedInstance"
+        :is-admin="consoleState.isAdmin.value"
         :commands="consoleState.commands.value"
         :loading="consoleState.loading.value"
         @close="selectedInstanceId = ''"

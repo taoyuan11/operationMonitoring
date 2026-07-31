@@ -17,17 +17,19 @@ use crate::{
     admin_auth::resolved_client_ip,
     auth::require_admin,
     db::{
-        approve_pending_instance, get_instance, get_instance_optional, instance_summary,
-        latest_metric, latest_metrics, normalize_metric_timestamp, register_or_touch_pending,
-        retention_days, setting_value, write_action_log,
+        approve_pending_instance, get_instance, get_instance_optional, instance_agent_metadata,
+        instance_capabilities, instance_summary, latest_metric, latest_metrics,
+        normalize_metric_timestamp, register_or_touch_pending, retention_days, setting_value,
+        upsert_agent_capabilities, upsert_agent_device_profile, write_action_log,
     },
     error::{AppError, AppResult},
     jobs::{create_command_job, dispatch_command},
     models::{
-        ActionLogRecord, AgentRegisterRequest, AgentRegisterResponse, AgentReportRequest,
-        AgentWsQuery, AppearanceResponse, AppearanceSettingsRequest, CommandJobRecord,
-        CommandRecord, CreateCommandRequest, HealthResponse, InstanceRecord, InstanceSummary,
-        ListQuery, MetricRecord, MetricsQuery, PendingInstance, SettingsRequest, SettingsResponse,
+        ActionLogRecord, AdminDeviceProfileResponse, AgentRegisterRequest, AgentRegisterResponse,
+        AgentReportRequest, AgentWsQuery, AppearanceResponse, AppearanceSettingsRequest,
+        CommandJobRecord, CommandRecord, CreateCommandRequest, DeviceProfile, HealthResponse,
+        InstanceRecord, InstanceSummary, ListQuery, MetricRecord, MetricsQuery, PendingInstance,
+        PublicDeviceProfile, PublicDeviceProfileResponse, SettingsRequest, SettingsResponse,
         ThemeMode, UpdateInstanceRequest,
     },
     remote_desktop::ensure_same_origin,
@@ -91,6 +93,7 @@ pub async fn public_instances(
         .map(|record| record.id.clone())
         .collect::<Vec<_>>();
     let mut metrics_by_instance = latest_metrics(&state.db, &instance_ids).await?;
+    let mut persisted_capabilities = instance_capabilities(&state.db, &instance_ids).await?;
 
     let connected = state
         .agents
@@ -100,20 +103,24 @@ pub async fn public_instances(
         .map(|(id, handle)| (id.clone(), handle.capabilities.clone()))
         .collect::<std::collections::HashMap<_, _>>();
     let mut summaries = Vec::with_capacity(records.len());
+    let now = now_ts();
     for record in records {
-        let metrics = metrics_by_instance.remove(&record.id);
-        let capabilities = connected.get(&record.id).cloned().map(|capabilities| {
-            capabilities
-                .into_iter()
-                .filter(|capability| capability != "docker_manager_v1")
-                .collect()
-        });
-        summaries.push(instance_summary(
-            record,
-            metrics,
-            capabilities.is_some(),
-            capabilities.unwrap_or_default(),
-        ));
+        let latest = metrics_by_instance.remove(&record.id);
+        let online = connected.contains_key(&record.id);
+        let metrics = if online {
+            latest
+        } else {
+            Some(offline_metric(latest.as_ref(), now))
+        };
+        let capabilities = connected
+            .get(&record.id)
+            .cloned()
+            .or_else(|| persisted_capabilities.remove(&record.id))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|capability| capability != "docker_manager_v1")
+            .collect();
+        summaries.push(instance_summary(record, metrics, online, capabilities));
     }
 
     Ok(Json(summaries))
@@ -144,25 +151,31 @@ pub async fn public_metrics(
     let metrics = if let Some(bucket_seconds) = params.bucket_seconds {
         let metrics = sqlx::query_as::<_, MetricRecord>(
             r#"
-            SELECT ROUND(AVG(ts))::BIGINT AS ts,
-                   AVG(cpu_percent)::DOUBLE PRECISION AS cpu_percent,
-                   ROUND(AVG(memory_used))::BIGINT AS memory_used,
-                   ROUND(AVG(memory_total))::BIGINT AS memory_total,
-                   ROUND(AVG(disk_used))::BIGINT AS disk_used,
-                   ROUND(AVG(disk_total))::BIGINT AS disk_total,
-                   ROUND(AVG(network_rx))::BIGINT AS network_rx,
-                   ROUND(AVG(network_tx))::BIGINT AS network_tx,
-                   AVG(gpu_percent)::DOUBLE PRECISION AS gpu_percent,
-                   ROUND(AVG(gpu_memory_used))::BIGINT AS gpu_memory_used,
-                   ROUND(AVG(gpu_memory_total))::BIGINT AS gpu_memory_total,
-                   ROUND(AVG(uptime_seconds))::BIGINT AS uptime_seconds,
-                   AVG(load_average)::DOUBLE PRECISION AS load_average,
-                   AVG(latency_ms)::DOUBLE PRECISION AS latency_ms
-            FROM metrics
-            WHERE instance_id = $1 AND ts BETWEEN $2 AND $3
-            GROUP BY (ts / $4)
+            SELECT ts, cpu_percent, memory_used, memory_total, disk_used, disk_total,
+                   network_rx, network_tx, gpu_percent, gpu_memory_used, gpu_memory_total,
+                   uptime_seconds, load_average, latency_ms
+            FROM (
+                SELECT $2 + ((ts - $2) / $4) * $4 AS ts,
+                       AVG(cpu_percent)::DOUBLE PRECISION AS cpu_percent,
+                       ROUND(AVG(memory_used))::BIGINT AS memory_used,
+                       ROUND(AVG(memory_total))::BIGINT AS memory_total,
+                       ROUND(AVG(disk_used))::BIGINT AS disk_used,
+                       ROUND(AVG(disk_total))::BIGINT AS disk_total,
+                       ROUND(AVG(network_rx))::BIGINT AS network_rx,
+                       ROUND(AVG(network_tx))::BIGINT AS network_tx,
+                       AVG(gpu_percent)::DOUBLE PRECISION AS gpu_percent,
+                       ROUND(AVG(gpu_memory_used))::BIGINT AS gpu_memory_used,
+                       ROUND(AVG(gpu_memory_total))::BIGINT AS gpu_memory_total,
+                       ROUND(AVG(uptime_seconds))::BIGINT AS uptime_seconds,
+                       AVG(load_average)::DOUBLE PRECISION AS load_average,
+                       AVG(latency_ms)::DOUBLE PRECISION AS latency_ms
+                FROM metrics
+                WHERE instance_id = $1 AND ts BETWEEN $2 AND $3
+                GROUP BY $2 + ((ts - $2) / $4) * $4
+                ORDER BY ts DESC
+                LIMIT $5
+            ) AS recent_buckets
             ORDER BY ts ASC
-            LIMIT $5
             "#,
         )
         .bind(&id)
@@ -172,7 +185,13 @@ pub async fn public_metrics(
         .bind(params.limit)
         .fetch_all(&mut *tx)
         .await?;
-        metrics
+        fill_metric_buckets(
+            metrics,
+            params.from,
+            params.to,
+            bucket_seconds,
+            params.limit,
+        )
     } else {
         sqlx::query_as::<_, MetricRecord>(
             r#"
@@ -195,6 +214,138 @@ pub async fn public_metrics(
     tx.commit().await?;
 
     Ok(Json(metrics))
+}
+
+pub async fn public_device_profile(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<PublicDeviceProfileResponse>> {
+    let is_public: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM instances WHERE id = $1 AND approved = 1 AND disabled = 0)",
+    )
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await?;
+    if !is_public {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "实例不存在"));
+    }
+    let metadata = instance_agent_metadata(&state.db, &id).await?;
+    let profile = metadata
+        .as_ref()
+        .and_then(|metadata| parse_stored_device_profile(&id, &metadata.device_profile))
+        .map(|profile| PublicDeviceProfile::from(&profile));
+    let updated_at = profile.as_ref().and_then(|_| {
+        metadata
+            .as_ref()
+            .and_then(|metadata| metadata.device_profile_updated_at)
+    });
+    Ok(Json(PublicDeviceProfileResponse {
+        profile,
+        updated_at,
+    }))
+}
+
+pub async fn admin_device_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<Json<AdminDeviceProfileResponse>> {
+    require_admin(&state, &headers).await?;
+    get_instance(&state.db, &id).await?;
+    let metadata = instance_agent_metadata(&state.db, &id).await?;
+    let profile = metadata
+        .as_ref()
+        .and_then(|metadata| parse_stored_device_profile(&id, &metadata.device_profile));
+    let observed_ip = metadata.as_ref().and_then(|metadata| {
+        (!metadata.observed_ip.is_empty()).then(|| metadata.observed_ip.clone())
+    });
+    let updated_at = profile.as_ref().and_then(|_| {
+        metadata
+            .as_ref()
+            .and_then(|metadata| metadata.device_profile_updated_at)
+    });
+    Ok(Json(AdminDeviceProfileResponse {
+        profile,
+        observed_ip,
+        updated_at,
+    }))
+}
+
+fn parse_stored_device_profile(instance_id: &str, encoded: &str) -> Option<DeviceProfile> {
+    if encoded.is_empty() {
+        return None;
+    }
+    match serde_json::from_str(encoded) {
+        Ok(profile) => Some(profile),
+        Err(error) => {
+            warn!(?error, %instance_id, "stored device profile is invalid");
+            None
+        }
+    }
+}
+
+fn offline_metric(latest: Option<&MetricRecord>, ts: i64) -> MetricRecord {
+    MetricRecord {
+        ts,
+        cpu_percent: 0.0,
+        memory_used: 0,
+        memory_total: latest.map(|metric| metric.memory_total).unwrap_or(0),
+        disk_used: 0,
+        disk_total: latest.map(|metric| metric.disk_total).unwrap_or(0),
+        network_rx: 0,
+        network_tx: 0,
+        gpu_percent: Some(0.0),
+        gpu_memory_used: Some(0),
+        gpu_memory_total: Some(
+            latest
+                .and_then(|metric| metric.gpu_memory_total)
+                .unwrap_or(0),
+        ),
+        uptime_seconds: 0,
+        load_average: Some(0.0),
+        latency_ms: Some(0.0),
+    }
+}
+
+fn zero_metric(ts: i64) -> MetricRecord {
+    MetricRecord {
+        ts,
+        cpu_percent: 0.0,
+        memory_used: 0,
+        memory_total: 0,
+        disk_used: 0,
+        disk_total: 0,
+        network_rx: 0,
+        network_tx: 0,
+        gpu_percent: Some(0.0),
+        gpu_memory_used: Some(0),
+        gpu_memory_total: Some(0),
+        uptime_seconds: 0,
+        load_average: Some(0.0),
+        latency_ms: Some(0.0),
+    }
+}
+
+fn fill_metric_buckets(
+    metrics: Vec<MetricRecord>,
+    from: i64,
+    to: i64,
+    bucket_seconds: i64,
+    limit: i64,
+) -> Vec<MetricRecord> {
+    let total_buckets = (to - from) / bucket_seconds + 1;
+    let selected_buckets = total_buckets.min(limit).max(0);
+    let first_index = total_buckets.saturating_sub(selected_buckets);
+    let mut existing = metrics
+        .into_iter()
+        .map(|metric| (metric.ts, metric))
+        .collect::<std::collections::HashMap<_, _>>();
+    (first_index..total_buckets)
+        .map(|index| {
+            let ts = from + index * bucket_seconds;
+            existing.remove(&ts).unwrap_or_else(|| zero_metric(ts))
+        })
+        .collect()
 }
 
 fn normalize_public_metrics_query(query: MetricsQuery, now: i64) -> AppResult<PublicMetricsParams> {
@@ -371,18 +522,35 @@ pub async fn admin_update_instance(
     .await?;
 
     let updated = get_instance(&state.db, &id).await?;
-    let metrics = latest_metric(&state.db, &updated.id).await?;
-    let capabilities = state
+    let latest = latest_metric(&state.db, &updated.id).await?;
+    let connected_capabilities = state
         .agents
         .read()
         .await
         .get(&updated.id)
         .map(|handle| handle.capabilities.clone());
+    let online = connected_capabilities.is_some();
+    let capabilities = if let Some(capabilities) = connected_capabilities {
+        capabilities
+    } else {
+        instance_capabilities(&state.db, std::slice::from_ref(&updated.id))
+            .await?
+            .remove(&updated.id)
+            .unwrap_or_default()
+    }
+    .into_iter()
+    .filter(|capability| capability != "docker_manager_v1")
+    .collect::<Vec<_>>();
+    let metrics = if online {
+        latest
+    } else {
+        Some(offline_metric(latest.as_ref(), now_ts()))
+    };
     Ok(Json(instance_summary(
         updated,
         metrics,
-        capabilities.is_some(),
-        capabilities.unwrap_or_default(),
+        online,
+        capabilities,
     )))
 }
 
@@ -921,12 +1089,13 @@ pub async fn agent_register(
     headers: HeaderMap,
     Json(payload): Json<AgentRegisterRequest>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
-    let source_key = agent_registration_source_key(resolved_client_ip(
+    let observed_ip = resolved_client_ip(
         state.trust_proxy_headers,
         &state.trusted_proxy_cidrs,
         &headers,
         peer.ip(),
-    ));
+    );
+    let source_key = agent_registration_source_key(observed_ip);
     register_or_touch_pending(&state.db, &payload, &source_key).await?;
 
     let Some(instance) = get_instance_optional(&state.db, &payload.instance_id).await? else {
@@ -940,6 +1109,14 @@ pub async fn agent_register(
     if instance.secret != payload.secret {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
     }
+
+    upsert_agent_device_profile(
+        &state.db,
+        &payload.instance_id,
+        payload.device_profile.as_ref(),
+        observed_ip,
+    )
+    .await?;
 
     Ok(Json(AgentRegisterResponse {
         approved: instance.approved == 1,
@@ -969,13 +1146,15 @@ pub async fn agent_report(
         package_type: payload.package_type.clone(),
         native_arch: payload.native_arch.clone(),
         update_privileged: payload.update_privileged,
+        device_profile: payload.device_profile.clone(),
     };
-    let source_key = agent_registration_source_key(resolved_client_ip(
+    let observed_ip = resolved_client_ip(
         state.trust_proxy_headers,
         &state.trusted_proxy_cidrs,
         &headers,
         peer.ip(),
-    ));
+    );
+    let source_key = agent_registration_source_key(observed_ip);
     register_or_touch_pending(&state.db, &register_payload, &source_key).await?;
 
     let Some(instance) = get_instance_optional(&state.db, &payload.instance_id).await? else {
@@ -989,6 +1168,13 @@ pub async fn agent_report(
     if instance.secret != payload.secret {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
     }
+    upsert_agent_device_profile(
+        &state.db,
+        &payload.instance_id,
+        payload.device_profile.as_ref(),
+        observed_ip,
+    )
+    .await?;
     if instance.disabled == 1 {
         return Ok(Json(AgentRegisterResponse {
             approved: true,
@@ -1074,27 +1260,47 @@ pub async fn agent_ws(
         return Err(AppError::new(StatusCode::FORBIDDEN, "实例已停用"));
     }
 
-    let capabilities = query
-        .capabilities
-        .as_deref()
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|capability| {
-            !capability.is_empty()
-                && capability.len() <= 64
-                && capability
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        })
-        .take(16)
-        .map(str::to_string)
-        .collect();
+    let reported_capabilities = parse_reported_capabilities(query.capabilities.as_deref())?;
+    let capabilities = reported_capabilities.clone().unwrap_or_default();
+    if let Some(capabilities) = reported_capabilities.as_ref() {
+        upsert_agent_capabilities(&state.db, &query.instance_id, capabilities).await?;
+    }
 
     Ok(ws
         .max_message_size(MAX_AGENT_MESSAGE_BYTES)
         .max_frame_size(MAX_AGENT_MESSAGE_BYTES)
         .on_upgrade(move |socket| agent_socket(state, query.instance_id, capabilities, socket)))
+}
+
+fn parse_reported_capabilities(value: Option<&str>) -> AppResult<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let raw_capabilities = value.split(',').collect::<Vec<_>>();
+    if raw_capabilities.len() > 16 {
+        return Err(AppError::bad_request("Agent capabilities 数量超出限制"));
+    }
+
+    let mut capabilities = Vec::with_capacity(raw_capabilities.len());
+    for raw_capability in raw_capabilities {
+        let capability = raw_capability.trim();
+        let valid = !capability.is_empty()
+            && capability.len() <= 64
+            && capability
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        if !valid {
+            return Err(AppError::bad_request("Agent capabilities 格式无效"));
+        }
+        if !capabilities.iter().any(|known| known == capability) {
+            capabilities.push(capability.to_string());
+        }
+    }
+    Ok(Some(capabilities))
 }
 
 pub async fn admin_terminal_ws(
@@ -1201,6 +1407,34 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_require_an_explicit_valid_report() {
+        assert_eq!(parse_reported_capabilities(None).unwrap(), None);
+        assert_eq!(
+            parse_reported_capabilities(Some("  ")).unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_reported_capabilities(Some(
+                "file_manager_v1, remote-desktop_v1, file_manager_v1"
+            ))
+            .unwrap(),
+            Some(vec![
+                "file_manager_v1".to_string(),
+                "remote-desktop_v1".to_string(),
+            ])
+        );
+
+        for invalid in ["!", "file_manager_v1,", "name with spaces"] {
+            assert!(parse_reported_capabilities(Some(invalid)).is_err());
+        }
+        let too_many = (0..17)
+            .map(|index| format!("capability_{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_reported_capabilities(Some(&too_many)).is_err());
+    }
+
+    #[test]
     fn agent_registration_sources_group_ipv6_prefixes() {
         assert_eq!(
             agent_registration_source_key("192.0.2.10".parse().unwrap()),
@@ -1289,5 +1523,123 @@ mod tests {
             value["background_image_url"],
             "/uploads/backgrounds/example.webp"
         );
+    }
+
+    #[test]
+    fn missing_metric_buckets_are_explicit_zeroes_and_keep_latest_limit() {
+        let metrics = vec![MetricRecord {
+            ts: 120,
+            cpu_percent: 42.0,
+            memory_used: 10,
+            memory_total: 100,
+            disk_used: 20,
+            disk_total: 200,
+            network_rx: 30,
+            network_tx: 40,
+            gpu_percent: Some(5.0),
+            gpu_memory_used: Some(6),
+            gpu_memory_total: Some(7),
+            uptime_seconds: 8,
+            load_average: Some(9.0),
+            latency_ms: Some(10.0),
+        }];
+        let filled = fill_metric_buckets(metrics, 0, 240, 60, 3);
+        assert_eq!(
+            filled.iter().map(|metric| metric.ts).collect::<Vec<_>>(),
+            vec![120, 180, 240]
+        );
+        assert_eq!(filled[0].cpu_percent, 42.0);
+        assert_eq!(filled[1].cpu_percent, 0.0);
+        assert_eq!(filled[2].network_rx, 0);
+        assert_eq!(filled[2].gpu_percent, Some(0.0));
+    }
+
+    #[test]
+    fn offline_metric_zeroes_usage_but_preserves_capacity() {
+        let latest = MetricRecord {
+            ts: 100,
+            cpu_percent: 80.0,
+            memory_used: 90,
+            memory_total: 100,
+            disk_used: 190,
+            disk_total: 200,
+            network_rx: 300,
+            network_tx: 400,
+            gpu_percent: Some(70.0),
+            gpu_memory_used: Some(50),
+            gpu_memory_total: Some(60),
+            uptime_seconds: 500,
+            load_average: Some(4.0),
+            latency_ms: Some(20.0),
+        };
+        let offline = offline_metric(Some(&latest), 200);
+        assert_eq!(offline.cpu_percent, 0.0);
+        assert_eq!(offline.memory_used, 0);
+        assert_eq!(offline.memory_total, 100);
+        assert_eq!(offline.disk_total, 200);
+        assert_eq!(offline.network_rx, 0);
+        assert_eq!(offline.gpu_memory_total, Some(60));
+        assert_eq!(offline.latency_ms, Some(0.0));
+    }
+
+    #[test]
+    fn public_device_projection_does_not_serialize_private_fields() {
+        let profile = DeviceProfile {
+            schema_version: 1,
+            collected_at: 100,
+            system: crate::models::DeviceSystemInfo {
+                os_name: "Linux".to_string(),
+                os_version: "6.8".to_string(),
+                kernel_version: "6.8.0-private".to_string(),
+                architecture: "x86_64".to_string(),
+            },
+            cpu: crate::models::DeviceCpuInfo {
+                model: "Example CPU".to_string(),
+                vendor: "Example Vendor".to_string(),
+                physical_cores: Some(4),
+                logical_cores: 8,
+                frequency_mhz: Some(3200),
+            },
+            memory_total: 1024,
+            storage_total: 2048,
+            gpus: vec![crate::models::DeviceGpuInfo {
+                name: "Example GPU".to_string(),
+                vendor: "Example".to_string(),
+                memory_total: Some(512),
+            }],
+            disks: vec![crate::models::DeviceDiskInfo {
+                name: "/dev/private".to_string(),
+                mount_point: "/secret".to_string(),
+                file_system: "ext4".to_string(),
+                kind: "ssd".to_string(),
+                total_bytes: 2048,
+            }],
+            network_interfaces: vec![crate::models::DeviceNetworkInterface {
+                name: "eth0".to_string(),
+                mac_address: Some("AA:BB:CC:DD:EE:FF".to_string()),
+                ipv4: vec!["192.0.2.1".to_string()],
+                ipv6: Vec::new(),
+            }],
+        };
+        let value = serde_json::to_value(PublicDeviceProfile::from(&profile)).unwrap();
+        assert_eq!(value["cpu_model"], "Example CPU");
+        assert_eq!(value["gpus"][0]["name"], "Example GPU");
+        assert_eq!(value["memory_total"], 1024);
+        assert_eq!(value["storage_total"], 2048);
+        assert!(value.get("kernel_version").is_none());
+        assert!(value.get("disks").is_none());
+        assert!(value.get("network_interfaces").is_none());
+        let encoded = value.to_string();
+        for private_value in [
+            "6.8.0-private",
+            "Example Vendor",
+            "/dev/private",
+            "/secret",
+            "eth0",
+            "192.0.2.1",
+            "AA:BB:CC:DD:EE:FF",
+        ] {
+            assert!(!encoded.contains(private_value));
+        }
     }
 }

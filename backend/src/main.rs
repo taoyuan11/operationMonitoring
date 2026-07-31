@@ -39,11 +39,11 @@ use files::{
 };
 use handlers::{
     admin_approve_instance, admin_commands, admin_create_command, admin_delete_background_image,
-    admin_delete_instance, admin_disable_command, admin_disable_instance, admin_get_settings,
-    admin_jobs, admin_logs, admin_pending_instances, admin_put_appearance, admin_put_settings,
-    admin_reject_instance, admin_run_whitelist_command, admin_terminal_ws, admin_update_instance,
-    admin_upload_background_image, agent_register, agent_report, agent_ws, health,
-    public_appearance, public_instances, public_metrics,
+    admin_delete_instance, admin_device_profile, admin_disable_command, admin_disable_instance,
+    admin_get_settings, admin_jobs, admin_logs, admin_pending_instances, admin_put_appearance,
+    admin_put_settings, admin_reject_instance, admin_run_whitelist_command, admin_terminal_ws,
+    admin_update_instance, admin_upload_background_image, agent_register, agent_report, agent_ws,
+    health, public_appearance, public_device_profile, public_instances, public_metrics,
 };
 use jobs::command_timeout_loop;
 use remote_desktop::{admin_desktop_ws, agent_desktop_ws, ensure_same_origin};
@@ -113,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/public/appearance", get(public_appearance))
         .route("/api/public/instances", get(public_instances))
         .route("/api/public/instances/{id}/metrics", get(public_metrics))
+        .route(
+            "/api/public/instances/{id}/device-profile",
+            get(public_device_profile),
+        )
         .route("/api/admin/auth/status", get(auth_status))
         .route("/api/admin/bootstrap/start", post(bootstrap_start))
         .route(
@@ -164,6 +168,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/instances/{id}/disable",
             post(admin_disable_instance),
+        )
+        .route(
+            "/api/admin/instances/{id}/device-profile",
+            get(admin_device_profile),
         )
         .route(
             "/api/admin/settings",
@@ -246,11 +254,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/agent/register",
-            post(agent_register).layer(DefaultBodyLimit::max(32 * 1024)),
+            post(agent_register).layer(DefaultBodyLimit::max(96 * 1024)),
         )
         .route(
             "/api/agent/report",
-            post(agent_report).layer(DefaultBodyLimit::max(32 * 1024)),
+            post(agent_report).layer(DefaultBodyLimit::max(96 * 1024)),
         )
         .route("/api/agent/ws", get(agent_ws))
         .route("/api/agent/desktop/ws", get(agent_desktop_ws))

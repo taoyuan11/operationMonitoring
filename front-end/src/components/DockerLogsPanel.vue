@@ -322,7 +322,7 @@ function decodeBase64(value: string) {
 </script>
 
 <template>
-  <div class="docker-overlay" @keydown.esc="emit('close')">
+  <div class="docker-overlay">
     <section class="docker-stream-window" role="dialog" aria-modal="true" aria-label="容器日志">
       <header class="docker-stream-head">
         <div class="docker-stream-title">

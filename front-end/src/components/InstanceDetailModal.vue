@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Activity,
   Box,
@@ -9,6 +9,7 @@ import {
   Gauge,
   HardDrive,
   Info,
+  LoaderCircle,
   MapPin,
   MemoryStick,
   Monitor,
@@ -17,6 +18,7 @@ import {
   Pencil,
   Play,
   Radio,
+  RefreshCw,
   Server,
   ShieldAlert,
   Terminal,
@@ -36,7 +38,13 @@ import OperatingSystemLogo from './OperatingSystemLogo.vue'
 import { api } from '../api/http'
 import { getDockerStatus } from '../api/docker'
 import { getCountryOption } from '../data/countries'
-import type { CommandRecord, Instance, Metric } from '../types/domain'
+import type {
+  AdminDeviceProfileResponse,
+  CommandRecord,
+  Instance,
+  Metric,
+  PublicDeviceProfileResponse,
+} from '../types/domain'
 import type { DockerStatus } from '../types/docker'
 import { formatBytes, formatDuration, formatTime, metricPercent } from '../utils/format'
 
@@ -56,6 +64,7 @@ const historyRanges: Array<{
 
 const props = defineProps<{
   instance: Instance
+  isAdmin: boolean
   commands: CommandRecord[]
   loading: boolean
 }>()
@@ -78,7 +87,13 @@ const historyError = ref('')
 const historyFrom = ref(0)
 const historyTo = ref(0)
 const dockerStatus = ref<DockerStatus | null>(null)
+const publicDeviceProfile = ref<PublicDeviceProfileResponse | null>(null)
+const adminDeviceProfile = ref<AdminDeviceProfileResponse | null>(null)
+const deviceProfileLoading = ref(false)
+const deviceProfileError = ref('')
+const adminDeviceProfileError = ref('')
 let dockerStatusRequest = 0
+let deviceProfileRequest = 0
 let dockerStatusTimer: ReturnType<typeof setInterval> | null = null
 let historyAbort: AbortController | null = null
 
@@ -87,8 +102,11 @@ watch(
   () => {
     activeTab.value = 'details'
     dockerStatus.value = null
-    void loadDockerStatus()
-    startDockerStatusPolling()
+    void loadDeviceProfile()
+    if (props.isAdmin) {
+      void loadDockerStatus()
+      startDockerStatusPolling()
+    }
   },
   { immediate: true },
 )
@@ -97,25 +115,51 @@ const supportsFiles = computed(() =>
   props.instance.capabilities?.includes('file_manager_v1') === true,
 )
 
-const supportsDocker = computed(() => dockerStatus.value?.installed === true)
+const supportsRemoteDesktop = computed(() =>
+  props.instance.os.trim().toLowerCase().includes('windows')
+    && props.instance.capabilities?.includes('remote_desktop_v1') === true,
+)
+
+const supportsDocker = computed(() => dockerStatus.value?.protocol_supported === true)
 
 watch(
   () => props.instance.online,
-  () => void loadDockerStatus(),
+  (online, previousOnline) => {
+    if (props.isAdmin) void loadDockerStatus()
+    if (online && previousOnline === false && !publicDeviceProfile.value?.profile) {
+      void loadDeviceProfile()
+    }
+  },
 )
 
-watch(supportsDocker, (supported) => {
-  if (!supported && activeTab.value === 'docker') activeTab.value = 'details'
-})
+watch(
+  [() => props.isAdmin, supportsFiles, supportsDocker],
+  ([isAdmin, filesSupported, dockerSupported]) => {
+    if (!isAdmin && activeTab.value !== 'details') activeTab.value = 'details'
+    if (!filesSupported && activeTab.value === 'files') activeTab.value = 'details'
+    if (!dockerSupported && activeTab.value === 'docker') activeTab.value = 'details'
+  },
+)
+
+watch(
+  () => props.isAdmin,
+  (isAdmin) => {
+    dockerStatusRequest += 1
+    if (dockerStatusTimer) {
+      clearInterval(dockerStatusTimer)
+      dockerStatusTimer = null
+    }
+    dockerStatus.value = null
+    void loadDeviceProfile()
+    if (isAdmin) {
+      void loadDockerStatus()
+      startDockerStatusPolling()
+    }
+  },
+)
 
 const remoteDesktopUnavailableReason = computed(() => {
   if (!props.instance.online) return '实例离线，无法连接远程桌面'
-  if (!props.instance.os.trim().toLowerCase().includes('windows')) {
-    return '远程桌面仅支持 Windows 实例'
-  }
-  if (!props.instance.capabilities?.includes('remote_desktop_v1')) {
-    return '当前 Agent 不支持远程桌面，请先更新 Agent'
-  }
   return ''
 })
 
@@ -123,7 +167,9 @@ const selectedHistoryRange = computed(() =>
   historyRanges.find((option) => option.value === historyRange.value) || historyRanges[0],
 )
 
-const historyWindowTo = computed(() => Math.max(historyTo.value, props.instance.metrics?.ts || 0))
+const historyWindowTo = computed(() =>
+  historyTo.value || props.instance.metrics?.ts || Math.floor(Date.now() / 1000),
+)
 const historyWindowFrom = computed(() =>
   historyFrom.value || historyWindowTo.value - selectedHistoryRange.value.seconds,
 )
@@ -137,26 +183,10 @@ const chartMetrics = computed(() => {
     .sort((left, right) => left.ts - right.ts)
 })
 
-const chartDomain = computed(() => {
-  const fallback = {
-    from: historyWindowFrom.value,
-    to: historyWindowTo.value,
-  }
-  if (!chartMetrics.value.length) return fallback
-
-  const dataFrom = chartMetrics.value[0].ts
-  const dataTo = chartMetrics.value[chartMetrics.value.length - 1].ts
-  const bucketSeconds = selectedHistoryRange.value.bucketSeconds
-  const coversWindow = dataFrom <= historyWindowFrom.value + bucketSeconds
-    && dataTo >= historyWindowTo.value - bucketSeconds
-  if (coversWindow) return fallback
-
-  if (dataFrom === dataTo) {
-    const halfBucket = bucketSeconds / 2
-    return { from: dataFrom - halfBucket, to: dataTo + halfBucket }
-  }
-  return { from: dataFrom, to: dataTo }
-})
+const chartDomain = computed(() => ({
+  from: historyWindowFrom.value,
+  to: historyWindowTo.value,
+}))
 
 const cpuHistory = computed(() => chartMetrics.value.map((metric) => ({
   ts: metric.ts,
@@ -165,12 +195,12 @@ const cpuHistory = computed(() => chartMetrics.value.map((metric) => ({
 
 const memoryHistory = computed(() => chartMetrics.value.map((metric) => ({
   ts: metric.ts,
-  value: metric.memory_total > 0 ? metricPercent(metric.memory_used, metric.memory_total) : null,
+  value: metric.memory_total > 0 ? metricPercent(metric.memory_used, metric.memory_total) : 0,
 })))
 
 const diskHistory = computed(() => chartMetrics.value.map((metric) => ({
   ts: metric.ts,
-  value: metric.disk_total > 0 ? metricPercent(metric.disk_used, metric.disk_total) : null,
+  value: metric.disk_total > 0 ? metricPercent(metric.disk_used, metric.disk_total) : 0,
 })))
 
 const gpuHistory = computed(() => chartMetrics.value.map((metric) => ({
@@ -190,9 +220,15 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  document.removeEventListener('keydown', handleDocumentKeydown)
   historyAbort?.abort()
   dockerStatusRequest += 1
+  deviceProfileRequest += 1
   if (dockerStatusTimer) clearInterval(dockerStatusTimer)
+})
+
+onMounted(() => {
+  document.addEventListener('keydown', handleDocumentKeydown)
 })
 
 function instanceName() {
@@ -208,6 +244,61 @@ function instanceCountry() {
 function formatLatency(value: number | null | undefined) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '未知'
   return `${value.toFixed(value >= 10 ? 0 : 1)} ms`
+}
+
+function closeImplicitly() {
+  if (activeTab.value === 'details' || activeTab.value === 'actions') emit('close')
+}
+
+function handleDocumentKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || event.defaultPrevented) return
+  if (activeTab.value !== 'details' && activeTab.value !== 'actions') return
+  event.preventDefault()
+  emit('close')
+}
+
+function cpuCoreSummary(physical: number | null, logical: number) {
+  if (physical && logical) return `${physical} 核 / ${logical} 线程`
+  if (logical) return `${logical} 线程`
+  return '未知'
+}
+
+function formatFrequency(value: number | null | undefined) {
+  if (!value) return '未知'
+  return value >= 1000 ? `${(value / 1000).toFixed(2)} GHz` : `${value} MHz`
+}
+
+async function loadDeviceProfile() {
+  const request = ++deviceProfileRequest
+  publicDeviceProfile.value = null
+  adminDeviceProfile.value = null
+  deviceProfileError.value = ''
+  adminDeviceProfileError.value = ''
+  deviceProfileLoading.value = true
+  try {
+    const publicProfile = await api<PublicDeviceProfileResponse>(
+      `/api/public/instances/${encodeURIComponent(props.instance.id)}/device-profile`,
+    )
+    if (request !== deviceProfileRequest) return
+    publicDeviceProfile.value = publicProfile
+  } catch (error) {
+    if (request !== deviceProfileRequest) return
+    deviceProfileError.value = error instanceof Error ? error.message : '设备配置读取失败'
+  }
+
+  if (props.isAdmin && request === deviceProfileRequest) {
+    try {
+      const adminProfile = await api<AdminDeviceProfileResponse>(
+        `/api/admin/instances/${encodeURIComponent(props.instance.id)}/device-profile`,
+      )
+      if (request !== deviceProfileRequest) return
+      adminDeviceProfile.value = adminProfile
+    } catch (error) {
+      if (request !== deviceProfileRequest) return
+      adminDeviceProfileError.value = error instanceof Error ? error.message : '完整设备配置读取失败'
+    }
+  }
+  if (request === deviceProfileRequest) deviceProfileLoading.value = false
 }
 
 async function loadMetricHistory() {
@@ -230,12 +321,14 @@ async function loadMetricHistory() {
     limit: '500',
   })
   try {
-    historyMetrics.value = await api<Metric[]>(
+    const metrics = await api<Metric[]>(
       `/api/public/instances/${encodeURIComponent(props.instance.id)}/metrics?${params}`,
       { signal: controller.signal },
     )
+    if (historyAbort !== controller || controller.signal.aborted) return
+    historyMetrics.value = metrics
   } catch (error) {
-    if (controller.signal.aborted) return
+    if (historyAbort !== controller || controller.signal.aborted) return
     historyError.value = error instanceof Error ? error.message : '历史指标读取失败'
   } finally {
     if (historyAbort === controller) {
@@ -246,6 +339,7 @@ async function loadMetricHistory() {
 }
 
 async function loadDockerStatus() {
+  if (!props.isAdmin) return
   const request = ++dockerStatusRequest
   try {
     const status = await getDockerStatus(props.instance.id)
@@ -254,13 +348,14 @@ async function loadDockerStatus() {
 }
 
 function startDockerStatusPolling() {
+  if (!props.isAdmin) return
   if (dockerStatusTimer) clearInterval(dockerStatusTimer)
   dockerStatusTimer = setInterval(() => void loadDockerStatus(), 15_000)
 }
 </script>
 
 <template>
-  <div class="modal-backdrop instance-detail-backdrop" @click.self="emit('close')" @keydown.esc="emit('close')">
+  <div class="modal-backdrop instance-detail-backdrop" @click.self="closeImplicitly">
     <section class="modal instance-detail-modal" role="dialog" aria-modal="true" aria-labelledby="instance-detail-title">
       <header class="instance-detail-header">
         <div class="instance-detail-identity">
@@ -295,6 +390,7 @@ function startDockerStatusPolling() {
           <Info :size="15" />详情
         </button>
         <button
+          v-if="isAdmin"
           :class="{ active: activeTab === 'actions' }"
           type="button"
           role="tab"
@@ -304,6 +400,7 @@ function startDockerStatusPolling() {
           <FileCog :size="15" />操作
         </button>
         <button
+          v-if="isAdmin && supportsFiles"
           :class="{ active: activeTab === 'files' }"
           type="button"
           role="tab"
@@ -313,7 +410,7 @@ function startDockerStatusPolling() {
           <UploadCloud :size="15" />文件
         </button>
         <button
-          v-if="supportsDocker"
+          v-if="isAdmin && supportsDocker"
           :class="{ active: activeTab === 'docker' }"
           type="button"
           role="tab"
@@ -357,7 +454,6 @@ function startDockerStatusPolling() {
                 :points="cpuHistory"
                 :from="chartDomain.from"
                 :to="chartDomain.to"
-                :bucket-seconds="selectedHistoryRange.bucketSeconds"
                 color="#58d4b1"
                 :loading="historyLoading"
               >
@@ -368,7 +464,6 @@ function startDockerStatusPolling() {
                 :points="memoryHistory"
                 :from="chartDomain.from"
                 :to="chartDomain.to"
-                :bucket-seconds="selectedHistoryRange.bucketSeconds"
                 color="#55b8cf"
                 :loading="historyLoading"
               >
@@ -379,7 +474,6 @@ function startDockerStatusPolling() {
                 :points="diskHistory"
                 :from="chartDomain.from"
                 :to="chartDomain.to"
-                :bucket-seconds="selectedHistoryRange.bucketSeconds"
                 color="#e5ae54"
                 :loading="historyLoading"
               >
@@ -390,7 +484,6 @@ function startDockerStatusPolling() {
                 :points="gpuHistory"
                 :from="chartDomain.from"
                 :to="chartDomain.to"
-                :bucket-seconds="selectedHistoryRange.bucketSeconds"
                 color="#aaa5dc"
                 :loading="historyLoading"
               >
@@ -402,7 +495,6 @@ function startDockerStatusPolling() {
                 :points="latencyHistory"
                 :from="chartDomain.from"
                 :to="chartDomain.to"
-                :bucket-seconds="selectedHistoryRange.bucketSeconds"
                 color="#df8f72"
                 :loading="historyLoading"
                 value-type="milliseconds"
@@ -427,6 +519,111 @@ function startDockerStatusPolling() {
             <div v-if="instance.remark" class="detail-remark">
               <MapPin :size="15" /><span>{{ instance.remark }}</span>
             </div>
+          </div>
+
+          <div class="detail-section device-profile-section">
+            <header>
+              <Cpu :size="16" />
+              <h3>硬件配置</h3>
+              <small v-if="publicDeviceProfile?.updated_at">更新于 {{ formatTime(publicDeviceProfile.updated_at) }}</small>
+            </header>
+            <div v-if="deviceProfileLoading" class="device-profile-state">
+              <LoaderCircle class="spin" :size="17" />正在读取设备配置
+            </div>
+            <div v-else-if="deviceProfileError" class="device-profile-state error" role="alert">
+              <span>{{ deviceProfileError }}</span>
+              <button class="text-button" type="button" @click="loadDeviceProfile">
+                <RefreshCw :size="13" />重试
+              </button>
+            </div>
+            <div v-else-if="!publicDeviceProfile?.profile" class="device-profile-state">
+              <span>当前 Agent 尚未上报设备配置</span>
+              <button class="text-button" type="button" @click="loadDeviceProfile">
+                <RefreshCw :size="13" />刷新
+              </button>
+            </div>
+            <dl v-else class="detail-grid device-summary-grid">
+              <div>
+                <dt><Cpu :size="13" />CPU</dt>
+                <dd :title="publicDeviceProfile.profile.cpu_model">{{ publicDeviceProfile.profile.cpu_model || '未知' }}</dd>
+                <small>{{ cpuCoreSummary(publicDeviceProfile.profile.physical_cores, publicDeviceProfile.profile.logical_cores) }}</small>
+              </div>
+              <div>
+                <dt><MemoryStick :size="13" />内存</dt>
+                <dd>{{ formatBytes(publicDeviceProfile.profile.memory_total) }}</dd>
+              </div>
+              <div>
+                <dt><HardDrive :size="13" />存储容量</dt>
+                <dd>{{ formatBytes(publicDeviceProfile.profile.storage_total) }}</dd>
+              </div>
+              <div>
+                <dt><Monitor :size="13" />系统</dt>
+                <dd>{{ publicDeviceProfile.profile.os_name || '未知' }} {{ publicDeviceProfile.profile.os_version }}</dd>
+                <small>{{ publicDeviceProfile.profile.architecture || '未知架构' }}</small>
+              </div>
+              <div class="device-gpu-summary">
+                <dt><Zap :size="13" />GPU</dt>
+                <dd v-if="publicDeviceProfile.profile.gpus.length" class="device-value-list">
+                  <span v-for="gpu in publicDeviceProfile.profile.gpus" :key="`${gpu.name}-${gpu.memory_total}`">
+                    <strong>{{ gpu.name }}</strong>
+                    <small>{{ gpu.memory_total ? formatBytes(gpu.memory_total) : '显存未知' }}</small>
+                  </span>
+                </dd>
+                <dd v-else>未检测到 GPU</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div v-if="isAdmin" class="detail-section device-admin-section">
+            <header><Network :size="16" /><h3>设备与网络详情</h3></header>
+            <div v-if="adminDeviceProfileError" class="device-profile-state error" role="alert">
+              <span>{{ adminDeviceProfileError }}</span>
+              <button class="text-button" type="button" @click="loadDeviceProfile">
+                <RefreshCw :size="13" />重试
+              </button>
+            </div>
+            <template v-else-if="adminDeviceProfile?.profile">
+              <dl class="detail-grid device-admin-grid">
+                <div><dt>内核版本</dt><dd :title="adminDeviceProfile.profile.system.kernel_version">{{ adminDeviceProfile.profile.system.kernel_version || '未知' }}</dd></div>
+                <div><dt>CPU 厂商</dt><dd>{{ adminDeviceProfile.profile.cpu.vendor || '未知' }}</dd></div>
+                <div><dt>CPU 频率</dt><dd>{{ formatFrequency(adminDeviceProfile.profile.cpu.frequency_mhz) }}</dd></div>
+                <div><dt>连接来源 IP</dt><dd>{{ adminDeviceProfile.observed_ip || '未知' }}</dd></div>
+              </dl>
+
+              <div class="device-inventory">
+                <div class="device-inventory-group">
+                  <h4><HardDrive :size="14" />磁盘</h4>
+                  <div v-if="adminDeviceProfile.profile.disks.length" class="device-inventory-list">
+                    <div v-for="disk in adminDeviceProfile.profile.disks" :key="`${disk.name}-${disk.mount_point}`" class="device-inventory-row">
+                      <strong :title="disk.name">{{ disk.name || '未命名磁盘' }}</strong>
+                      <span :title="disk.mount_point">{{ disk.mount_point || '无挂载点' }}</span>
+                      <span>{{ disk.file_system || disk.kind || '未知类型' }}</span>
+                      <span>{{ formatBytes(disk.total_bytes) }}</span>
+                    </div>
+                  </div>
+                  <p v-else class="device-inventory-empty">未检测到磁盘明细</p>
+                </div>
+
+                <div class="device-inventory-group">
+                  <h4><Network :size="14" />网络接口</h4>
+                  <div v-if="adminDeviceProfile.profile.network_interfaces.length" class="device-network-list">
+                    <div v-for="networkInterface in adminDeviceProfile.profile.network_interfaces" :key="networkInterface.name" class="device-network-row">
+                      <div>
+                        <strong>{{ networkInterface.name }}</strong>
+                        <small>{{ networkInterface.mac_address || '无 MAC 地址' }}</small>
+                      </div>
+                      <div class="device-address-list">
+                        <span v-for="address in networkInterface.ipv4" :key="`v4-${address}`">{{ address }}</span>
+                        <span v-for="address in networkInterface.ipv6" :key="`v6-${address}`">{{ address }}</span>
+                        <span v-if="!networkInterface.ipv4.length && !networkInterface.ipv6.length">无 IP 地址</span>
+                      </div>
+                    </div>
+                  </div>
+                  <p v-else class="device-inventory-empty">未检测到网络接口</p>
+                </div>
+              </div>
+            </template>
+            <div v-else-if="!deviceProfileLoading" class="device-profile-state">暂无完整设备资料</div>
           </div>
 
           <div class="detail-section">
@@ -465,6 +662,7 @@ function startDockerStatusPolling() {
                 <small>打开交互式 Shell</small>
               </button>
               <button
+                v-if="supportsRemoteDesktop"
                 type="button"
                 :disabled="Boolean(remoteDesktopUnavailableReason) || loading"
                 :title="remoteDesktopUnavailableReason || '在浏览器中控制 Windows 桌面'"
@@ -512,11 +710,6 @@ function startDockerStatusPolling() {
             <WifiOff :size="30" />
             <strong>实例当前离线</strong>
             <span>Agent 重新连接后才能浏览和传输文件。</span>
-          </div>
-          <div v-else-if="!supportsFiles" class="file-unavailable">
-            <UploadCloud :size="30" />
-            <strong>当前 Agent 不支持文件管理</strong>
-            <span>更新至包含 file_manager_v1 能力的 Agent 后即可使用。</span>
           </div>
           <FileManagerPanel v-else :instance="instance" />
         </section>

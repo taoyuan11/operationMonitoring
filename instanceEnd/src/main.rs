@@ -1,6 +1,7 @@
 mod activity;
 mod command;
 mod config;
+mod device_profile;
 mod docker;
 mod file_manager;
 mod http;

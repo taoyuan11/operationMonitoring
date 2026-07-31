@@ -1,6 +1,6 @@
 [package]
 name = "instanceEnd"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2024"
 rust-version = "1.89"
 
@@ -16,6 +16,7 @@ directories = "6.0"
 futures-util = "0.3"
 fs2 = "0.4"
 hostname = "0.4"
+network-interface = "2.0.5"
 portable-pty = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 semver = "1.0"

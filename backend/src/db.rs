@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{collections::HashMap, net::IpAddr, str::FromStr, time::Duration};
 
 use axum::http::StatusCode;
 use sqlx::{
@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::{
-        AgentRegisterRequest, InstanceRecord, InstanceSummary, MetricRecord, PendingInstanceSecret,
-        SettingsRow,
+        AgentRegisterRequest, DeviceProfile, InstanceAgentMetadata, InstanceRecord,
+        InstanceSummary, MetricRecord, PendingInstanceSecret, SettingsRow,
     },
     state::AppState,
     utils::now_ts,
@@ -22,6 +22,12 @@ const MAX_PENDING_INSTANCES: i64 = 1_000;
 const MAX_PENDING_INSTANCES_PER_SOURCE: i64 = 50;
 const PENDING_INSTANCE_MAX_AGE: i64 = 7 * 24 * 60 * 60;
 const PENDING_INSTANCE_TOUCH_INTERVAL: i64 = 5;
+const MAX_DEVICE_PROFILE_BYTES: usize = 64 * 1024;
+const MAX_DEVICE_PROFILE_STRING_BYTES: usize = 256;
+const MAX_DEVICE_GPUS: usize = 16;
+const MAX_DEVICE_DISKS: usize = 32;
+const MAX_DEVICE_INTERFACES: usize = 32;
+const MAX_DEVICE_INTERFACE_ADDRESSES: usize = 16;
 
 #[derive(FromRow)]
 struct InstanceMetricRecord {
@@ -111,6 +117,31 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
 
     ensure_instance_location_columns(db).await?;
     ensure_capability_columns(db, "instances").await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS instance_agent_metadata (
+            instance_id TEXT PRIMARY KEY REFERENCES instances(id) ON DELETE CASCADE,
+            capabilities TEXT NOT NULL DEFAULT '',
+            device_profile TEXT NOT NULL DEFAULT '',
+            observed_ip TEXT NOT NULL DEFAULT '',
+            device_profile_updated_at BIGINT,
+            updated_at BIGINT NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE instance_agent_metadata ADD COLUMN IF NOT EXISTS device_profile_updated_at BIGINT",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "UPDATE instance_agent_metadata SET device_profile_updated_at = updated_at WHERE device_profile <> '' AND device_profile_updated_at IS NULL",
+    )
+    .execute(db)
+    .await?;
 
     sqlx::query(
         r#"
@@ -912,7 +943,112 @@ fn validate_agent_registration(payload: &AgentRegisterRequest) -> AppResult<()> 
     if let Some(value) = payload.native_arch.as_deref() {
         validate_agent_field("native_arch", value, 64, true)?;
     }
+    if let Some(profile) = payload.device_profile.as_ref() {
+        validate_device_profile(profile)?;
+    }
     Ok(())
+}
+
+fn validate_device_profile(profile: &DeviceProfile) -> AppResult<()> {
+    if profile.schema_version != 1 {
+        return Err(AppError::bad_request("设备资料版本不受支持"));
+    }
+    if profile.collected_at <= 0
+        || profile.memory_total < 0
+        || profile.storage_total < 0
+        || profile.cpu.logical_cores > 65_536
+        || profile.gpus.len() > MAX_DEVICE_GPUS
+        || profile.disks.len() > MAX_DEVICE_DISKS
+        || profile.network_interfaces.len() > MAX_DEVICE_INTERFACES
+    {
+        return Err(AppError::bad_request("设备资料格式无效"));
+    }
+    for value in [
+        &profile.system.os_name,
+        &profile.system.os_version,
+        &profile.system.kernel_version,
+        &profile.system.architecture,
+        &profile.cpu.model,
+        &profile.cpu.vendor,
+    ] {
+        validate_device_text(value, true)?;
+    }
+    for gpu in &profile.gpus {
+        validate_device_text(&gpu.name, false)?;
+        validate_device_text(&gpu.vendor, true)?;
+        if gpu.memory_total.is_some_and(|value| value < 0) {
+            return Err(AppError::bad_request("GPU 设备资料格式无效"));
+        }
+    }
+    for disk in &profile.disks {
+        validate_device_text(&disk.name, true)?;
+        validate_device_text(&disk.mount_point, true)?;
+        validate_device_text(&disk.file_system, true)?;
+        validate_device_text(&disk.kind, true)?;
+        if disk.total_bytes < 0 {
+            return Err(AppError::bad_request("磁盘设备资料格式无效"));
+        }
+    }
+    for interface in &profile.network_interfaces {
+        validate_device_text(&interface.name, false)?;
+        if interface.ipv4.len() > MAX_DEVICE_INTERFACE_ADDRESSES
+            || interface.ipv6.len() > MAX_DEVICE_INTERFACE_ADDRESSES
+        {
+            return Err(AppError::bad_request("网卡地址数量超过限制"));
+        }
+        if let Some(mac) = interface.mac_address.as_deref()
+            && !valid_mac_address(mac)
+        {
+            return Err(AppError::bad_request("MAC 地址格式无效"));
+        }
+        for address in &interface.ipv4 {
+            if !address.parse::<IpAddr>().is_ok_and(|address| {
+                address.is_ipv4() && !address.is_loopback() && !address.is_unspecified()
+            }) {
+                return Err(AppError::bad_request("IPv4 地址格式无效"));
+            }
+        }
+        for address in &interface.ipv6 {
+            if !address.parse::<IpAddr>().is_ok_and(|address| {
+                address.is_ipv6() && !address.is_loopback() && !address.is_unspecified()
+            }) {
+                return Err(AppError::bad_request("IPv6 地址格式无效"));
+            }
+        }
+    }
+    let encoded =
+        serde_json::to_vec(profile).map_err(|_| AppError::bad_request("设备资料无法序列化"))?;
+    if encoded.len() > MAX_DEVICE_PROFILE_BYTES {
+        return Err(AppError::bad_request("设备资料超过大小限制"));
+    }
+    Ok(())
+}
+
+fn validate_device_text(value: &str, allow_empty: bool) -> AppResult<()> {
+    if (!allow_empty && value.trim().is_empty())
+        || value.len() > MAX_DEVICE_PROFILE_STRING_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(AppError::bad_request("设备资料文本格式无效"));
+    }
+    Ok(())
+}
+
+fn valid_mac_address(value: &str) -> bool {
+    let bytes = value
+        .split(':')
+        .map(|part| {
+            (part.len() == 2)
+                .then(|| u8::from_str_radix(part, 16).ok())
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(bytes) = bytes.filter(|bytes| bytes.len() == 6) else {
+        return false;
+    };
+    bytes.iter().any(|byte| *byte != 0)
+        && bytes.iter().any(|byte| *byte != u8::MAX)
+        && bytes[0] & 1 == 0
 }
 
 fn agent_secret_is_authorized(current_secret: &str, payload: &AgentRegisterRequest) -> bool {
@@ -1037,6 +1173,113 @@ pub async fn get_instance_optional(db: &PgPool, id: &str) -> AppResult<Option<In
     .fetch_optional(db)
     .await?;
     Ok(record)
+}
+
+pub async fn upsert_agent_device_profile(
+    db: &PgPool,
+    instance_id: &str,
+    profile: Option<&DeviceProfile>,
+    observed_ip: IpAddr,
+) -> AppResult<()> {
+    let encoded_profile = profile
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| AppError::bad_request("设备资料无法序列化"))?;
+    let now = now_ts();
+    let profile_updated_at = profile.map(|_| now);
+    sqlx::query(
+        r#"
+        INSERT INTO instance_agent_metadata(
+            instance_id, capabilities, device_profile, observed_ip,
+            device_profile_updated_at, updated_at
+        )
+        VALUES($1, '', COALESCE($2, ''), $3, $4, $5)
+        ON CONFLICT(instance_id) DO UPDATE SET
+            device_profile = COALESCE($2, instance_agent_metadata.device_profile),
+            observed_ip = EXCLUDED.observed_ip,
+            device_profile_updated_at = COALESCE($4, instance_agent_metadata.device_profile_updated_at),
+            updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .bind(instance_id)
+    .bind(encoded_profile)
+    .bind(observed_ip.to_string())
+    .bind(profile_updated_at)
+    .bind(now)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub async fn upsert_agent_capabilities(
+    db: &PgPool,
+    instance_id: &str,
+    capabilities: &[String],
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO instance_agent_metadata(
+            instance_id, capabilities, device_profile, observed_ip,
+            device_profile_updated_at, updated_at
+        )
+        VALUES($1, $2, '', '', NULL, $3)
+        ON CONFLICT(instance_id) DO UPDATE SET
+            capabilities = EXCLUDED.capabilities,
+            updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .bind(instance_id)
+    .bind(capabilities.join(","))
+    .bind(now_ts())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub async fn instance_agent_metadata(
+    db: &PgPool,
+    instance_id: &str,
+) -> AppResult<Option<InstanceAgentMetadata>> {
+    Ok(sqlx::query_as::<_, InstanceAgentMetadata>(
+        r#"
+        SELECT device_profile, observed_ip, device_profile_updated_at
+        FROM instance_agent_metadata
+        WHERE instance_id = $1
+        "#,
+    )
+    .bind(instance_id)
+    .fetch_optional(db)
+    .await?)
+}
+
+pub async fn instance_capabilities(
+    db: &PgPool,
+    instance_ids: &[String],
+) -> AppResult<HashMap<String, Vec<String>>> {
+    if instance_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT instance_id, capabilities
+        FROM instance_agent_metadata
+        WHERE instance_id = ANY($1)
+        "#,
+    )
+    .bind(instance_ids)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(instance_id, encoded)| {
+            let capabilities = encoded
+                .split(',')
+                .filter(|capability| !capability.is_empty())
+                .map(str::to_string)
+                .collect();
+            (instance_id, capabilities)
+        })
+        .collect())
 }
 
 pub async fn latest_metric(db: &PgPool, instance_id: &str) -> AppResult<Option<MetricRecord>> {
@@ -1215,6 +1458,37 @@ mod tests {
             package_type: Some("standalone".to_string()),
             native_arch: Some("x86_64".to_string()),
             update_privileged: Some(true),
+            device_profile: None,
+        }
+    }
+
+    fn device_profile() -> DeviceProfile {
+        DeviceProfile {
+            schema_version: 1,
+            collected_at: 100,
+            system: crate::models::DeviceSystemInfo {
+                os_name: "Linux".to_string(),
+                os_version: "6.8".to_string(),
+                kernel_version: "6.8.0".to_string(),
+                architecture: "x86_64".to_string(),
+            },
+            cpu: crate::models::DeviceCpuInfo {
+                model: "CPU".to_string(),
+                vendor: "Vendor".to_string(),
+                physical_cores: Some(2),
+                logical_cores: 4,
+                frequency_mhz: Some(3200),
+            },
+            memory_total: 1024,
+            storage_total: 2048,
+            gpus: Vec::new(),
+            disks: Vec::new(),
+            network_interfaces: vec![crate::models::DeviceNetworkInterface {
+                name: "eth0".to_string(),
+                mac_address: Some("AA:BB:CC:DD:EE:FF".to_string()),
+                ipv4: vec!["192.0.2.1".to_string()],
+                ipv6: Vec::new(),
+            }],
         }
     }
 
@@ -1233,6 +1507,27 @@ mod tests {
         let mut control_character = registration_payload();
         control_character.os = "linux\nforged-log".to_string();
         assert!(validate_agent_registration(&control_character).is_err());
+    }
+
+    #[test]
+    fn validates_device_profile_limits_and_network_privacy_inputs() {
+        let mut payload = registration_payload();
+        payload.device_profile = Some(device_profile());
+        assert!(validate_agent_registration(&payload).is_ok());
+
+        payload.device_profile.as_mut().unwrap().network_interfaces[0].ipv4[0] =
+            "127.0.0.1".to_string();
+        assert!(validate_agent_registration(&payload).is_err());
+
+        payload.device_profile = Some(device_profile());
+        payload.device_profile.as_mut().unwrap().network_interfaces[0].ipv4[0] =
+            "0.0.0.0".to_string();
+        assert!(validate_agent_registration(&payload).is_err());
+
+        payload.device_profile = Some(device_profile());
+        payload.device_profile.as_mut().unwrap().network_interfaces[0].mac_address =
+            Some("FF:FF:FF:FF:FF:FF".to_string());
+        assert!(validate_agent_registration(&payload).is_err());
     }
 
     #[test]
@@ -1261,6 +1556,94 @@ mod tests {
         assert_eq!(normalize_metric_timestamp(i64::MAX, 1_000).unwrap(), 1_000);
         assert!(normalize_metric_timestamp(0, 1_000).is_err());
         assert!(normalize_metric_timestamp(i64::MIN, 1_000).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn agent_metadata_preserves_profiles_and_replaces_explicit_capabilities() {
+        let db = PgPoolOptions::new()
+            .max_connections(1)
+            .connect("postgresql://localhost/postgres")
+            .await
+            .expect("connect database");
+        init_db(&db).await.expect("initialize database");
+        let instance_id = format!("metadata-test-{}", Uuid::new_v4());
+        sqlx::query(
+            r#"
+            INSERT INTO instances(id, secret, name, hostname, os, arch, agent_version,
+                                  approved, disabled, first_seen)
+            VALUES($1, 'secret', 'Metadata test', 'host', 'linux', 'x86_64', '0.1.21',
+                   1, 0, $2)
+            "#,
+        )
+        .bind(&instance_id)
+        .bind(now_ts())
+        .execute(&db)
+        .await
+        .expect("insert test instance");
+
+        let profile = device_profile();
+        upsert_agent_device_profile(
+            &db,
+            &instance_id,
+            Some(&profile),
+            "192.0.2.10".parse().unwrap(),
+        )
+        .await
+        .expect("store device profile");
+        sqlx::query(
+            "UPDATE instance_agent_metadata SET device_profile_updated_at = 42 WHERE instance_id = $1",
+        )
+        .bind(&instance_id)
+        .execute(&db)
+        .await
+        .expect("set stable profile timestamp");
+        upsert_agent_capabilities(
+            &db,
+            &instance_id,
+            &[
+                "file_manager_v1".to_string(),
+                "docker_manager_v1".to_string(),
+            ],
+        )
+        .await
+        .expect("store capabilities");
+
+        upsert_agent_device_profile(&db, &instance_id, None, "192.0.2.11".parse().unwrap())
+            .await
+            .expect("refresh legacy agent metadata");
+        let metadata = instance_agent_metadata(&db, &instance_id)
+            .await
+            .expect("read metadata")
+            .expect("metadata exists");
+        assert_eq!(
+            serde_json::from_str::<DeviceProfile>(&metadata.device_profile).unwrap(),
+            profile
+        );
+        assert_eq!(metadata.observed_ip, "192.0.2.11");
+        assert_eq!(metadata.device_profile_updated_at, Some(42));
+        assert_eq!(
+            instance_capabilities(&db, std::slice::from_ref(&instance_id))
+                .await
+                .expect("read capabilities")[&instance_id],
+            ["file_manager_v1", "docker_manager_v1"]
+        );
+
+        upsert_agent_capabilities(&db, &instance_id, &[])
+            .await
+            .expect("clear capabilities");
+        assert!(
+            instance_capabilities(&db, std::slice::from_ref(&instance_id))
+                .await
+                .expect("read cleared capabilities")[&instance_id]
+                .is_empty()
+        );
+
+        sqlx::query("DELETE FROM instances WHERE id = $1")
+            .bind(&instance_id)
+            .execute(&db)
+            .await
+            .expect("delete test instance");
     }
 
     #[tokio::test]
@@ -1378,6 +1761,7 @@ mod tests {
             package_type: Some("standalone".to_string()),
             native_arch: Some("x86_64".to_string()),
             update_privileged: Some(true),
+            device_profile: None,
         };
 
         register_or_touch_pending(&db, &payload, "test-source")

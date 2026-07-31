@@ -25,6 +25,8 @@ pub struct AgentRegisterRequest {
     pub native_arch: Option<String>,
     #[serde(default)]
     pub update_privileged: Option<bool>,
+    #[serde(default)]
+    pub device_profile: Option<DeviceProfile>,
 }
 
 #[derive(Serialize)]
@@ -48,7 +50,132 @@ pub struct AgentReportRequest {
     pub native_arch: Option<String>,
     #[serde(default)]
     pub update_privileged: Option<bool>,
+    #[serde(default)]
+    pub device_profile: Option<DeviceProfile>,
     pub metrics: MetricPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceProfile {
+    pub schema_version: u32,
+    pub collected_at: i64,
+    pub system: DeviceSystemInfo,
+    pub cpu: DeviceCpuInfo,
+    pub memory_total: i64,
+    pub storage_total: i64,
+    #[serde(default)]
+    pub gpus: Vec<DeviceGpuInfo>,
+    #[serde(default)]
+    pub disks: Vec<DeviceDiskInfo>,
+    #[serde(default)]
+    pub network_interfaces: Vec<DeviceNetworkInterface>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceSystemInfo {
+    pub os_name: String,
+    pub os_version: String,
+    pub kernel_version: String,
+    pub architecture: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceCpuInfo {
+    pub model: String,
+    pub vendor: String,
+    pub physical_cores: Option<u32>,
+    pub logical_cores: u32,
+    pub frequency_mhz: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceGpuInfo {
+    pub name: String,
+    pub vendor: String,
+    pub memory_total: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceDiskInfo {
+    pub name: String,
+    pub mount_point: String,
+    pub file_system: String,
+    pub kind: String,
+    pub total_bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceNetworkInterface {
+    pub name: String,
+    pub mac_address: Option<String>,
+    pub ipv4: Vec<String>,
+    pub ipv6: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PublicDeviceProfile {
+    pub schema_version: u32,
+    pub collected_at: i64,
+    pub os_name: String,
+    pub os_version: String,
+    pub architecture: String,
+    pub cpu_model: String,
+    pub physical_cores: Option<u32>,
+    pub logical_cores: u32,
+    pub memory_total: i64,
+    pub storage_total: i64,
+    pub gpus: Vec<PublicDeviceGpuInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PublicDeviceGpuInfo {
+    pub name: String,
+    pub memory_total: Option<i64>,
+}
+
+impl From<&DeviceProfile> for PublicDeviceProfile {
+    fn from(profile: &DeviceProfile) -> Self {
+        Self {
+            schema_version: profile.schema_version,
+            collected_at: profile.collected_at,
+            os_name: profile.system.os_name.clone(),
+            os_version: profile.system.os_version.clone(),
+            architecture: profile.system.architecture.clone(),
+            cpu_model: profile.cpu.model.clone(),
+            physical_cores: profile.cpu.physical_cores,
+            logical_cores: profile.cpu.logical_cores,
+            memory_total: profile.memory_total,
+            storage_total: profile.storage_total,
+            gpus: profile
+                .gpus
+                .iter()
+                .map(|gpu| PublicDeviceGpuInfo {
+                    name: gpu.name.clone(),
+                    memory_total: gpu.memory_total,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublicDeviceProfileResponse {
+    pub profile: Option<PublicDeviceProfile>,
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDeviceProfileResponse {
+    pub profile: Option<DeviceProfile>,
+    pub observed_ip: Option<String>,
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct InstanceAgentMetadata {
+    pub device_profile: String,
+    pub observed_ip: String,
+    pub device_profile_updated_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

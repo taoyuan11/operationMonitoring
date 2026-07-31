@@ -162,7 +162,7 @@ type TerminalServerMessage =
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="emit('close')" @keydown.esc="emit('close')">
+  <div class="modal-backdrop">
     <section class="modal terminal-modal" role="dialog" aria-modal="true" aria-labelledby="terminal-title">
       <div class="terminal-head">
         <div>

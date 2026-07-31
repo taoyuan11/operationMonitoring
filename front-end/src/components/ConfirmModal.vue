@@ -23,7 +23,7 @@ const enteredConfirmation = ref('')
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="$emit('close')" @keydown.esc="$emit('close')">
+  <div class="modal-backdrop">
     <section class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
       <button class="icon-button subtle modal-close" type="button" title="关闭" aria-label="关闭确认弹窗" @click="$emit('close')">
         <X :size="17" />

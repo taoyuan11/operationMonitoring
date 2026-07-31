@@ -69,6 +69,38 @@
 .detail-remark { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; padding: 11px 13px; color: #a8b2ad; background: rgba(229, 174, 84, .055); border-left: 2px solid var(--warning); font-size: 12px; line-height: 1.55; }
 .detail-remark svg { flex: 0 0 auto; margin-top: 1px; color: var(--warning); }
 
+.device-profile-section > header small { margin-left: auto; color: var(--muted-faint); font-size: 9px; font-weight: 500; }
+.device-profile-state { display: flex; min-height: 72px; align-items: center; justify-content: center; gap: 8px; padding: 14px; color: var(--muted); background: var(--surface-inset); border: 1px solid var(--line); border-radius: 7px; font-size: 11px; }
+.device-profile-state.error { justify-content: space-between; color: var(--danger-text); background: rgba(236, 113, 130, .06); border-color: rgba(236, 113, 130, .16); }
+.device-profile-state .text-button { flex: 0 0 auto; }
+.device-summary-grid > div:nth-last-child(-n + 4) { border-bottom: 1px solid var(--line); }
+.device-summary-grid > .device-gpu-summary { grid-column: 1 / -1; border-right: 0; border-bottom: 0; }
+.device-summary-grid dd + small { display: block; margin-top: 5px; color: var(--muted-faint); font-size: 9px; }
+.device-summary-grid .device-gpu-summary dd { overflow: visible; text-overflow: clip; white-space: normal; }
+.device-value-list { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.device-value-list > span { display: inline-flex; min-width: 0; align-items: baseline; gap: 7px; }
+.device-value-list strong { overflow-wrap: anywhere; color: var(--text-strong); font-size: 11px; }
+.device-value-list small { color: var(--muted-faint); font-size: 9px; white-space: nowrap; }
+.device-admin-grid { margin-bottom: 13px; }
+.device-inventory { display: grid; grid-template-columns: minmax(0, 1fr); gap: 13px; }
+.device-inventory-group { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; }
+.device-inventory-group h4 { display: flex; min-height: 38px; align-items: center; gap: 7px; padding: 0 12px; color: var(--text-strong); background: var(--panel-soft); border-bottom: 1px solid var(--line); font-size: 11px; }
+.device-inventory-group h4 svg { color: var(--accent-strong); }
+.device-inventory-list, .device-network-list { display: flex; min-width: 0; flex-direction: column; }
+.device-inventory-row { display: grid; min-width: 0; grid-template-columns: minmax(140px, 1.2fr) minmax(160px, 1.5fr) minmax(90px, .7fr) 100px; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 10px; }
+.device-inventory-row:last-child, .device-network-row:last-child { border-bottom: 0; }
+.device-inventory-row strong, .device-inventory-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.device-inventory-row strong { color: var(--text-strong); }
+.device-inventory-row span { color: var(--muted); }
+.device-inventory-row span:last-child { color: var(--muted-strong); text-align: right; font-variant-numeric: tabular-nums; }
+.device-network-row { display: grid; min-width: 0; grid-template-columns: minmax(140px, .7fr) minmax(0, 2fr); align-items: start; gap: 14px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.device-network-row > div:first-child { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.device-network-row strong { overflow-wrap: anywhere; color: var(--text-strong); font-size: 11px; }
+.device-network-row small { overflow-wrap: anywhere; color: var(--muted-faint); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; }
+.device-address-list { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px 12px; }
+.device-address-list span { max-width: 100%; overflow-wrap: anywhere; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; }
+.device-inventory-empty { padding: 14px 12px; color: var(--muted); font-size: 10px; }
+
 .operation-section { padding-bottom: 22px; border-bottom: 1px solid var(--line); }
 .operation-section:last-child { padding-bottom: 0; border-bottom: 0; }
 .operation-section > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
@@ -192,6 +224,11 @@
   .instance-detail-tabs button { min-width: 0; flex: 1; padding: 0 8px; }
   .instance-overview, .instance-operations { gap: 18px; padding: 14px; }
   .operation-command-grid { grid-template-columns: 1fr; }
+  .device-inventory-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .device-inventory-row span:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+  .device-inventory-row span:nth-child(3) { grid-column: 1; grid-row: 3; }
+  .device-inventory-row span:last-child { grid-column: 2; grid-row: 1; }
+  .device-network-row { grid-template-columns: 1fr; gap: 8px; }
   .file-toolbar { position: static; grid-template-columns: minmax(120px, 1fr) 34px 34px; }
   .file-breadcrumbs { grid-column: 1 / -1; grid-row: 2; min-height: 32px; }
   .file-toolbar-actions { grid-column: 1 / -1; grid-row: 3; justify-content: stretch; }
@@ -212,6 +249,8 @@
   .detail-metrics, .detail-grid { grid-template-columns: 1fr; }
   .detail-grid > div, .detail-grid > div:nth-child(2n), .detail-grid > div:nth-child(4n) { border-right: 0; border-bottom: 1px solid var(--line); }
   .detail-grid > div:last-child { border-bottom: 0; }
+  .device-summary-grid > div, .device-summary-grid > div:nth-last-child(-n + 4) { border-bottom: 1px solid var(--line); }
+  .device-summary-grid > .device-gpu-summary { border-bottom: 0; }
   .metric-history-toolbar { align-items: flex-end; }
   .metric-history-toolbar p { display: none; }
   .metric-history-ranges button { min-width: 38px; padding: 0 8px; }

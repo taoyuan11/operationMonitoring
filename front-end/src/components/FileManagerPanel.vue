@@ -703,7 +703,6 @@ function buildBreadcrumbs(path: string) {
     <div
       v-if="dialog"
       class="file-dialog-backdrop"
-      @click.self="dialog = null"
       @wheel.self.prevent
       @touchmove.self.prevent
     >

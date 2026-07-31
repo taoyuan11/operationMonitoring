@@ -916,7 +916,7 @@ export function useMonitoringConsole() {
   function updateNetworkRates(nextInstances: Instance[]) {
     const counters = new Map<string, { rx: number; tx: number }>()
     for (const instance of nextInstances) {
-      if (!instance.metrics) continue
+      if (!instance.online || !instance.metrics) continue
       counters.set(instance.id, {
         rx: instance.metrics.network_rx,
         tx: instance.metrics.network_tx,
@@ -928,6 +928,8 @@ export function useMonitoringConsole() {
     }
     const previous = trafficSnapshot.value
     trafficSnapshot.value = nextSnapshot
+    networkRxRate.value = 0
+    networkTxRate.value = 0
     if (!previous) return
 
     const elapsedSeconds = (nextSnapshot.capturedAt - previous.capturedAt) / 1000

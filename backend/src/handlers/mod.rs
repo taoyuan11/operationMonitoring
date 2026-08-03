@@ -150,13 +150,15 @@ pub async fn public_metrics(
     }
 
     let metrics = if let Some(bucket_seconds) = params.bucket_seconds {
+        let last_bucket_index =
+            metric_bucket_count(params.from, params.to, bucket_seconds).saturating_sub(1);
         let metrics = sqlx::query_as::<_, MetricRecord>(
             r#"
             SELECT ts, cpu_percent, memory_used, memory_total, disk_used, disk_total,
                    network_rx, network_tx, gpu_percent, gpu_memory_used, gpu_memory_total,
                    uptime_seconds, load_average, latency_ms
             FROM (
-                SELECT $2 + ((ts - $2) / $4) * $4 AS ts,
+                SELECT $2 + LEAST((ts - $2) / $4, $6) * $4 AS ts,
                        AVG(cpu_percent)::DOUBLE PRECISION AS cpu_percent,
                        ROUND(AVG(memory_used))::BIGINT AS memory_used,
                        ROUND(AVG(memory_total))::BIGINT AS memory_total,
@@ -172,7 +174,7 @@ pub async fn public_metrics(
                        AVG(latency_ms)::DOUBLE PRECISION AS latency_ms
                 FROM metrics
                 WHERE instance_id = $1 AND ts BETWEEN $2 AND $3
-                GROUP BY $2 + ((ts - $2) / $4) * $4
+                GROUP BY $2 + LEAST((ts - $2) / $4, $6) * $4
                 ORDER BY ts DESC
                 LIMIT $5
             ) AS recent_buckets
@@ -184,6 +186,7 @@ pub async fn public_metrics(
         .bind(params.to)
         .bind(bucket_seconds)
         .bind(params.limit)
+        .bind(last_bucket_index)
         .fetch_all(&mut *tx)
         .await?;
         fill_metric_buckets(
@@ -334,7 +337,7 @@ fn fill_metric_buckets(
     bucket_seconds: i64,
     limit: i64,
 ) -> Vec<MetricRecord> {
-    let total_buckets = (to - from) / bucket_seconds + 1;
+    let total_buckets = metric_bucket_count(from, to, bucket_seconds);
     let selected_buckets = total_buckets.min(limit).max(0);
     let first_index = total_buckets.saturating_sub(selected_buckets);
     let mut existing = metrics
@@ -347,6 +350,18 @@ fn fill_metric_buckets(
             existing.remove(&ts).unwrap_or_else(|| zero_metric(ts))
         })
         .collect()
+}
+
+fn metric_bucket_count(from: i64, to: i64, bucket_seconds: i64) -> i64 {
+    if bucket_seconds <= 0 || to < from {
+        return 0;
+    }
+    let span = to - from;
+    if span == 0 {
+        1
+    } else {
+        (span - 1) / bucket_seconds + 1
+    }
 }
 
 fn normalize_public_metrics_query(query: MetricsQuery, now: i64) -> AppResult<PublicMetricsParams> {
@@ -1531,9 +1546,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_metric_buckets_are_explicit_zeroes_and_keep_latest_limit() {
+    fn metric_buckets_do_not_append_an_empty_right_endpoint() {
         let metrics = vec![MetricRecord {
-            ts: 120,
+            ts: 180,
             cpu_percent: 42.0,
             memory_used: 10,
             memory_total: 100,
@@ -1551,12 +1566,19 @@ mod tests {
         let filled = fill_metric_buckets(metrics, 0, 240, 60, 3);
         assert_eq!(
             filled.iter().map(|metric| metric.ts).collect::<Vec<_>>(),
-            vec![120, 180, 240]
+            vec![60, 120, 180]
         );
-        assert_eq!(filled[0].cpu_percent, 42.0);
-        assert_eq!(filled[1].cpu_percent, 0.0);
-        assert_eq!(filled[2].network_rx, 0);
-        assert_eq!(filled[2].gpu_percent, Some(0.0));
+        assert_eq!(filled[0].cpu_percent, 0.0);
+        assert_eq!(filled[1].network_rx, 0);
+        assert_eq!(filled[2].cpu_percent, 42.0);
+        assert_eq!(filled[2].gpu_percent, Some(5.0));
+    }
+
+    #[test]
+    fn metric_bucket_count_includes_only_a_real_partial_tail() {
+        assert_eq!(metric_bucket_count(0, 0, 60), 1);
+        assert_eq!(metric_bucket_count(0, 240, 60), 4);
+        assert_eq!(metric_bucket_count(0, 241, 60), 5);
     }
 
     #[test]

@@ -1078,6 +1078,27 @@ pub async fn admin_jobs(
     Ok(Json(jobs))
 }
 
+pub async fn admin_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> AppResult<Json<CommandJobRecord>> {
+    require_admin(&state, &headers).await?;
+    let job = sqlx::query_as::<_, CommandJobRecord>(
+        r#"
+        SELECT id, command_id, instance_id, command, status, requested_by, created_at,
+               completed_at, output, exit_code
+        FROM command_jobs
+        WHERE id = $1
+        "#,
+    )
+    .bind(&job_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "命令任务不存在"))?;
+    Ok(Json(job))
+}
+
 pub async fn admin_logs(
     State(state): State<AppState>,
     headers: HeaderMap,

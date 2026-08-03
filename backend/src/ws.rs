@@ -19,7 +19,10 @@ use crate::{
     },
     error::AppResult,
     files::{close_connection_file_requests, handle_agent_file_binary, handle_agent_file_response},
-    jobs::{complete_command_job, fail_connection_command_jobs},
+    jobs::{
+        MAX_COMMAND_OUTPUT_BYTES, append_command_job_output, complete_command_job,
+        fail_connection_command_jobs,
+    },
     models::{
         AgentInbound, AgentOutbound, MetricPayload, TerminalClientMessage, TerminalServerMessage,
     },
@@ -33,7 +36,6 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 pub(crate) const MAX_AGENT_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AGENT_RESPONSE_BYTES: usize = 1024 * 1024;
-const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_STATUS_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_AGENT_ID_BYTES: usize = 128;
@@ -314,6 +316,11 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
                 return Err("command result too large");
             }
         }
+        AgentInbound::CommandOutput { job_id, output } => {
+            if !id(job_id) || output.len() > MAX_STREAM_CHUNK_BYTES {
+                return Err("command output chunk too large");
+            }
+        }
         AgentInbound::TerminalOpened { session_id }
         | AgentInbound::DesktopOpened { session_id }
         | AgentInbound::DockerExecOpened { session_id } => {
@@ -461,6 +468,13 @@ async fn handle_agent_message(
             .await?
             {
                 warn!(%instance_id, %connection_id, %job_id, "ignored unmatched or terminal command result");
+            }
+        }
+        AgentInbound::CommandOutput { job_id, output } => {
+            if !append_command_job_output(state, &job_id, instance_id, connection_id, &output)
+                .await?
+            {
+                warn!(%instance_id, %connection_id, %job_id, "ignored unmatched or terminal command output");
             }
         }
         AgentInbound::TerminalOpened { session_id } => {
@@ -818,6 +832,18 @@ mod tests {
             output: "x".repeat(MAX_COMMAND_OUTPUT_BYTES + 1),
         };
         assert!(validate_agent_inbound(&oversized_command).is_err());
+
+        let command_output = AgentInbound::CommandOutput {
+            job_id: "job-1".to_string(),
+            output: "x".repeat(MAX_STREAM_CHUNK_BYTES),
+        };
+        assert!(validate_agent_inbound(&command_output).is_ok());
+
+        let oversized_command_output = AgentInbound::CommandOutput {
+            job_id: "job-1".to_string(),
+            output: "x".repeat(MAX_STREAM_CHUNK_BYTES + 1),
+        };
+        assert!(validate_agent_inbound(&oversized_command_output).is_err());
 
         let oversized_id = AgentInbound::DesktopOpened {
             session_id: "x".repeat(MAX_AGENT_ID_BYTES + 1),

@@ -150,6 +150,13 @@ export type CommandJob = {
   exit_code: number | null
 }
 
+export type CommandExecutionState = {
+  commandName: string
+  instanceName: string
+  job: CommandJob
+  error: string
+}
+
 export type ActionLog = {
   id: string
   actor: string

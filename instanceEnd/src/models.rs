@@ -735,6 +735,10 @@ pub enum AgentInbound {
         exit_code: i64,
         output: String,
     },
+    CommandOutput {
+        job_id: String,
+        output: String,
+    },
     TerminalOpened {
         session_id: String,
     },

@@ -40,6 +40,23 @@
 .terminal-screen .xterm { height: 100%; }
 .terminal-screen .xterm-viewport { border-radius: 4px; }
 
+.command-result-modal { width: min(100%, 720px); gap: 14px; }
+.command-result-modal .modal-title > div { min-width: 0; }
+.command-result-modal .modal-title p { margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.command-result-status { display: grid; min-height: 54px; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 10px 12px; color: var(--cyan-text); background: color-mix(in srgb, var(--cyan) 8%, transparent); border: 1px solid color-mix(in srgb, var(--cyan) 20%, transparent); border-radius: 6px; }
+.command-result-status.completed { color: var(--success-text); background: color-mix(in srgb, var(--success) 8%, transparent); border-color: color-mix(in srgb, var(--success) 20%, transparent); }
+.command-result-status.failed { color: var(--danger-text); background: color-mix(in srgb, var(--danger) 8%, transparent); border-color: color-mix(in srgb, var(--danger) 20%, transparent); }
+.command-result-status > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.command-result-status strong { color: currentColor; font-size: 12px; }
+.command-result-status small { color: var(--muted); font-size: 10px; }
+.command-result-status time { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.command-result-error { padding: 9px 10px; color: var(--danger-text); background: color-mix(in srgb, var(--danger) 7%, transparent); border: 1px solid color-mix(in srgb, var(--danger) 18%, transparent); border-radius: 5px; font-size: 11px; }
+.command-result-command, .command-result-output { display: flex; min-width: 0; flex-direction: column; gap: 7px; }
+.command-result-command > span, .command-result-output > span { color: var(--muted-strong); font-size: 11px; font-weight: 650; }
+.command-result-command code { overflow-x: auto; padding: 10px 11px; color: var(--accent-strong); background: var(--surface-inset); border: 1px solid var(--line); border-radius: 5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.5; white-space: pre; }
+.command-result-output pre { min-height: 180px; max-height: min(46vh, 420px); margin: 0; overflow: auto; padding: 12px; color: var(--text-strong); background: #080b0d; border: 1px solid var(--line-strong); border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
+.command-result-modal .modal-actions .text-button { min-width: 88px; }
+
 .login-modal { position: relative; width: min(100%, 410px); align-items: stretch; gap: 17px; padding: 28px; }
 .login-modal .modal-close { position: absolute; top: 14px; right: 14px; }
 .login-modal .login-icon { align-self: center; display: inline-flex; width: 50px; height: 50px; align-items: center; justify-content: center; color: var(--accent-strong); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 7px; }

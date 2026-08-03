@@ -16,6 +16,7 @@ import type {
   AppearanceResponse,
   AuthEnrollment,
   AuthMode,
+  CommandExecutionState,
   CommandJob,
   CommandRecord,
   Instance,
@@ -34,6 +35,9 @@ type TrafficSnapshot = {
 
 type AgentUpdateOperation = 'creating' | 'saving' | 'uploading' | 'publishing' | 'deleting' | 'retrying' | null
 
+const COMMAND_JOB_POLL_INTERVAL_MS = 750
+const COMMAND_JOB_POLL_RETRY_MS = 2000
+
 function abortedRequestError() {
   return new DOMException('Request superseded by a session change', 'AbortError')
 }
@@ -48,6 +52,7 @@ export function useMonitoringConsole() {
   const pendingInstances = ref<PendingInstance[]>([])
   const commands = ref<CommandRecord[]>([])
   const jobs = ref<CommandJob[]>([])
+  const commandExecution = ref<CommandExecutionState | null>(null)
   const logs = ref<ActionLog[]>([])
   const agentReleases = ref<AgentRelease[]>([])
   const agentUpdateAttempts = ref<AgentUpdateAttempt[]>([])
@@ -88,6 +93,8 @@ export function useMonitoringConsole() {
   let agentUpdatesRequest = 0
   let usersRequest = 0
   let sessionEpoch = 0
+  const trackedCommandJobs = new Set<string>()
+  const commandJobPollTimers = new Map<string, number>()
   let adminAbortController = new AbortController()
   const operationLocks = new Set<string>()
 
@@ -181,6 +188,7 @@ export function useMonitoringConsole() {
   onBeforeUnmount(() => {
     if (publicPollTimer !== null) window.clearInterval(publicPollTimer)
     if (clockTimer !== null) window.clearInterval(clockTimer)
+    clearTrackedCommandJobs()
     invalidateAdminRequests()
   })
 
@@ -248,6 +256,7 @@ export function useMonitoringConsole() {
   }
 
   function clearAdminState() {
+    clearTrackedCommandJobs()
     terminalState.instance = null
     remoteDesktopState.instance = null
     editInstance.value = null
@@ -256,6 +265,7 @@ export function useMonitoringConsole() {
     pendingInstances.value = []
     commands.value = []
     jobs.value = []
+    commandExecution.value = null
     logs.value = []
     agentReleases.value = []
     agentUpdateAttempts.value = []
@@ -534,11 +544,93 @@ export function useMonitoringConsole() {
 
   function runCommand(instance: Instance, command: CommandRecord) {
     guarded(async () => {
-      await api(`/api/admin/instances/${instance.id}/commands/${command.id}/run`, {
+      const job = await api<CommandJob>(`/api/admin/instances/${instance.id}/commands/${command.id}/run`, {
         method: 'POST',
       })
-      await loadAdminData()
+      upsertCommandJob(job)
+      commandExecution.value = {
+        commandName: command.name,
+        instanceName: instance.name || instance.hostname,
+        job,
+        error: '',
+      }
+      trackCommandJob(job.id)
     }, `run-command:${instance.id}:${command.id}`)
+  }
+
+  function closeCommandExecution() {
+    commandExecution.value = null
+  }
+
+  function trackCommandJob(jobId: string) {
+    if (trackedCommandJobs.has(jobId)) return
+    trackedCommandJobs.add(jobId)
+    void pollCommandJob(jobId)
+  }
+
+  async function pollCommandJob(jobId: string) {
+    if (!trackedCommandJobs.has(jobId)) return
+    commandJobPollTimers.delete(jobId)
+    try {
+      const job = await api<CommandJob>(`/api/admin/jobs/${encodeURIComponent(jobId)}`, {
+        cache: 'no-store',
+      })
+      if (!trackedCommandJobs.has(jobId)) return
+      upsertCommandJob(job)
+      if (commandExecution.value?.job.id === jobId) {
+        commandExecution.value = {
+          ...commandExecution.value,
+          job,
+          error: '',
+        }
+      }
+      if (isTerminalCommandJob(job)) {
+        trackedCommandJobs.delete(jobId)
+        return
+      }
+      scheduleCommandJobPoll(jobId, COMMAND_JOB_POLL_INTERVAL_MS)
+    } catch (error) {
+      if (!trackedCommandJobs.has(jobId) || isAbortError(error)) return
+      if (commandExecution.value?.job.id === jobId) {
+        commandExecution.value = {
+          ...commandExecution.value,
+          error: error instanceof Error ? error.message : '暂时无法获取命令结果',
+        }
+      }
+      if (error instanceof ApiError && error.status === 404) {
+        trackedCommandJobs.delete(jobId)
+        return
+      }
+      scheduleCommandJobPoll(jobId, COMMAND_JOB_POLL_RETRY_MS)
+    }
+  }
+
+  function scheduleCommandJobPoll(jobId: string, delay: number) {
+    if (!trackedCommandJobs.has(jobId)) return
+    const timer = window.setTimeout(() => {
+      commandJobPollTimers.delete(jobId)
+      void pollCommandJob(jobId)
+    }, delay)
+    commandJobPollTimers.set(jobId, timer)
+  }
+
+  function upsertCommandJob(job: CommandJob) {
+    const existingIndex = jobs.value.findIndex((candidate) => candidate.id === job.id)
+    if (existingIndex === -1) {
+      jobs.value = [job, ...jobs.value].slice(0, 200)
+      return
+    }
+    jobs.value = jobs.value.map((candidate, index) => index === existingIndex ? job : candidate)
+  }
+
+  function clearTrackedCommandJobs() {
+    trackedCommandJobs.clear()
+    for (const timer of commandJobPollTimers.values()) window.clearTimeout(timer)
+    commandJobPollTimers.clear()
+  }
+
+  function isTerminalCommandJob(job: CommandJob) {
+    return job.status === 'completed' || job.status === 'failed'
   }
 
   function saveSettings() {
@@ -952,6 +1044,7 @@ export function useMonitoringConsole() {
     pendingInstances,
     commands,
     jobs,
+    commandExecution,
     logs,
     agentReleases,
     agentUpdateAttempts,
@@ -1013,6 +1106,7 @@ export function useMonitoringConsole() {
     createCommand,
     removeCommand,
     runCommand,
+    closeCommandExecution,
     saveSettings,
     saveAppearance,
     createUserEnrollment,

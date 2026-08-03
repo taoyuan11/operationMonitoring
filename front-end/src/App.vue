@@ -24,6 +24,7 @@ const TerminalModal = defineAsyncComponent(() => import('./components/TerminalMo
 const RemoteDesktopModal = defineAsyncComponent(() => import('./components/RemoteDesktopModal.vue'))
 const EditInstanceModal = defineAsyncComponent(() => import('./components/EditInstanceModal.vue'))
 const InstanceDetailModal = defineAsyncComponent(() => import('./components/InstanceDetailModal.vue'))
+const CommandResultModal = defineAsyncComponent(() => import('./components/CommandResultModal.vue'))
 
 const consoleState = useMonitoringConsole()
 const currentPage = ref<AppPage>('home')
@@ -466,6 +467,14 @@ function confirmAction() {
         v-if="consoleState.remoteDesktopState.instance"
         :instance="consoleState.remoteDesktopState.instance"
         @close="consoleState.closeRemoteDesktop"
+      />
+    </Transition>
+
+    <Transition name="modal" appear>
+      <CommandResultModal
+        v-if="consoleState.commandExecution.value"
+        :execution="consoleState.commandExecution.value"
+        @close="consoleState.closeCommandExecution"
       />
     </Transition>
 

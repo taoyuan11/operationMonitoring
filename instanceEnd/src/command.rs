@@ -3,6 +3,7 @@ use std::{io, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
+    sync::mpsc,
     time::timeout,
 };
 
@@ -11,30 +12,58 @@ use crate::activity::ActivityTracker;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const OUTPUT_TRUNCATION_MARKER: &str = "\n[output truncated]";
 
-pub async fn execute_command(command: &str) -> (i64, String) {
-    execute_command_with_timeout(command, Duration::from_secs(120)).await
+#[cfg(test)]
+async fn execute_command_with_timeout(command: &str, command_timeout: Duration) -> (i64, String) {
+    execute_command_with_timeout_streaming(command, command_timeout, |_| {}).await
 }
 
-async fn execute_command_with_timeout(command: &str, command_timeout: Duration) -> (i64, String) {
+async fn execute_command_with_timeout_streaming<F>(
+    command: &str,
+    command_timeout: Duration,
+    mut on_output: F,
+) -> (i64, String)
+where
+    F: FnMut(String) + Send,
+{
     let mut process = shell_command(command);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_process_group(&mut process);
     let mut child = match process.spawn() {
         Ok(child) => child,
-        Err(error) => return (-1, format!("failed to execute command: {error}")),
+        Err(error) => {
+            let output = format!("failed to execute command: {error}");
+            on_output(output.clone());
+            return (-1, output);
+        }
     };
     let process_id = child.id();
     let Some(stdout) = child.stdout.take() else {
-        return (-1, "failed to capture command stdout".to_string());
+        let output = "failed to capture command stdout".to_string();
+        on_output(output.clone());
+        return (-1, output);
     };
     let Some(stderr) = child.stderr.take() else {
-        return (-1, "failed to capture command stderr".to_string());
+        let output = "failed to capture command stderr".to_string();
+        on_output(output.clone());
+        return (-1, output);
     };
+    let (output_tx, output_rx) = mpsc::channel(16);
+    let stdout_tx = output_tx.clone();
+    let stderr_tx = output_tx;
     let completed = async {
-        let (status, stdout, stderr) = tokio::try_join!(
+        let (status, stdout, stderr, ()) = tokio::try_join!(
             child.wait(),
-            capture_output(stdout, MAX_OUTPUT_BYTES),
-            capture_output(stderr, MAX_OUTPUT_BYTES),
+            capture_output(
+                stdout,
+                MAX_OUTPUT_BYTES,
+                Some((CommandOutputStream::Stdout, stdout_tx)),
+            ),
+            capture_output(
+                stderr,
+                MAX_OUTPUT_BYTES,
+                Some((CommandOutputStream::Stderr, stderr_tx)),
+            ),
+            forward_output(output_rx, &mut on_output),
         )?;
         Ok::<_, io::Error>((status, stdout, stderr))
     };
@@ -52,29 +81,42 @@ async fn execute_command_with_timeout(command: &str, command_timeout: Duration) 
         }
         Ok(Err(error)) => {
             terminate_process_tree(&mut child, process_id).await;
-            (-1, format!("failed to execute command: {error}"))
+            let output = format!("failed to execute command: {error}");
+            on_output(output.clone());
+            (-1, output)
         }
         Err(_) => {
             terminate_process_tree(&mut child, process_id).await;
-            (
-                -1,
-                format!(
-                    "command timed out after {} seconds",
-                    command_timeout.as_secs_f64()
-                ),
-            )
+            let output = format!(
+                "command timed out after {} seconds",
+                command_timeout.as_secs_f64()
+            );
+            on_output(output.clone());
+            (-1, output)
         }
     }
 }
 
-pub async fn execute_tracked_command(command: &str, activity: &ActivityTracker) -> (i64, String) {
+pub async fn execute_tracked_command<F>(
+    command: &str,
+    activity: &ActivityTracker,
+    mut on_output: F,
+) -> (i64, String)
+where
+    F: FnMut(String) + Send,
+{
     let Some(_guard) = activity.try_enter() else {
-        return (
-            -1,
-            "command rejected because an agent update is waiting to install".to_string(),
-        );
+        let output = "command rejected because an agent update is waiting to install".to_string();
+        on_output(output.clone());
+        return (-1, output);
     };
-    execute_command(command).await
+    execute_command_with_timeout_streaming(command, Duration::from_secs(120), on_output).await
+}
+
+#[derive(Clone, Copy)]
+enum CommandOutputStream {
+    Stdout,
+    Stderr,
 }
 
 struct CapturedOutput {
@@ -85,6 +127,10 @@ struct CapturedOutput {
 async fn capture_output(
     mut reader: impl AsyncRead + Unpin,
     max_bytes: usize,
+    stream_output: Option<(
+        CommandOutputStream,
+        mpsc::Sender<(CommandOutputStream, Vec<u8>)>,
+    )>,
 ) -> io::Result<CapturedOutput> {
     let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
     let mut buffer = [0_u8; 8 * 1024];
@@ -94,11 +140,87 @@ async fn capture_output(
         if count == 0 {
             break;
         }
+        if let Some((stream, sender)) = &stream_output {
+            let _ = sender.send((*stream, buffer[..count].to_vec())).await;
+        }
         let retained = count.min(max_bytes.saturating_sub(bytes.len()));
         bytes.extend_from_slice(&buffer[..retained]);
         truncated |= retained < count;
     }
     Ok(CapturedOutput { bytes, truncated })
+}
+
+async fn forward_output<F>(
+    mut output_rx: mpsc::Receiver<(CommandOutputStream, Vec<u8>)>,
+    on_output: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(String) + Send,
+{
+    let mut stdout_pending = Vec::new();
+    let mut stderr_pending = Vec::new();
+    let mut streamed_bytes = 0;
+    while let Some((stream, bytes)) = output_rx.recv().await {
+        let retained = bytes
+            .len()
+            .min(MAX_OUTPUT_BYTES.saturating_sub(streamed_bytes));
+        streamed_bytes += retained;
+        if retained == 0 {
+            continue;
+        }
+        let pending = match stream {
+            CommandOutputStream::Stdout => &mut stdout_pending,
+            CommandOutputStream::Stderr => &mut stderr_pending,
+        };
+        let decoded = decode_utf8_chunk(pending, &bytes[..retained], false);
+        if !decoded.is_empty() {
+            on_output(decoded);
+        }
+    }
+    for pending in [&mut stdout_pending, &mut stderr_pending] {
+        let decoded = decode_utf8_chunk(pending, &[], true);
+        if !decoded.is_empty() {
+            on_output(decoded);
+        }
+    }
+    Ok(())
+}
+
+fn decode_utf8_chunk(pending: &mut Vec<u8>, bytes: &[u8], flush: bool) -> String {
+    pending.extend_from_slice(bytes);
+    let mut decoded = String::new();
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(valid) => {
+                decoded.push_str(valid);
+                pending.clear();
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                let error_len = error.error_len();
+                if valid_up_to > 0 {
+                    decoded.push_str(
+                        std::str::from_utf8(&pending[..valid_up_to])
+                            .expect("prefix reported by Utf8Error is valid"),
+                    );
+                    pending.drain(..valid_up_to);
+                    continue;
+                }
+                if let Some(error_len) = error_len {
+                    decoded.push('\u{fffd}');
+                    pending.drain(..error_len);
+                    continue;
+                }
+                if flush {
+                    decoded.push_str(&String::from_utf8_lossy(pending));
+                    pending.clear();
+                }
+                break;
+            }
+        }
+    }
+    decoded
 }
 
 #[cfg(unix)]
@@ -204,12 +326,49 @@ mod tests {
     #[tokio::test]
     async fn output_capture_discards_bytes_beyond_the_retention_limit() {
         let input = vec![b'x'; MAX_OUTPUT_BYTES * 4];
-        let captured = capture_output(std::io::Cursor::new(input), MAX_OUTPUT_BYTES)
+        let captured = capture_output(std::io::Cursor::new(input), MAX_OUTPUT_BYTES, None)
             .await
             .unwrap();
 
         assert_eq!(captured.bytes.len(), MAX_OUTPUT_BYTES);
         assert!(captured.truncated);
+    }
+
+    #[test]
+    fn streaming_decoder_preserves_split_utf8_characters() {
+        let value = "命".as_bytes();
+        let mut pending = Vec::new();
+
+        assert_eq!(decode_utf8_chunk(&mut pending, &value[..2], false), "");
+        assert_eq!(decode_utf8_chunk(&mut pending, &value[2..], false), "命");
+        assert!(pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_output_is_streamed_before_process_completion() {
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let execution = tokio::spawn(async move {
+            execute_command_with_timeout_streaming(
+                "printf first; sleep 0.5; printf second",
+                Duration::from_secs(2),
+                move |output| {
+                    let _ = output_tx.send(output);
+                },
+            )
+            .await
+        });
+
+        let first = timeout(Duration::from_millis(300), output_rx.recv())
+            .await
+            .expect("first output should arrive while the command is running")
+            .expect("output channel should remain open");
+        assert_eq!(first, "first");
+        assert!(!execution.is_finished());
+
+        let (exit_code, output) = execution.await.unwrap();
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "firstsecond");
     }
 
     #[cfg(unix)]

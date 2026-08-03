@@ -651,10 +651,19 @@ fn dispatch_command_job(
 
     crate::logging::info(format_args!("running command job {job_id}: {command}"));
     let command_outbound = outbound.clone();
+    let output_outbound = outbound.clone();
+    let output_job_id = job_id.clone();
     let command_activity = activity.clone();
     tokio::spawn(async move {
         let _command_slot = command_slot;
-        let (exit_code, output) = execute_tracked_command(&command, &command_activity).await;
+        let (exit_code, output) =
+            execute_tracked_command(&command, &command_activity, move |output| {
+                let _ = output_outbound.send(AgentInbound::CommandOutput {
+                    job_id: output_job_id.clone(),
+                    output,
+                });
+            })
+            .await;
         let _ = command_outbound.send(AgentInbound::CommandResult {
             job_id,
             exit_code,

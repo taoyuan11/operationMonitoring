@@ -15,6 +15,7 @@ use crate::{
 const COMMAND_TIMEOUT_SECONDS: i64 = 60 * 60;
 const COMMAND_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INFLIGHT_COMMANDS_PER_INSTANCE: i64 = 4;
+pub(crate) const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 
 pub async fn create_command_job(
     state: &AppState,
@@ -171,6 +172,34 @@ pub async fn complete_command_job(
     .bind(now_ts())
     .bind(output)
     .bind(exit_code)
+    .bind(job_id)
+    .bind(instance_id)
+    .bind(connection_id.to_string())
+    .execute(&state.db)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn append_command_job_output(
+    state: &AppState,
+    job_id: &str,
+    instance_id: &str,
+    connection_id: Uuid,
+    output: &str,
+) -> AppResult<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE command_jobs
+        SET output = CASE
+            WHEN octet_length(output) + octet_length($1) <= $2 THEN output || $1
+            ELSE output
+        END
+        WHERE id = $3 AND instance_id = $4 AND agent_connection_id = $5
+          AND status = 'running'
+        "#,
+    )
+    .bind(output)
+    .bind(MAX_COMMAND_OUTPUT_BYTES as i64)
     .bind(job_id)
     .bind(instance_id)
     .bind(connection_id.to_string())

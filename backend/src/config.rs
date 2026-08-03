@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{ffi::OsString, net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
 use ipnet::IpNet;
@@ -45,7 +45,7 @@ pub struct Cli {
     pub upload_dir: PathBuf,
     #[arg(long, env = "OM_UPDATE_DIR", default_value = "updates")]
     pub update_dir: PathBuf,
-    #[arg(long, env = "OM_UPDATE_SIGNING_KEY_FILE")]
+    #[arg(long)]
     pub update_signing_key_file: Option<PathBuf>,
     #[arg(long, env = "OM_UPDATE_SIGNING_KEY_ID", default_value = "default")]
     pub update_signing_key_id: String,
@@ -61,6 +61,14 @@ pub struct Cli {
         default_value_t = 1024 * 1024 * 1024
     )]
     pub file_transfer_max_bytes: usize,
+}
+
+pub fn update_signing_key_file_from_env() -> Option<PathBuf> {
+    optional_path_from_env_value(std::env::var_os("OM_UPDATE_SIGNING_KEY_FILE"))
+}
+
+fn optional_path_from_env_value(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 pub fn validate_bootstrap_password(password: &str) -> anyhow::Result<()> {
@@ -86,7 +94,11 @@ pub fn validate_bootstrap_password(password: &str) -> anyhow::Result<()> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, EXAMPLE_BOOTSTRAP_PASSWORD, validate_bootstrap_password};
+    use std::{ffi::OsString, path::PathBuf};
+
+    use super::{
+        Cli, EXAMPLE_BOOTSTRAP_PASSWORD, optional_path_from_env_value, validate_bootstrap_password,
+    };
 
     #[test]
     fn bootstrap_password_requires_a_long_explicit_value() {
@@ -120,6 +132,16 @@ mod tests {
                     .parse::<std::net::IpAddr>()
                     .expect("IPv6 address")
             )
+        );
+    }
+
+    #[test]
+    fn empty_update_signing_key_path_disables_the_signer() {
+        assert_eq!(optional_path_from_env_value(None), None);
+        assert_eq!(optional_path_from_env_value(Some(OsString::new())), None);
+        assert_eq!(
+            optional_path_from_env_value(Some(OsString::from("/keys/update-signing.key"))),
+            Some(PathBuf::from("/keys/update-signing.key"))
         );
     }
 }

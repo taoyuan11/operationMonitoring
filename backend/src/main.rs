@@ -32,7 +32,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use clap::Parser;
-use config::{Cli, validate_bootstrap_password};
+use config::{Cli, update_signing_key_file_from_env, validate_bootstrap_password};
 use db::{cleanup_loop, connect_db, init_db};
 use error::AppResult;
 use files::{
@@ -73,6 +73,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut cli = Cli::parse();
+    if cli.update_signing_key_file.is_none() {
+        cli.update_signing_key_file = update_signing_key_file_from_env();
+    }
     let bind = cli.bind;
     let package_body_limit = cli.agent_package_max_bytes.saturating_add(1024 * 1024);
     let file_body_limit = cli.file_transfer_max_bytes;

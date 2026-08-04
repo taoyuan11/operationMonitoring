@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     admin_auth::resolved_client_ip,
-    audit,
+    alerts, audit,
     auth::require_admin,
     db::{
         agent_secret_matches, approve_pending_instance, get_instance, get_instance_optional,
@@ -588,6 +588,7 @@ pub async fn admin_disable_instance(
     if updated.rows_affected() != 1 {
         return Err(AppError::new(StatusCode::NOT_FOUND, "实例不存在"));
     }
+    alerts::resolve_instance(&mut transaction, &id, "instance_disabled").await?;
     write_action_log(
         &mut *transaction,
         &admin.username,
@@ -624,6 +625,8 @@ pub async fn admin_delete_instance(
     if instance_exists.is_none() {
         return Err(AppError::new(StatusCode::NOT_FOUND, "实例不存在"));
     }
+    alerts::resolve_instance(&mut transaction, &id, "instance_deleted").await?;
+    alerts::remove_instance_maintenance_target(&mut transaction, &id).await?;
     sqlx::query("DELETE FROM metrics WHERE instance_id = $1")
         .bind(&id)
         .execute(&mut *transaction)
@@ -683,30 +686,43 @@ pub async fn admin_put_settings(
         .audit_retention_days
         .map(|days| days.clamp(1, audit::MAX_AUDIT_RETENTION_DAYS))
         .unwrap_or(audit::retention_days(&state.db).await?);
+    let alert_days = payload
+        .alert_retention_days
+        .map(|days| days.clamp(1, alerts::MAX_ALERT_RETENTION_DAYS))
+        .unwrap_or(alerts::retention_days(&state.db).await?);
+    let mut transaction = state.db.begin().await?;
     sqlx::query(
         "INSERT INTO settings(key, value) VALUES('retention_days', $1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
     .bind(days.to_string())
-    .execute(&state.db)
+    .execute(&mut *transaction)
     .await?;
     sqlx::query(
         "INSERT INTO settings(key, value) VALUES('audit_retention_days', $1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
     .bind(audit_days.to_string())
-    .execute(&state.db)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO settings(key, value) VALUES('alert_retention_days', $1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(alert_days.to_string())
+    .execute(&mut *transaction)
     .await?;
     write_action_log(
-        &state.db,
+        &mut *transaction,
         &admin.username,
         Some(&admin.user_id),
         "update_settings",
         "retention_days",
-        &format!("指标保留天数设置为 {}", days),
+        &format!("保留天数设置：指标 {days}，审计 {audit_days}，告警 {alert_days}"),
     )
     .await?;
+    transaction.commit().await?;
     let mut response = settings_response(&state).await?;
     response.retention_days = days;
     response.audit_retention_days = audit_days;
+    response.alert_retention_days = alert_days;
     Ok(Json(response))
 }
 
@@ -860,6 +876,7 @@ async fn settings_response(state: &AppState) -> AppResult<SettingsResponse> {
     Ok(SettingsResponse {
         retention_days: retention_days(&state.db).await?,
         audit_retention_days: audit::retention_days(&state.db).await?,
+        alert_retention_days: alerts::retention_days(&state.db).await?,
         background_image_url: appearance.background_image_url,
         theme_mode: appearance.theme_mode,
         accent_color: appearance.accent_color,
@@ -1261,14 +1278,15 @@ pub async fn agent_report(
 
     confirm_update_version(&state, &payload.instance_id, &payload.agent_version).await?;
 
-    let metric_timestamp = normalize_metric_timestamp(payload.metrics.ts, now_ts())?;
+    let received_at = now_ts();
+    let metric_timestamp = normalize_metric_timestamp(payload.metrics.ts, received_at)?;
     sqlx::query(
         r#"
         INSERT INTO metrics(instance_id, ts, cpu_percent, memory_used, memory_total,
                             disk_used, disk_total, network_rx, network_tx, gpu_percent,
                             gpu_memory_used, gpu_memory_total, uptime_seconds, load_average,
-                            latency_ms)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL)
+                            latency_ms, received_at, latency_sampled_at)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL, $15, NULL)
         "#,
     )
     .bind(&payload.instance_id)
@@ -1285,7 +1303,18 @@ pub async fn agent_report(
     .bind(payload.metrics.gpu_memory_total)
     .bind(payload.metrics.uptime_seconds)
     .bind(payload.metrics.load_average)
+    .bind(received_at)
     .execute(&state.db)
+    .await?;
+
+    alerts::observe_metric(
+        &state,
+        &payload.instance_id,
+        &payload.metrics,
+        None,
+        received_at,
+        None,
+    )
     .await?;
 
     Ok(Json(AgentRegisterResponse {

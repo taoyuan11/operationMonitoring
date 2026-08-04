@@ -161,6 +161,7 @@ export function useMonitoringConsole() {
   const settingsForm = reactive({
     retention_days: 30,
     audit_retention_days: 180,
+    alert_retention_days: 180,
     background_image_url: null as string | null,
     theme_mode: appearance.themeMode.value,
     accent_color: appearance.accentColor.value,
@@ -351,6 +352,7 @@ export function useMonitoringConsole() {
     editForm.remark = ''
     settingsForm.retention_days = 30
     settingsForm.audit_retention_days = 180
+    settingsForm.alert_retention_days = 180
     settingsForm.background_image_url = appearance.backgroundImageUrl.value
     settingsForm.theme_mode = appearance.themeMode.value
     settingsForm.accent_color = appearance.accentColor.value
@@ -430,6 +432,7 @@ export function useMonitoringConsole() {
     jobs.value = jobList
     settingsForm.retention_days = settings.retention_days
     settingsForm.audit_retention_days = settings.audit_retention_days ?? 180
+    settingsForm.alert_retention_days = settings.alert_retention_days ?? 180
     appearance.applyAppearance(settings)
     settingsForm.background_image_url = settings.background_image_url
     settingsForm.theme_mode = settings.theme_mode
@@ -801,6 +804,7 @@ export function useMonitoringConsole() {
         body: JSON.stringify({
           retention_days: settingsForm.retention_days,
           audit_retention_days: settingsForm.audit_retention_days,
+          alert_retention_days: settingsForm.alert_retention_days,
         }),
       })
       await loadAdminData()
@@ -1330,6 +1334,7 @@ export function useMonitoringConsole() {
     networkRxRate,
     networkTxRate,
     appearanceStyle: appearance.appearanceStyle,
+    adminApi: api,
     refreshAll,
     login,
     restartBootstrap,

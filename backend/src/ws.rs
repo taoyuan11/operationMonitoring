@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::Future,
     time::{Duration, Instant},
 };
@@ -11,7 +12,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    audit,
+    alerts, audit,
     auth::AdminSessionGuard,
     db::normalize_metric_timestamp,
     docker::{
@@ -39,6 +40,7 @@ use crate::{
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_PENDING_HEARTBEATS: usize = 8;
 pub(crate) const MAX_AGENT_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AGENT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -122,14 +124,18 @@ pub async fn agent_socket(
         .execute(&state.db)
         .await;
     offer_update_on_connect(&state, &instance_id).await;
+    if let Err(error) = alerts::observe_connection(&state, &instance_id, true).await {
+        warn!(?error, %instance_id, %connection_id, "failed to evaluate connected agent alerts");
+    }
 
     info!(%instance_id, %connection_id, "agent websocket connected");
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_inbound = Instant::now();
     let mut heartbeat_token = 0_i64;
-    let mut pending_heartbeat: Option<PendingHeartbeat> = None;
+    let mut pending_heartbeats = VecDeque::new();
     let mut latency_ms = None;
+    let mut latency_sampled_at = None;
 
     loop {
         tokio::select! {
@@ -185,11 +191,12 @@ pub async fn agent_socket(
                                 match message {
                                     AgentInbound::Pong { now } => {
                                         if let Some(sample) = accept_heartbeat_pong(
-                                            &mut pending_heartbeat,
+                                            &mut pending_heartbeats,
                                             now,
                                             Instant::now(),
                                         ) {
                                             latency_ms = Some(sample);
+                                            latency_sampled_at = Some(now_ts());
                                         }
                                     }
                                     message => {
@@ -199,6 +206,7 @@ pub async fn agent_socket(
                                             connection_id,
                                             message,
                                             latency_ms,
+                                            latency_sampled_at,
                                         ).await {
                                             error!(?error, %instance_id, "failed to handle agent websocket message");
                                         }
@@ -239,7 +247,11 @@ pub async fn agent_socket(
                 {
                     break;
                 }
-                pending_heartbeat = Some(PendingHeartbeat {
+                retain_recent_heartbeats(&mut pending_heartbeats, sent_at);
+                if pending_heartbeats.len() == MAX_PENDING_HEARTBEATS {
+                    pending_heartbeats.pop_front();
+                }
+                pending_heartbeats.push_back(PendingHeartbeat {
                     token: heartbeat_token,
                     sent_at,
                 });
@@ -247,7 +259,10 @@ pub async fn agent_socket(
         }
     }
 
-    remove_current_agent(&state, &instance_id, connection_id).await;
+    let removed = remove_current_agent(&state, &instance_id, connection_id).await;
+    if removed && let Err(error) = alerts::observe_connection(&state, &instance_id, false).await {
+        warn!(?error, %instance_id, %connection_id, "failed to evaluate disconnected agent alerts");
+    }
 
     if let Err(error) = fail_connection_command_jobs(&state, &instance_id, connection_id).await {
         warn!(?error, %instance_id, %connection_id, "failed to close disconnected agent command jobs");
@@ -260,14 +275,15 @@ pub async fn agent_socket(
     info!(%instance_id, %connection_id, "agent websocket disconnected");
 }
 
-async fn remove_current_agent(state: &AppState, instance_id: &str, connection_id: Uuid) {
+async fn remove_current_agent(state: &AppState, instance_id: &str, connection_id: Uuid) -> bool {
     let mut agents = state.agents.write().await;
     if agents
         .get(instance_id)
         .is_some_and(|handle| handle.connection_id == connection_id)
     {
-        agents.remove(instance_id);
+        return agents.remove(instance_id).is_some();
     }
+    false
 }
 
 pub async fn revoke_instance_connection(state: &AppState, instance_id: &str) {
@@ -276,6 +292,9 @@ pub async fn revoke_instance_connection(state: &AppState, instance_id: &str) {
         cancel_instance_docker(state, instance_id, None).await;
         return;
     };
+    if let Err(error) = alerts::observe_connection(state, instance_id, false).await {
+        warn!(?error, %instance_id, connection_id = %agent.connection_id, "failed to evaluate revoked agent alerts");
+    }
     agent.shutdown_tx.send_replace(true);
     if let Err(error) = fail_connection_command_jobs(state, instance_id, agent.connection_id).await
     {
@@ -447,6 +466,7 @@ async fn handle_agent_message(
     connection_id: Uuid,
     message: AgentInbound,
     latency_ms: Option<f64>,
+    latency_sampled_at: Option<i64>,
 ) -> AppResult<()> {
     match message {
         AgentInbound::Pong { .. } => {}
@@ -479,6 +499,7 @@ async fn handle_agent_message(
                 docker_status,
                 metrics,
                 latency_ms,
+                latency_sampled_at,
             )
             .await?;
         }
@@ -686,6 +707,7 @@ async fn store_metrics(
     docker_status: Option<crate::models::DockerStatus>,
     metrics: MetricPayload,
     latency_ms: Option<f64>,
+    latency_sampled_at: Option<i64>,
 ) -> AppResult<()> {
     if !state
         .agents
@@ -696,7 +718,8 @@ async fn store_metrics(
     {
         return Ok(());
     }
-    let metric_timestamp = normalize_metric_timestamp(metrics.ts, now_ts())?;
+    let received_at = now_ts();
+    let metric_timestamp = normalize_metric_timestamp(metrics.ts, received_at)?;
     sqlx::query(
         r#"
         UPDATE instances
@@ -748,8 +771,8 @@ async fn store_metrics(
         INSERT INTO metrics(instance_id, ts, cpu_percent, memory_used, memory_total,
                             disk_used, disk_total, network_rx, network_tx, gpu_percent,
                             gpu_memory_used, gpu_memory_total, uptime_seconds, load_average,
-                            latency_ms)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                            latency_ms, received_at, latency_sampled_at)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         "#,
     )
     .bind(instance_id)
@@ -767,31 +790,47 @@ async fn store_metrics(
     .bind(metrics.uptime_seconds)
     .bind(metrics.load_average)
     .bind(latency_ms)
+    .bind(received_at)
+    .bind(latency_sampled_at)
     .execute(&state.db)
+    .await?;
+
+    alerts::observe_metric(
+        state,
+        instance_id,
+        &metrics,
+        latency_ms,
+        received_at,
+        latency_sampled_at,
+    )
     .await?;
 
     Ok(())
 }
 
 fn accept_heartbeat_pong(
-    pending: &mut Option<PendingHeartbeat>,
+    pending: &mut VecDeque<PendingHeartbeat>,
     token: i64,
     received_at: Instant,
 ) -> Option<f64> {
-    if pending
-        .as_ref()
-        .is_none_or(|heartbeat| heartbeat.token != token)
-    {
-        return None;
-    }
-
-    let heartbeat = pending.take()?;
+    let position = pending
+        .iter()
+        .position(|heartbeat| heartbeat.token == token)?;
+    let heartbeat = pending.remove(position)?;
     Some(
         received_at
             .saturating_duration_since(heartbeat.sent_at)
             .as_secs_f64()
             * 1_000.0,
     )
+}
+
+fn retain_recent_heartbeats(pending: &mut VecDeque<PendingHeartbeat>, now: Instant) {
+    while pending.front().is_some_and(|heartbeat| {
+        now.saturating_duration_since(heartbeat.sent_at) > HEARTBEAT_TIMEOUT
+    }) {
+        pending.pop_front();
+    }
 }
 
 #[cfg(test)]
@@ -868,22 +907,40 @@ mod tests {
     #[test]
     fn matching_pong_returns_millisecond_latency_and_clears_pending_heartbeat() {
         let sent_at = Instant::now();
-        let mut pending = Some(PendingHeartbeat { token: 42, sent_at });
+        let mut pending = VecDeque::from([PendingHeartbeat { token: 42, sent_at }]);
 
         let latency = accept_heartbeat_pong(&mut pending, 42, sent_at + Duration::from_millis(37))
             .expect("matching pong should produce a latency sample");
 
         assert!((latency - 37.0).abs() < f64::EPSILON);
-        assert!(pending.is_none());
+        assert!(pending.is_empty());
     }
 
     #[test]
     fn mismatched_pong_is_ignored_without_clearing_pending_heartbeat() {
         let sent_at = Instant::now();
-        let mut pending = Some(PendingHeartbeat { token: 42, sent_at });
+        let mut pending = VecDeque::from([PendingHeartbeat { token: 42, sent_at }]);
 
         assert!(accept_heartbeat_pong(&mut pending, 41, sent_at).is_none());
-        assert_eq!(pending.as_ref().map(|heartbeat| heartbeat.token), Some(42));
+        assert_eq!(pending.front().map(|heartbeat| heartbeat.token), Some(42));
+    }
+
+    #[test]
+    fn out_of_order_pongs_match_their_own_pending_heartbeat() {
+        let sent_at = Instant::now();
+        let mut pending = VecDeque::from([
+            PendingHeartbeat { token: 41, sent_at },
+            PendingHeartbeat {
+                token: 42,
+                sent_at: sent_at + Duration::from_millis(5),
+            },
+        ]);
+
+        let latency = accept_heartbeat_pong(&mut pending, 41, sent_at + Duration::from_millis(37))
+            .expect("an older pong should still match");
+
+        assert!((latency - 37.0).abs() < f64::EPSILON);
+        assert_eq!(pending.front().map(|heartbeat| heartbeat.token), Some(42));
     }
 
     #[test]

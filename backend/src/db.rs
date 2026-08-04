@@ -205,6 +205,7 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             id BIGSERIAL PRIMARY KEY,
             instance_id TEXT NOT NULL,
             ts BIGINT NOT NULL,
+            received_at BIGINT NOT NULL,
             cpu_percent DOUBLE PRECISION NOT NULL,
             memory_used BIGINT NOT NULL,
             memory_total BIGINT NOT NULL,
@@ -217,7 +218,8 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             gpu_memory_total BIGINT,
             uptime_seconds BIGINT NOT NULL,
             load_average DOUBLE PRECISION,
-            latency_ms DOUBLE PRECISION
+            latency_ms DOUBLE PRECISION,
+            latency_sampled_at BIGINT
         );
         "#,
     )
@@ -228,6 +230,11 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_metrics_instance_ts ON metrics(instance_id, ts DESC);",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_metrics_instance_received ON metrics(instance_id, received_at DESC, id DESC);",
     )
     .execute(db)
     .await?;
@@ -657,6 +664,7 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
     .await?;
 
     crate::audit::ensure_schema(db).await?;
+    crate::alerts::ensure_schema(db).await?;
 
     Ok(())
 }
@@ -766,6 +774,18 @@ async fn ensure_instance_location_columns(db: &PgPool) -> anyhow::Result<()> {
 
 async fn ensure_metric_columns(db: &PgPool) -> anyhow::Result<()> {
     sqlx::query("ALTER TABLE metrics ADD COLUMN IF NOT EXISTS latency_ms DOUBLE PRECISION")
+        .execute(db)
+        .await?;
+    sqlx::query("ALTER TABLE metrics ADD COLUMN IF NOT EXISTS received_at BIGINT")
+        .execute(db)
+        .await?;
+    sqlx::query("UPDATE metrics SET received_at = ts WHERE received_at IS NULL")
+        .execute(db)
+        .await?;
+    sqlx::query("ALTER TABLE metrics ALTER COLUMN received_at SET NOT NULL")
+        .execute(db)
+        .await?;
+    sqlx::query("ALTER TABLE metrics ADD COLUMN IF NOT EXISTS latency_sampled_at BIGINT")
         .execute(db)
         .await?;
 
@@ -1403,7 +1423,7 @@ pub async fn latest_metric(db: &PgPool, instance_id: &str) -> AppResult<Option<M
                uptime_seconds, load_average, latency_ms
         FROM metrics
         WHERE instance_id = $1
-        ORDER BY ts DESC
+        ORDER BY received_at DESC, id DESC
         LIMIT 1
         "#,
     )
@@ -1428,7 +1448,7 @@ pub async fn latest_metrics(
                uptime_seconds, load_average, latency_ms
         FROM metrics
         WHERE instance_id = ANY($1)
-        ORDER BY instance_id, ts DESC
+        ORDER BY instance_id, received_at DESC, id DESC
         "#,
     )
     .bind(instance_ids)
@@ -1519,6 +1539,16 @@ pub async fn cleanup_loop(state: AppState) {
                 }
             }
             Err(error) => error!(?error, "failed to read audit retention setting"),
+        }
+        match crate::alerts::retention_days(&state.db).await {
+            Ok(alert_days) => {
+                let alert_cutoff = now_ts() - alert_days * 24 * 3600;
+                if let Err(error) = crate::alerts::cleanup_old_alerts(&state.db, alert_cutoff).await
+                {
+                    error!(?error, "failed to clean old alert records");
+                }
+            }
+            Err(error) => error!(?error, "failed to read alert retention setting"),
         }
         if let Err(error) = sqlx::query("DELETE FROM pending_instances WHERE first_seen < $1")
             .bind(now_ts() - PENDING_INSTANCE_MAX_AGE)

@@ -1,4 +1,5 @@
 mod admin_auth;
+mod alerts;
 mod audit;
 mod auth;
 mod config;
@@ -134,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
 
     let upload_dir = cli.upload_dir.clone();
     let state = AppState::new(db, cli, auth_cipher, update_signer);
+    alerts::reset_metric_pending_states(&state.db, None).await?;
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/public/appearance", get(public_appearance))
@@ -253,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/audit", get(audit::admin_audit))
         .route("/api/admin/audit/export", get(audit::admin_audit_export))
         .route("/api/admin/logs", get(audit::admin_audit))
+        .nest("/api/admin/alerts", alerts::router())
         .route(
             "/api/admin/agent-releases",
             get(admin_agent_releases).post(admin_create_agent_release),
@@ -352,6 +355,14 @@ async fn main() -> anyhow::Result<()> {
     let command_timeout_state = state.clone();
     tokio::spawn(async move {
         command_timeout_loop(command_timeout_state).await;
+    });
+    let alert_evaluation_state = state.clone();
+    tokio::spawn(async move {
+        alerts::evaluation_loop(alert_evaluation_state).await;
+    });
+    let alert_delivery_state = state.clone();
+    tokio::spawn(async move {
+        alerts::delivery_loop(alert_delivery_state).await;
     });
 
     let listener = tokio::net::TcpListener::bind(bind).await?;

@@ -49,6 +49,7 @@ const props = defineProps<{
   settingsForm: {
     retention_days: number
     audit_retention_days: number
+    alert_retention_days: number
     background_image_url: string | null
     theme_mode: ThemeMode
     accent_color: string
@@ -417,7 +418,7 @@ const emit = defineEmits<{
         </div>
 
         <div class="admin-content-card retention-card">
-          <div class="card-heading"><div><h3>数据保留</h3><p>分别设置历史指标与审计事件的自动清理期限。</p></div></div>
+          <div class="card-heading"><div><h3>数据保留</h3><p>分别设置历史指标、审计事件和已恢复告警的自动清理期限。</p></div></div>
           <form class="stack-form page-form" @submit.prevent="$emit('saveSettings')">
             <label>
               <span>指标保留天数</span>
@@ -429,6 +430,11 @@ const emit = defineEmits<{
               <input v-model.number="settingsForm.audit_retention_days" min="1" max="3650" type="number" />
             </label>
             <small class="form-help">可设置 1 至 3650 天，运行中的会话不会被清理。</small>
+            <label>
+              <span>告警保留天数</span>
+              <input v-model.number="settingsForm.alert_retention_days" min="1" max="3650" type="number" />
+            </label>
+            <small class="form-help">仅清理过期的已恢复事件及投递记录，活动事件不会被清理。</small>
             <button class="primary-button" type="submit"><Settings :size="16" />保存设置</button>
           </form>
         </div>

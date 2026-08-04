@@ -212,6 +212,7 @@ export type AuditPage = {
 export type SettingsResponse = {
   retention_days: number
   audit_retention_days: number
+  alert_retention_days: number
   background_image_url: string | null
   theme_mode: ThemeMode
   accent_color: string
@@ -410,9 +411,206 @@ export type AgentReleaseForm = {
 
 export type ViewMode = 'grid' | 'rows'
 
-export type AdminTab = 'pending' | 'commands' | 'updates' | 'users' | 'settings' | 'logs'
+export type AdminTab = 'pending' | 'commands' | 'updates' | 'alerts' | 'users' | 'settings' | 'logs'
 
 export type AppPage = 'home' | AdminTab
+
+export type AlertMetric =
+  | 'node_offline'
+  | 'cpu_percent'
+  | 'memory_percent'
+  | 'disk_percent'
+  | 'latency_ms'
+
+export type AlertSeverity = 'warning' | 'critical'
+export type AlertEventStatus = 'firing' | 'acknowledged' | 'resolved'
+export type AlertRuleScope = 'all' | 'specific'
+export type AlertMaintenanceScope = 'global' | 'rule' | 'node'
+export type AlertDeliveryKind =
+  | 'alert.firing'
+  | 'alert.acknowledged'
+  | 'alert.resolved'
+  | 'webhook.test'
+export type AlertDeliveryStatus = 'pending' | 'processing' | 'succeeded' | 'failed' | 'suppressed'
+export type AlertCenterTab = 'events' | 'rules' | 'maintenance' | 'webhooks' | 'deliveries'
+
+export type AlertPage<T> = {
+  items: T[]
+  page: number
+  page_size: number
+  total: number
+  pages: number
+}
+
+export type AlertSummary = {
+  firing: number
+  acknowledged: number
+  suppressed: number
+  resolved_24h: number
+}
+
+export type AlertRule = {
+  id: string
+  name: string
+  metric: AlertMetric
+  threshold: number | null
+  duration_seconds: number
+  severity: AlertSeverity
+  scope: AlertRuleScope
+  enabled: boolean
+  version: number
+  created_by: string
+  created_at: number
+  updated_at: number
+  target_instance_ids: string[]
+  channel_ids: string[]
+}
+
+export type AlertRuleInput = Pick<
+  AlertRule,
+  'name' | 'metric' | 'threshold' | 'duration_seconds' | 'severity' | 'scope' | 'enabled'
+> & {
+  target_instance_ids: string[]
+  channel_ids: string[]
+}
+
+export type AlertEventTimelineItem = {
+  id: string
+  event_id: string
+  kind: string
+  actor: string
+  note: string
+  value: number | null
+  created_at: number
+}
+
+export type AlertEvent = {
+  id: string
+  rule_id: string
+  instance_id: string
+  status: AlertEventStatus
+  severity: AlertSeverity
+  metric: AlertMetric
+  rule_snapshot: Record<string, unknown>
+  node_snapshot: Record<string, unknown>
+  threshold: number | null
+  duration_seconds: number
+  current_value: number | null
+  first_observed_at: number
+  fired_at: number
+  last_observed_at: number
+  match_count: number
+  acknowledged_by: string | null
+  acknowledged_by_user_id: string | null
+  acknowledged_at: number | null
+  acknowledge_note: string
+  resolved_at: number | null
+  resolution_reason: string
+  suppressed: boolean
+  suppression_reason: string
+}
+
+export type AlertEventDetail = AlertEvent & {
+  timeline: AlertEventTimelineItem[]
+  deliveries: AlertDelivery[]
+}
+
+export type AlertEventQuery = {
+  page: number
+  page_size: number
+  status: AlertEventStatus | ''
+  severity: AlertSeverity | ''
+  metric: AlertMetric | ''
+  instance_id: string
+  suppressed: '' | 'true' | 'false'
+  from: number | null
+  to: number | null
+  search: string
+}
+
+export type AlertMaintenanceWindow = {
+  id: string
+  name: string
+  reason: string
+  scope: AlertMaintenanceScope
+  target_ids: string[]
+  starts_at: number
+  ends_at: number
+  enabled: boolean
+  created_by: string
+  created_by_user_id: string | null
+  created_at: number
+  updated_at: number
+}
+
+export type AlertMaintenanceInput = Pick<
+  AlertMaintenanceWindow,
+  'name' | 'reason' | 'scope' | 'target_ids' | 'starts_at' | 'ends_at' | 'enabled'
+>
+
+export type AlertWebhookChannel = {
+  id: string
+  name: string
+  masked_url: string
+  header_names: string[]
+  has_secret: boolean
+  enabled: boolean
+  created_at: number
+  updated_at: number
+}
+
+export type AlertWebhookChannelInput = {
+  name: string
+  url?: string
+  secret?: string
+  clear_secret: boolean
+  headers?: Record<string, string>
+  enabled: boolean
+}
+
+export type AlertDeliveryAttempt = {
+  id: string
+  delivery_id: string
+  attempt_number: number
+  http_status: number | null
+  duration_ms: number
+  error: string
+  response_excerpt: string
+  created_at: number
+}
+
+export type AlertDelivery = {
+  id: string
+  event_id: string | null
+  channel_id: string
+  kind: AlertDeliveryKind
+  status: AlertDeliveryStatus
+  payload: Record<string, unknown>
+  channel_snapshot: Record<string, unknown>
+  suppression_reason: string
+  attempts_count: number
+  cycle_attempts: number
+  manual_retry_count: number
+  next_attempt_at: number | null
+  lease_until: number | null
+  last_error: string
+  created_at: number
+  updated_at: number
+  completed_at: number | null
+}
+
+export type AlertDeliveryDetail = AlertDelivery & {
+  attempts: AlertDeliveryAttempt[]
+}
+
+export type AlertDeliveryQuery = {
+  page: number
+  page_size: number
+  status: AlertDeliveryStatus | ''
+  kind: AlertDeliveryKind | ''
+  channel_id: string
+  event_id: string
+}
 
 export type FileEntryKind = 'file' | 'directory' | 'symlink' | 'other'
 

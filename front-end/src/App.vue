@@ -3,6 +3,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch 
 import AdminNavigation from './components/AdminNavigation.vue'
 import AdminPanel from './components/AdminPanel.vue'
 import AgentUpdatesPanel from './components/AgentUpdatesPanel.vue'
+import AlertCenterPanel from './components/AlertCenterPanel.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import InstanceBoard from './components/InstanceBoard.vue'
 import LoginModal from './components/LoginModal.vue'
@@ -10,11 +11,15 @@ import SummaryBand from './components/SummaryBand.vue'
 import TopBar from './components/TopBar.vue'
 import UserManagementPanel from './components/UserManagementPanel.vue'
 import { useMonitoringConsole } from './composables/useMonitoringConsole'
+import { useAlertingConsole } from './composables/useAlertingConsole'
 import type {
   AdminTab,
   AdminUser,
   AgentRelease,
   AgentUpdateAttempt,
+  AlertMaintenanceWindow,
+  AlertRule,
+  AlertWebhookChannel,
   AppPage,
   AuthenticatorDevice,
   CommandRecord,
@@ -29,6 +34,11 @@ const CommandResultModal = defineAsyncComponent(() => import('./components/Comma
 
 const consoleState = useMonitoringConsole()
 const currentPage = ref<AppPage>('home')
+const alertingState = useAlertingConsole({
+  isAdmin: consoleState.isAdmin,
+  active: computed(() => currentPage.value === 'alerts'),
+  request: consoleState.adminApi,
+})
 const loginOpen = ref(false)
 const selectedInstanceId = ref('')
 const confirmation = ref<{
@@ -54,6 +64,7 @@ const pageFromHash: Record<string, AppPage> = {
   '#/approval': 'pending',
   '#/commands': 'commands',
   '#/updates': 'updates',
+  '#/alerts': 'alerts',
   '#/users': 'users',
   '#/logs': 'logs',
   '#/settings': 'settings',
@@ -64,6 +75,7 @@ const hashFromPage: Record<AppPage, string> = {
   pending: '#/approval',
   commands: '#/commands',
   updates: '#/updates',
+  alerts: '#/alerts',
   users: '#/users',
   logs: '#/logs',
   settings: '#/settings',
@@ -127,6 +139,16 @@ async function logout() {
   if (!success) return
   selectedInstanceId.value = ''
   navigate('home')
+}
+
+function refreshAll() {
+  consoleState.refreshAll()
+  if (!consoleState.isAdmin.value) return
+  if (currentPage.value === 'alerts') {
+    alertingState.refreshCurrentTab()
+  } else {
+    void alertingState.loadSummary(true)
+  }
 }
 
 function requestDisable(instance: Instance) {
@@ -317,6 +339,36 @@ function requestRevokeAuthenticatorDevice(device: AuthenticatorDevice) {
   }
 }
 
+function requestDeleteAlertRule(rule: AlertRule) {
+  confirmation.value = {
+    title: '删除告警规则',
+    message: `删除“${rule.name}”会以系统原因恢复其活动事件，并停止后续评估。`,
+    confirmLabel: '确认删除',
+    tone: 'danger',
+    action: () => alertingState.removeRule(rule),
+  }
+}
+
+function requestDeleteMaintenance(window: AlertMaintenanceWindow) {
+  confirmation.value = {
+    title: '删除维护窗口',
+    message: `将删除维护窗口“${window.name}”，仍处于异常状态的事件可能恢复发送首次通知。`,
+    confirmLabel: '确认删除',
+    tone: 'danger',
+    action: () => alertingState.removeMaintenance(window),
+  }
+}
+
+function requestDeleteAlertChannel(channel: AlertWebhookChannel) {
+  confirmation.value = {
+    title: '删除 Webhook',
+    message: `将删除“${channel.name}”，已产生的投递历史仍会保留。`,
+    confirmLabel: '确认删除',
+    tone: 'danger',
+    action: () => alertingState.removeChannel(channel),
+  }
+}
+
 function confirmAction() {
   const action = confirmation.value?.action
   confirmation.value = null
@@ -339,7 +391,7 @@ function confirmAction() {
       :network-rx-rate="consoleState.networkRxRate.value"
       :network-tx-rate="consoleState.networkTxRate.value"
       :refreshing="consoleState.refreshing.value"
-      @refresh="consoleState.refreshAll"
+      @refresh="refreshAll"
       @login="openLogin"
       @logout="logout"
     />
@@ -349,6 +401,7 @@ function confirmAction() {
         v-if="consoleState.isAdmin.value"
         :current-page="currentPage"
         :pending-count="consoleState.pendingInstances.value.length"
+        :alert-count="alertingState.attentionCount.value"
         @navigate="navigate"
       />
     </Transition>
@@ -400,8 +453,17 @@ function confirmAction() {
             </p>
           </Transition>
 
+          <AlertCenterPanel
+            v-if="currentPage === 'alerts'"
+            :key="`alerts-${consoleState.adminResetKey.value}`"
+            :alerting="alertingState"
+            :instances="consoleState.instances.value"
+            @delete-rule="requestDeleteAlertRule"
+            @delete-maintenance="requestDeleteMaintenance"
+            @delete-channel="requestDeleteAlertChannel"
+          />
           <AgentUpdatesPanel
-            v-if="currentPage === 'updates'"
+            v-else-if="currentPage === 'updates'"
             :key="`updates-${consoleState.adminResetKey.value}`"
             :instances="consoleState.instances.value"
             :releases="consoleState.agentReleases.value"

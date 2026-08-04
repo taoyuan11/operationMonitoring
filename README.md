@@ -502,9 +502,62 @@ cd backend && cargo fmt --check && cargo test && cargo check
 cd instanceEnd && cargo fmt --check && cargo test && cargo check
 ```
 
+## 告警与事件闭环
+
+管理员登录后可从“告警中心”创建节点离线、CPU、内存、聚合磁盘占用率和通信延迟
+规则。规则可作用于全部节点或指定节点，并使用 `warning`、`critical` 两个严重级别。
+阈值持续时间按后端接收样本的时间计算；无效或缺失指标不会触发告警，也不会被当作
+恢复。节点在线状态仍以授权 Agent WebSocket 为准，旧 `/api/agent/report` 只参与资源
+阈值判断，不会使节点进入在线状态。
+
+同一规则和节点在恢复前只保留一个事件。事件从“告警中”进入“已确认”，条件恢复后
+自动进入“已恢复”；确认人、备注、状态时间线、规则与节点快照均会保留。一次性维护
+窗口可覆盖全局、指定规则或指定节点，窗口内继续记录事件但静默首报。节点离线告警
+生效时也会抑制同节点的资源首报；维护结束或节点重新上线后，新的有效观察确认异常仍
+存在时会补发首报。告警及投递记录默认保留 180 天，活动事件不会被自动清理。
+
+Webhook 渠道按规则选择，发送 `alert.firing`、`alert.acknowledged`、
+`alert.resolved` 和 `webhook.test` 四类版本化 JSON。事件通知负载包含规则与节点的
+触发时快照、观察值、阈值、持续时间、操作者及恢复原因，例如：
+
+```json
+{
+  "version": 1,
+  "type": "alert.resolved",
+  "event": {
+    "id": "...",
+    "status": "resolved",
+    "metric": "cpu_percent",
+    "current_value": 42.1,
+    "threshold": 90.0,
+    "duration_seconds": 300,
+    "resolution_reason": "condition_recovered"
+  },
+  "rule": { "id": "...", "name": "CPU 使用率过高", "version": 1 },
+  "node": { "id": "...", "name": "核心节点", "hostname": "core-01" },
+  "actor": "system",
+  "note": "condition_recovered"
+}
+```
+
+配置签名密钥后，请求包含：
+
+```text
+X-OM-Timestamp: <Unix 秒>
+X-OM-Delivery-ID: <稳定投递 ID>
+X-OM-Signature: sha256=<HMAC-SHA256(secret, timestamp + "." + raw_body)>
+```
+
+URL、签名密钥和自定义请求头使用管理员认证密钥加密保存，接口不会回显明文。投递只把
+HTTP 2xx 视为成功，禁用重定向并按固定退避重试；持久化 worker 使用带 fencing 令牌的
+租约认领，进程恢复后不会让过期 worker 覆盖新投递结果。所有尝试均可在告警中心查询。为适配
+自托管集成，管理员可以配置内网 HTTP/HTTPS 地址；这意味着告警管理员拥有后端出站
+访问能力，应只向可信目标投递，并避免在 Webhook 响应中返回敏感信息。该功能不改变
+Agent 通信协议，不需要为了启用告警升级实例端。
+
 ## 后续增强
 
 - 增加历史趋势图和指标明细页。
-- 增加告警规则、通知渠道和阈值配置。
+- 增加周期维护窗口、节点分组以及邮件、短信等通知渠道。
 - 增加登录失败限制、密码哈希和更细粒度权限。
 - 增加 CI 中的多平台 standalone 可执行文件构建、签名和发布流水线。

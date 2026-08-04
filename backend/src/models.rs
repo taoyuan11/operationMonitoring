@@ -656,6 +656,7 @@ pub struct SettingsRow {
 pub struct SettingsResponse {
     pub retention_days: i64,
     pub audit_retention_days: i64,
+    pub alert_retention_days: i64,
     pub background_image_url: Option<String>,
     pub theme_mode: ThemeMode,
     pub accent_color: String,
@@ -666,6 +667,8 @@ pub struct SettingsRequest {
     pub retention_days: i64,
     #[serde(default)]
     pub audit_retention_days: Option<i64>,
+    #[serde(default)]
+    pub alert_retention_days: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

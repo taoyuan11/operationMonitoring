@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ClipboardList, Home, ListChecks, PackageCheck, Settings, Terminal, Users } from 'lucide-vue-next'
+import { BellRing, ClipboardList, Home, ListChecks, PackageCheck, Settings, Terminal, Users } from 'lucide-vue-next'
 import type { AppPage } from '../types/domain'
 
 defineProps<{
   currentPage: AppPage
   pendingCount: number
+  alertCount: number
 }>()
 
 defineEmits<{
@@ -16,6 +17,7 @@ const items: Array<{ page: AppPage; label: string; icon: typeof Home }> = [
   { page: 'pending', label: '接入审核', icon: ListChecks },
   { page: 'commands', label: '快捷命令', icon: Terminal },
   { page: 'updates', label: '程序更新', icon: PackageCheck },
+  { page: 'alerts', label: '告警中心', icon: BellRing },
   { page: 'users', label: '用户管理', icon: Users },
   { page: 'logs', label: '统一审计', icon: ClipboardList },
   { page: 'settings', label: '系统设置', icon: Settings },
@@ -36,6 +38,7 @@ const items: Array<{ page: AppPage; label: string; icon: typeof Home }> = [
       <component :is="item.icon" :size="16" />
       <span>{{ item.label }}</span>
       <em v-if="item.page === 'pending' && pendingCount">{{ pendingCount }}</em>
+      <em v-else-if="item.page === 'alerts' && alertCount">{{ alertCount }}</em>
     </button>
   </nav>
 </template>

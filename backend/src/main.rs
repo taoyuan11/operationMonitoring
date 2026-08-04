@@ -1,4 +1,5 @@
 mod admin_auth;
+mod audit;
 mod auth;
 mod config;
 mod db;
@@ -16,6 +17,7 @@ mod updates;
 mod utils;
 mod ws;
 
+use admin_auth::resolved_client_ip;
 use admin_auth::{
     admin_login, admin_logout, admin_me, admin_users, auth_status, bootstrap_confirm,
     bootstrap_start, cancel_admin_enrollment, confirm_admin_enrollment, create_device_enrollment,
@@ -26,15 +28,15 @@ use auth::load_auth_cipher;
 use axum::{
     Router,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::{HeaderMap, Method},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
 use clap::Parser;
 use config::{Cli, update_signing_key_file_from_env, validate_bootstrap_password};
 use db::{cleanup_loop, connect_db, init_db};
-use error::AppResult;
+use error::{AppErrorAuditInfo, AppResult};
 use files::{
     admin_create_directory, admin_delete_file, admin_download_file, admin_file_roots,
     admin_list_files, admin_move_file, admin_upload_file,
@@ -42,11 +44,10 @@ use files::{
 use handlers::{
     admin_approve_instance, admin_commands, admin_create_command, admin_delete_background_image,
     admin_delete_instance, admin_device_profile, admin_disable_command, admin_disable_instance,
-    admin_get_settings, admin_job, admin_jobs, admin_logs, admin_pending_instances,
-    admin_put_appearance, admin_put_settings, admin_reject_instance, admin_run_whitelist_command,
-    admin_terminal_ws, admin_update_instance, admin_upload_background_image, agent_register,
-    agent_report, agent_ws, health, public_appearance, public_device_profile, public_instances,
-    public_metrics,
+    admin_get_settings, admin_job, admin_jobs, admin_pending_instances, admin_put_appearance,
+    admin_put_settings, admin_reject_instance, admin_run_whitelist_command, admin_terminal_ws,
+    admin_update_instance, admin_upload_background_image, agent_register, agent_report, agent_ws,
+    health, public_appearance, public_device_profile, public_instances, public_metrics,
 };
 use jobs::command_timeout_loop;
 use remote_desktop::{admin_desktop_ws, agent_desktop_ws};
@@ -65,6 +66,8 @@ use updates::{
     admin_update_agent_release, admin_upload_agent_artifact, agent_download_artifact,
     agent_download_artifact_checksum, agent_update_manifest, update_timeout_loop,
 };
+use utils::now_ts;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -247,7 +250,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/admin/jobs", get(admin_jobs))
         .route("/api/admin/jobs/{job_id}", get(admin_job))
-        .route("/api/admin/logs", get(admin_logs))
+        .route("/api/admin/audit", get(audit::admin_audit))
+        .route("/api/admin/audit/export", get(audit::admin_audit_export))
+        .route("/api/admin/logs", get(audit::admin_audit))
         .route(
             "/api/admin/agent-releases",
             get(admin_agent_releases).post(admin_create_agent_release),
@@ -362,19 +367,159 @@ async fn main() -> anyhow::Result<()> {
 async fn enforce_admin_write_origin(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<std::net::SocketAddr>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> AppResult<Response> {
-    if admin_write_requires_origin(request.method(), request.uri().path()) {
-        let scheme = request_scheme(&state, request.headers(), peer_addr.ip())?;
-        ensure_admin_write_origin(
-            request.method(),
-            request.uri().path(),
-            request.headers(),
-            scheme,
-        )?;
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let client_ip = resolved_client_ip(
+        state.trust_proxy_headers,
+        &state.trusted_proxy_cidrs,
+        request.headers(),
+        peer_addr.ip(),
+    );
+    let request_path = request.uri().path().to_string();
+    let request_method = request.method().clone();
+    let user_agent = audit::AuditContext::from_headers(request.headers()).user_agent;
+    let audit_context = audit::AuditContext {
+        request_id: Some(request_id.clone()),
+        source_ip: Some(client_ip.to_string()),
+        user_agent: user_agent.clone(),
+    };
+    let headers = request.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        headers.insert("x-request-id", value);
     }
-    Ok(next.run(request).await)
+    if let Ok(value) = HeaderValue::from_str(&client_ip.to_string()) {
+        headers.insert("x-audit-client-ip", value);
+    }
+    let request_headers = request.headers().clone();
+    let origin_check = if admin_write_requires_origin(request.method(), request.uri().path()) {
+        request_scheme(&state, request.headers(), peer_addr.ip()).and_then(|scheme| {
+            ensure_admin_write_origin(
+                request.method(),
+                request.uri().path(),
+                request.headers(),
+                scheme,
+            )
+        })
+    } else {
+        Ok(())
+    };
+    let mut response = match origin_check {
+        Ok(()) => audit::with_context(audit_context.clone(), next.run(request)).await,
+        Err(error) => error.into_response(),
+    };
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    let app_error = response.extensions().get::<AppErrorAuditInfo>().cloned();
+    if (matches!(
+        request_path.as_str(),
+        "/api/admin/login" | "/api/admin/bootstrap/start"
+    ) && response.status().is_client_error())
+    {
+        let _ = audit::insert_event(
+            &state.db,
+            &audit::AuditEventInput {
+                category: "security".to_string(),
+                kind: "operation".to_string(),
+                actor: "anonymous".to_string(),
+                user_id: None,
+                action: if request_path.ends_with("/bootstrap/start") {
+                    "bootstrap_start"
+                } else {
+                    "login"
+                }
+                .to_string(),
+                target: "authentication".to_string(),
+                detail: "管理员认证失败".to_string(),
+                metadata: serde_json::json!({}),
+                instance_id: None,
+                node_snapshot: serde_json::json!({}),
+                context: audit_context.clone(),
+                session_id: None,
+                operation_id: None,
+                status: "failed".to_string(),
+                error_code: Some(
+                    app_error
+                        .as_ref()
+                        .map(|error| error.code.clone())
+                        .unwrap_or_else(|| "invalid_credentials".to_string()),
+                ),
+                error_reason: app_error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| "管理员认证失败".to_string()),
+                created_at: now_ts(),
+                completed_at: Some(now_ts()),
+            },
+        )
+        .await;
+    }
+    let login_or_bootstrap = matches!(
+        request_path.as_str(),
+        "/api/admin/login" | "/api/admin/bootstrap/start"
+    );
+    let request_failed = response.status().is_client_error() || response.status().is_server_error();
+    let should_record_failure = request_failed
+        && !login_or_bootstrap
+        && !app_error.as_ref().is_some_and(|error| error.handled)
+        && (admin_write_requires_origin(&request_method, &request_path)
+            || (request_method == Method::GET && request_path.ends_with("/download"))
+            || (request_method == Method::GET
+                && request_path.starts_with("/api/admin/")
+                && (request_path.ends_with("/terminal/ws")
+                    || request_path.ends_with("/desktop/ws")
+                    || request_path.ends_with("/logs/ws")
+                    || request_path.ends_with("/exec/ws")))
+            || response.status() == StatusCode::UNAUTHORIZED);
+    if should_record_failure {
+        let principal = crate::auth::require_admin(&state, &request_headers)
+            .await
+            .ok();
+        let (actor, user_id, category) = principal
+            .map(|admin| (admin.username, Some(admin.user_id), "admin"))
+            .unwrap_or_else(|| ("anonymous".to_string(), None, "security"));
+        let _ = audit::insert_event(
+            &state.db,
+            &audit::AuditEventInput {
+                category: category.to_string(),
+                kind: "operation".to_string(),
+                actor,
+                user_id,
+                action: format!("http_{}", request_method.as_str().to_ascii_lowercase()),
+                target: request_path,
+                detail: "管理员请求失败".to_string(),
+                metadata: serde_json::json!({ "status": response.status().as_u16() }),
+                instance_id: None,
+                node_snapshot: serde_json::json!({}),
+                context: audit_context,
+                session_id: None,
+                operation_id: None,
+                status: "failed".to_string(),
+                error_code: Some(
+                    app_error
+                        .as_ref()
+                        .map(|error| error.code.clone())
+                        .unwrap_or_else(|| format!("http_{}", response.status().as_u16())),
+                ),
+                error_reason: app_error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| format!("HTTP {}", response.status().as_u16())),
+                created_at: now_ts(),
+                completed_at: Some(now_ts()),
+            },
+        )
+        .await;
+    }
+    Ok(response)
 }
 
 fn admin_write_requires_origin(method: &Method, path: &str) -> bool {

@@ -23,8 +23,9 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    audit,
     auth::{AdminSessionGuard, require_admin},
-    db::{get_instance, write_action_log},
+    db::get_instance,
     error::{AppError, AppResult},
     models::{AgentOutbound, DesktopAgentWsQuery},
     request_security::{ensure_same_origin, request_scheme},
@@ -140,6 +141,8 @@ pub async fn admin_desktop_ws(
     }
 
     let session_guard = admin.session_guard();
+    let user_id = admin.user_id.clone();
+    let audit_context = audit::AuditContext::from_headers(&headers);
     Ok(ws
         .max_message_size(CONTROL_MESSAGE_MAX_BYTES)
         .max_frame_size(CONTROL_MESSAGE_MAX_BYTES)
@@ -148,6 +151,8 @@ pub async fn admin_desktop_ws(
                 state,
                 instance_id,
                 admin.username,
+                user_id,
+                audit_context,
                 session_guard,
                 query.quality,
                 socket,
@@ -173,6 +178,8 @@ async fn desktop_browser_socket(
     state: AppState,
     instance_id: String,
     actor: String,
+    user_id: String,
+    audit_context: audit::AuditContext,
     session_guard: AdminSessionGuard,
     quality: DesktopQuality,
     socket: WebSocket,
@@ -219,7 +226,6 @@ async fn desktop_browser_socket(
             session_id.clone(),
             DesktopSessionHandle {
                 instance_id: instance_id.clone(),
-                actor: actor.clone(),
                 agent_connection_id: agent.connection_id,
                 token_hash,
                 token_expires_at: now_ts() + TOKEN_TTL_SECONDS,
@@ -232,31 +238,28 @@ async fn desktop_browser_socket(
         );
     }
 
-    if let Err(error) = sqlx::query(
-        "INSERT INTO desktop_sessions(id, instance_id, actor, started_at) VALUES($1, $2, $3, $4)",
-    )
-    .bind(&session_id)
-    .bind(&instance_id)
-    .bind(&actor)
-    .bind(now_ts())
-    .execute(&state.db)
-    .await
-    {
-        error!(?error, %session_id, "failed to create desktop session audit row");
-        end_desktop_session(&state, &session_id, "database_error").await;
-        send_single_message(
-            socket,
-            server_error("database_error", "无法创建远程桌面会话"),
-        )
-        .await;
-        return;
-    }
-    if let Err(error) = write_action_log(
+    if let Err(error) = audit::insert_event(
         &state.db,
-        &actor,
-        "desktop_start",
-        &instance_id,
-        &format!("启动远程桌面会话 {session_id}"),
+        &audit::AuditEventInput {
+            category: "desktop".to_string(),
+            kind: "session".to_string(),
+            actor: actor.clone(),
+            user_id: Some(user_id),
+            action: "desktop_session".to_string(),
+            target: instance_id.clone(),
+            detail: "启动远程桌面会话".to_string(),
+            metadata: json!({ "quality": format!("{quality:?}").to_ascii_lowercase() }),
+            instance_id: Some(instance_id.clone()),
+            node_snapshot: audit::instance_snapshot(&state.db, &instance_id).await,
+            context: audit_context,
+            session_id: Some(session_id.clone()),
+            operation_id: None,
+            status: "running".to_string(),
+            error_code: None,
+            error_reason: String::new(),
+            created_at: now_ts(),
+            completed_at: None,
+        },
     )
     .await
     {
@@ -635,28 +638,19 @@ async fn end_desktop_session(state: &AppState, session_id: &str, reason: &str) {
             reason: reason.clone(),
         });
     }
-    if let Err(error) = sqlx::query(
-        "UPDATE desktop_sessions SET ended_at = $1, end_reason = $2 WHERE id = $3 AND ended_at IS NULL",
-    )
-    .bind(now_ts())
-    .bind(&reason)
-    .bind(session_id)
-    .execute(&state.db)
-    .await
-    {
-        error!(?error, %session_id, "failed to finish desktop session audit row");
-    }
-    if let Err(error) = write_action_log(
+    let status = if matches!(reason.as_str(), "client_closed" | "agent_closed" | "") {
+        "success"
+    } else {
+        "failed"
+    };
+    let _ = audit::finish_session_event(
         &state.db,
-        &handle.actor,
-        "desktop_end",
-        &handle.instance_id,
-        &format!("结束远程桌面会话 {session_id}：{reason}"),
+        session_id,
+        status,
+        (status == "failed").then_some(reason.as_str()),
+        &reason,
     )
-    .await
-    {
-        warn!(?error, %session_id, "failed to write desktop end action log");
-    }
+    .await;
 }
 
 fn bearer_token(headers: &HeaderMap) -> AppResult<&str> {

@@ -14,6 +14,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
+    audit,
     auth::{
         AdminPrincipal, ENROLLMENT_MAX_AGE, SECURE_SESSION_COOKIE, SESSION_COOKIE, SESSION_MAX_AGE,
         generate_totp_secret, insert_session, otpauth_uri, require_admin, revoke_device_sessions,
@@ -218,6 +219,15 @@ pub async fn bootstrap_start(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    write_action_log(
+        &state.db,
+        &username,
+        None,
+        "bootstrap_start",
+        &enrollment_id,
+        "开始管理员 Authenticator 初始化",
+    )
+    .await?;
 
     no_store_json(EnrollmentResponse {
         id: enrollment_id,
@@ -303,6 +313,7 @@ pub async fn bootstrap_confirm(
     write_action_log(
         &state.db,
         &enrollment.username,
+        Some(&user_id),
         "initialize_auth",
         &user_id,
         "初始化管理员 Authenticator 认证",
@@ -372,7 +383,15 @@ pub async fn admin_login(
     };
     clear_source_auth_failures(&state, &source_attempt_key).await;
     clear_account_auth_failures(&state, &account_attempt_key).await;
-    write_action_log(&state.db, &user.username, "login", &user.id, "管理员登录").await?;
+    write_action_log(
+        &state.db,
+        &user.username,
+        Some(&user.id),
+        "login",
+        &user.id,
+        "管理员登录",
+    )
+    .await?;
     session_response(
         &state,
         user.id,
@@ -388,8 +407,20 @@ pub async fn admin_logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
+    let principal = require_admin(&state, &headers).await.ok();
     for token in session_tokens(&headers) {
         revoke_session(&state, &token).await;
+    }
+    if let Some(principal) = principal {
+        write_action_log(
+            &state.db,
+            &principal.username,
+            Some(&principal.user_id),
+            "logout",
+            &principal.user_id,
+            "管理员退出登录",
+        )
+        .await?;
     }
     let mut response = Json(MeResponse {
         authenticated: false,
@@ -514,6 +545,7 @@ pub async fn create_user_enrollment(
     write_action_log(
         &state.db,
         &principal.username,
+        Some(&principal.user_id),
         "create_user_enrollment",
         &response.id,
         &format!("为 {username} 创建 Authenticator 注册"),
@@ -543,6 +575,7 @@ pub async fn create_device_enrollment(
     write_action_log(
         &state.db,
         &principal.username,
+        Some(&principal.user_id),
         "create_device_enrollment",
         &response.id,
         &format!("为 {} 添加 Authenticator 设备", user.username),
@@ -628,6 +661,7 @@ pub async fn confirm_admin_enrollment(
     write_action_log(
         &state.db,
         &principal.username,
+        Some(&principal.user_id),
         "confirm_authenticator",
         &device_id,
         &format!(
@@ -655,6 +689,7 @@ pub async fn cancel_admin_enrollment(
     write_action_log(
         &state.db,
         &principal.username,
+        Some(&principal.user_id),
         "cancel_authenticator_enrollment",
         &enrollment_id,
         &format!("取消 {} 的 Authenticator 注册", enrollment.username),
@@ -700,6 +735,7 @@ pub async fn set_admin_user_enabled(
     write_action_log(
         &state.db,
         &principal.username,
+        Some(&principal.user_id),
         if payload.enabled {
             "enable_user"
         } else {
@@ -712,7 +748,8 @@ pub async fn set_admin_user_enabled(
             "停用管理员用户"
         },
     )
-    .await?;
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -739,6 +776,7 @@ pub async fn delete_admin_user(
     write_action_log(
         &state.db,
         &principal.username,
+        Some(&principal.user_id),
         "delete_user",
         &target.id,
         &format!("删除管理员用户 {}", target.username),
@@ -774,6 +812,7 @@ pub async fn revoke_authenticator_device(
     write_action_log(
         &state.db,
         &principal.username,
+        Some(&principal.user_id),
         "revoke_authenticator",
         &device.id,
         &format!("撤销 {} 的 {}", user.username, device.name),
@@ -793,13 +832,32 @@ pub async fn reset_admin_auth(db: &PgPool) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM admin_users")
         .execute(&mut *tx)
         .await?;
-    sqlx::query(
-        "INSERT INTO action_logs(id, actor, action, target, detail, created_at) VALUES($1, 'system', 'reset_admin_auth', 'authentication', '通过服务器本地命令重置管理员认证', $2)",
+    let created_at = now_ts();
+    audit::insert_event(
+        &mut *tx,
+        &audit::AuditEventInput {
+            category: "auth".to_string(),
+            kind: "operation".to_string(),
+            actor: "system".to_string(),
+            user_id: None,
+            action: "reset_admin_auth".to_string(),
+            target: "authentication".to_string(),
+            detail: "通过服务器本地命令重置管理员认证".to_string(),
+            metadata: serde_json::json!({}),
+            instance_id: None,
+            node_snapshot: serde_json::json!({}),
+            context: audit::current_context(),
+            session_id: None,
+            operation_id: None,
+            status: "success".to_string(),
+            error_code: None,
+            error_reason: String::new(),
+            created_at,
+            completed_at: Some(created_at),
+        },
     )
-    .bind(Uuid::new_v4().to_string())
-    .bind(now_ts())
-    .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message))?;
     tx.commit().await?;
     Ok(())
 }
@@ -1538,7 +1596,7 @@ mod tests {
             .await
             .expect("count users");
         let logs: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM action_logs WHERE action = 'reset_admin_auth'",
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'reset_admin_auth'",
         )
         .fetch_one(&state.db)
         .await

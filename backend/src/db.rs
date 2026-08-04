@@ -167,81 +167,6 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS docker_exec_sessions (
-            id TEXT PRIMARY KEY,
-            instance_id TEXT REFERENCES instances(id) ON DELETE SET NULL,
-            instance_snapshot TEXT NOT NULL DEFAULT '',
-            request_id TEXT NOT NULL UNIQUE,
-            actor TEXT NOT NULL,
-            operation TEXT NOT NULL,
-            target TEXT NOT NULL DEFAULT '',
-            metadata TEXT NOT NULL DEFAULT '{}',
-            status TEXT NOT NULL,
-            error_code TEXT,
-            error_message TEXT NOT NULL DEFAULT '',
-            requested_at BIGINT NOT NULL,
-            completed_at BIGINT
-        );
-        "#,
-    )
-    .execute(db)
-    .await?;
-    sqlx::query(
-        "ALTER TABLE docker_exec_sessions ADD COLUMN IF NOT EXISTS instance_snapshot TEXT NOT NULL DEFAULT ''",
-    )
-    .execute(db)
-    .await?;
-    sqlx::query(
-        "ALTER TABLE docker_exec_sessions ADD COLUMN IF NOT EXISTS metadata TEXT NOT NULL DEFAULT '{}'",
-    )
-    .execute(db)
-    .await?;
-    sqlx::query(
-        "UPDATE docker_exec_sessions SET instance_snapshot = instance_id WHERE instance_snapshot = '' AND instance_id IS NOT NULL",
-    )
-    .execute(db)
-    .await?;
-    sqlx::query("ALTER TABLE docker_exec_sessions ALTER COLUMN instance_id DROP NOT NULL")
-        .execute(db)
-        .await?;
-    sqlx::query(
-        "ALTER TABLE docker_exec_sessions DROP CONSTRAINT IF EXISTS docker_exec_sessions_instance_id_fkey",
-    )
-    .execute(db)
-    .await?;
-    sqlx::query(
-        r#"
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conname = 'docker_exec_sessions_instance_id_fkey_set_null'
-                  AND conrelid = 'docker_exec_sessions'::regclass
-            ) THEN
-                ALTER TABLE docker_exec_sessions
-                    ADD CONSTRAINT docker_exec_sessions_instance_id_fkey_set_null
-                    FOREIGN KEY(instance_id) REFERENCES instances(id) ON DELETE SET NULL;
-            END IF;
-        END
-        $$;
-        "#,
-    )
-    .execute(db)
-    .await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_docker_exec_instance_requested ON docker_exec_sessions(instance_id, requested_at DESC);",
-    )
-    .execute(db)
-    .await?;
-    sqlx::query(
-        "UPDATE docker_exec_sessions SET status = 'failed', error_code = 'backend_restarted', error_message = '后端服务重启', completed_at = $1 WHERE status = 'running'",
-    )
-    .bind(now_ts())
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
         CREATE TABLE IF NOT EXISTS pending_instances (
             id TEXT PRIMARY KEY,
             secret TEXT NOT NULL,
@@ -361,69 +286,6 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
         .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_command_jobs_running_started ON command_jobs(status, started_at) WHERE status = 'running'",
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS ssh_sessions (
-            id TEXT PRIMARY KEY,
-            instance_id TEXT NOT NULL,
-            actor TEXT NOT NULL,
-            started_at BIGINT NOT NULL,
-            ended_at BIGINT
-        );
-        "#,
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS desktop_sessions (
-            id TEXT PRIMARY KEY,
-            instance_id TEXT NOT NULL,
-            actor TEXT NOT NULL,
-            started_at BIGINT NOT NULL,
-            ended_at BIGINT,
-            end_reason TEXT
-        );
-        "#,
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_desktop_sessions_instance_started ON desktop_sessions(instance_id, started_at DESC);",
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_desktop_sessions_ended ON desktop_sessions(ended_at) WHERE ended_at IS NOT NULL;",
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        "UPDATE desktop_sessions SET ended_at = $1, end_reason = 'backend_restarted' WHERE ended_at IS NULL",
-    )
-    .bind(now_ts())
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS action_logs (
-            id TEXT PRIMARY KEY,
-            actor TEXT NOT NULL,
-            action TEXT NOT NULL,
-            target TEXT NOT NULL,
-            detail TEXT NOT NULL,
-            created_at BIGINT NOT NULL
-        );
-        "#,
     )
     .execute(db)
     .await?;
@@ -794,6 +656,8 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
+    crate::audit::ensure_schema(db).await?;
+
     Ok(())
 }
 
@@ -834,9 +698,6 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
             "command_jobs",
             &["created_at", "started_at", "completed_at", "exit_code"][..],
         ),
-        ("ssh_sessions", &["started_at", "ended_at"][..]),
-        ("desktop_sessions", &["started_at", "ended_at"][..]),
-        ("action_logs", &["created_at"][..]),
         ("admin_users", &["enabled", "created_at"][..]),
         (
             "authenticator_devices",
@@ -856,10 +717,6 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
             &["retry_count", "created_at", "updated_at", "completed_at"][..],
         ),
         ("instance_docker_status", &["checked_at"][..]),
-        (
-            "docker_exec_sessions",
-            &["requested_at", "completed_at"][..],
-        ),
     ] {
         for column in columns {
             let data_type: Option<String> = sqlx::query_scalar(
@@ -1651,25 +1508,24 @@ pub async fn cleanup_loop(state: AppState) {
                 {
                     error!(?error, "failed to clean old metrics");
                 }
-                if let Err(error) = sqlx::query(
-                    "DELETE FROM desktop_sessions WHERE ended_at IS NOT NULL AND ended_at < $1",
-                )
-                .bind(cutoff)
-                .execute(&state.db)
-                .await
-                {
-                    error!(?error, "failed to clean old desktop sessions");
-                }
-                if let Err(error) =
-                    sqlx::query("DELETE FROM pending_instances WHERE first_seen < $1")
-                        .bind(now_ts() - PENDING_INSTANCE_MAX_AGE)
-                        .execute(&state.db)
-                        .await
-                {
-                    error!(?error, "failed to clean stale pending instances");
-                }
             }
             Err(error) => error!(?error, "failed to read retention setting"),
+        }
+        match crate::audit::retention_days(&state.db).await {
+            Ok(audit_days) => {
+                let audit_cutoff = now_ts() - audit_days * 24 * 3600;
+                if let Err(error) = crate::audit::cleanup(&state.db, audit_cutoff).await {
+                    error!(?error, "failed to clean old audit events");
+                }
+            }
+            Err(error) => error!(?error, "failed to read audit retention setting"),
+        }
+        if let Err(error) = sqlx::query("DELETE FROM pending_instances WHERE first_seen < $1")
+            .bind(now_ts() - PENDING_INSTANCE_MAX_AGE)
+            .execute(&state.db)
+            .await
+        {
+            error!(?error, "failed to clean stale pending instances");
         }
     }
 }
@@ -1677,25 +1533,52 @@ pub async fn cleanup_loop(state: AppState) {
 pub async fn write_action_log<'e, E>(
     executor: E,
     actor: &str,
+    user_id: Option<&str>,
     action: &str,
     target: &str,
     detail: &str,
-) -> AppResult<()>
+) -> AppResult<String>
 where
     E: Executor<'e, Database = Postgres>,
 {
+    let context = crate::audit::current_context();
+    let id = Uuid::new_v4().to_string();
+    let created_at = now_ts();
     sqlx::query(
-        "INSERT INTO action_logs(id, actor, action, target, detail, created_at) VALUES($1, $2, $3, $4, $5, $6)",
+        r#"
+        INSERT INTO audit_events(
+            id, category, kind, actor, user_id, action, target, detail, metadata,
+            instance_id, node_snapshot, source_ip, user_agent, request_id,
+            status, created_at, completed_at
+        )
+        SELECT $1,
+               CASE WHEN $4 IN ('login', 'initialize_auth', 'bootstrap_start', 'logout', 'reset_admin_auth') THEN 'auth' ELSE 'admin' END,
+               'operation', $2,
+               $3,
+               $4, $5, $6, '{}'::jsonb,
+               i.id,
+               CASE WHEN i.id IS NULL THEN '{}'::jsonb ELSE jsonb_build_object(
+                   'id', i.id, 'name', i.name, 'hostname', i.hostname, 'region', i.region,
+                   'os', i.os, 'arch', i.arch, 'agent_version', i.agent_version
+               ) END,
+               $7, $8, $9, 'success', $10, $10
+        FROM (SELECT 1) AS anchor
+        LEFT JOIN instances i ON i.id = $5
+        "#,
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&id)
     .bind(actor)
+    .bind(user_id)
     .bind(action)
     .bind(target)
-    .bind(detail)
-    .bind(now_ts())
+    .bind(crate::audit::truncate(detail, 4 * 1024))
+    .bind(&context.source_ip)
+    .bind(&context.user_agent)
+    .bind(&context.request_id)
+    .bind(created_at)
     .execute(executor)
     .await?;
-    Ok(())
+    Ok(id)
 }
 
 #[cfg(test)]

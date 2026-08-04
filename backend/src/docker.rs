@@ -27,7 +27,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    auth::{AdminSessionGuard, require_admin},
+    audit,
+    auth::{AdminPrincipal, AdminSessionGuard, require_admin},
     db::get_instance,
     error::{AppError, AppResult},
     models::{
@@ -55,6 +56,7 @@ const CANCEL_GRACE: Duration = Duration::from_secs(5);
 const STREAM_BUFFER: usize = 64;
 const MAX_DOCKER_CLIENT_MESSAGE_BYTES: usize = 128 * 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const STREAM_SESSION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -134,8 +136,11 @@ pub fn router() -> Router<AppState> {
         .route("/prune/{resource}", post(admin_resource_prune))
 }
 
-async fn require_docker_write_admin(state: &AppState, headers: &HeaderMap) -> AppResult<String> {
-    Ok(require_admin(state, headers).await?.username)
+async fn require_docker_write_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> AppResult<AdminPrincipal> {
+    require_admin(state, headers).await
 }
 
 #[derive(Debug, FromRow)]
@@ -462,7 +467,7 @@ async fn admin_list_containers(
     headers: HeaderMap,
     Query(query): Query<AllQuery>,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(
         &state,
         &instance_id,
@@ -477,7 +482,7 @@ async fn admin_inspect_container(
     Path((instance_id, container)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(
         &state,
         &instance_id,
@@ -492,7 +497,7 @@ async fn admin_container_stats(
     Path((instance_id, container)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(
         &state,
         &instance_id,
@@ -587,7 +592,7 @@ async fn admin_list_images(
     headers: HeaderMap,
     Query(query): Query<AllQuery>,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(
         &state,
         &instance_id,
@@ -602,7 +607,7 @@ async fn admin_inspect_image(
     Path((instance_id, image)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(
         &state,
         &instance_id,
@@ -678,7 +683,7 @@ async fn admin_list_networks(
     Path(instance_id): Path<String>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(&state, &instance_id, &actor, DockerRequest::NetworkList).await
 }
 
@@ -687,7 +692,7 @@ async fn admin_inspect_network(
     Path((instance_id, network)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(
         &state,
         &instance_id,
@@ -781,7 +786,7 @@ async fn admin_list_volumes(
     Path(instance_id): Path<String>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(&state, &instance_id, &actor, DockerRequest::VolumeList).await
 }
 
@@ -790,7 +795,7 @@ async fn admin_inspect_volume(
     Path((instance_id, volume)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(
         &state,
         &instance_id,
@@ -846,7 +851,7 @@ async fn admin_list_compose_projects(
     Path(instance_id): Path<String>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(&state, &instance_id, &actor, DockerRequest::ComposeList).await
 }
 
@@ -855,7 +860,7 @@ async fn admin_inspect_compose_project(
     Path((instance_id, project)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     let target = resolve_compose_target(
         &state,
         &instance_id,
@@ -925,7 +930,7 @@ async fn admin_deploy_compose(
 async fn compose_action_digest(
     state: &AppState,
     instance_id: &str,
-    actor: &str,
+    admin: &AdminPrincipal,
     action: DockerComposeAction,
     target: &DockerComposeTarget,
     supplied: Option<&str>,
@@ -936,7 +941,8 @@ async fn compose_action_digest(
     let response = execute_request(
         state,
         instance_id,
-        actor,
+        &admin.username,
+        &admin.user_id,
         DockerRequest::ComposeValidate {
             target: target.clone(),
         },
@@ -1021,7 +1027,7 @@ async fn admin_system_df(
     Path(instance_id): Path<String>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
-    let actor = require_admin(&state, &headers).await?.username;
+    let actor = require_admin(&state, &headers).await?;
     execute_json(&state, &instance_id, &actor, DockerRequest::SystemDf).await
 }
 
@@ -1185,15 +1191,21 @@ fn compose_target(payload: &ComposeRequest) -> DockerComposeTarget {
 async fn resolve_compose_target(
     state: &AppState,
     instance_id: &str,
-    actor: &str,
+    admin: &AdminPrincipal,
     project: String,
     files: Vec<String>,
     profiles: Vec<String>,
     services: Vec<String>,
 ) -> AppResult<DockerComposeTarget> {
     let files = if files.is_empty() {
-        let response =
-            execute_request(state, instance_id, actor, DockerRequest::ComposeList).await?;
+        let response = execute_request(
+            state,
+            instance_id,
+            &admin.username,
+            &admin.user_id,
+            DockerRequest::ComposeList,
+        )
+        .await?;
         let DockerResponse::Data { data } = response else {
             return Err(unexpected_response());
         };
@@ -1225,11 +1237,13 @@ fn compose_project_files(value: &Value, project: &str) -> Option<Vec<String>> {
 async fn execute_json(
     state: &AppState,
     instance_id: &str,
-    actor: &str,
+    admin: &AdminPrincipal,
     request: DockerRequest,
 ) -> AppResult<Json<Value>> {
     let view = response_view(&request);
-    let value = response_value(execute_request(state, instance_id, actor, request).await?);
+    let value = response_value(
+        execute_request(state, instance_id, &admin.username, &admin.user_id, request).await?,
+    );
     Ok(Json(normalize_response(view, value)))
 }
 
@@ -1701,6 +1715,7 @@ async fn execute_request(
     state: &AppState,
     instance_id: &str,
     actor: &str,
+    user_id: &str,
     request: DockerRequest,
 ) -> AppResult<DockerResponse> {
     let audit = request_audit_metadata(&request);
@@ -1713,6 +1728,7 @@ async fn execute_request(
             instance_id,
             &request_id,
             actor,
+            user_id,
             audit.operation,
             &audit.target,
             &audit.metadata,
@@ -1729,7 +1745,7 @@ async fn execute_request(
                     "",
                 )
                 .await;
-                return Err(error.error);
+                return Err(error.error.audit_handled());
             }
         };
         (agent, Some(audit_id))
@@ -1740,9 +1756,14 @@ async fn execute_request(
         Ok(permit) => permit,
         Err(error) => {
             finish_audit_best_effort(state, audit_id.as_deref(), "failed", Some("busy"), "").await;
-            return Err(error);
+            return Err(if audit_id.is_some() {
+                error.audit_handled()
+            } else {
+                error
+            });
         }
     };
+    let audit_started = audit_id.is_some();
     let timeout = request_timeout(&request);
     let (tx, rx) = oneshot::channel();
     let mut cleanup = DockerRequestCleanup {
@@ -1772,7 +1793,12 @@ async fn execute_request(
             )
             .await;
             cleanup.release();
-            return Err(AppError::new(StatusCode::CONFLICT, "实例不在线"));
+            let error = AppError::new(StatusCode::CONFLICT, "实例不在线");
+            return Err(if audit_started {
+                error.audit_handled()
+            } else {
+                error
+            });
         };
         state.docker_requests.write().await.insert(
             request_id.clone(),
@@ -1804,27 +1830,43 @@ async fn execute_request(
             .await;
         }
         cleanup.release();
-        return Err(AppError::new(StatusCode::CONFLICT, "实例不在线"));
+        return Err(if audit_started {
+            AppError::new(StatusCode::CONFLICT, "实例不在线").audit_handled()
+        } else {
+            AppError::new(StatusCode::CONFLICT, "实例不在线")
+        });
     }
 
     let response = match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(Ok(response))) => response,
         Ok(Ok(Err(DockerRequestFailure::Disconnected))) | Ok(Err(_)) => {
             cleanup.release();
-            return Err(AppError::new(StatusCode::CONFLICT, "实例连接已断开"));
+            let error = AppError::new(StatusCode::CONFLICT, "实例连接已断开");
+            return Err(if audit_started {
+                error.audit_handled()
+            } else {
+                error
+            });
         }
         Err(_) => {
             cleanup.timeout();
-            return Err(AppError::new(
-                StatusCode::GATEWAY_TIMEOUT,
-                "Docker 操作超时",
-            ));
+            let error = AppError::new(StatusCode::GATEWAY_TIMEOUT, "Docker 操作超时");
+            return Err(if audit_started {
+                error.audit_handled()
+            } else {
+                error
+            });
         }
     };
     cleanup.release();
 
     if let DockerResponse::Error { error } = response {
-        return Err(map_docker_error(error));
+        let error = map_docker_error(error);
+        return Err(if audit_started {
+            error.audit_handled()
+        } else {
+            error
+        });
     }
     Ok(response)
 }
@@ -2239,30 +2281,55 @@ async fn start_audit(
     instance_id: &str,
     request_id: &str,
     actor: &str,
+    user_id: &str,
     operation: &str,
     target: &str,
     metadata: &Value,
 ) -> AppResult<String> {
-    let id = Uuid::new_v4().to_string();
-    sqlx::query(
-        r#"
-        INSERT INTO docker_exec_sessions(
-            id, instance_id, instance_snapshot, request_id, actor, operation,
-            target, metadata, status, requested_at
-        ) VALUES($1, $2, $2, $3, $4, $5, $6, $7, 'running', $8)
-        "#,
+    let mut context = audit::current_context();
+    if context.request_id.is_none() {
+        context.request_id = Some(request_id.to_string());
+    }
+    let event_id = match audit::insert_event(
+        &state.db,
+        &audit::AuditEventInput {
+            category: "docker".to_string(),
+            kind: if operation == "container_exec" {
+                "session"
+            } else {
+                "operation"
+            }
+            .to_string(),
+            actor: actor.to_string(),
+            user_id: Some(user_id.to_string()),
+            action: operation.to_string(),
+            target: limited_message(target),
+            detail: String::new(),
+            metadata: metadata.clone(),
+            instance_id: Some(instance_id.to_string()),
+            node_snapshot: audit::instance_snapshot(&state.db, instance_id).await,
+            context,
+            session_id: (operation == "container_exec").then(|| request_id.to_string()),
+            operation_id: Some(request_id.to_string()),
+            status: "running".to_string(),
+            error_code: None,
+            error_reason: String::new(),
+            created_at: now_ts(),
+            completed_at: None,
+        },
     )
-    .bind(&id)
-    .bind(instance_id)
-    .bind(request_id)
-    .bind(actor)
-    .bind(operation)
-    .bind(limited_message(target))
-    .bind(serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_string()))
-    .bind(now_ts())
-    .execute(&state.db)
-    .await?;
-    Ok(id)
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            warn!(
+                ?error,
+                instance_id, "failed to create unified Docker audit event"
+            );
+            return Err(error);
+        }
+    };
+    Ok(event_id)
 }
 
 async fn finish_audit(
@@ -2271,19 +2338,18 @@ async fn finish_audit(
     status: &str,
     error_code: Option<&str>,
 ) -> AppResult<()> {
-    sqlx::query(
-        r#"
-        UPDATE docker_exec_sessions
-        SET status = $1, error_code = $2, error_message = $3, completed_at = $4
-        WHERE id = $5 AND status = 'running'
-        "#,
+    let normalized_status = if status == "succeeded" {
+        "success"
+    } else {
+        status
+    };
+    audit::finish_event(
+        &state.db,
+        id,
+        normalized_status,
+        error_code,
+        error_code.map(audit_error_message).unwrap_or_default(),
     )
-    .bind(status)
-    .bind(error_code)
-    .bind(error_code.map(audit_error_message).unwrap_or_default())
-    .bind(now_ts())
-    .bind(id)
-    .execute(&state.db)
     .await?;
     Ok(())
 }
@@ -2309,6 +2375,7 @@ fn audit_error_message(code: &str) -> &'static str {
         "offline" => "实例连接已断开",
         "disabled" => "实例已停用",
         "timeout" => "Docker 操作超时",
+        "session_timeout" => "Docker 会话已超时",
         "cancelled" => "Docker 操作已取消",
         "backpressure" => "浏览器读取速度不足，流已关闭",
         "exec_open_failed" => "容器终端启动失败",
@@ -2355,7 +2422,15 @@ fn docker_error_code(code: &DockerErrorCode) -> &'static str {
     }
 }
 
+fn docker_error_audit_status(code: &DockerErrorCode) -> &'static str {
+    match code {
+        DockerErrorCode::Cancelled => "cancelled",
+        _ => "failed",
+    }
+}
+
 fn map_docker_error(error: DockerError) -> AppError {
+    let code = docker_error_code(&error.code);
     let status = match error.code {
         DockerErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
         DockerErrorCode::NotFound => StatusCode::NOT_FOUND,
@@ -2372,11 +2447,15 @@ fn map_docker_error(error: DockerError) -> AppError {
         | DockerErrorCode::CommandFailed
         | DockerErrorCode::Internal => StatusCode::BAD_GATEWAY,
     };
-    AppError::new(status, limited_message(&error.message))
+    AppError::with_code(status, code, limited_message(&error.message))
 }
 
 fn unexpected_response() -> AppError {
-    AppError::new(StatusCode::BAD_GATEWAY, "Agent 返回了非预期的 Docker 响应")
+    AppError::with_code(
+        StatusCode::BAD_GATEWAY,
+        "unexpected_agent_response",
+        "Agent 返回了非预期的 Docker 响应",
+    )
 }
 
 pub async fn store_docker_status(
@@ -2519,7 +2598,10 @@ fn docker_response_audit_outcome(
     response: &DockerResponse,
 ) -> (&'static str, Option<&'static str>) {
     match response {
-        DockerResponse::Error { error } => ("failed", Some(docker_error_code(&error.code))),
+        DockerResponse::Error { error } => (
+            docker_error_audit_status(&error.code),
+            Some(docker_error_code(&error.code)),
+        ),
         DockerResponse::OperationComplete { data }
             if data.get("partial_success").and_then(Value::as_bool) == Some(true) =>
         {
@@ -2840,7 +2922,14 @@ pub async fn cancel_instance_docker(
     for pending in pending {
         let audit_id = pending.audit_id.clone();
         let _ = pending.tx.send(Err(DockerRequestFailure::Disconnected));
-        finish_audit_best_effort(state, audit_id.as_deref(), "failed", Some("cancelled"), "").await;
+        finish_audit_best_effort(
+            state,
+            audit_id.as_deref(),
+            "cancelled",
+            Some("cancelled"),
+            "",
+        )
+        .await;
     }
     let logs = {
         let mut streams = state.docker_log_streams.write().await;
@@ -2871,7 +2960,7 @@ pub async fn cancel_instance_docker(
         finish_audit_best_effort(
             state,
             Some(&handle.audit_id),
-            "failed",
+            "cancelled",
             Some("cancelled"),
             "",
         )
@@ -2910,6 +2999,9 @@ async fn admin_container_logs_ws(
     manageable_agent(&state, &instance_id).await?;
     let permit = acquire_stream_slot(&state, &instance_id).await?;
     let session_guard = admin.session_guard();
+    let actor = admin.username.clone();
+    let user_id = admin.user_id.clone();
+    let audit_context = audit::AuditContext::from_headers(&headers);
     Ok(ws
         .max_message_size(MAX_DOCKER_CLIENT_MESSAGE_BYTES)
         .max_frame_size(MAX_DOCKER_CLIENT_MESSAGE_BYTES)
@@ -2918,6 +3010,9 @@ async fn admin_container_logs_ws(
                 state,
                 instance_id,
                 container,
+                actor,
+                user_id,
+                audit_context,
                 session_guard,
                 query,
                 socket,
@@ -2930,6 +3025,9 @@ async fn docker_logs_socket(
     state: AppState,
     instance_id: String,
     container: String,
+    actor: String,
+    user_id: String,
+    audit_context: audit::AuditContext,
     session_guard: AdminSessionGuard,
     query: DockerLogsQuery,
     mut socket: WebSocket,
@@ -2944,9 +3042,54 @@ async fn docker_logs_socket(
         return;
     };
     let request_id = Uuid::new_v4().to_string();
+    if let Err(error) = audit::insert_event(
+        &state.db,
+        &audit::AuditEventInput {
+            category: "docker".to_string(),
+            kind: "session".to_string(),
+            actor,
+            user_id: Some(user_id),
+            action: "docker_log_session".to_string(),
+            target: container.clone(),
+            detail: "打开 Docker 日志流".to_string(),
+            metadata: json!({ "tail": query.tail, "follow": query.follow, "since": query.since }),
+            instance_id: Some(instance_id.clone()),
+            node_snapshot: audit::instance_snapshot(&state.db, &instance_id).await,
+            context: audit_context,
+            session_id: Some(request_id.clone()),
+            operation_id: Some(request_id.clone()),
+            status: "running".to_string(),
+            error_code: None,
+            error_reason: String::new(),
+            created_at: now_ts(),
+            completed_at: None,
+        },
+    )
+    .await
+    {
+        warn!(?error, %instance_id, %request_id, "failed to create Docker log audit event");
+        send_ws_event(
+            &mut socket,
+            &json!({
+                "type": "error",
+                "code": "audit_unavailable",
+                "message": "无法创建 Docker 日志审计记录"
+            }),
+        )
+        .await;
+        return;
+    }
     let (tx, mut rx) = mpsc::channel(STREAM_BUFFER);
     let (close_tx, mut close_rx) = watch::channel(None);
     if !send_ws_event(&mut socket, &json!({"type": "opening"})).await {
+        let _ = audit::finish_session_event(
+            &state.db,
+            &request_id,
+            "failed",
+            Some("client_disconnected"),
+            "客户端连接已断开",
+        )
+        .await;
         return;
     }
     let send_failed = {
@@ -2959,6 +3102,14 @@ async fn docker_logs_socket(
             send_ws_event(
                 &mut socket,
                 &json!({"type": "error", "code": "offline", "message": "实例连接已断开"}),
+            )
+            .await;
+            let _ = audit::finish_session_event(
+                &state.db,
+                &request_id,
+                "failed",
+                Some("offline"),
+                "实例连接已断开",
             )
             .await;
             return;
@@ -2990,25 +3141,62 @@ async fn docker_logs_socket(
             &json!({"type": "error", "code": "offline", "message": "实例连接已断开"}),
         )
         .await;
+        let _ = audit::finish_session_event(
+            &state.db,
+            &request_id,
+            "failed",
+            Some("offline"),
+            "实例连接已断开",
+        )
+        .await;
         return;
     }
     if !send_ws_event(&mut socket, &json!({"type": "ready"})).await {
         state.docker_log_streams.write().await.remove(&request_id);
-        let _ = agent.tx.send(AgentOutbound::DockerLogCancel { request_id });
+        let _ = agent.tx.send(AgentOutbound::DockerLogCancel {
+            request_id: request_id.clone(),
+        });
         let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket.close()).await;
+        let _ = audit::finish_session_event(
+            &state.db,
+            &request_id,
+            "failed",
+            Some("client_disconnected"),
+            "客户端连接已断开",
+        )
+        .await;
         return;
     }
     let authorization = session_guard.wait_until_invalid(state.clone());
     tokio::pin!(authorization);
+    let session_timeout = tokio::time::sleep(STREAM_SESSION_TIMEOUT);
+    tokio::pin!(session_timeout);
+    let mut finish_status = "success";
+    let mut finish_code = None;
+    let mut finish_reason = "";
 
     loop {
         tokio::select! {
+            _ = &mut session_timeout => {
+                send_ws_event(
+                    &mut socket,
+                    &json!({"type": "closed", "reason": "session_timeout"}),
+                )
+                .await;
+                finish_status = "failed";
+                finish_code = Some("session_timeout");
+                finish_reason = "Docker 日志会话已超时";
+                break;
+            }
             _ = &mut authorization => {
                 send_ws_event(
                     &mut socket,
                     &json!({"type": "closed", "reason": "authorization_revoked"}),
                 )
                 .await;
+                finish_status = "failed";
+                finish_code = Some("authorization_revoked");
+                finish_reason = "管理员会话已失效";
                 break;
             }
             event = rx.recv() => {
@@ -3021,16 +3209,41 @@ async fn docker_logs_socket(
                             "data": data,
                             "cursor": cursor,
                         })).await {
+                            finish_status = "failed";
+                            finish_code = Some("client_disconnected");
+                            finish_reason = "客户端连接已断开";
                             break;
                         }
                     }
                     Some(event @ DockerLogEvent::Closed { .. })
                     | Some(event @ DockerLogEvent::Disconnected)
                     | Some(event @ DockerLogEvent::Backpressure) => {
+                        match &event {
+                            DockerLogEvent::Closed { error: Some(error) } => {
+                                finish_status = "failed";
+                                finish_code = Some(docker_error_code(&error.code));
+                                finish_reason = "Docker 日志流异常结束";
+                            }
+                            DockerLogEvent::Closed { error: None } => {}
+                            DockerLogEvent::Disconnected => {
+                                finish_status = "failed";
+                                finish_code = Some("offline");
+                                finish_reason = "实例连接已断开";
+                            }
+                            DockerLogEvent::Backpressure => {
+                                finish_status = "failed";
+                                finish_code = Some("backpressure");
+                                finish_reason = "浏览器读取速度不足，日志流已暂停";
+                            }
+                            DockerLogEvent::Chunk { .. } => unreachable!(),
+                        }
                         send_docker_log_terminal_event(&mut socket, &event).await;
                         break;
                     }
                     None => {
+                        finish_status = "failed";
+                        finish_code = Some("offline");
+                        finish_reason = "实例连接已断开";
                         send_docker_log_terminal_event(
                             &mut socket,
                             &DockerLogEvent::Disconnected,
@@ -3050,6 +3263,9 @@ async fn docker_logs_socket(
                             "data": data,
                             "cursor": cursor,
                         })).await {
+                            finish_status = "failed";
+                            finish_code = Some("client_disconnected");
+                            finish_reason = "客户端连接已断开";
                             break;
                         }
                     }
@@ -3058,12 +3274,37 @@ async fn docker_logs_socket(
                     .borrow()
                     .clone()
                     .unwrap_or(DockerLogEvent::Disconnected);
+                match &event {
+                    DockerLogEvent::Closed { error: Some(error) } => {
+                        finish_status = "failed";
+                        finish_code = Some(docker_error_code(&error.code));
+                        finish_reason = "Docker 日志流异常结束";
+                    }
+                    DockerLogEvent::Closed { error: None } => {}
+                    DockerLogEvent::Disconnected => {
+                        finish_status = "failed";
+                        finish_code = Some("offline");
+                        finish_reason = "实例连接已断开";
+                    }
+                    DockerLogEvent::Backpressure => {
+                        finish_status = "failed";
+                        finish_code = Some("backpressure");
+                        finish_reason = "浏览器读取速度不足，日志流已暂停";
+                    }
+                    DockerLogEvent::Chunk { .. } => {}
+                }
                 send_docker_log_terminal_event(&mut socket, &event).await;
                 break;
             }
             incoming = socket.recv() => {
                 match incoming {
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_))) => break,
+                    None | Some(Err(_)) => {
+                        finish_status = "failed";
+                        finish_code = Some("client_disconnected");
+                        finish_reason = "客户端连接已断开";
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -3079,8 +3320,18 @@ async fn docker_logs_socket(
             .filter(|current| current.connection_id == agent.connection_id)
             .cloned()
     {
-        let _ = agent.tx.send(AgentOutbound::DockerLogCancel { request_id });
+        let _ = agent.tx.send(AgentOutbound::DockerLogCancel {
+            request_id: request_id.clone(),
+        });
     }
+    let _ = audit::finish_session_event(
+        &state.db,
+        &request_id,
+        finish_status,
+        finish_code,
+        finish_reason,
+    )
+    .await;
     let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket.close()).await;
 }
 
@@ -3127,6 +3378,8 @@ async fn admin_container_exec_ws(
     }
     let permit = acquire_stream_slot(&state, &instance_id).await?;
     let actor = admin.username.clone();
+    let user_id = admin.user_id.clone();
+    let audit_context = audit::AuditContext::from_headers(&headers);
     let session_guard = admin.session_guard();
     Ok(ws
         .max_message_size(MAX_DOCKER_CLIENT_MESSAGE_BYTES)
@@ -3137,6 +3390,8 @@ async fn admin_container_exec_ws(
                 instance_id,
                 container,
                 actor,
+                user_id,
+                audit_context,
                 session_guard,
                 query,
                 socket,
@@ -3150,6 +3405,8 @@ async fn docker_exec_socket(
     instance_id: String,
     container: String,
     actor: String,
+    user_id: String,
+    audit_context: audit::AuditContext,
     session_guard: AdminSessionGuard,
     query: DockerExecQuery,
     socket: WebSocket,
@@ -3167,14 +3424,18 @@ async fn docker_exec_socket(
         return;
     };
     let session_id = Uuid::new_v4().to_string();
-    let audit_id = match start_audit(
-        &state,
-        &instance_id,
-        &session_id,
-        &actor,
-        "container_exec",
-        &safe_audit_target(&container),
-        &json!({ "shell": query.shell }),
+    let audit_id = match audit::with_context(
+        audit_context,
+        start_audit(
+            &state,
+            &instance_id,
+            &session_id,
+            &actor,
+            &user_id,
+            "container_exec",
+            &safe_audit_target(&container),
+            &json!({ "shell": query.shell }),
+        ),
     )
     .await
     {
@@ -3260,10 +3521,23 @@ async fn docker_exec_socket(
     }
     let authorization = session_guard.wait_until_invalid(state.clone());
     tokio::pin!(authorization);
+    let session_timeout = tokio::time::sleep(STREAM_SESSION_TIMEOUT);
+    tokio::pin!(session_timeout);
     let mut failure_code = "client_disconnected";
 
     loop {
         tokio::select! {
+            _ = &mut session_timeout => {
+                failure_code = "session_timeout";
+                let _ = send_split_terminal_event(
+                    &mut sender,
+                    &TerminalServerMessage::Error {
+                        message: "容器终端会话已超时".to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
             _ = &mut authorization => {
                 failure_code = "authorization_revoked";
                 let _ = send_split_terminal_event(
@@ -3716,7 +3990,7 @@ mod tests {
     }
 
     #[test]
-    fn docker_operation_audit_distinguishes_success_partial_and_failure() {
+    fn docker_operation_audit_distinguishes_success_partial_failure_and_cancellation() {
         let succeeded = DockerResponse::OperationComplete {
             data: json!({"completed": true}),
         };
@@ -3750,6 +4024,20 @@ mod tests {
             docker_response_audit_outcome(&failed),
             ("failed", Some("operation_failed"))
         );
+
+        let cancelled = DockerResponse::Error {
+            error: DockerError {
+                code: DockerErrorCode::Cancelled,
+                message: "cancelled by administrator".to_string(),
+                retryable: false,
+                exit_code: None,
+            },
+        };
+        assert_eq!(
+            docker_response_audit_outcome(&cancelled),
+            ("cancelled", Some("cancelled"))
+        );
+        assert_eq!(audit_error_message("cancelled"), "Docker 操作已取消");
     }
 
     #[test]
@@ -3801,6 +4089,7 @@ mod tests {
         let instance_id = format!("docker-audit-{suffix}");
         let missing_id = format!("missing-docker-audit-{suffix}");
         let actor = format!("docker-audit-actor-{suffix}");
+        let user_id = format!("docker-audit-user-{suffix}");
         sqlx::query(
             "INSERT INTO instances(id, secret, name, first_seen) VALUES($1, 'secret', 'Docker audit test', $2)",
         )
@@ -3814,6 +4103,7 @@ mod tests {
             &state,
             &instance_id,
             &actor,
+            &user_id,
             DockerRequest::ContainerAction {
                 container: "web".to_string(),
                 action: DockerContainerAction::Start,
@@ -3823,19 +4113,21 @@ mod tests {
         .await
         .expect_err("offline mutation must fail");
         assert_eq!(error.status, StatusCode::CONFLICT);
-        let audit: (String, Option<String>) =
-            sqlx::query_as("SELECT status, error_code FROM docker_exec_sessions WHERE actor = $1")
+        let audit: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, error_code, user_id FROM audit_events WHERE actor = $1 AND category = 'docker' ORDER BY created_at DESC LIMIT 1")
                 .bind(&actor)
                 .fetch_one(&state.db)
                 .await
                 .expect("load failed audit");
         assert_eq!(audit.0, "failed");
         assert_eq!(audit.1.as_deref(), Some("offline"));
+        assert_eq!(audit.2.as_deref(), Some(user_id.as_str()));
 
         execute_request(
             &state,
             &instance_id,
             &actor,
+            &user_id,
             DockerRequest::ContainerList { all: true },
         )
         .await
@@ -3844,6 +4136,7 @@ mod tests {
             &state,
             &missing_id,
             &actor,
+            &user_id,
             DockerRequest::ContainerAction {
                 container: "web".to_string(),
                 action: DockerContainerAction::Start,
@@ -3853,15 +4146,16 @@ mod tests {
         .await
         .expect_err("missing instance must retain the 404 contract");
         assert_eq!(missing_error.status, StatusCode::NOT_FOUND);
-        let audit_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM docker_exec_sessions WHERE actor = $1")
-                .bind(&actor)
-                .fetch_one(&state.db)
-                .await
-                .expect("count audits");
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE actor = $1 AND category = 'docker'",
+        )
+        .bind(&actor)
+        .fetch_one(&state.db)
+        .await
+        .expect("count audits");
         assert_eq!(audit_count, 1);
 
-        sqlx::query("DELETE FROM docker_exec_sessions WHERE actor = $1")
+        sqlx::query("DELETE FROM audit_events WHERE actor = $1 AND category = 'docker'")
             .bind(&actor)
             .execute(&state.db)
             .await

@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     admin_auth::resolved_client_ip,
+    audit,
     auth::require_admin,
     db::{
         agent_secret_matches, approve_pending_instance, get_instance, get_instance_optional,
@@ -25,7 +26,7 @@ use crate::{
     error::{AppError, AppResult},
     jobs::{create_command_job, dispatch_command},
     models::{
-        ActionLogRecord, AdminDeviceProfileResponse, AgentRegisterRequest, AgentRegisterResponse,
+        AdminDeviceProfileResponse, AgentRegisterRequest, AgentRegisterResponse,
         AgentReportRequest, AgentWsQuery, AppearanceResponse, AppearanceSettingsRequest,
         CommandJobRecord, CommandRecord, CreateCommandRequest, DeviceProfile, HealthResponse,
         InstanceRecord, InstanceSummary, ListQuery, MetricRecord, MetricsQuery, PendingInstance,
@@ -426,6 +427,7 @@ pub async fn admin_approve_instance(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "approve_instance",
         &id,
         "批准实例接入",
@@ -453,6 +455,7 @@ pub async fn admin_reject_instance(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "reject_instance",
         &id,
         "拒绝实例接入",
@@ -531,6 +534,7 @@ pub async fn admin_update_instance(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "update_instance",
         &id,
         "编辑实例资料",
@@ -576,7 +580,6 @@ pub async fn admin_disable_instance(
     Path(id): Path<String>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
-
     let mut transaction = state.db.begin().await?;
     let updated = sqlx::query("UPDATE instances SET disabled = 1 WHERE id = $1")
         .bind(&id)
@@ -588,6 +591,7 @@ pub async fn admin_disable_instance(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "disable_instance",
         &id,
         "停用实例",
@@ -609,6 +613,7 @@ pub async fn admin_delete_instance(
     Path(id): Path<String>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
+    let node_snapshot = audit::instance_snapshot(&state.db, &id).await;
 
     let mut transaction = state.db.begin().await?;
     let instance_exists =
@@ -634,14 +639,21 @@ pub async fn admin_delete_instance(
     if deleted.rows_affected() != 1 {
         return Err(AppError::new(StatusCode::CONFLICT, "实例状态已发生变化"));
     }
-    write_action_log(
+    let audit_event_id = write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "delete_instance",
         &id,
         "删除实例和历史指标",
     )
     .await?;
+    sqlx::query("UPDATE audit_events SET instance_id = $1, node_snapshot = $2 WHERE id = $3")
+        .bind(&id)
+        .bind(node_snapshot)
+        .bind(audit_event_id)
+        .execute(&mut *transaction)
+        .await?;
     transaction.commit().await?;
     revoke_instance_connection(&state, &id).await;
 
@@ -667,15 +679,26 @@ pub async fn admin_put_settings(
 ) -> AppResult<Json<SettingsResponse>> {
     let admin = require_admin(&state, &headers).await?;
     let days = payload.retention_days.clamp(1, 365);
+    let audit_days = payload
+        .audit_retention_days
+        .map(|days| days.clamp(1, audit::MAX_AUDIT_RETENTION_DAYS))
+        .unwrap_or(audit::retention_days(&state.db).await?);
     sqlx::query(
         "INSERT INTO settings(key, value) VALUES('retention_days', $1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
     .bind(days.to_string())
     .execute(&state.db)
     .await?;
+    sqlx::query(
+        "INSERT INTO settings(key, value) VALUES('audit_retention_days', $1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(audit_days.to_string())
+    .execute(&state.db)
+    .await?;
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "update_settings",
         "retention_days",
         &format!("指标保留天数设置为 {}", days),
@@ -683,6 +706,7 @@ pub async fn admin_put_settings(
     .await?;
     let mut response = settings_response(&state).await?;
     response.retention_days = days;
+    response.audit_retention_days = audit_days;
     Ok(Json(response))
 }
 
@@ -713,6 +737,7 @@ pub async fn admin_put_appearance(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "update_appearance",
         "appearance",
         &format!("主题模式设置为 {theme_mode}，主题色设置为 {accent_color}"),
@@ -791,6 +816,7 @@ pub async fn admin_upload_background_image(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "update_background",
         "appearance",
         "更新站点背景图",
@@ -818,6 +844,7 @@ pub async fn admin_delete_background_image(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "clear_background",
         "appearance",
         "清除站点背景图",
@@ -832,6 +859,7 @@ async fn settings_response(state: &AppState) -> AppResult<SettingsResponse> {
     let appearance = appearance_response(state).await?;
     Ok(SettingsResponse {
         retention_days: retention_days(&state.db).await?,
+        audit_retention_days: audit::retention_days(&state.db).await?,
         background_image_url: appearance.background_image_url,
         theme_mode: appearance.theme_mode,
         accent_color: appearance.accent_color,
@@ -988,6 +1016,7 @@ pub async fn admin_create_command(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "create_command",
         &record.id,
         &record.name,
@@ -1009,6 +1038,7 @@ pub async fn admin_disable_command(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "disable_command",
         &id,
         "停用快捷操作",
@@ -1048,6 +1078,7 @@ pub async fn admin_run_whitelist_command(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "run_command",
         &instance_id,
         &format!("执行快捷操作：{}", command.name),
@@ -1097,27 +1128,6 @@ pub async fn admin_job(
     .await?
     .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "命令任务不存在"))?;
     Ok(Json(job))
-}
-
-pub async fn admin_logs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<ListQuery>,
-) -> AppResult<Json<Vec<ActionLogRecord>>> {
-    require_admin(&state, &headers).await?;
-    let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let logs = sqlx::query_as::<_, ActionLogRecord>(
-        r#"
-        SELECT id, actor, action, target, detail, created_at
-        FROM action_logs
-        ORDER BY created_at DESC
-        LIMIT $1
-        "#,
-    )
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await?;
-    Ok(Json(logs))
 }
 
 pub async fn agent_register(
@@ -1357,12 +1367,22 @@ pub async fn admin_terminal_ws(
     ensure_same_origin(&headers, request_scheme(&state, &headers, peer_addr.ip())?)?;
     let admin = require_admin(&state, &headers).await?;
     get_instance(&state.db, &instance_id).await?;
+    let audit_context = audit::AuditContext::from_headers(&headers);
+    let user_id = admin.user_id.clone();
     let session_guard = admin.session_guard();
     Ok(ws
         .max_message_size(MAX_TERMINAL_CLIENT_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_CLIENT_MESSAGE_BYTES)
         .on_upgrade(move |socket| {
-            terminal_socket(state, instance_id, admin.username, session_guard, socket)
+            terminal_socket(
+                state,
+                instance_id,
+                admin.username,
+                user_id,
+                audit_context,
+                session_guard,
+                socket,
+            )
         }))
 }
 

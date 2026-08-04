@@ -168,7 +168,6 @@ pub struct PendingFileRequest {
 #[derive(Clone)]
 pub struct DesktopSessionHandle {
     pub instance_id: String,
-    pub actor: String,
     pub agent_connection_id: Uuid,
     pub token_hash: [u8; 32],
     pub token_expires_at: i64,

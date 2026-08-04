@@ -1,9 +1,9 @@
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ApiError, api as rawApi } from '../api/http'
+import { auditExportFileName, auditQueryPath, downloadAuditExport } from '../api/audit'
 import { getCountryOption } from '../data/countries'
 import { useAppearance } from './useAppearance'
 import type {
-  ActionLog,
   AgentArtifactTarget,
   AgentArtifactUploadItem,
   AgentArtifactUploadResult,
@@ -15,6 +15,9 @@ import type {
   AdminUsersResponse,
   AdminTab,
   AppearanceResponse,
+  AuditExportFormat,
+  AuditPage,
+  AuditQuery,
   AuthEnrollment,
   AuthMode,
   CommandExecutionState,
@@ -51,6 +54,29 @@ type AgentUpdateOperation =
 
 const COMMAND_JOB_POLL_INTERVAL_MS = 750
 const COMMAND_JOB_POLL_RETRY_MS = 2000
+const DEFAULT_AUDIT_PAGE_SIZE = 50
+
+function defaultAuditQuery(): AuditQuery {
+  return {
+    from: null,
+    to: null,
+    page: 1,
+    page_size: DEFAULT_AUDIT_PAGE_SIZE,
+    user_id: '',
+    actor: '',
+    category: '',
+    action: '',
+    instance_id: '',
+    status: '',
+    source_ip: '',
+    request_id: '',
+    keyword: '',
+  }
+}
+
+function emptyAuditPage(): AuditPage {
+  return { items: [], page: 1, page_size: DEFAULT_AUDIT_PAGE_SIZE, total: 0, pages: 0 }
+}
 
 function abortedRequestError() {
   return new DOMException('Request superseded by a session change', 'AbortError')
@@ -67,7 +93,11 @@ export function useMonitoringConsole() {
   const commands = ref<CommandRecord[]>([])
   const jobs = ref<CommandJob[]>([])
   const commandExecution = ref<CommandExecutionState | null>(null)
-  const logs = ref<ActionLog[]>([])
+  const audit = ref<AuditPage>(emptyAuditPage())
+  const auditQuery = reactive<AuditQuery>(defaultAuditQuery())
+  const auditLoading = ref(false)
+  const auditError = ref('')
+  const auditExporting = ref<AuditExportFormat | null>(null)
   const agentReleases = ref<AgentRelease[]>([])
   const agentUpdateAttempts = ref<AgentUpdateAttempt[]>([])
   const agentRolloutCandidates = ref<Record<string, AgentRolloutCandidate[]>>({})
@@ -106,6 +136,8 @@ export function useMonitoringConsole() {
   let appearanceRequest = 0
   let sessionRequest = 0
   let adminDataRequest = 0
+  let auditDataRequest = 0
+  let auditExportRequest = 0
   let agentUpdatesRequest = 0
   let usersRequest = 0
   let sessionEpoch = 0
@@ -128,6 +160,7 @@ export function useMonitoringConsole() {
 
   const settingsForm = reactive({
     retention_days: 30,
+    audit_retention_days: 180,
     background_image_url: null as string | null,
     theme_mode: appearance.themeMode.value,
     accent_color: appearance.accentColor.value,
@@ -208,6 +241,13 @@ export function useMonitoringConsole() {
     invalidateAdminRequests()
   })
 
+  watch(
+    [() => adminTab.value, () => isAdmin.value],
+    ([tab, admin]) => {
+      if (tab === 'logs' && admin) void loadAudit()
+    },
+  )
+
   async function guarded(task: () => Promise<void>, operationKey?: string): Promise<boolean> {
     if (operationKey && operationLocks.has(operationKey)) return false
     if (operationKey) operationLocks.add(operationKey)
@@ -282,7 +322,13 @@ export function useMonitoringConsole() {
     commands.value = []
     jobs.value = []
     commandExecution.value = null
-    logs.value = []
+    auditDataRequest += 1
+    auditExportRequest += 1
+    audit.value = emptyAuditPage()
+    Object.assign(auditQuery, defaultAuditQuery())
+    auditLoading.value = false
+    auditError.value = ''
+    auditExporting.value = null
     agentReleases.value = []
     agentUpdateAttempts.value = []
     adminUsers.value = []
@@ -304,6 +350,7 @@ export function useMonitoringConsole() {
     editForm.country = ''
     editForm.remark = ''
     settingsForm.retention_days = 30
+    settingsForm.audit_retention_days = 180
     settingsForm.background_image_url = appearance.backgroundImageUrl.value
     settingsForm.theme_mode = appearance.themeMode.value
     settingsForm.accent_color = appearance.accentColor.value
@@ -369,11 +416,10 @@ export function useMonitoringConsole() {
   async function loadAdminData() {
     const request = ++adminDataRequest
     const userRequest = ++usersRequest
-    const [pending, commandList, jobList, logList, settings, users] = await Promise.all([
+    const [pending, commandList, jobList, settings, users] = await Promise.all([
       api<PendingInstance[]>('/api/admin/pending-instances'),
       api<CommandRecord[]>('/api/admin/commands'),
       api<CommandJob[]>('/api/admin/jobs'),
-      api<ActionLog[]>('/api/admin/logs'),
       api<SettingsResponse>('/api/admin/settings'),
       api<AdminUsersResponse>('/api/admin/users'),
       loadAgentUpdates(),
@@ -382,13 +428,85 @@ export function useMonitoringConsole() {
     pendingInstances.value = pending
     commands.value = commandList
     jobs.value = jobList
-    logs.value = logList
     settingsForm.retention_days = settings.retention_days
+    settingsForm.audit_retention_days = settings.audit_retention_days ?? 180
     appearance.applyAppearance(settings)
     settingsForm.background_image_url = settings.background_image_url
     settingsForm.theme_mode = settings.theme_mode
     settingsForm.accent_color = settings.accent_color
     if (userRequest === usersRequest) applyUsers(users)
+    if (adminTab.value === 'logs') void loadAudit()
+  }
+
+  async function loadAudit() {
+    if (!isAdmin.value) return
+    const request = ++auditDataRequest
+    auditLoading.value = true
+    auditError.value = ''
+    try {
+      const response = await api<AuditPage>(auditQueryPath(auditQuery))
+      if (request !== auditDataRequest) return
+      audit.value = {
+        items: response.items || [],
+        page: response.page || auditQuery.page,
+        page_size: response.page_size || auditQuery.page_size,
+        total: response.total || 0,
+        pages: response.pages || 0,
+      }
+      if (audit.value.pages > 0 && audit.value.page > audit.value.pages) {
+        auditQuery.page = audit.value.pages
+        void loadAudit()
+        return
+      }
+      auditQuery.page = audit.value.page
+      auditQuery.page_size = audit.value.page_size
+    } catch (error) {
+      if (request !== auditDataRequest || isAbortError(error)) return
+      auditError.value = error instanceof Error ? error.message : '审计记录加载失败'
+    } finally {
+      if (request === auditDataRequest) auditLoading.value = false
+    }
+  }
+
+  function updateAuditQuery(patch: Partial<AuditQuery>) {
+    Object.assign(auditQuery, patch)
+    auditQuery.page = 1
+    void loadAudit()
+  }
+
+  function setAuditPage(page: number) {
+    const nextPage = Math.max(1, Math.min(page, audit.value.pages || 1))
+    if (nextPage === auditQuery.page) return
+    auditQuery.page = nextPage
+    void loadAudit()
+  }
+
+  async function exportAudit(format: AuditExportFormat) {
+    if (auditExporting.value) return
+    const request = ++auditExportRequest
+    const epoch = sessionEpoch
+    const controller = adminAbortController
+    auditExporting.value = format
+    auditError.value = ''
+    try {
+      const blob = await downloadAuditExport(auditQuery, format, controller.signal)
+      if (request !== auditExportRequest || epoch !== sessionEpoch || controller.signal.aborted) {
+        throw abortedRequestError()
+      }
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = auditExportFileName(format)
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 0)
+    } catch (error) {
+      if (request !== auditExportRequest || isAbortError(error)) return
+      auditError.value = error instanceof Error ? error.message : '审计记录导出失败'
+    } finally {
+      if (request === auditExportRequest) auditExporting.value = null
+    }
   }
 
   async function loadAgentUpdates() {
@@ -680,7 +798,10 @@ export function useMonitoringConsole() {
     guarded(async () => {
       await api('/api/admin/settings', {
         method: 'PUT',
-        body: JSON.stringify({ retention_days: settingsForm.retention_days }),
+        body: JSON.stringify({
+          retention_days: settingsForm.retention_days,
+          audit_retention_days: settingsForm.audit_retention_days,
+        }),
       })
       await loadAdminData()
     }, 'settings:retention')
@@ -1156,7 +1277,11 @@ export function useMonitoringConsole() {
     commands,
     jobs,
     commandExecution,
-    logs,
+    audit,
+    auditQuery,
+    auditLoading,
+    auditError,
+    auditExporting,
     agentReleases,
     agentUpdateAttempts,
     agentRolloutCandidates,
@@ -1221,6 +1346,10 @@ export function useMonitoringConsole() {
     runCommand,
     closeCommandExecution,
     saveSettings,
+    loadAudit,
+    updateAuditQuery,
+    setAuditPage,
+    exportAudit,
     saveAppearance,
     createUserEnrollment,
     createDeviceEnrollment,

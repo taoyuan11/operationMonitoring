@@ -5,11 +5,13 @@ use std::{
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    audit,
     auth::AdminSessionGuard,
     db::normalize_metric_timestamp,
     docker::{
@@ -46,6 +48,7 @@ const AGENT_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 128;
 const MAX_TERMINAL_SESSIONS_PER_INSTANCE: usize = 8;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const TERMINAL_SESSION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Debug)]
 struct PendingHeartbeat {
@@ -1025,6 +1028,8 @@ pub async fn terminal_socket(
     state: AppState,
     instance_id: String,
     actor: String,
+    user_id: String,
+    audit_context: audit::AuditContext,
     session_guard: AdminSessionGuard,
     socket: WebSocket,
 ) {
@@ -1041,17 +1046,40 @@ pub async fn terminal_socket(
         return;
     };
 
-    if let Err(error) = sqlx::query(
-        "INSERT INTO ssh_sessions(id, instance_id, actor, started_at) VALUES($1, $2, $3, $4)",
+    if let Err(error) = audit::insert_event(
+        &state.db,
+        &audit::AuditEventInput {
+            category: "terminal".to_string(),
+            kind: "session".to_string(),
+            actor: actor.clone(),
+            user_id: Some(user_id),
+            action: "terminal_session".to_string(),
+            target: instance_id.clone(),
+            detail: "启动终端会话".to_string(),
+            metadata: json!({}),
+            instance_id: Some(instance_id.clone()),
+            node_snapshot: audit::instance_snapshot(&state.db, &instance_id).await,
+            context: audit_context,
+            session_id: Some(session_id.clone()),
+            operation_id: None,
+            status: "running".to_string(),
+            error_code: None,
+            error_reason: String::new(),
+            created_at: started_at,
+            completed_at: None,
+        },
     )
-    .bind(&session_id)
-    .bind(&instance_id)
-    .bind(&actor)
-    .bind(started_at)
-    .execute(&state.db)
     .await
     {
-        error!(?error, "failed to create terminal session");
+        warn!(?error, %instance_id, %session_id, "failed to create terminal audit event");
+        send_single_terminal_message(
+            socket,
+            TerminalServerMessage::Error {
+                message: "无法创建终端审计记录".to_string(),
+            },
+        )
+        .await;
+        return;
     }
 
     let (event_tx, mut event_rx) = mpsc::channel(TERMINAL_EVENT_QUEUE_CAPACITY);
@@ -1074,7 +1102,14 @@ pub async fn terminal_socket(
         limit_reached
     };
     if terminal_limit_reached {
-        mark_terminal_session_ended(&state, &session_id).await;
+        mark_terminal_session_ended(
+            &state,
+            &session_id,
+            "failed",
+            Some("session_limit"),
+            "终端会话已达到上限",
+        )
+        .await;
         send_single_terminal_message(
             socket,
             TerminalServerMessage::Error {
@@ -1093,7 +1128,15 @@ pub async fn terminal_socket(
             rows: 24,
         },
     ) {
-        finish_terminal_session(&state, &agent, &session_id).await;
+        finish_terminal_session(
+            &state,
+            &agent,
+            &session_id,
+            "failed",
+            Some("offline"),
+            "实例连接已断开",
+        )
+        .await;
         send_single_terminal_message(
             socket,
             TerminalServerMessage::Error {
@@ -1109,14 +1152,40 @@ pub async fn terminal_socket(
         .await
         .is_err()
     {
-        finish_terminal_session(&state, &agent, &session_id).await;
+        finish_terminal_session(
+            &state,
+            &agent,
+            &session_id,
+            "failed",
+            Some("client_disconnected"),
+            "客户端连接已断开",
+        )
+        .await;
         return;
     }
     let authorization = session_guard.wait_until_invalid(state.clone());
     tokio::pin!(authorization);
+    let session_timeout = tokio::time::sleep(TERMINAL_SESSION_TIMEOUT);
+    tokio::pin!(session_timeout);
+    let mut end_status = "success";
+    let mut end_code = None;
+    let mut end_reason = String::new();
 
     loop {
         tokio::select! {
+            _ = &mut session_timeout => {
+                let _ = send_terminal_message(
+                    &mut sender,
+                    &TerminalServerMessage::Error {
+                        message: "终端会话已超时".to_string(),
+                    },
+                )
+                .await;
+                end_status = "failed";
+                end_code = Some("session_timeout");
+                end_reason = "终端会话已超时".to_string();
+                break;
+            }
             _ = &mut authorization => {
                 let _ = send_terminal_message(
                     &mut sender,
@@ -1125,10 +1194,16 @@ pub async fn terminal_socket(
                     },
                 )
                 .await;
+                end_status = "failed";
+                end_code = Some("authorization_revoked");
+                end_reason = "管理员会话已失效".to_string();
                 break;
             }
             browser_message = receiver.next() => {
                 let Some(browser_message) = browser_message else {
+                    end_status = "failed";
+                    end_code = Some("client_disconnected");
+                    end_reason = "客户端连接已断开".to_string();
                     break;
                 };
                 match browser_message {
@@ -1143,11 +1218,17 @@ pub async fn terminal_socket(
                                         data,
                                     },
                                 ) {
+                                    end_status = "failed";
+                                    end_code = Some("agent_disconnected");
+                                    end_reason = "实例连接已断开".to_string();
                                     break;
                                 }
                             }
                             Ok(TerminalClientMessage::Input { .. }) => {
                                 warn!(%instance_id, %session_id, "terminal browser input exceeded limit");
+                                end_status = "failed";
+                                end_code = Some("message_too_large");
+                                end_reason = "终端消息超过大小限制".to_string();
                                 break;
                             }
                             Ok(TerminalClientMessage::Resize { cols, rows }) => {
@@ -1159,33 +1240,80 @@ pub async fn terminal_socket(
                                         rows: rows.clamp(1, 300),
                                     },
                                 ) {
+                                    end_status = "failed";
+                                    end_code = Some("agent_disconnected");
+                                    end_reason = "实例连接已断开".to_string();
                                     break;
                                 }
                             }
                             Err(error) => warn!(?error, "invalid browser terminal message"),
                         }
                     }
-                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(Message::Close(_)) => break,
+                    Err(_) => {
+                        end_status = "failed";
+                        end_code = Some("client_disconnected");
+                        end_reason = "客户端连接已断开".to_string();
+                        break;
+                    }
                     _ => {}
                 }
             }
             event = event_rx.recv() => {
                 let Some(event) = event else {
+                    end_status = "failed";
+                    end_code = Some("agent_disconnected");
+                    end_reason = "实例连接已断开".to_string();
                     break;
                 };
                 let terminal_closed = matches!(event, TerminalServerMessage::Closed { .. });
+                if let TerminalServerMessage::Closed { exit_code, reason } = &event {
+                    if let Some(reason) = reason.as_deref().filter(|reason| !reason.is_empty()) {
+                        end_status = "failed";
+                        end_code = Some(if reason.contains("断开") {
+                            "agent_disconnected"
+                        } else {
+                            "terminal_closed"
+                        });
+                        end_reason = reason.to_string();
+                    } else if exit_code.is_some_and(|exit_code| exit_code != 0) {
+                        end_status = "failed";
+                        end_code = Some("terminal_nonzero_exit");
+                        end_reason = format!("终端进程退出码 {}", exit_code.unwrap_or_default());
+                    }
+                }
                 if send_terminal_message(&mut sender, &event).await.is_err() || terminal_closed {
+                    if !terminal_closed {
+                        end_status = "failed";
+                        end_code = Some("client_disconnected");
+                        end_reason = "客户端连接已断开".to_string();
+                    }
                     break;
                 }
             }
         }
     }
 
-    finish_terminal_session(&state, &agent, &session_id).await;
+    finish_terminal_session(
+        &state,
+        &agent,
+        &session_id,
+        end_status,
+        end_code,
+        &end_reason,
+    )
+    .await;
     let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, sender.close()).await;
 }
 
-async fn finish_terminal_session(state: &AppState, agent: &AgentHandle, session_id: &str) {
+async fn finish_terminal_session(
+    state: &AppState,
+    agent: &AgentHandle,
+    session_id: &str,
+    status: &str,
+    error_code: Option<&str>,
+    error_reason: &str,
+) {
     state.terminal_sessions.write().await.remove(session_id);
     send_terminal_agent_message(
         agent,
@@ -1193,15 +1321,18 @@ async fn finish_terminal_session(state: &AppState, agent: &AgentHandle, session_
             session_id: session_id.to_string(),
         },
     );
-    mark_terminal_session_ended(state, session_id).await;
+    mark_terminal_session_ended(state, session_id, status, error_code, error_reason).await;
 }
 
-async fn mark_terminal_session_ended(state: &AppState, session_id: &str) {
-    let _ = sqlx::query("UPDATE ssh_sessions SET ended_at = $1 WHERE id = $2")
-        .bind(now_ts())
-        .bind(session_id)
-        .execute(&state.db)
-        .await;
+async fn mark_terminal_session_ended(
+    state: &AppState,
+    session_id: &str,
+    status: &str,
+    error_code: Option<&str>,
+    error_reason: &str,
+) {
+    let _ =
+        audit::finish_session_event(&state.db, session_id, status, error_code, error_reason).await;
 }
 
 fn terminal_session_limit_reached<'a>(

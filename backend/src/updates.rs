@@ -172,6 +172,7 @@ pub async fn admin_create_agent_release(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "create_agent_release",
         &id,
         &format!("创建 Agent 版本 {version}"),
@@ -212,6 +213,7 @@ pub async fn admin_update_agent_release(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "update_agent_release",
         &release_id,
         &format!("更新 Agent 草稿 {version}"),
@@ -227,11 +229,16 @@ pub async fn admin_delete_agent_release(
     Path(release_id): Path<String>,
 ) -> AppResult<StatusCode> {
     let admin = require_admin(&state, &headers).await?;
-    delete_agent_release(&state, &admin.username, &release_id).await?;
+    delete_agent_release(&state, &admin.username, &admin.user_id, &release_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn delete_agent_release(state: &AppState, actor: &str, release_id: &str) -> AppResult<()> {
+async fn delete_agent_release(
+    state: &AppState,
+    actor: &str,
+    user_id: &str,
+    release_id: &str,
+) -> AppResult<()> {
     let mut transaction = state.db.begin().await?;
     let release = sqlx::query_as::<_, AgentReleaseRecord>(
         "SELECT id, version, notes, status, rollout_state, rollout_updated_at, created_at, published_at FROM agent_releases WHERE id = $1 FOR UPDATE",
@@ -317,6 +324,7 @@ async fn delete_agent_release(state: &AppState, actor: &str, release_id: &str) -
     write_action_log(
         &mut *transaction,
         actor,
+        Some(user_id),
         "delete_agent_release",
         release_id,
         &format!(
@@ -350,6 +358,7 @@ pub async fn admin_upload_agent_artifact(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "upload_agent_artifact",
         &artifact.id,
         &format!(
@@ -392,6 +401,7 @@ pub async fn admin_delete_agent_artifact(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "delete_agent_artifact",
         &artifact_id,
         "删除 Agent 可执行文件及 SHA-256 校验文件",
@@ -573,6 +583,7 @@ pub async fn admin_publish_agent_release(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "publish_agent_release",
         &release_id,
         &format!(
@@ -774,6 +785,7 @@ pub async fn admin_add_agent_rollout_targets(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "add_agent_rollout_targets",
         &release_id,
         "添加 Agent 灰度批次",
@@ -866,6 +878,7 @@ pub async fn admin_promote_agent_rollout(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "promote_agent_rollout",
         &release_id,
         &format!("Agent {} 晋级全量发布", release.version),
@@ -917,6 +930,7 @@ pub async fn admin_rollback_agent_release(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "rollback_agent_release",
         &release_id,
         &format!("回滚 Agent 版本 {}", release.version),
@@ -1001,6 +1015,7 @@ pub async fn admin_rollback_agent_instance(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "rollback_agent_instance",
         &instance_id,
         &format!("回滚实例的 Agent {}", release.version),
@@ -1096,6 +1111,7 @@ pub async fn admin_reupgrade_agent_instance(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "reupgrade_agent_instance",
         &instance_id,
         &format!("重新升级实例到 Agent {}", release.version),
@@ -1268,6 +1284,7 @@ pub async fn admin_retry_agent_update(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         "retry_agent_update",
         &attempt_id,
         &format!("重试实例 {} 的 Agent 更新", attempt.instance_id),
@@ -2687,6 +2704,7 @@ async fn set_rollout_paused(
     write_action_log(
         &mut *transaction,
         &admin.username,
+        Some(&admin.user_id),
         if paused {
             "pause_agent_rollout"
         } else {
@@ -4520,7 +4538,7 @@ mod tests {
         .await
         .expect("insert local baseline rollback dependency");
 
-        let error = delete_agent_release(&state, "test-admin", "release-1.0.0")
+        let error = delete_agent_release(&state, "test-admin", "test-admin-id", "release-1.0.0")
             .await
             .expect_err("target-version rollback dependency blocks deletion");
         assert_eq!(error.status, StatusCode::CONFLICT);
@@ -4634,7 +4652,7 @@ mod tests {
         let state = test_state().await;
         let fixture = insert_stored_release(&state, "published", Some("succeeded")).await;
 
-        delete_agent_release(&state, "test-admin", &fixture.release_id)
+        delete_agent_release(&state, "test-admin", "test-admin-id", &fixture.release_id)
             .await
             .expect("delete published release");
 
@@ -4660,7 +4678,7 @@ mod tests {
         assert!(!fixture.release_dir.exists());
 
         let detail: String = sqlx::query_scalar(
-            "SELECT detail FROM action_logs WHERE action = 'delete_agent_release' AND target = $1 ORDER BY created_at DESC LIMIT 1",
+            "SELECT detail FROM audit_events WHERE action = 'delete_agent_release' AND target = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .bind(&fixture.release_id)
         .fetch_one(&state.db)
@@ -4701,9 +4719,10 @@ mod tests {
             "awaiting_restart",
         ] {
             let fixture = insert_stored_release(&state, "published", Some(status)).await;
-            let error = delete_agent_release(&state, "test-admin", &fixture.release_id)
-                .await
-                .expect_err("active update must block release deletion");
+            let error =
+                delete_agent_release(&state, "test-admin", "test-admin-id", &fixture.release_id)
+                    .await
+                    .expect_err("active update must block release deletion");
             assert_eq!(error.status, StatusCode::CONFLICT, "status {status}");
             assert!(error.message.contains("1 个实例更新未结束"));
 
@@ -4730,7 +4749,7 @@ mod tests {
             .execute(&state.db)
             .await
             .expect("finish blocked attempt for cleanup");
-            delete_agent_release(&state, "test-admin", &fixture.release_id)
+            delete_agent_release(&state, "test-admin", "test-admin-id", &fixture.release_id)
                 .await
                 .expect("clean blocked release fixture");
         }
@@ -4745,12 +4764,13 @@ mod tests {
             .await
             .expect("remove fixture storage before deletion");
 
-        delete_agent_release(&state, "test-admin", &fixture.release_id)
+        delete_agent_release(&state, "test-admin", "test-admin-id", &fixture.release_id)
             .await
             .expect("delete draft with already missing storage");
-        let error = delete_agent_release(&state, "test-admin", &fixture.release_id)
-            .await
-            .expect_err("deleted release must no longer exist");
+        let error =
+            delete_agent_release(&state, "test-admin", "test-admin-id", &fixture.release_id)
+                .await
+                .expect_err("deleted release must no longer exist");
         assert_eq!(error.status, StatusCode::NOT_FOUND);
     }
 
@@ -4766,7 +4786,7 @@ mod tests {
             .await
             .expect("replace release directory with a file");
 
-        delete_agent_release(&state, "test-admin", &fixture.release_id)
+        delete_agent_release(&state, "test-admin", "test-admin-id", &fixture.release_id)
             .await
             .expect("database deletion must survive storage cleanup failure");
 
@@ -4783,7 +4803,7 @@ mod tests {
                 .await
                 .expect("count deleted artifacts");
         let audit_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM action_logs WHERE action = 'delete_agent_release' AND target = $1",
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'delete_agent_release' AND target = $1",
         )
         .bind(&fixture.release_id)
         .fetch_one(&state.db)
@@ -4809,9 +4829,14 @@ mod tests {
         insert_release(&state, &fallback_version, "standalone", "amd64").await;
         insert_release(&state, &deleted_version, "standalone", "amd64").await;
 
-        delete_agent_release(&state, "test-admin", &format!("release-{deleted_version}"))
-            .await
-            .expect("delete latest release");
+        delete_agent_release(
+            &state,
+            "test-admin",
+            "test-admin-id",
+            &format!("release-{deleted_version}"),
+        )
+        .await
+        .expect("delete latest release");
         let instance = get_instance(&state.db, &instance_id)
             .await
             .expect("load candidate instance");

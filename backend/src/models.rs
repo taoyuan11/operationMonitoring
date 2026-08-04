@@ -655,6 +655,7 @@ pub struct SettingsRow {
 #[derive(Serialize)]
 pub struct SettingsResponse {
     pub retention_days: i64,
+    pub audit_retention_days: i64,
     pub background_image_url: Option<String>,
     pub theme_mode: ThemeMode,
     pub accent_color: String,
@@ -663,6 +664,8 @@ pub struct SettingsResponse {
 #[derive(Deserialize)]
 pub struct SettingsRequest {
     pub retention_days: i64,
+    #[serde(default)]
+    pub audit_retention_days: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -715,16 +718,6 @@ pub struct CommandJobRecord {
     pub completed_at: Option<i64>,
     pub output: String,
     pub exit_code: Option<i64>,
-}
-
-#[derive(Serialize, FromRow)]
-pub struct ActionLogRecord {
-    pub id: String,
-    pub actor: String,
-    pub action: String,
-    pub target: String,
-    pub detail: String,
-    pub created_at: i64,
 }
 
 #[derive(Deserialize)]

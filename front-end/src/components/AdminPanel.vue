@@ -1,8 +1,12 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import {
   Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   ClipboardList,
+  Download,
   Image,
   ListChecks,
   LoaderCircle,
@@ -10,6 +14,8 @@ import {
   Moon,
   Palette,
   Plus,
+  RefreshCw,
+  Search,
   Settings,
   Sun,
   Terminal,
@@ -17,8 +23,11 @@ import {
   X,
 } from 'lucide-vue-next'
 import type {
-  ActionLog,
   AdminTab,
+  AuditEvent,
+  AuditExportFormat,
+  AuditPage,
+  AuditQuery,
   CommandJob,
   CommandRecord,
   PendingInstance,
@@ -32,9 +41,14 @@ const props = defineProps<{
   pendingInstances: PendingInstance[]
   commands: CommandRecord[]
   jobs: CommandJob[]
-  logs: ActionLog[]
+  audit: AuditPage
+  auditQuery: AuditQuery
+  auditLoading: boolean
+  auditError: string
+  auditExporting: AuditExportFormat | null
   settingsForm: {
     retention_days: number
+    audit_retention_days: number
     background_image_url: string | null
     theme_mode: ThemeMode
     accent_color: string
@@ -49,18 +63,6 @@ const props = defineProps<{
     command: string
     confirm_text: string
   }
-}>()
-
-defineEmits<{
-  approve: [id: string]
-  reject: [id: string]
-  createCommand: []
-  removeCommand: [command: CommandRecord]
-  saveSettings: []
-  saveAppearance: []
-  appearanceChanged: []
-  selectBackgroundImage: [event: Event]
-  clearBackgroundImage: []
 }>()
 
 const themeOptions = [
@@ -81,6 +83,104 @@ const accentPresets = [
 const previewTheme = computed(() =>
   props.settingsForm.theme_mode === 'auto' ? props.resolvedTheme : props.settingsForm.theme_mode,
 )
+
+const expandedAuditId = ref('')
+const auditRange = computed(() => {
+  if (props.audit.total === 0) return '0 条记录'
+  if (props.audit.items.length === 0) return `0 / ${props.audit.total}`
+  const start = (props.audit.page - 1) * props.audit.page_size + 1
+  const end = Math.min(props.audit.total, start + props.audit.items.length - 1)
+  return `${start}-${end} / ${props.audit.total}`
+})
+
+function dateInputValue(timestamp: number | null, endOfMinute = false) {
+  if (!timestamp) return ''
+  const date = new Date((timestamp - (endOfMinute ? 60 : 0)) * 1000)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function timestampFromInput(value: string, endOfMinute = false) {
+  if (!value) return null
+  const timestamp = Date.parse(value)
+  return Number.isNaN(timestamp) ? null : Math.floor(timestamp / 1000) + (endOfMinute ? 60 : 0)
+}
+
+function updateDateFilter(key: 'from' | 'to', event: Event) {
+  const value = (event.target as HTMLInputElement).value
+  const patch = { [key]: timestampFromInput(value, key === 'to') } as Partial<AuditQuery>
+  emit('auditQueryChanged', patch)
+}
+
+type AuditTextFilter = 'user_id' | 'actor' | 'category' | 'action' | 'instance_id' | 'source_ip' | 'request_id' | 'keyword'
+
+function updateTextFilter(key: AuditTextFilter, event: Event) {
+  emit('auditQueryChanged', { [key]: (event.target as HTMLInputElement).value })
+}
+
+function updateStatusFilter(event: Event) {
+  emit('auditQueryChanged', { status: (event.target as HTMLSelectElement).value as AuditQuery['status'] })
+}
+
+function toggleAuditDetails(event: AuditEvent) {
+  expandedAuditId.value = expandedAuditId.value === event.id ? '' : event.id
+}
+
+function statusLabel(status: AuditEvent['status']) {
+  return {
+    running: '进行中',
+    success: '成功',
+    partial_success: '部分成功',
+    failed: '失败',
+    cancelled: '已取消',
+  }[status] || status
+}
+
+function categoryLabel(category: string) {
+  return {
+    admin: '管理',
+    auth: '认证',
+    session: '会话',
+    terminal: '终端',
+    desktop: '桌面',
+    docker: 'Docker',
+    security: '安全',
+  }[category] || category || '其他'
+}
+
+function nodeLabel(event: AuditEvent) {
+  const snapshot = event.node_snapshot
+  for (const key of ['name', 'hostname', 'id']) {
+    const value = snapshot?.[key]
+    if (typeof value === 'string' && value) return value
+  }
+  return event.instance_id || '全局'
+}
+
+function jsonValue(value: unknown) {
+  if (value === null || value === undefined) return ''
+  return JSON.stringify(value, null, 2)
+}
+
+function hasJsonContent(value: Record<string, unknown> | null) {
+  return value !== null && Object.keys(value).length > 0
+}
+
+const emit = defineEmits<{
+  approve: [id: string]
+  reject: [id: string]
+  createCommand: []
+  removeCommand: [command: CommandRecord]
+  saveSettings: []
+  saveAppearance: []
+  appearanceChanged: []
+  selectBackgroundImage: [event: Event]
+  clearBackgroundImage: []
+  auditQueryChanged: [patch: Partial<AuditQuery>]
+  auditPageChanged: [page: number]
+  refreshAudit: []
+  exportAudit: [format: AuditExportFormat]
+}>()
 </script>
 
 <template>
@@ -317,13 +417,18 @@ const previewTheme = computed(() =>
         </div>
 
         <div class="admin-content-card retention-card">
-          <div class="card-heading"><div><h3>数据保留</h3><p>超过保留期限的历史指标会被自动清理。</p></div></div>
+          <div class="card-heading"><div><h3>数据保留</h3><p>分别设置历史指标与审计事件的自动清理期限。</p></div></div>
           <form class="stack-form page-form" @submit.prevent="$emit('saveSettings')">
             <label>
               <span>指标保留天数</span>
               <input v-model.number="settingsForm.retention_days" min="1" max="365" type="number" />
             </label>
             <small class="form-help">可设置 1 至 365 天，不影响节点基础信息。</small>
+            <label>
+              <span>审计保留天数</span>
+              <input v-model.number="settingsForm.audit_retention_days" min="1" max="3650" type="number" />
+            </label>
+            <small class="form-help">可设置 1 至 3650 天，运行中的会话不会被清理。</small>
             <button class="primary-button" type="submit"><Settings :size="16" />保存设置</button>
           </form>
         </div>
@@ -335,28 +440,90 @@ const previewTheme = computed(() =>
         <div class="page-heading-icon cyan"><ClipboardList :size="22" /></div>
         <div>
           <span class="section-kicker">Audit trail</span>
-          <h2>操作日志</h2>
-          <p>查看管理员最近执行的审批、配置和节点操作。</p>
+          <h2>统一审计</h2>
+          <p>查询管理员操作、认证安全事件与远程会话生命周期。</p>
         </div>
-        <span class="page-count">最近 {{ Math.min(logs.length, 20) }} 条</span>
+        <span class="page-count">{{ auditRange }}</span>
       </header>
 
-      <div class="admin-content-card wide-card admin-list-card">
-        <div class="card-heading"><div><h3>管理操作记录</h3><p>按操作时间倒序显示。</p></div></div>
-        <Transition name="content" mode="out-in">
-          <div v-if="logs.length === 0" key="empty" class="page-empty">
-            <span><ClipboardList :size="24" /></span><strong>暂无操作记录</strong>
+      <div class="admin-content-card wide-card admin-list-card" :aria-busy="auditLoading">
+        <div class="card-heading audit-heading">
+          <div><h3>审计记录</h3><p>按创建时间倒序排列，支持节点、用户、请求和状态筛选。</p></div>
+          <div class="audit-toolbar-actions">
+            <button class="icon-button subtle" type="button" title="刷新审计记录" :disabled="auditLoading" @click="$emit('refreshAudit')">
+              <RefreshCw :class="{ spin: auditLoading }" :size="15" />
+            </button>
+            <button class="text-button" type="button" :disabled="Boolean(auditExporting)" @click="$emit('exportAudit', 'csv')">
+              <LoaderCircle v-if="auditExporting === 'csv'" class="spin" :size="14" /><Download v-else :size="14" />CSV
+            </button>
+            <button class="text-button" type="button" :disabled="Boolean(auditExporting)" @click="$emit('exportAudit', 'json')">
+              <LoaderCircle v-if="auditExporting === 'json'" class="spin" :size="14" /><Download v-else :size="14" />JSON
+            </button>
           </div>
-          <TransitionGroup v-else key="logs" name="row" tag="div" class="logs-table">
-            <div key="header" class="logs-table-head"><span>操作</span><span>详细信息</span><span>目标</span><span>时间</span></div>
-            <article v-for="log in logs.slice(0, 20)" :key="log.id" class="logs-table-row">
-              <strong>{{ log.action }}</strong>
-              <p>{{ log.detail }}</p>
-              <span>{{ log.target }}</span>
-              <time>{{ formatTime(log.created_at) }}</time>
+        </div>
+
+        <div class="audit-filters">
+          <label class="audit-filter-wide"><span>关键字</span><div class="input-shell"><Search :size="15" /><input :value="auditQuery.keyword" placeholder="动作、目标或详情" @change="updateTextFilter('keyword', $event)" /></div></label>
+          <label><span>开始时间</span><input :value="dateInputValue(auditQuery.from)" type="datetime-local" @change="updateDateFilter('from', $event)" /></label>
+          <label><span>结束时间</span><input :value="dateInputValue(auditQuery.to, true)" type="datetime-local" @change="updateDateFilter('to', $event)" /></label>
+          <label><span>状态</span><select :value="auditQuery.status" @change="updateStatusFilter"><option value="">全部状态</option><option value="running">进行中</option><option value="success">成功</option><option value="partial_success">部分成功</option><option value="failed">失败</option><option value="cancelled">已取消</option></select></label>
+          <label><span>类别</span><input :value="auditQuery.category" placeholder="admin / session" @change="updateTextFilter('category', $event)" /></label>
+          <label><span>动作</span><input :value="auditQuery.action" placeholder="操作名称" @change="updateTextFilter('action', $event)" /></label>
+          <label><span>用户 ID</span><input :value="auditQuery.user_id" placeholder="用户 ID" @change="updateTextFilter('user_id', $event)" /></label>
+          <label><span>操作者</span><input :value="auditQuery.actor" placeholder="用户名" @change="updateTextFilter('actor', $event)" /></label>
+          <label><span>节点 ID</span><input :value="auditQuery.instance_id" placeholder="节点 ID" @change="updateTextFilter('instance_id', $event)" /></label>
+          <label><span>来源 IP</span><input :value="auditQuery.source_ip" placeholder="例如 10.0.0.1" @change="updateTextFilter('source_ip', $event)" /></label>
+          <label class="audit-filter-wide"><span>请求 ID</span><input :value="auditQuery.request_id" placeholder="UUID request ID" @change="updateTextFilter('request_id', $event)" /></label>
+        </div>
+
+        <p v-if="auditError" class="notice audit-error">{{ auditError }}</p>
+        <Transition name="content" mode="out-in">
+          <div v-if="auditLoading && audit.items.length === 0" key="loading" class="page-empty"><LoaderCircle class="spin" :size="26" /><strong>正在加载审计记录</strong></div>
+          <div v-else-if="audit.items.length === 0" key="empty" class="page-empty"><span><ClipboardList :size="24" /></span><strong>暂无匹配记录</strong><p>调整筛选条件后重试。</p></div>
+          <div v-else key="audit" class="audit-table">
+            <div class="audit-table-head"><span>时间 / 状态</span><span>动作与目标</span><span>节点 / 用户</span><span>请求 / 来源</span><span aria-hidden="true"></span></div>
+            <article v-for="event in audit.items" :key="event.id" class="audit-row">
+              <div class="audit-primary"><time>{{ formatTime(event.created_at) }}</time><span :class="['audit-status', event.status]">{{ statusLabel(event.status) }}</span><small>{{ categoryLabel(event.category) }}</small></div>
+              <div class="audit-action"><strong :title="event.action || event.kind">{{ event.action || event.kind }}</strong><p :title="event.detail || event.target">{{ event.detail || event.target || '无详情' }}</p><small :title="event.target">{{ event.target || '全局操作' }}</small></div>
+              <div class="audit-context"><strong :title="nodeLabel(event)">{{ nodeLabel(event) }}</strong><small v-if="event.actor">操作者 {{ event.actor }}</small><small v-if="event.user_id" :title="event.user_id">用户 {{ event.user_id }}</small><small v-if="event.instance_id" :title="event.instance_id">节点 {{ event.instance_id }}</small></div>
+              <div class="audit-request"><code v-if="event.request_id" :title="event.request_id">{{ event.request_id }}</code><small v-if="event.source_ip">{{ event.source_ip }}</small><small v-if="event.operation_id" :title="event.operation_id">操作 {{ event.operation_id }}</small></div>
+              <button
+                class="icon-button subtle"
+                type="button"
+                :aria-controls="`audit-detail-${event.id}`"
+                :aria-expanded="expandedAuditId === event.id"
+                :aria-label="expandedAuditId === event.id ? '收起审计详情' : '展开审计详情'"
+                :title="expandedAuditId === event.id ? '收起详情' : '展开详情'"
+                @click="toggleAuditDetails(event)"
+              ><ChevronDown :size="16" /></button>
+              <div v-if="expandedAuditId === event.id" :id="`audit-detail-${event.id}`" class="audit-detail">
+                <dl>
+                  <div><dt>事件 ID</dt><dd>{{ event.id }}</dd></div>
+                  <div><dt>请求 ID</dt><dd>{{ event.request_id || '无' }}</dd></div>
+                  <div><dt>操作 ID</dt><dd>{{ event.operation_id || '无' }}</dd></div>
+                  <div><dt>会话 ID</dt><dd>{{ event.session_id || '无' }}</dd></div>
+                  <div><dt>用户 ID</dt><dd>{{ event.user_id || '无' }}</dd></div>
+                  <div><dt>操作者</dt><dd>{{ event.actor || '无' }}</dd></div>
+                  <div><dt>来源 IP</dt><dd>{{ event.source_ip || '无' }}</dd></div>
+                  <div><dt>类别 / 类型</dt><dd>{{ event.category || '无' }} / {{ event.kind || '无' }}</dd></div>
+                  <div><dt>创建时间</dt><dd>{{ formatTime(event.created_at) }}</dd></div>
+                  <div><dt>完成时间</dt><dd>{{ event.completed_at ? formatTime(event.completed_at) : '未完成' }}</dd></div>
+                  <div><dt>错误码</dt><dd>{{ event.error_code || '无' }}</dd></div>
+                  <div class="audit-detail-wide"><dt>错误原因</dt><dd>{{ event.error_reason || '无' }}</dd></div>
+                  <div class="audit-detail-wide"><dt>动作 / 目标</dt><dd>{{ event.action || event.kind || '无' }} / {{ event.target || '无' }}</dd></div>
+                  <div class="audit-detail-wide"><dt>详情</dt><dd>{{ event.detail || '无' }}</dd></div>
+                  <div class="audit-detail-wide"><dt>User-Agent</dt><dd>{{ event.user_agent || '无' }}</dd></div>
+                  <div v-if="hasJsonContent(event.node_snapshot)" class="audit-detail-wide"><dt>节点快照</dt><dd><pre>{{ jsonValue(event.node_snapshot) }}</pre></dd></div>
+                  <div v-if="hasJsonContent(event.metadata)" class="audit-detail-wide"><dt>元数据</dt><dd><pre>{{ jsonValue(event.metadata) }}</pre></dd></div>
+                </dl>
+              </div>
             </article>
-          </TransitionGroup>
+          </div>
         </Transition>
+        <footer class="audit-pagination">
+          <span>{{ auditRange }}</span>
+          <div><button class="icon-button subtle" type="button" title="上一页" :disabled="audit.page <= 1 || auditLoading" @click="$emit('auditPageChanged', audit.page - 1)"><ChevronLeft :size="16" /></button><strong>第 {{ audit.page }} / {{ Math.max(audit.pages, 1) }} 页</strong><button class="icon-button subtle" type="button" title="下一页" :disabled="audit.page >= audit.pages || auditLoading" @click="$emit('auditPageChanged', audit.page + 1)"><ChevronRight :size="16" /></button></div>
+        </footer>
       </div>
     </template>
   </section>

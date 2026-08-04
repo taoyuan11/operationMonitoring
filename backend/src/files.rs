@@ -10,11 +10,13 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    audit,
     auth::require_admin,
     db::{get_instance, write_action_log},
     error::{AppError, AppResult},
@@ -22,6 +24,7 @@ use crate::{
         AgentOutbound, FileErrorCode, FileListing, FileRequest, FileResponse, FileSystemRoot,
     },
     state::{AgentHandle, AppState, FileRequestEvent, PendingFileRequest},
+    utils::now_ts,
 };
 
 const FILE_MANAGER_CAPABILITY: &str = "file_manager_v1";
@@ -165,6 +168,52 @@ impl Drop for RequestCleanup {
     }
 }
 
+struct DownloadAuditGuard {
+    state: AppState,
+    event_id: String,
+    finished: bool,
+}
+
+impl DownloadAuditGuard {
+    async fn finish(&mut self, status: &str, error_code: Option<&str>, error_reason: &str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let _ = audit::finish_event(
+            &self.state.db,
+            &self.event_id,
+            status,
+            error_code,
+            error_reason,
+        )
+        .await;
+    }
+}
+
+impl Drop for DownloadAuditGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let state = self.state.clone();
+        let event_id = self.event_id.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let _ = audit::finish_event(
+                &state.db,
+                &event_id,
+                "failed",
+                Some("client_disconnected"),
+                "客户端下载连接已断开",
+            )
+            .await;
+        });
+    }
+}
+
 pub async fn admin_file_roots(
     State(state): State<AppState>,
     Path(instance_id): Path<String>,
@@ -229,6 +278,7 @@ pub async fn admin_create_directory(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "create_instance_directory",
         &instance_id,
         &format!("创建目录 {path}"),
@@ -263,6 +313,7 @@ pub async fn admin_move_file(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "move_instance_file",
         &instance_id,
         &format!("移动或重命名 {source} -> {path}"),
@@ -298,6 +349,7 @@ pub async fn admin_delete_file(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "delete_instance_file",
         &instance_id,
         &format!(
@@ -419,6 +471,7 @@ pub async fn admin_upload_file(
     write_action_log(
         &state.db,
         &admin.username,
+        Some(&admin.user_id),
         "upload_instance_file",
         &instance_id,
         &format!("上传文件 {path}（{size_bytes} 字节）"),
@@ -462,29 +515,54 @@ pub async fn admin_download_file(
             "文件超过允许的下载大小上限",
         ));
     }
-    write_action_log(
+    let disposition = content_disposition(&name)?;
+    let audit_event_id = audit::insert_event(
         &state.db,
-        &admin.username,
-        "download_instance_file",
-        &instance_id,
-        &format!("下载文件 {requested_path}（{size_bytes} 字节）"),
+        &audit::AuditEventInput {
+            category: "file".to_string(),
+            kind: "operation".to_string(),
+            actor: admin.username,
+            user_id: Some(admin.user_id),
+            action: "download_instance_file".to_string(),
+            target: instance_id.clone(),
+            detail: format!("下载文件 {requested_path}（{size_bytes} 字节）"),
+            metadata: json!({ "path": requested_path, "size_bytes": size_bytes }),
+            instance_id: Some(instance_id.clone()),
+            node_snapshot: audit::instance_snapshot(&state.db, &instance_id).await,
+            context: audit::AuditContext::from_headers(&headers),
+            session_id: None,
+            operation_id: Some(request_id.clone()),
+            status: "running".to_string(),
+            error_code: None,
+            error_reason: String::new(),
+            created_at: now_ts(),
+            completed_at: None,
+        },
     )
     .await?;
 
     let stream_agent = agent.clone();
     let stream_request_id = request_id.clone();
+    let audit_state = state.clone();
     let stream = stream! {
         let mut cleanup = cleanup;
+        let mut audit_guard = DownloadAuditGuard {
+            state: audit_state,
+            event_id: audit_event_id,
+            finished: false,
+        };
         let mut expected_sequence = 0_u64;
         let mut transferred = 0_u64;
         loop {
             let event = match tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, events.recv()).await {
                 Ok(Some(event)) => event,
                 Ok(None) => {
+                    audit_guard.finish("failed", Some("stream_closed"), "文件下载连接已关闭").await;
                     yield Err::<Bytes, io::Error>(io::Error::other("文件下载连接已关闭"));
                     break;
                 }
                 Err(_) => {
+                    audit_guard.finish("failed", Some("timeout"), "文件下载等待数据超时").await;
                     yield Err::<Bytes, io::Error>(io::Error::other("文件下载等待数据超时"));
                     break;
                 }
@@ -492,11 +570,13 @@ pub async fn admin_download_file(
             match event {
                 FileRequestEvent::Chunk { sequence, data } => {
                     if sequence != expected_sequence {
+                        audit_guard.finish("failed", Some("invalid_sequence"), "文件下载分块顺序无效").await;
                         yield Err::<Bytes, io::Error>(io::Error::other("文件下载分块顺序无效"));
                         break;
                     }
                     transferred = transferred.saturating_add(data.len() as u64);
                     if transferred > size_bytes {
+                        audit_guard.finish("failed", Some("size_mismatch"), "文件下载内容超过声明大小").await;
                         yield Err::<Bytes, io::Error>(io::Error::other("文件下载内容超过声明大小"));
                         break;
                     }
@@ -510,6 +590,7 @@ pub async fn admin_download_file(
                         })
                         .is_err()
                     {
+                        audit_guard.finish("failed", Some("agent_disconnected"), "实例连接已断开").await;
                         yield Err::<Bytes, io::Error>(io::Error::other("实例连接已断开"));
                         break;
                     }
@@ -519,21 +600,26 @@ pub async fn admin_download_file(
                     ..
                 }) => {
                     if completed_size != size_bytes || transferred != size_bytes {
+                        audit_guard.finish("failed", Some("size_mismatch"), "文件下载内容长度不一致").await;
                         yield Err::<Bytes, io::Error>(io::Error::other("文件下载内容长度不一致"));
                         break;
                     }
                     cleanup.release().await;
+                    audit_guard.finish("success", None, "").await;
                     break;
                 }
-                FileRequestEvent::Response(FileResponse::Error { message, .. }) => {
+                FileRequestEvent::Response(FileResponse::Error { code, message }) => {
+                    audit_guard.finish("failed", Some(file_error_code(&code)), &message).await;
                     yield Err::<Bytes, io::Error>(io::Error::other(message));
                     break;
                 }
                 FileRequestEvent::Disconnected => {
+                    audit_guard.finish("failed", Some("agent_disconnected"), "实例连接已断开").await;
                     yield Err::<Bytes, io::Error>(io::Error::other("实例连接已断开"));
                     break;
                 }
                 FileRequestEvent::Response(_) => {
+                    audit_guard.finish("failed", Some("unexpected_agent_response"), "收到无效的文件下载响应").await;
                     yield Err::<Bytes, io::Error>(io::Error::other("收到无效的文件下载响应"));
                     break;
                 }
@@ -541,7 +627,6 @@ pub async fn admin_download_file(
         }
     };
 
-    let disposition = content_disposition(&name)?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -764,6 +849,7 @@ fn response_error_or_unexpected(response: FileResponse) -> AppError {
 }
 
 fn file_error(code: FileErrorCode, message: String) -> AppError {
+    let error_code = file_error_code(&code);
     let status = match code {
         FileErrorCode::InvalidPath | FileErrorCode::NotDirectory | FileErrorCode::IsDirectory => {
             StatusCode::BAD_REQUEST
@@ -775,15 +861,34 @@ fn file_error(code: FileErrorCode, message: String) -> AppError {
         FileErrorCode::Unsupported => StatusCode::UNPROCESSABLE_ENTITY,
         FileErrorCode::Io => StatusCode::BAD_GATEWAY,
     };
-    AppError::new(status, message)
+    AppError::with_code(status, error_code, message)
+}
+
+fn file_error_code(code: &FileErrorCode) -> &'static str {
+    match code {
+        FileErrorCode::InvalidPath => "invalid_path",
+        FileErrorCode::NotDirectory => "not_directory",
+        FileErrorCode::IsDirectory => "is_directory",
+        FileErrorCode::NotFound => "not_found",
+        FileErrorCode::PermissionDenied => "permission_denied",
+        FileErrorCode::AlreadyExists => "already_exists",
+        FileErrorCode::Busy => "busy",
+        FileErrorCode::TooLarge => "too_large",
+        FileErrorCode::Unsupported => "unsupported",
+        FileErrorCode::Io => "io",
+    }
 }
 
 fn unexpected_response() -> AppError {
-    AppError::new(StatusCode::BAD_GATEWAY, "Agent 返回了无效的文件响应")
+    AppError::with_code(
+        StatusCode::BAD_GATEWAY,
+        "unexpected_agent_response",
+        "Agent 返回了无效的文件响应",
+    )
 }
 
 fn disconnected_error() -> AppError {
-    AppError::new(StatusCode::CONFLICT, "实例连接已断开")
+    AppError::with_code(StatusCode::CONFLICT, "agent_disconnected", "实例连接已断开")
 }
 
 fn content_length(headers: &HeaderMap) -> AppResult<u64> {

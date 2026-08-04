@@ -157,17 +157,61 @@ export type CommandExecutionState = {
   error: string
 }
 
-export type ActionLog = {
+export type AuditEventStatus = 'running' | 'success' | 'partial_success' | 'failed' | 'cancelled'
+
+export type AuditEvent = {
   id: string
+  user_id: string | null
   actor: string
+  category: string
+  kind: string
   action: string
   target: string
   detail: string
+  metadata: Record<string, unknown> | null
+  instance_id: string | null
+  node_snapshot: Record<string, unknown> | null
+  source_ip: string | null
+  user_agent: string | null
+  request_id: string | null
+  session_id: string | null
+  operation_id: string | null
+  status: AuditEventStatus
+  error_code: string | null
+  error_reason: string | null
   created_at: number
+  completed_at: number | null
+}
+
+export type AuditQuery = {
+  from: number | null
+  to: number | null
+  page: number
+  page_size: number
+  user_id: string
+  actor: string
+  category: string
+  action: string
+  instance_id: string
+  status: AuditEventStatus | ''
+  source_ip: string
+  request_id: string
+  keyword: string
+}
+
+export type AuditExportFormat = 'csv' | 'json'
+
+export type AuditPage = {
+  items: AuditEvent[]
+  page: number
+  page_size: number
+  total: number
+  pages: number
 }
 
 export type SettingsResponse = {
   retention_days: number
+  audit_retention_days: number
   background_image_url: string | null
   theme_mode: ThemeMode
   accent_color: string

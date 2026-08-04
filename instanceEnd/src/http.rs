@@ -9,7 +9,7 @@ use crate::{
     device_profile::collect_device_profile,
     models::{AgentRegisterRequest, AgentRegisterResponse, DeviceProfile, Identity},
     profile::host_profile,
-    update::update_capability,
+    update::{rollback_baseline_version, update_capability},
 };
 
 pub(crate) const MAX_AGENT_JSON_RESPONSE_BYTES: usize = 64 * 1024;
@@ -35,6 +35,8 @@ pub async fn register_once(
         package_type: capability.package_type,
         native_arch: capability.native_arch,
         update_privileged: Some(capability.update_privileged),
+        rollback_supported: Some(true),
+        rollback_version: rollback_baseline_version(config),
         device_profile,
     };
     let url = config.server_endpoint()?.http_url("api/agent/register")?;

@@ -226,6 +226,16 @@ export type AdminUsersResponse = {
 
 export type AgentReleaseStatus = 'draft' | 'published'
 
+export type AgentRolloutState =
+  | 'draft'
+  | 'canary_active'
+  | 'canary_paused'
+  | 'full_active'
+  | 'full_paused'
+  | 'rollback_active'
+  | 'rolled_back'
+  | 'rollback_partial'
+
 export type AgentPackageType = 'standalone'
 
 export type AgentArtifactTarget = {
@@ -276,12 +286,17 @@ export type AgentUpdateAttemptStatus =
   | 'succeeded'
   | 'rollback_succeeded'
   | 'failed'
+  | 'cancelled'
+
+export type AgentUpdateOperation = 'upgrade' | 'rollback'
 
 export type AgentUpdateAttempt = {
   id: string
   release_id: string
-  artifact_id: string
+  artifact_id: string | null
   instance_id: string
+  operation: AgentUpdateOperation
+  parent_attempt_id: string | null
   from_version: string
   target_version: string
   status: AgentUpdateAttemptStatus
@@ -297,6 +312,36 @@ export type AgentReleaseCoverage = {
   covered_instances: number
   missing_artifact_instances: number
   unprivileged_instances: number
+  selected_instances: number
+}
+
+export type AgentRollbackCoverage = {
+  succeeded_upgrades: number
+  rollback_supported: number
+  server_package_available: number
+  local_package_available: number
+  unavailable: number
+  active_rollbacks: number
+  failed_rollbacks: number
+}
+
+export type AgentRolloutCandidate = {
+  instance_id: string
+  name: string
+  hostname: string
+  os: string
+  package_type: string
+  native_arch: string
+  agent_version: string
+  online: boolean
+  update_privileged: boolean
+  selected: boolean
+  eligible: boolean
+  reason: string
+  active_operation: AgentUpdateOperation | null
+  active_status: AgentUpdateAttemptStatus | null
+  rollback_supported: boolean
+  rollback_version: string | null
 }
 
 export type AgentRelease = {
@@ -304,11 +349,14 @@ export type AgentRelease = {
   version: string
   notes: string
   status: AgentReleaseStatus
+  rollout_state: AgentRolloutState
+  rollout_updated_at: number | null
   created_at: number
   published_at: number | null
   artifacts: AgentArtifact[]
   attempts: AgentUpdateAttempt[]
   coverage: AgentReleaseCoverage
+  rollback_coverage: AgentRollbackCoverage
 }
 
 export type AgentReleaseForm = {

@@ -79,7 +79,7 @@ pub async fn public_instances(
         r#"
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version,
-               package_type, native_arch, update_privileged,
+               package_type, native_arch, update_privileged, rollback_supported, rollback_version,
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE approved = 1 AND disabled = 0
@@ -1183,6 +1183,8 @@ pub async fn agent_report(
         package_type: payload.package_type.clone(),
         native_arch: payload.native_arch.clone(),
         update_privileged: payload.update_privileged,
+        rollback_supported: payload.rollback_supported,
+        rollback_version: payload.rollback_version.clone(),
         device_profile: payload.device_profile.clone(),
     };
     let observed_ip = resolved_client_ip(
@@ -1226,8 +1228,11 @@ pub async fn agent_report(
         SET hostname = $1, os = $2, arch = $3, agent_version = $4,
             package_type = COALESCE($5, package_type),
             native_arch = COALESCE($6, native_arch),
-            update_privileged = COALESCE($7, update_privileged), last_seen = $8
-        WHERE id = $9
+            update_privileged = COALESCE($7, update_privileged),
+            rollback_supported = COALESCE($8, 0),
+            rollback_version = CASE WHEN $8 = 1 THEN COALESCE($9, '') ELSE '' END,
+            last_seen = $10
+        WHERE id = $11
         "#,
     )
     .bind(&payload.hostname)
@@ -1237,6 +1242,8 @@ pub async fn agent_report(
     .bind(payload.package_type.as_deref())
     .bind(payload.native_arch.as_deref())
     .bind(payload.update_privileged.map(i64::from))
+    .bind(payload.rollback_supported.map(i64::from))
+    .bind(payload.rollback_version.as_deref())
     .bind(now_ts())
     .bind(&payload.instance_id)
     .execute(&state.db)

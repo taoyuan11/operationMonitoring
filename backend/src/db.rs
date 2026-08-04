@@ -108,6 +108,8 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             package_type TEXT NOT NULL DEFAULT '',
             native_arch TEXT NOT NULL DEFAULT '',
             update_privileged BIGINT NOT NULL DEFAULT 0,
+            rollback_supported BIGINT NOT NULL DEFAULT 0,
+            rollback_version TEXT NOT NULL DEFAULT '',
             approved BIGINT NOT NULL DEFAULT 1,
             disabled BIGINT NOT NULL DEFAULT 0,
             first_seen BIGINT NOT NULL,
@@ -499,9 +501,55 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             version TEXT NOT NULL UNIQUE,
             notes TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'published')),
+            rollout_state TEXT NOT NULL DEFAULT 'draft' CHECK(rollout_state IN (
+                'draft', 'canary_active', 'canary_paused', 'full_active', 'full_paused',
+                'rollback_active', 'rolled_back', 'rollback_partial'
+            )),
+            rollout_updated_at BIGINT,
             created_at BIGINT NOT NULL,
             published_at BIGINT
         );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "ALTER TABLE agent_releases ADD COLUMN IF NOT EXISTS rollout_state TEXT NOT NULL DEFAULT 'full_active'",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("ALTER TABLE agent_releases ADD COLUMN IF NOT EXISTS rollout_updated_at BIGINT")
+        .execute(db)
+        .await?;
+    sqlx::query(
+        r#"
+        UPDATE agent_releases
+        SET rollout_state = CASE WHEN status = 'draft' THEN 'draft' ELSE rollout_state END,
+            rollout_updated_at = COALESCE(rollout_updated_at, published_at, created_at)
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'agent_releases'::regclass
+                  AND conname = 'agent_releases_rollout_state_check'
+            ) THEN
+                ALTER TABLE agent_releases
+                ADD CONSTRAINT agent_releases_rollout_state_check CHECK (
+                    rollout_state IN (
+                        'draft', 'canary_active', 'canary_paused', 'full_active',
+                        'full_paused', 'rollback_active', 'rolled_back', 'rollback_partial'
+                    )
+                );
+            END IF;
+        END
+        $$
         "#,
     )
     .execute(db)
@@ -562,11 +610,28 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS agent_release_targets (
+            release_id TEXT NOT NULL REFERENCES agent_releases(id) ON DELETE CASCADE,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            state TEXT NOT NULL CHECK(state IN ('included', 'excluded')),
+            created_at BIGINT NOT NULL,
+            updated_at BIGINT NOT NULL,
+            PRIMARY KEY(release_id, instance_id)
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS agent_update_attempts (
             id TEXT PRIMARY KEY,
             release_id TEXT NOT NULL REFERENCES agent_releases(id) ON DELETE CASCADE,
-            artifact_id TEXT NOT NULL REFERENCES agent_artifacts(id) ON DELETE CASCADE,
+            artifact_id TEXT REFERENCES agent_artifacts(id) ON DELETE CASCADE,
             instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            operation TEXT NOT NULL DEFAULT 'upgrade' CHECK(operation IN ('upgrade', 'rollback')),
+            parent_attempt_id TEXT REFERENCES agent_update_attempts(id) ON DELETE SET NULL,
             from_version TEXT NOT NULL,
             target_version TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -574,9 +639,122 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             retry_count BIGINT NOT NULL DEFAULT 0,
             created_at BIGINT NOT NULL,
             updated_at BIGINT NOT NULL,
-            completed_at BIGINT,
-            UNIQUE(release_id, instance_id)
+            completed_at BIGINT
         );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "ALTER TABLE agent_update_attempts ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'upgrade'",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE agent_update_attempts ADD COLUMN IF NOT EXISTS parent_attempt_id TEXT",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'agent_update_attempts'::regclass
+                  AND conname = 'agent_update_attempts_operation_check'
+            ) THEN
+                ALTER TABLE agent_update_attempts
+                ADD CONSTRAINT agent_update_attempts_operation_check
+                CHECK (operation IN ('upgrade', 'rollback'));
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'agent_update_attempts'::regclass
+                  AND conname = 'agent_update_attempts_parent_attempt_id_fkey'
+            ) THEN
+                ALTER TABLE agent_update_attempts
+                ADD CONSTRAINT agent_update_attempts_parent_attempt_id_fkey
+                FOREIGN KEY (parent_attempt_id) REFERENCES agent_update_attempts(id)
+                ON DELETE SET NULL;
+            END IF;
+        END
+        $$
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("ALTER TABLE agent_update_attempts ALTER COLUMN artifact_id DROP NOT NULL")
+        .execute(db)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE agent_update_attempts DROP CONSTRAINT IF EXISTS agent_update_attempts_release_id_instance_id_key",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        r#"
+        WITH superseded AS (
+            SELECT id
+            FROM (
+                SELECT id, row_number() OVER (
+                    PARTITION BY instance_id ORDER BY updated_at DESC, created_at DESC, id DESC
+                ) AS position
+                FROM agent_update_attempts
+                WHERE status NOT IN ('succeeded', 'rollback_succeeded', 'failed', 'cancelled')
+            ) ranked
+            WHERE position > 1
+        )
+        UPDATE agent_update_attempts
+        SET status = 'cancelled', message = '由数据库迁移取消的重复活动任务',
+            completed_at = COALESCE(completed_at, updated_at)
+        WHERE id IN (SELECT id FROM superseded)
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_attempts_one_active_per_instance
+        ON agent_update_attempts(instance_id)
+        WHERE status NOT IN ('succeeded', 'rollback_succeeded', 'failed', 'cancelled');
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        WITH duplicate_rollbacks AS (
+            SELECT id
+            FROM (
+                SELECT id, row_number() OVER (
+                    PARTITION BY parent_attempt_id ORDER BY updated_at DESC, created_at DESC, id DESC
+                ) AS position
+                FROM agent_update_attempts
+                WHERE operation = 'rollback' AND parent_attempt_id IS NOT NULL
+            ) ranked
+            WHERE position > 1
+        )
+        UPDATE agent_update_attempts
+        SET parent_attempt_id = NULL,
+            message = CASE
+                WHEN message = '' THEN '由数据库迁移解除的重复回滚父任务关联'
+                ELSE message
+            END
+        WHERE id IN (SELECT id FROM duplicate_rollbacks)
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_attempts_one_rollback_per_parent
+        ON agent_update_attempts(parent_attempt_id)
+        WHERE operation = 'rollback' AND parent_attempt_id IS NOT NULL;
         "#,
     )
     .execute(db)
@@ -665,7 +843,10 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
             &["created_at", "last_used_at", "last_totp_counter"][..],
         ),
         ("admin_enrollments", &["created_at", "expires_at"][..]),
-        ("agent_releases", &["created_at", "published_at"][..]),
+        (
+            "agent_releases",
+            &["created_at", "published_at", "rollout_updated_at"][..],
+        ),
         (
             "agent_artifacts",
             &["size_bytes", "created_at", "published_at"][..],
@@ -739,6 +920,8 @@ async fn ensure_capability_columns(db: &PgPool, table: &str) -> anyhow::Result<(
         ("package_type", "TEXT NOT NULL DEFAULT ''"),
         ("native_arch", "TEXT NOT NULL DEFAULT ''"),
         ("update_privileged", "BIGINT NOT NULL DEFAULT 0"),
+        ("rollback_supported", "BIGINT NOT NULL DEFAULT 0"),
+        ("rollback_version", "TEXT NOT NULL DEFAULT ''"),
     ] {
         sqlx::query(&format!(
             "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}"
@@ -762,7 +945,7 @@ pub async fn register_or_touch_pending(
         r#"
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version,
-               package_type, native_arch, update_privileged,
+               package_type, native_arch, update_privileged, rollback_supported, rollback_version,
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE id = $1
@@ -788,7 +971,7 @@ pub async fn register_or_touch_pending(
                 r#"
                 SELECT id, secret, name, region, country_code, country, province_code, province, city,
                        remark, hostname, os, arch, agent_version,
-                       package_type, native_arch, update_privileged,
+                       package_type, native_arch, update_privileged, rollback_supported, rollback_version,
                        approved, disabled, first_seen, last_seen
                 FROM instances
                 WHERE id = $1
@@ -820,8 +1003,13 @@ pub async fn register_or_touch_pending(
                 package_type = COALESCE($6, package_type),
                 native_arch = COALESCE($7, native_arch),
                 update_privileged = COALESCE($8, update_privileged),
-                last_seen = $9
-            WHERE id = $10
+                rollback_supported = COALESCE($9, 0),
+                rollback_version = CASE
+                    WHEN $9 = 1 THEN COALESCE($10, '')
+                    ELSE ''
+                END,
+                last_seen = $11
+            WHERE id = $12
             "#,
         )
         .bind(&secret_verifier)
@@ -832,6 +1020,8 @@ pub async fn register_or_touch_pending(
         .bind(payload.package_type.as_deref())
         .bind(payload.native_arch.as_deref())
         .bind(payload.update_privileged.map(i64::from))
+        .bind(payload.rollback_supported.map(i64::from))
+        .bind(payload.rollback_version.as_deref())
         .bind(now_ts())
         .bind(&payload.instance_id)
         .execute(&mut *tx)
@@ -947,6 +1137,19 @@ fn validate_agent_registration(payload: &AgentRegisterRequest) -> AppResult<()> 
     }
     if let Some(value) = payload.native_arch.as_deref() {
         validate_agent_field("native_arch", value, 64, true)?;
+    }
+    if let Some(value) = payload.rollback_version.as_deref() {
+        validate_agent_field("rollback_version", value, 64, true)?;
+    }
+    if payload.rollback_supported != Some(true)
+        && payload
+            .rollback_version
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Err(AppError::bad_request(
+            "不支持回滚的 Agent 不能上报本地回滚版本",
+        ));
     }
     if let Some(profile) = payload.device_profile.as_ref() {
         validate_device_profile(profile)?;
@@ -1216,7 +1419,7 @@ pub async fn get_instance_optional(db: &PgPool, id: &str) -> AppResult<Option<In
         r#"
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version,
-               package_type, native_arch, update_privileged,
+               package_type, native_arch, update_privileged, rollback_supported, rollback_version,
                approved, disabled, first_seen, last_seen
         FROM instances
         WHERE id = $1
@@ -1511,6 +1714,8 @@ mod tests {
             package_type: Some("standalone".to_string()),
             native_arch: Some("x86_64".to_string()),
             update_privileged: Some(true),
+            rollback_supported: Some(true),
+            rollback_version: Some("0.0.9".to_string()),
             device_profile: None,
         }
     }
@@ -1824,6 +2029,8 @@ mod tests {
             package_type: Some("standalone".to_string()),
             native_arch: Some("x86_64".to_string()),
             update_privileged: Some(true),
+            rollback_supported: Some(false),
+            rollback_version: None,
             device_profile: None,
         };
 

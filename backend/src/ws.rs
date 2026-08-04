@@ -28,7 +28,10 @@ use crate::{
     },
     remote_desktop::{close_connection_desktops, desktop_agent_closed, desktop_agent_opened},
     state::{AgentHandle, AgentOutboundSender, AppState, TerminalSessionHandle},
-    updates::{confirm_update_version, offer_update_on_connect, record_connection_update_status},
+    updates::{
+        confirm_update_version, offer_update_on_connect, record_connection_rollback_status,
+        record_connection_update_status,
+    },
     utils::now_ts,
 };
 
@@ -293,6 +296,7 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
             agent_version,
             package_type,
             native_arch,
+            rollback_version,
             docker_status,
             ..
         } => {
@@ -302,6 +306,9 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
                 || agent_version.len() > 64
                 || package_type.as_ref().is_some_and(|value| value.len() > 64)
                 || native_arch.as_ref().is_some_and(|value| value.len() > 64)
+                || rollback_version
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 64)
                 || docker_status.as_ref().is_some_and(|value| {
                     serde_json::to_vec(value)
                         .map(|encoded| encoded.len() > MAX_STATUS_MESSAGE_BYTES)
@@ -388,6 +395,7 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
             }
         }
         AgentInbound::UpdateStatus {
+            attempt_id,
             release_id,
             artifact_id,
             version,
@@ -395,7 +403,8 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
             status: update_status,
             message,
         } => {
-            if !id(release_id)
+            if attempt_id.as_ref().is_some_and(|value| !id(value))
+                || !id(release_id)
                 || !id(artifact_id)
                 || version.len() > 64
                 || !(0..=100).contains(retry_count)
@@ -403,6 +412,20 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
                 || message.as_ref().is_some_and(|value| !status(value))
             {
                 return Err("update status too large");
+            }
+        }
+        AgentInbound::RollbackStatus {
+            attempt_id,
+            retry_count,
+            status: rollback_status,
+            message,
+        } => {
+            if !id(attempt_id)
+                || !(0..=100).contains(retry_count)
+                || rollback_status.len() > 64
+                || message.as_ref().is_some_and(|value| !status(value))
+            {
+                return Err("rollback status too large");
             }
         }
     }
@@ -432,6 +455,8 @@ async fn handle_agent_message(
             package_type,
             native_arch,
             update_privileged,
+            rollback_supported,
+            rollback_version,
             docker_status,
             metrics,
         } => {
@@ -445,6 +470,8 @@ async fn handle_agent_message(
                 package_type.as_deref(),
                 native_arch.as_deref(),
                 update_privileged,
+                rollback_supported,
+                rollback_version.as_deref(),
                 connection_id,
                 docker_status,
                 metrics,
@@ -591,6 +618,7 @@ async fn handle_agent_message(
             .await;
         }
         AgentInbound::UpdateStatus {
+            attempt_id,
             release_id,
             artifact_id,
             version,
@@ -602,6 +630,7 @@ async fn handle_agent_message(
                 state,
                 instance_id,
                 connection_id,
+                attempt_id.as_deref(),
                 &release_id,
                 &artifact_id,
                 &version,
@@ -612,6 +641,26 @@ async fn handle_agent_message(
             .await?
             {
                 warn!(%instance_id, %connection_id, %release_id, %artifact_id, "ignored update status from stale agent connection");
+            }
+        }
+        AgentInbound::RollbackStatus {
+            attempt_id,
+            retry_count,
+            status,
+            message,
+        } => {
+            if !record_connection_rollback_status(
+                state,
+                instance_id,
+                connection_id,
+                &attempt_id,
+                retry_count,
+                &status,
+                message.as_deref(),
+            )
+            .await?
+            {
+                warn!(%instance_id, %connection_id, %attempt_id, "ignored rollback status from stale agent connection");
             }
         }
     }
@@ -628,6 +677,8 @@ async fn store_metrics(
     package_type: Option<&str>,
     native_arch: Option<&str>,
     update_privileged: Option<bool>,
+    rollback_supported: Option<bool>,
+    rollback_version: Option<&str>,
     connection_id: Uuid,
     docker_status: Option<crate::models::DockerStatus>,
     metrics: MetricPayload,
@@ -649,8 +700,26 @@ async fn store_metrics(
         SET hostname = $1, os = $2, arch = $3, agent_version = $4,
             package_type = COALESCE($5, package_type),
             native_arch = COALESCE($6, native_arch),
-            update_privileged = COALESCE($7, update_privileged), last_seen = $8
-        WHERE id = $9
+            update_privileged = COALESCE($7, update_privileged),
+            rollback_supported = CASE
+                WHEN $8 IS NULL AND EXISTS (
+                    SELECT 1 FROM agent_update_attempts AS u
+                    WHERE u.instance_id = $11 AND u.operation = 'rollback'
+                      AND u.target_version = $4
+                ) THEN 0
+                ELSE COALESCE($8, 0)
+            END,
+            rollback_version = CASE
+                WHEN $8 IS NULL AND EXISTS (
+                    SELECT 1 FROM agent_update_attempts AS u
+                    WHERE u.instance_id = $11 AND u.operation = 'rollback'
+                      AND u.target_version = $4
+                ) THEN ''
+                WHEN $8 = 1 THEN COALESCE($9, '')
+                ELSE ''
+            END,
+            last_seen = $10
+        WHERE id = $11
         "#,
     )
     .bind(hostname)
@@ -660,6 +729,8 @@ async fn store_metrics(
     .bind(package_type)
     .bind(native_arch)
     .bind(update_privileged.map(i64::from))
+    .bind(rollback_supported.map(i64::from))
+    .bind(rollback_version)
     .bind(now_ts())
     .bind(instance_id)
     .execute(&state.db)

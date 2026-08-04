@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import {
+  ArrowUpCircle,
   Check,
   ChevronDown,
   CircleAlert,
@@ -8,16 +9,22 @@ import {
   FileArchive,
   LoaderCircle,
   PackageCheck,
+  Pause,
   Pencil,
+  Play,
   Plus,
+  RefreshCw,
   RotateCcw,
   Save,
   Send,
   ShieldAlert,
   Trash2,
+  Undo2,
   Upload,
+  UserPlus,
   X,
 } from 'lucide-vue-next'
+import AgentRolloutSelectorModal from './AgentRolloutSelectorModal.vue'
 import type {
   AgentArtifactTarget,
   AgentArtifactUploadItem,
@@ -25,6 +32,7 @@ import type {
   AgentArtifactUploadRow,
   AgentRelease,
   AgentReleaseForm,
+  AgentRolloutCandidate,
   AgentUpdateAttempt,
   AgentUpdateAttemptStatus,
   Instance,
@@ -40,6 +48,8 @@ const props = defineProps<{
   operation: string | null
   busyId: string
   message: string
+  rolloutCandidates: Record<string, AgentRolloutCandidate[]>
+  rolloutCandidatesLoading: string
 }>()
 
 const emit = defineEmits<{
@@ -47,9 +57,17 @@ const emit = defineEmits<{
   saveRelease: [releaseId: string, form: AgentReleaseForm]
   uploadArtifact: [releaseId: string, uploads: AgentArtifactUploadItem[], onComplete: (result: AgentArtifactUploadResult) => void]
   deleteArtifact: [releaseId: string, artifactId: string]
-  publishRelease: [release: AgentRelease]
+  publishRelease: [release: AgentRelease, instanceIds?: string[]]
   deleteRelease: [release: AgentRelease]
   retryAttempt: [attempt: AgentUpdateAttempt]
+  loadRolloutCandidates: [releaseId: string]
+  addRolloutTargets: [release: AgentRelease, instanceIds: string[]]
+  pauseRollout: [release: AgentRelease]
+  resumeRollout: [release: AgentRelease]
+  promoteRollout: [release: AgentRelease]
+  rollbackRelease: [release: AgentRelease]
+  rollbackInstance: [release: AgentRelease, attempt: AgentUpdateAttempt]
+  reupgradeInstance: [release: AgentRelease, attempt: AgentUpdateAttempt]
 }>()
 
 const draftEdits = reactive<Record<string, AgentReleaseForm>>({})
@@ -64,6 +82,7 @@ const fileDragDepths = reactive<Record<string, number>>({})
 const fileDragActive = reactive<Record<string, boolean>>({})
 const collapsedReleases = reactive<Record<string, boolean>>({})
 const editingReleaseId = ref<string | null>(null)
+const rolloutSelector = ref<{ release: AgentRelease; mode: 'publish' | 'add' } | null>(null)
 const createReleaseFiles = ref<File[]>([])
 const createReleaseFileError = ref('')
 const createReleaseVersionSource = ref('')
@@ -83,6 +102,17 @@ const releaseStatusText: Record<AgentRelease['status'], string> = {
   published: '已发布',
 }
 
+const rolloutStatusText: Record<AgentRelease['rollout_state'], string> = {
+  draft: '草稿',
+  canary_active: '灰度中',
+  canary_paused: '灰度已暂停',
+  full_active: '全量',
+  full_paused: '全量已暂停',
+  rollback_active: '回滚中',
+  rolled_back: '已回滚',
+  rollback_partial: '部分回滚',
+}
+
 const attemptStatusText: Record<AgentUpdateAttemptStatus, string> = {
   pending: '等待安排',
   waiting: '等待执行',
@@ -94,12 +124,14 @@ const attemptStatusText: Record<AgentUpdateAttemptStatus, string> = {
   succeeded: '已完成',
   rollback_succeeded: '已回滚',
   failed: '失败',
+  cancelled: '已取消',
 }
 
 const terminalAttemptStatuses = new Set<AgentUpdateAttemptStatus>([
   'succeeded',
   'rollback_succeeded',
   'failed',
+  'cancelled',
 ])
 
 const publishedCount = computed(() => props.releases.filter((release) => release.status === 'published').length)
@@ -612,6 +644,20 @@ function attemptsFor(release: AgentRelease) {
     : props.attempts.filter((attempt) => attempt.release_id === release.id)
 }
 
+function attemptStats(release: AgentRelease) {
+  const attempts = attemptsFor(release)
+  return {
+    active: attempts.filter((attempt) => !terminalAttemptStatuses.has(attempt.status)).length,
+    upgradeSucceeded: attempts.filter(
+      (attempt) => attempt.operation === 'upgrade' && attempt.status === 'succeeded',
+    ).length,
+    rollbackSucceeded: attempts.filter(
+      (attempt) => attempt.operation === 'rollback' && attempt.status === 'rollback_succeeded',
+    ).length,
+    failed: attempts.filter((attempt) => attempt.status === 'failed').length,
+  }
+}
+
 function activeAttemptCount(release: AgentRelease) {
   return attemptsFor(release).filter((attempt) => !terminalAttemptStatuses.has(attempt.status)).length
 }
@@ -619,6 +665,8 @@ function activeAttemptCount(release: AgentRelease) {
 function deleteReleaseTitle(release: AgentRelease) {
   const activeCount = activeAttemptCount(release)
   if (activeCount > 0) return `仍有 ${activeCount} 个实例更新未结束，暂不能删除`
+  const rollbackRecords = attemptsFor(release).filter((attempt) => attempt.operation === 'rollback').length
+  if (rollbackRecords > 0) return `仍有 ${rollbackRecords} 条回滚记录依赖此版本，暂不能删除`
   return release.status === 'published' ? '永久删除已发布版本' : '删除草稿'
 }
 
@@ -633,6 +681,83 @@ function draftArtifactCount(release: AgentRelease) {
 function attemptInstanceName(attempt: AgentUpdateAttempt) {
   const instance = instancesById.value.get(attempt.instance_id)
   return instance?.name || instance?.hostname || attempt.instance_id
+}
+
+function openRolloutSelector(release: AgentRelease, mode: 'publish' | 'add') {
+  rolloutSelector.value = { release, mode }
+  emit('loadRolloutCandidates', release.id)
+}
+
+function confirmRolloutTargets(instanceIds: string[]) {
+  const selector = rolloutSelector.value
+  if (!selector) return
+  rolloutSelector.value = null
+  if (selector.mode === 'publish') {
+    emit('publishRelease', selector.release, instanceIds)
+  } else {
+    emit('addRolloutTargets', selector.release, instanceIds)
+  }
+}
+
+function isRolloutActive(release: AgentRelease) {
+  return release.rollout_state === 'canary_active' || release.rollout_state === 'full_active'
+}
+
+function isRolloutPaused(release: AgentRelease) {
+  return release.rollout_state === 'canary_paused' || release.rollout_state === 'full_paused'
+}
+
+function canRollbackRelease(release: AgentRelease) {
+  return [
+    'canary_active',
+    'canary_paused',
+    'full_active',
+    'full_paused',
+  ].includes(release.rollout_state)
+}
+
+function canRollbackInstance(release: AgentRelease, attempt: AgentUpdateAttempt) {
+  return attempt.operation === 'upgrade'
+    && attempt.status === 'succeeded'
+    && ['canary_active', 'canary_paused', 'full_active', 'full_paused'].includes(release.rollout_state)
+    && !attemptsFor(release).some(
+      (candidate) => candidate.operation === 'rollback' && candidate.parent_attempt_id === attempt.id,
+  )
+}
+
+function canRetryAttempt(release: AgentRelease, attempt: AgentUpdateAttempt) {
+  if (attempt.operation === 'upgrade') {
+    return ['failed', 'rollback_succeeded'].includes(attempt.status)
+      && ['canary_active', 'canary_paused', 'full_active', 'full_paused'].includes(release.rollout_state)
+  }
+  return attempt.status === 'failed' && [
+    'canary_active',
+    'canary_paused',
+    'full_active',
+    'full_paused',
+    'rollback_active',
+    'rollback_partial',
+  ].includes(release.rollout_state)
+}
+
+function canReupgradeInstance(release: AgentRelease, attempt: AgentUpdateAttempt) {
+  return attempt.operation === 'rollback'
+    && attempt.status === 'rollback_succeeded'
+    && ['canary_active', 'canary_paused', 'full_active', 'full_paused'].includes(release.rollout_state)
+    && !attemptsFor(release).some(
+      (candidate) => candidate.instance_id === attempt.instance_id
+        && candidate.operation === 'upgrade'
+        && candidate.created_at > attempt.created_at,
+    )
+}
+
+function canPublishArtifacts(release: AgentRelease) {
+  return release.status === 'draft'
+    || !['rollback_active', 'rolled_back', 'rollback_partial'].includes(release.rollout_state)
+}
+
+function isCanaryRollout(release: AgentRelease) {
+  return release.rollout_state === 'canary_active' || release.rollout_state === 'canary_paused'
 }
 
 function isBusy(id: string) {
@@ -753,7 +878,13 @@ function toggleRelease(releaseId: string) {
       >
         <header class="release-card-header">
           <div class="release-identity">
-            <span :class="['release-status', release.status]">{{ releaseStatusText[release.status] }}</span>
+            <div class="release-badges">
+              <span :class="['release-status', release.status]">{{ releaseStatusText[release.status] }}</span>
+              <span
+                v-if="release.status === 'published'"
+                :class="['rollout-status', release.rollout_state]"
+              >{{ rolloutStatusText[release.rollout_state] }}</span>
+            </div>
             <div v-if="editingReleaseId !== release.id">
               <h3>Agent {{ release.version }}</h3>
               <p v-if="release.notes" class="release-notes" :title="release.notes">{{ release.notes }}</p>
@@ -794,8 +925,8 @@ function toggleRelease(releaseId: string) {
               class="primary-button release-publish-button"
               type="button"
               :title="release.status === 'published' ? '发布新增更新包' : '发布更新'"
-              :disabled="Boolean(operation)"
-              @click="$emit('publishRelease', release)"
+              :disabled="Boolean(operation) || !canPublishArtifacts(release)"
+              @click="release.status === 'draft' ? openRolloutSelector(release, 'publish') : $emit('publishRelease', release)"
             >
               <LoaderCircle v-if="isBusy(release.id) && operation === 'publishing'" class="spin" :size="15" />
               <Send v-else :size="15" />{{ release.status === 'published' ? '发布新增包' : '发布' }}
@@ -844,8 +975,93 @@ function toggleRelease(releaseId: string) {
             </div>
           </form>
 
+          <section v-if="release.status === 'published'" class="release-rollout-control">
+            <div class="release-rollout-summary">
+              <span :class="['rollout-state-icon', release.rollout_state]">
+                <Pause v-if="isRolloutPaused(release)" :size="16" />
+                <Undo2 v-else-if="['rollback_active', 'rolled_back', 'rollback_partial'].includes(release.rollout_state)" :size="16" />
+                <Send v-else :size="16" />
+              </span>
+              <div>
+                <strong>{{ rolloutStatusText[release.rollout_state] }}</strong>
+                <small>
+                  {{ isCanaryRollout(release) ? `${release.coverage.selected_instances} 个灰度目标` : '全量发布策略' }}
+                  <template v-if="release.rollout_updated_at"> · {{ formatTime(release.rollout_updated_at) }}</template>
+                </small>
+              </div>
+            </div>
+            <div class="release-rollout-actions">
+              <button
+                v-if="isCanaryRollout(release)"
+                class="text-button"
+                type="button"
+                title="添加灰度批次"
+                :disabled="Boolean(operation)"
+                @click="openRolloutSelector(release, 'add')"
+              >
+                <UserPlus :size="15" />添加批次
+              </button>
+              <button
+                v-if="isRolloutActive(release)"
+                class="text-button"
+                type="button"
+                title="暂停尚未下发的任务"
+                :disabled="Boolean(operation)"
+                @click="$emit('pauseRollout', release)"
+              >
+                <Pause :size="15" />暂停
+              </button>
+              <button
+                v-if="isRolloutPaused(release)"
+                class="text-button"
+                type="button"
+                title="恢复发布"
+                :disabled="Boolean(operation)"
+                @click="$emit('resumeRollout', release)"
+              >
+                <Play :size="15" />恢复
+              </button>
+              <button
+                v-if="isCanaryRollout(release)"
+                class="text-button"
+                type="button"
+                title="晋级为全量发布"
+                :disabled="Boolean(operation)"
+                @click="$emit('promoteRollout', release)"
+              >
+                <ArrowUpCircle :size="15" />晋级全量
+              </button>
+              <button
+                v-if="canRollbackRelease(release)"
+                class="text-button danger"
+                type="button"
+                title="批量回滚此版本"
+                :disabled="Boolean(operation)"
+                @click="$emit('rollbackRelease', release)"
+              >
+                <Undo2 :size="15" />批量回滚
+              </button>
+            </div>
+          </section>
+
           <div class="release-coverage" :aria-label="`Agent ${release.version} 覆盖情况`">
-            <span><strong>{{ release.coverage.covered_instances }}</strong> / {{ release.coverage.eligible_instances }} 已覆盖</span>
+            <span><strong>{{ release.coverage.selected_instances }}</strong> 显式目标</span>
+            <span><strong>{{ release.coverage.covered_instances }}</strong> / {{ release.coverage.eligible_instances }} 平台覆盖</span>
+            <span><strong>{{ attemptStats(release).upgradeSucceeded }}</strong> 升级成功</span>
+            <span><strong>{{ attemptStats(release).rollbackSucceeded }}</strong> 回滚成功</span>
+            <span><strong>{{ attemptStats(release).active }}</strong> 处理中</span>
+            <span :class="{ warning: attemptStats(release).failed > 0 }">
+              <strong>{{ attemptStats(release).failed }}</strong> 失败
+            </span>
+            <span v-if="release.rollback_coverage.succeeded_upgrades > 0">
+              <strong>{{ release.rollback_coverage.rollback_supported }}</strong> / {{ release.rollback_coverage.succeeded_upgrades }} 支持回滚协议
+            </span>
+            <span
+              v-if="release.rollback_coverage.unavailable > 0"
+              class="warning"
+            >
+              <ShieldAlert :size="14" />{{ release.rollback_coverage.unavailable }} 不可回滚
+            </span>
             <span :class="{ warning: release.coverage.missing_artifact_instances > 0 }">
               <CircleAlert :size="14" />{{ release.coverage.missing_artifact_instances }} 缺少可执行文件
             </span>
@@ -1069,31 +1285,62 @@ function toggleRelease(releaseId: string) {
             </div>
             <div v-else class="update-attempts-table">
               <div class="update-attempts-head">
-                <span>实例</span><span>版本</span><span>状态</span><span>说明</span><span>更新时间</span><span></span>
+                <span>实例</span><span>操作</span><span>版本</span><span>状态</span><span>说明</span><span>更新时间</span><span></span>
               </div>
               <article v-for="attempt in attemptsFor(release)" :key="attempt.id" class="update-attempt-row">
                 <div class="attempt-instance">
                   <strong :title="attemptInstanceName(attempt)">{{ attemptInstanceName(attempt) }}</strong>
                   <small :title="attempt.instance_id">{{ attempt.instance_id.slice(0, 12) }}</small>
                 </div>
+                <span :class="['attempt-operation', attempt.operation]">
+                  <ArrowUpCircle v-if="attempt.operation === 'upgrade'" :size="13" />
+                  <Undo2 v-else :size="13" />
+                  {{ attempt.operation === 'upgrade' ? '升级' : '回滚' }}
+                </span>
                 <span class="attempt-versions">{{ attempt.from_version }} -&gt; {{ attempt.target_version }}</span>
                 <span :class="['attempt-status', attempt.status]" :title="attemptStatusText[attempt.status]">
                   {{ attemptStatusText[attempt.status] }}
                 </span>
                 <span class="attempt-message" :title="attempt.message || '暂无补充说明'">{{ attempt.message || '—' }}</span>
                 <time>{{ formatTime(attempt.updated_at) }}</time>
-                <button
-                  v-if="attempt.status === 'failed' || attempt.status === 'rollback_succeeded'"
-                  class="icon-button"
-                  type="button"
-                  title="重新尝试更新"
-                  :aria-label="`重新尝试实例 ${attempt.instance_id} 的更新`"
-                  :disabled="Boolean(operation)"
-                  @click="$emit('retryAttempt', attempt)"
-                >
-                  <LoaderCircle v-if="isBusy(attempt.id) && operation === 'retrying'" class="spin" :size="15" />
-                  <RotateCcw v-else :size="15" />
-                </button>
+                <div class="attempt-actions">
+                  <button
+                    v-if="canRetryAttempt(release, attempt)"
+                    class="icon-button"
+                    type="button"
+                    title="重试此任务"
+                    :aria-label="`重试实例 ${attempt.instance_id} 的${attempt.operation === 'upgrade' ? '升级' : '回滚'}任务`"
+                    :disabled="Boolean(operation)"
+                    @click="$emit('retryAttempt', attempt)"
+                  >
+                    <LoaderCircle v-if="isBusy(attempt.id) && operation === 'retrying'" class="spin" :size="15" />
+                    <RotateCcw v-else :size="15" />
+                  </button>
+                  <button
+                    v-else-if="canRollbackInstance(release, attempt)"
+                    class="icon-button danger"
+                    type="button"
+                    title="回滚此实例"
+                    :aria-label="`将实例 ${attempt.instance_id} 回滚到 ${attempt.from_version}`"
+                    :disabled="Boolean(operation)"
+                    @click="$emit('rollbackInstance', release, attempt)"
+                  >
+                    <LoaderCircle v-if="isBusy(attempt.id) && operation === 'rolling_back'" class="spin" :size="15" />
+                    <Undo2 v-else :size="15" />
+                  </button>
+                  <button
+                    v-else-if="canReupgradeInstance(release, attempt)"
+                    class="icon-button"
+                    type="button"
+                    title="重新升级此实例"
+                    :aria-label="`将实例 ${attempt.instance_id} 重新升级到 ${release.version}`"
+                    :disabled="Boolean(operation)"
+                    @click="$emit('reupgradeInstance', release, attempt)"
+                  >
+                    <LoaderCircle v-if="isBusy(attempt.id) && operation === 'reupgrading'" class="spin" :size="15" />
+                    <RefreshCw v-else :size="15" />
+                  </button>
+                </div>
               </article>
             </div>
           </section>
@@ -1101,4 +1348,14 @@ function toggleRelease(releaseId: string) {
       </article>
     </section>
   </section>
+
+  <AgentRolloutSelectorModal
+    v-if="rolloutSelector"
+    :release="rolloutSelector.release"
+    :mode="rolloutSelector.mode"
+    :candidates="rolloutCandidates[rolloutSelector.release.id] || []"
+    :loading="rolloutCandidatesLoading === rolloutSelector.release.id"
+    @close="rolloutSelector = null"
+    @confirm="confirmRolloutTargets"
+  />
 </template>

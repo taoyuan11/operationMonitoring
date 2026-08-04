@@ -14,6 +14,7 @@ import type {
   AdminTab,
   AdminUser,
   AgentRelease,
+  AgentUpdateAttempt,
   AppPage,
   AuthenticatorDevice,
   CommandRecord,
@@ -190,16 +191,65 @@ function openSelectedRemoteDesktop(instance: Instance) {
   consoleState.openRemoteDesktop(instance)
 }
 
-function requestPublishAgentRelease(release: AgentRelease) {
+function requestPublishAgentRelease(release: AgentRelease, instanceIds: string[] = []) {
   const draftArtifacts = release.artifacts.filter((artifact) => artifact.status === 'draft')
   const targets = draftArtifacts.map((artifact) => `${artifact.os}/${artifact.native_arch}`).join('、')
   const isAdditionalBatch = release.status === 'published'
+  const rolloutMessage = isAdditionalBatch
+    ? '新增包会按照此版本当前的灰度或全量策略补建任务。'
+    : `首批灰度包含 ${instanceIds.length} 个实例，离线实例将在上线后接收任务。`
   confirmation.value = {
     title: isAdditionalBatch ? '发布新增更新包' : '发布 Agent 更新',
-    message: `将发布 ${release.version} 的 ${draftArtifacts.length} 个更新包（${targets}）。符合条件的实例会自动安装对应更新包。尚未完成过受管更新的实例可能没有可用的回滚包。`,
-    confirmLabel: isAdditionalBatch ? '确认发布新增包' : '确认发布',
+    message: `将发布 ${release.version} 的 ${draftArtifacts.length} 个更新包（${targets}）。${rolloutMessage} 尚未完成过受管更新的实例可能没有可用的回滚包。`,
+    confirmLabel: isAdditionalBatch ? '确认发布新增包' : '确认灰度发布',
     tone: 'warning',
-    action: () => consoleState.publishAgentRelease(release),
+    action: () => consoleState.publishAgentRelease(release, instanceIds),
+  }
+}
+
+function requestPromoteAgentRollout(release: AgentRelease) {
+  const remainsPaused = release.rollout_state === 'canary_paused'
+  confirmation.value = {
+    title: '晋级全量发布',
+    message: `Agent ${release.version} 将对所有未排除且符合条件的当前及以后实例生效。${remainsPaused ? '当前暂停状态会保留，恢复后才会继续下发。' : '确认后会立即为符合条件的实例安排任务。'}`,
+    confirmLabel: '确认晋级全量',
+    tone: 'warning',
+    action: () => consoleState.promoteAgentRollout(release),
+  }
+}
+
+function requestRollbackAgentRelease(release: AgentRelease) {
+  const coverage = release.rollback_coverage
+  confirmation.value = {
+    title: '批量回滚 Agent 版本',
+    message: `Agent ${release.version} 有 ${coverage.succeeded_upgrades} 个成功升级实例。支持回滚协议 ${coverage.rollback_supported} 个，具有服务端旧包 ${coverage.server_package_available} 个，具有本地基线 ${coverage.local_package_available} 个，不可回滚 ${coverage.unavailable} 个。操作将取消尚未下发的升级任务，其余实例按各自升级前版本回滚。`,
+    confirmLabel: '确认批量回滚',
+    tone: 'danger',
+    action: () => consoleState.rollbackAgentRelease(release),
+  }
+}
+
+function requestRollbackAgentInstance(release: AgentRelease, attempt: AgentUpdateAttempt) {
+  const instance = consoleState.instances.value.find((item) => item.id === attempt.instance_id)
+  const name = instance?.name || instance?.hostname || attempt.instance_id
+  confirmation.value = {
+    title: '回滚实例 Agent',
+    message: `将 ${name} 从 ${attempt.target_version} 回滚到 ${attempt.from_version}，并从 Agent ${release.version} 的自动发布目标中排除。之后只有明确执行“重新升级”才会再次加入。`,
+    confirmLabel: '确认回滚实例',
+    tone: 'danger',
+    action: () => consoleState.rollbackAgentInstance(release, attempt),
+  }
+}
+
+function requestReupgradeAgentInstance(release: AgentRelease, attempt: AgentUpdateAttempt) {
+  const instance = consoleState.instances.value.find((item) => item.id === attempt.instance_id)
+  const name = instance?.name || instance?.hostname || attempt.instance_id
+  confirmation.value = {
+    title: '重新升级实例',
+    message: `将 ${name} 重新加入 Agent ${release.version} 的发布目标，并安排从 ${attempt.target_version} 升级到 ${release.version}。`,
+    confirmLabel: '确认重新升级',
+    tone: 'warning',
+    action: () => consoleState.reupgradeAgentInstance(release, attempt),
   }
 }
 
@@ -360,6 +410,8 @@ function confirmAction() {
             :operation="consoleState.agentUpdateOperation.value"
             :busy-id="consoleState.agentUpdateBusyId.value"
             :message="consoleState.agentUpdateMessage.value"
+            :rollout-candidates="consoleState.agentRolloutCandidates.value"
+            :rollout-candidates-loading="consoleState.agentRolloutCandidatesLoading.value"
             @create-release="consoleState.createAgentRelease"
             @save-release="consoleState.saveAgentRelease"
             @upload-artifact="consoleState.uploadAgentArtifact"
@@ -367,6 +419,14 @@ function confirmAction() {
             @publish-release="requestPublishAgentRelease"
             @delete-release="requestDeleteAgentRelease"
             @retry-attempt="consoleState.retryAgentUpdateAttempt"
+            @load-rollout-candidates="consoleState.loadAgentRolloutCandidates"
+            @add-rollout-targets="consoleState.addAgentRolloutTargets"
+            @pause-rollout="consoleState.pauseAgentRollout"
+            @resume-rollout="consoleState.resumeAgentRollout"
+            @promote-rollout="requestPromoteAgentRollout"
+            @rollback-release="requestRollbackAgentRelease"
+            @rollback-instance="requestRollbackAgentInstance"
+            @reupgrade-instance="requestReupgradeAgentInstance"
           />
           <UserManagementPanel
             v-else-if="currentPage === 'users'"

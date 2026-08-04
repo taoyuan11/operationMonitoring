@@ -57,11 +57,13 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing::info;
 use update_signature::load_update_signer;
 use updates::{
-    admin_agent_releases, admin_agent_update_attempts, admin_create_agent_release,
-    admin_delete_agent_artifact, admin_delete_agent_release, admin_publish_agent_release,
-    admin_retry_agent_update, admin_update_agent_release, admin_upload_agent_artifact,
-    agent_download_artifact, agent_download_artifact_checksum, agent_update_manifest,
-    update_timeout_loop,
+    admin_add_agent_rollout_targets, admin_agent_releases, admin_agent_rollout_candidates,
+    admin_agent_update_attempts, admin_create_agent_release, admin_delete_agent_artifact,
+    admin_delete_agent_release, admin_pause_agent_rollout, admin_promote_agent_rollout,
+    admin_publish_agent_release, admin_resume_agent_rollout, admin_retry_agent_update,
+    admin_reupgrade_agent_instance, admin_rollback_agent_instance, admin_rollback_agent_release,
+    admin_update_agent_release, admin_upload_agent_artifact, agent_download_artifact,
+    agent_download_artifact_checksum, agent_update_manifest, update_timeout_loop,
 };
 
 #[tokio::main]
@@ -265,6 +267,38 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/agent-releases/{release_id}/publish",
             post(admin_publish_agent_release),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/rollout/candidates",
+            get(admin_agent_rollout_candidates),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/rollout/targets",
+            post(admin_add_agent_rollout_targets),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/rollout/pause",
+            post(admin_pause_agent_rollout),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/rollout/resume",
+            post(admin_resume_agent_rollout),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/rollout/promote",
+            post(admin_promote_agent_rollout),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/rollback",
+            post(admin_rollback_agent_release),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/instances/{instance_id}/rollback",
+            post(admin_rollback_agent_instance),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/instances/{instance_id}/reupgrade",
+            post(admin_reupgrade_agent_instance),
         )
         .route(
             "/api/admin/agent-update-attempts",

@@ -27,6 +27,9 @@ pub struct AgentRegisterRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_arch: Option<String>,
     pub update_privileged: Option<bool>,
+    pub rollback_supported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_profile: Option<DeviceProfile>,
 }
@@ -446,6 +449,8 @@ pub struct HostProfile {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateOffer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
     pub release_id: String,
     pub version: String,
     pub artifact_id: String,
@@ -462,6 +467,33 @@ pub struct UpdateOffer {
     pub signature: Option<String>,
     #[serde(default)]
     pub retry_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RollbackPackage {
+    pub artifact_id: String,
+    pub download_url: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub package_type: String,
+    pub native_arch: String,
+    pub target_os: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RollbackOffer {
+    pub attempt_id: String,
+    pub release_id: String,
+    pub instance_id: String,
+    pub from_version: String,
+    pub target_version: String,
+    pub retry_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<RollbackPackage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -678,6 +710,8 @@ pub enum AgentOutbound {
         session_id: String,
     },
     UpdateAvailable {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
         release_id: String,
         version: String,
         artifact_id: String,
@@ -694,6 +728,9 @@ pub enum AgentOutbound {
         signature: Option<String>,
         #[serde(default)]
         retry_count: i64,
+    },
+    RollbackAvailable {
+        offer: RollbackOffer,
     },
     DesktopOpen {
         session_id: String,
@@ -726,6 +763,9 @@ pub enum AgentInbound {
         #[serde(skip_serializing_if = "Option::is_none")]
         native_arch: Option<String>,
         update_privileged: Option<bool>,
+        rollback_supported: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rollback_version: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         docker_status: Option<DockerStatus>,
         metrics: MetricPayload,
@@ -782,9 +822,18 @@ pub enum AgentInbound {
         reason: Option<String>,
     },
     UpdateStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
         release_id: String,
         artifact_id: String,
         version: String,
+        retry_count: i64,
+        status: UpdateStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    RollbackStatus {
+        attempt_id: String,
         retry_count: i64,
         status: UpdateStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -822,6 +871,8 @@ mod tests {
             package_type: Some("standalone".to_string()),
             native_arch: Some("x86_64".to_string()),
             update_privileged: Some(true),
+            rollback_supported: Some(true),
+            rollback_version: None,
             device_profile: None,
         };
         let legacy_shape = serde_json::to_value(&request).unwrap();
@@ -909,6 +960,7 @@ mod tests {
     #[test]
     fn update_status_matches_the_backend_websocket_shape() {
         let message = AgentInbound::UpdateStatus {
+            attempt_id: None,
             release_id: "release-1".to_string(),
             artifact_id: "artifact-1".to_string(),
             version: "1.2.3".to_string(),
@@ -926,6 +978,60 @@ mod tests {
                 "version": "1.2.3",
                 "retry_count": 2,
                 "status": "awaiting_restart"
+            })
+        );
+    }
+
+    #[test]
+    fn rollback_messages_use_attempt_scoped_protocol_shapes() {
+        let value = json!({
+            "type": "rollback_available",
+            "offer": {
+                "attempt_id": "rollback-attempt-1",
+                "release_id": "release-2",
+                "instance_id": "instance-1",
+                "from_version": "2.0.0",
+                "target_version": "1.2.3",
+                "retry_count": 1,
+                "package": {
+                    "artifact_id": "artifact-1",
+                    "download_url": "/api/agent/update/artifacts/artifact-1/download",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size_bytes": 42,
+                    "package_type": "standalone",
+                    "native_arch": "arm64",
+                    "target_os": "linux"
+                },
+                "signature_key_id": "release-v1",
+                "signature": "c2lnbmF0dXJl"
+            }
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentOutbound>(value).unwrap(),
+            AgentOutbound::RollbackAvailable {
+                offer: RollbackOffer {
+                    attempt_id,
+                    retry_count: 1,
+                    package: Some(RollbackPackage { artifact_id, .. }),
+                    ..
+                }
+            } if attempt_id == "rollback-attempt-1" && artifact_id == "artifact-1"
+        ));
+
+        let status = AgentInbound::RollbackStatus {
+            attempt_id: "rollback-attempt-1".to_string(),
+            retry_count: 1,
+            status: UpdateStatus::RollbackSucceeded,
+            message: Some("local baseline used".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            json!({
+                "type": "rollback_status",
+                "attempt_id": "rollback-attempt-1",
+                "retry_count": 1,
+                "status": "rollback_succeeded",
+                "message": "local baseline used"
             })
         );
     }

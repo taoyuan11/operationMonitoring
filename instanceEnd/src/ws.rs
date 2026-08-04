@@ -20,7 +20,7 @@ use crate::{
     file_manager::{CAPABILITY as FILE_MANAGER_CAPABILITY, FileManager},
     http::register_once,
     metrics::MetricsCollector,
-    models::{AgentInbound, AgentOutbound, Identity, UpdateOffer, UpdateStatus},
+    models::{AgentInbound, AgentOutbound, Identity, RollbackOffer, UpdateOffer, UpdateStatus},
     outbound::AgentEventSender,
     profile::host_profile,
     remote_desktop::{CAPABILITY as DESKTOP_CAPABILITY, DesktopManager, DesktopOpenRequest},
@@ -34,6 +34,7 @@ const TERMINAL_STREAM_QUEUE_CAPACITY: usize = 128;
 const MAX_CONCURRENT_COMMANDS: usize = 4;
 const MAX_SERVER_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const ROLLBACK_CAPABILITY: &str = "agent_rollback_v1";
 
 enum SocketOutcome {
     Disconnected,
@@ -42,12 +43,17 @@ enum SocketOutcome {
 }
 
 enum UpdateTaskEvent {
-    ReadyToApply { offer: UpdateOffer },
-    Finished { artifact_id: String },
+    ReadyToApply {
+        operation_id: String,
+        offer: UpdateOffer,
+    },
+    Finished {
+        operation_id: String,
+    },
 }
 
 struct ActiveUpdate {
-    artifact_id: String,
+    operation_id: String,
     task: JoinHandle<()>,
     manager: UpdateManager,
 }
@@ -293,6 +299,10 @@ async fn handle_agent_socket(
                     package_type: capability.package_type.clone(),
                     native_arch: capability.native_arch.clone(),
                     update_privileged: Some(capability.update_privileged),
+                    rollback_supported: Some(true),
+                    rollback_version: update_manager
+                        .as_ref()
+                        .and_then(UpdateManager::rollback_version),
                     docker_status: docker.status(),
                     metrics: collector.sample(),
                 })?;
@@ -303,8 +313,24 @@ async fn handle_agent_socket(
             _ = manifest_interval.tick(), if update_manager.is_some() && active_update.is_none() => {
                 let manager = update_manager.as_ref().expect("guarded by update_manager.is_some()");
                 match manager.fetch_manifest().await {
-                    Ok(Some(offer)) => {
-                        match manager.can_start_offer(&offer) {
+                    Ok((update, rollback)) => {
+                        if let Some(offer) = rollback {
+                            match manager.can_start_rollback(&offer) {
+                                Ok(true) => {
+                                    active_update = Some(spawn_rollback_task(
+                                        manager.clone(),
+                                        offer,
+                                        outbound_tx.clone(),
+                                        update_event_tx.clone(),
+                                    ));
+                                }
+                                Ok(false) => {}
+                                Err(error) => crate::logging::error(format_args!(
+                                    "failed to inspect local update state before rollback offer: {error:#}"
+                                )),
+                            }
+                        } else if let Some(offer) = update {
+                            match manager.can_start_offer(&offer) {
                             Ok(true) => {
                                 active_update = Some(spawn_update_task(
                                     manager.clone(),
@@ -317,9 +343,9 @@ async fn handle_agent_socket(
                             Err(error) => crate::logging::error(format_args!(
                                 "failed to inspect local update state before manifest offer: {error:#}"
                             )),
+                            }
                         }
                     }
-                    Ok(None) => {}
                     Err(error) => crate::logging::error(format_args!(
                         "failed to check for an agent update: {error:#}"
                     )),
@@ -330,10 +356,10 @@ async fn handle_agent_socket(
                     continue;
                 };
                 match event {
-                    UpdateTaskEvent::ReadyToApply { offer } => {
+                    UpdateTaskEvent::ReadyToApply { operation_id, offer } => {
                         if active_update
                             .as_ref()
-                            .is_some_and(|active| active.artifact_id == offer.artifact_id)
+                            .is_some_and(|active| active.operation_id == operation_id)
                         {
                             let active = active_update
                                 .take()
@@ -369,10 +395,10 @@ async fn handle_agent_socket(
                             break SocketOutcome::ApplyUpdate;
                         }
                     }
-                    UpdateTaskEvent::Finished { artifact_id } => {
+                    UpdateTaskEvent::Finished { operation_id } => {
                         if active_update
                             .as_ref()
-                            .is_some_and(|active| active.artifact_id == artifact_id)
+                            .is_some_and(|active| active.operation_id == operation_id)
                         {
                             active_update.take();
                         }
@@ -513,6 +539,7 @@ async fn handle_agent_socket(
                                 docker.exec_close(&session_id);
                             }
                             AgentOutbound::UpdateAvailable {
+                                attempt_id,
                                 release_id,
                                 version,
                                 artifact_id,
@@ -527,6 +554,7 @@ async fn handle_agent_socket(
                                 retry_count,
                             } => {
                                 let offer = UpdateOffer {
+                                    attempt_id,
                                     release_id,
                                     version,
                                     artifact_id,
@@ -561,9 +589,43 @@ async fn handle_agent_socket(
                                         }
                                     } else {
                                         let _ = outbound_tx.send(AgentInbound::UpdateStatus {
+                                            attempt_id: offer.attempt_id,
                                             release_id: offer.release_id,
                                             artifact_id: offer.artifact_id,
                                             version: offer.version,
+                                            retry_count: offer.retry_count,
+                                            status: UpdateStatus::Failed,
+                                            message: Some(
+                                                "agent update storage could not be initialized"
+                                                    .to_string(),
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            AgentOutbound::RollbackAvailable { offer } => {
+                                if active_update.is_none() {
+                                    if let Some(manager) = &update_manager {
+                                        match manager.can_start_rollback(&offer) {
+                                            Ok(true) => {
+                                                active_update = Some(spawn_rollback_task(
+                                                    manager.clone(),
+                                                    offer,
+                                                    outbound_tx.clone(),
+                                                    update_event_tx.clone(),
+                                                ));
+                                            }
+                                            Ok(false) => crate::logging::info(format_args!(
+                                                "ignored duplicate rollback offer {}",
+                                                offer.attempt_id
+                                            )),
+                                            Err(error) => crate::logging::error(format_args!(
+                                                "failed to inspect local update state before websocket rollback offer: {error:#}"
+                                            )),
+                                        }
+                                    } else {
+                                        let _ = outbound_tx.send(AgentInbound::RollbackStatus {
+                                            attempt_id: offer.attempt_id,
                                             retry_count: offer.retry_count,
                                             status: UpdateStatus::Failed,
                                             message: Some(
@@ -719,22 +781,56 @@ fn spawn_update_task(
     outbound: AgentEventSender,
     events: mpsc::Sender<UpdateTaskEvent>,
 ) -> ActiveUpdate {
-    let artifact_id = offer.artifact_id.clone();
-    let task_artifact_id = artifact_id.clone();
-    let ready_offer = offer.clone();
+    let operation_id = offer
+        .attempt_id
+        .clone()
+        .unwrap_or_else(|| offer.artifact_id.clone());
+    let task_operation_id = operation_id.clone();
     let task_manager = manager.clone();
     let task = tokio::spawn(async move {
         let result = task_manager.prepare(offer, outbound).await;
         let event = match result {
-            PrepareResult::ReadyToApply => UpdateTaskEvent::ReadyToApply { offer: ready_offer },
+            PrepareResult::ReadyToApply { offer } => UpdateTaskEvent::ReadyToApply {
+                operation_id: task_operation_id.clone(),
+                offer,
+            },
             PrepareResult::Finished => UpdateTaskEvent::Finished {
-                artifact_id: task_artifact_id,
+                operation_id: task_operation_id,
             },
         };
         let _ = events.send(event).await;
     });
     ActiveUpdate {
-        artifact_id,
+        operation_id,
+        task,
+        manager,
+    }
+}
+
+fn spawn_rollback_task(
+    manager: UpdateManager,
+    offer: RollbackOffer,
+    outbound: AgentEventSender,
+    events: mpsc::Sender<UpdateTaskEvent>,
+) -> ActiveUpdate {
+    let operation_id = offer.attempt_id.clone();
+    let task_operation_id = operation_id.clone();
+    let task_manager = manager.clone();
+    let task = tokio::spawn(async move {
+        let result = task_manager.prepare_rollback(offer, outbound).await;
+        let event = match result {
+            PrepareResult::ReadyToApply { offer } => UpdateTaskEvent::ReadyToApply {
+                operation_id: task_operation_id.clone(),
+                offer,
+            },
+            PrepareResult::Finished => UpdateTaskEvent::Finished {
+                operation_id: task_operation_id,
+            },
+        };
+        let _ = events.send(event).await;
+    });
+    ActiveUpdate {
+        operation_id,
         task,
         manager,
     }
@@ -745,7 +841,7 @@ fn websocket_request(
     identity: &Identity,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     let endpoint = ServerEndpoint::parse(server)?;
-    let mut capabilities = vec![FILE_MANAGER_CAPABILITY];
+    let mut capabilities = vec![FILE_MANAGER_CAPABILITY, ROLLBACK_CAPABILITY];
     if cfg!(windows) {
         capabilities.push(DESKTOP_CAPABILITY);
     }
@@ -794,6 +890,7 @@ mod tests {
             request.headers().get("authorization").unwrap(),
             "Bearer secret-1"
         );
+        assert!(url.contains(ROLLBACK_CAPABILITY));
         assert_eq!(url.contains(DESKTOP_CAPABILITY), cfg!(windows));
         assert_eq!(url.contains(DOCKER_CAPABILITY), cfg!(target_os = "linux"));
     }

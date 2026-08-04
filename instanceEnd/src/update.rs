@@ -28,7 +28,7 @@ use crate::{
     activity::ActivityTracker,
     config::AgentConfig,
     http::{AGENT_CONTROL_HTTP_TIMEOUT, MAX_AGENT_JSON_RESPONSE_BYTES, bounded_json_response},
-    models::{AgentInbound, Identity, UpdateOffer, UpdateStatus},
+    models::{AgentInbound, Identity, RollbackOffer, RollbackPackage, UpdateOffer, UpdateStatus},
     outbound::AgentEventSender,
     time::now_ts,
 };
@@ -56,6 +56,7 @@ const DISK_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CHECKSUM_FILE_BYTES: usize = 4096;
 const DEFAULT_UPDATE_SIGNATURE_KEY_ID: &str = "default";
 const UPDATE_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-update-v1";
+const ROLLBACK_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-rollback-v1";
 
 static UPDATE_CAPABILITY: OnceLock<UpdateCapability> = OnceLock::new();
 
@@ -104,15 +105,17 @@ pub struct UpdateManager {
     paths: UpdatePaths,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareResult {
-    ReadyToApply,
+    ReadyToApply { offer: UpdateOffer },
     Finished,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpdateManifest {
     update: Option<UpdateOffer>,
+    #[serde(default)]
+    rollback: Option<RollbackOffer>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,9 +152,25 @@ enum AttemptPhase {
     Completed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AttemptOperation {
+    #[default]
+    Upgrade,
+    Rollback {
+        attempt_id: String,
+        release_id: String,
+        from_version: String,
+        target_version: String,
+        retry_count: i64,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedAttempt {
     offer: UpdateOffer,
+    #[serde(default)]
+    operation: AttemptOperation,
     #[serde(default)]
     manual: bool,
     status: UpdateStatus,
@@ -166,6 +185,8 @@ struct PersistedAttempt {
 struct UpdateState {
     schema_version: u32,
     current_package: Option<CachedPackage>,
+    #[serde(default)]
+    rollback_package: Option<CachedPackage>,
     attempt: Option<PersistedAttempt>,
 }
 
@@ -174,6 +195,7 @@ impl Default for UpdateState {
         Self {
             schema_version: UPDATE_SCHEMA_VERSION,
             current_package: None,
+            rollback_package: None,
             attempt: None,
         }
     }
@@ -182,6 +204,8 @@ impl Default for UpdateState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ApplyPlan {
     offer: UpdateOffer,
+    #[serde(default)]
+    operation: AttemptOperation,
     package_path: PathBuf,
     previous_package: Option<CachedPackage>,
     state_file: PathBuf,
@@ -221,6 +245,25 @@ pub fn update_capability() -> UpdateCapability {
     UPDATE_CAPABILITY
         .get_or_init(detect_update_capability)
         .clone()
+}
+
+pub fn rollback_baseline_version(config: &AgentConfig) -> Option<String> {
+    let paths = UpdatePaths::from_config(config).ok()?;
+    let state = read_update_state(&paths.state_file).ok()?;
+    let package = state.rollback_package?;
+    if package.package_type != PackageType::Standalone
+        || package.native_arch != standalone_native_arch()
+        || verify_package_at_rest(
+            &package.path,
+            package.package_type,
+            package.size_bytes,
+            &package.sha256,
+        )
+        .is_err()
+    {
+        return None;
+    }
+    Some(package.version)
 }
 
 pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
@@ -277,6 +320,7 @@ pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
         }
     };
     let offer = UpdateOffer {
+        attempt_id: None,
         release_id: format!("manual-{operation_id}"),
         version: version.clone(),
         artifact_id: format!("manual-{operation_id}"),
@@ -294,6 +338,7 @@ pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
     let mut state = read_update_state(&paths.state_file)?;
     state.attempt = Some(PersistedAttempt {
         offer: offer.clone(),
+        operation: AttemptOperation::Upgrade,
         manual: true,
         status: UpdateStatus::AwaitingRestart,
         message: Some(format!("forced update from {}", source.display())),
@@ -430,7 +475,7 @@ impl UpdateManager {
         })
     }
 
-    pub async fn fetch_manifest(&self) -> Result<Option<UpdateOffer>> {
+    pub async fn fetch_manifest(&self) -> Result<(Option<UpdateOffer>, Option<RollbackOffer>)> {
         let url = self
             .config
             .server_endpoint()?
@@ -450,7 +495,11 @@ impl UpdateManager {
             "agent update manifest",
         )
         .await?;
-        Ok(manifest.update)
+        Ok((manifest.update, manifest.rollback))
+    }
+
+    pub fn rollback_version(&self) -> Option<String> {
+        rollback_baseline_version(&self.config)
     }
 
     pub fn connected_status(&self) -> Result<Option<AgentInbound>> {
@@ -461,27 +510,36 @@ impl UpdateManager {
 
         let current_version = env!("CARGO_PKG_VERSION");
         let (status, health, message, finalize) = match attempt.phase {
-            AttemptPhase::Target if current_version == attempt.offer.version => (
-                UpdateStatus::Succeeded,
-                Some((
-                    attempt.offer.artifact_id.clone(),
-                    attempt.offer.version.clone(),
-                    attempt.offer.retry_count,
-                )),
-                None,
-                true,
-            ),
-            AttemptPhase::Rollback => match &attempt.previous_package {
-                Some(previous) if current_version == previous.version => (
-                    UpdateStatus::RollbackSucceeded,
+            AttemptPhase::Target if current_version == attempt.offer.version => {
+                let status = target_success_status(&attempt.operation);
+                let message = matches!(attempt.operation, AttemptOperation::Rollback { .. })
+                    .then(|| attempt.message.clone())
+                    .flatten();
+                (
+                    status,
                     Some((
-                        previous.artifact_id.clone(),
-                        previous.version.clone(),
-                        previous.retry_count,
+                        attempt.offer.artifact_id.clone(),
+                        attempt.offer.version.clone(),
+                        attempt.offer.retry_count,
                     )),
-                    attempt.message.clone(),
+                    message,
                     true,
-                ),
+                )
+            }
+            AttemptPhase::Rollback => match &attempt.previous_package {
+                Some(previous) if current_version == previous.version => {
+                    let status = restored_previous_status(&attempt.operation);
+                    (
+                        status,
+                        Some((
+                            previous.artifact_id.clone(),
+                            previous.version.clone(),
+                            previous.retry_count,
+                        )),
+                        attempt.message.clone(),
+                        true,
+                    )
+                }
                 _ => (attempt.status, None, attempt.message.clone(), false),
             },
             AttemptPhase::Completed
@@ -499,10 +557,29 @@ impl UpdateManager {
                     false,
                 )
             }
-            AttemptPhase::Completed if attempt.status == UpdateStatus::RollbackSucceeded => {
+            AttemptPhase::Completed
+                if attempt.status == UpdateStatus::RollbackSucceeded
+                    && matches!(attempt.operation, AttemptOperation::Rollback { .. })
+                    && current_version == attempt.offer.version =>
+            {
+                (
+                    attempt.status,
+                    Some((
+                        attempt.offer.artifact_id.clone(),
+                        attempt.offer.version.clone(),
+                        attempt.offer.retry_count,
+                    )),
+                    attempt.message.clone(),
+                    false,
+                )
+            }
+            AttemptPhase::Completed
+                if attempt.status == UpdateStatus::RollbackSucceeded
+                    && matches!(attempt.operation, AttemptOperation::Upgrade) =>
+            {
                 match &attempt.previous_package {
                     Some(previous) if current_version == previous.version => (
-                        attempt.status,
+                        UpdateStatus::RollbackSucceeded,
                         Some((
                             previous.artifact_id.clone(),
                             previous.version.clone(),
@@ -517,28 +594,13 @@ impl UpdateManager {
             _ => (attempt.status, None, attempt.message.clone(), false),
         };
 
+        let mut stale_package = None;
         if finalize {
-            if status == UpdateStatus::Succeeded {
-                let package_type: PackageType = attempt.offer.package_type.parse()?;
-                let package_path = attempt
-                    .package_path
-                    .clone()
-                    .ok_or_else(|| anyhow!("installed update package is missing from state"))?;
-                state.current_package = Some(CachedPackage {
-                    artifact_id: attempt.offer.artifact_id.clone(),
-                    version: attempt.offer.version.clone(),
-                    package_type,
-                    native_arch: attempt.offer.native_arch.clone(),
-                    path: package_path,
-                    retry_count: attempt.offer.retry_count,
-                    size_bytes: u64::try_from(attempt.offer.size_bytes)
-                        .context("invalid installed package size")?,
-                    sha256: attempt.offer.sha256.clone(),
-                });
+            if status == target_success_status(&attempt.operation) {
+                stale_package = rotate_successful_package_state(&mut state, &attempt)?;
             }
             if let Some(current_attempt) = &mut state.attempt
-                && current_attempt.offer.artifact_id == attempt.offer.artifact_id
-                && current_attempt.offer.retry_count == attempt.offer.retry_count
+                && offer_generation_matches(&current_attempt.offer, &attempt.offer)
             {
                 current_attempt.status = status;
                 current_attempt.message = message.clone();
@@ -546,6 +608,9 @@ impl UpdateManager {
                 current_attempt.updated_at = now_ts();
             }
             write_update_state(&self.paths.state_file, &state)?;
+        }
+        if let Some(path) = stale_package {
+            let _ = fs::remove_file(path);
         }
 
         if let Some((artifact_id, version, retry_count)) = health {
@@ -564,7 +629,7 @@ impl UpdateManager {
             return Ok(None);
         }
 
-        Ok(Some(update_status_message(&attempt.offer, status, message)))
+        Ok(Some(attempt_status_message(&attempt, status, message)))
     }
 
     pub fn can_start_offer(&self, offer: &UpdateOffer) -> Result<bool> {
@@ -581,7 +646,7 @@ impl UpdateManager {
                 UpdateStatus::Installing | UpdateStatus::AwaitingRestart
             );
         if active_handoff {
-            if attempt.offer.artifact_id == offer.artifact_id {
+            if same_offer_attempt(&attempt.offer, offer) {
                 return Ok(offer.retry_count > attempt.offer.retry_count);
             }
             let persisted_version = Version::parse(&attempt.offer.version)
@@ -590,7 +655,7 @@ impl UpdateManager {
                 .with_context(|| format!("invalid offered version {}", offer.version))?;
             return Ok(incoming_version > persisted_version);
         }
-        if attempt.offer.artifact_id != offer.artifact_id {
+        if !same_offer_attempt(&attempt.offer, offer) {
             return Ok(true);
         }
         let terminal = matches!(
@@ -601,6 +666,42 @@ impl UpdateManager {
             return Ok(offer.retry_count > attempt.offer.retry_count);
         }
         Ok(offer.retry_count >= attempt.offer.retry_count)
+    }
+
+    pub fn can_start_rollback(&self, offer: &RollbackOffer) -> Result<bool> {
+        if update_lock_is_held(&self.paths.lock_file)? {
+            return Ok(false);
+        }
+        let state = read_update_state(&self.paths.state_file)?;
+        let Some(attempt) = state.attempt else {
+            return Ok(true);
+        };
+        let active_handoff = matches!(attempt.phase, AttemptPhase::Target | AttemptPhase::Rollback)
+            && matches!(
+                attempt.status,
+                UpdateStatus::Installing | UpdateStatus::AwaitingRestart
+            );
+        if active_handoff {
+            return Ok(false);
+        }
+        let terminal = matches!(
+            attempt.status,
+            UpdateStatus::Succeeded | UpdateStatus::RollbackSucceeded | UpdateStatus::Failed
+        );
+        match attempt.operation {
+            AttemptOperation::Rollback {
+                attempt_id,
+                retry_count,
+                ..
+            } if attempt_id == offer.attempt_id => {
+                if terminal {
+                    Ok(offer.retry_count > retry_count)
+                } else {
+                    Ok(offer.retry_count >= retry_count)
+                }
+            }
+            _ => Ok(terminal),
+        }
     }
 
     pub fn cancel_preparation(&self) {
@@ -645,7 +746,7 @@ impl UpdateManager {
         package_type: PackageType,
         outbound: &AgentEventSender,
     ) -> Result<PrepareResult> {
-        self.begin_attempt(offer)?;
+        self.begin_attempt(offer, AttemptOperation::Upgrade)?;
 
         let current_version = Version::parse(env!("CARGO_PKG_VERSION"))?;
         let target_version = Version::parse(&offer.version)
@@ -676,7 +777,9 @@ impl UpdateManager {
 
         self.send_status(offer, UpdateStatus::Downloading, None, outbound)?;
         let checksum_sha256 = self.download_checksum(offer).await?;
-        let downloaded = self.download_to_temporary(offer, package_type).await?;
+        let downloaded = self
+            .download_to_temporary(offer, package_type, &offer_storage_component(offer))
+            .await?;
 
         self.send_status(offer, UpdateStatus::Verifying, None, outbound)?;
         verify_download(offer, package_type, &downloaded, &checksum_sha256)?;
@@ -697,7 +800,196 @@ impl UpdateManager {
         }
         self.activity.wait_until_idle().await;
 
-        Ok(PrepareResult::ReadyToApply)
+        Ok(PrepareResult::ReadyToApply {
+            offer: offer.clone(),
+        })
+    }
+
+    pub async fn prepare_rollback(
+        &self,
+        rollback: RollbackOffer,
+        outbound: AgentEventSender,
+    ) -> PrepareResult {
+        match self.prepare_rollback_inner(&rollback, &outbound).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.activity.stop_draining();
+                let message = format!("{error:#}");
+                crate::logging::error(format_args!(
+                    "failed to prepare agent rollback {}: {message}",
+                    rollback.attempt_id
+                ));
+                if let Ok(state) = read_update_state(&self.paths.state_file)
+                    && state.attempt.as_ref().is_some_and(|attempt| {
+                        matches!(
+                            &attempt.operation,
+                            AttemptOperation::Rollback { attempt_id, retry_count, .. }
+                                if attempt_id == &rollback.attempt_id
+                                    && *retry_count == rollback.retry_count
+                        )
+                    })
+                {
+                    if let Err(persist_error) = self.send_status_for_current_attempt(
+                        UpdateStatus::Failed,
+                        Some(message),
+                        &outbound,
+                    ) {
+                        crate::logging::error(format_args!(
+                            "failed to persist rollback failure: {persist_error:#}"
+                        ));
+                    }
+                } else {
+                    let _ = outbound.send(rollback_status_message(
+                        &rollback,
+                        UpdateStatus::Failed,
+                        Some(message),
+                    ));
+                }
+                PrepareResult::Finished
+            }
+        }
+    }
+
+    async fn prepare_rollback_inner(
+        &self,
+        rollback: &RollbackOffer,
+        outbound: &AgentEventSender,
+    ) -> Result<PrepareResult> {
+        self.validate_rollback_offer(rollback)?;
+        let current_version = Version::parse(env!("CARGO_PKG_VERSION"))?;
+        let from_version = Version::parse(&rollback.from_version).with_context(|| {
+            format!("invalid rollback source version {}", rollback.from_version)
+        })?;
+        let target_version = Version::parse(&rollback.target_version).with_context(|| {
+            format!(
+                "invalid rollback target version {}",
+                rollback.target_version
+            )
+        })?;
+        if current_version == target_version {
+            let _ = outbound.send(rollback_status_message(
+                rollback,
+                UpdateStatus::RollbackSucceeded,
+                Some("rollback target version is already running".to_string()),
+            ));
+            return Ok(PrepareResult::Finished);
+        }
+        if current_version != from_version {
+            bail!(
+                "rollback source mismatch: running {current_version}, instruction expects {from_version}"
+            );
+        }
+        if target_version >= from_version {
+            bail!("rollback target {target_version} must be lower than source {from_version}");
+        }
+
+        let local_baseline = self.local_rollback_package(&rollback.target_version);
+        if rollback.package.is_none() && local_baseline.is_none() {
+            bail!("no matching server package or local rollback baseline is available");
+        }
+        let mut effective =
+            rollback_effective_offer(rollback, rollback.package.as_ref(), local_baseline.as_ref())?;
+        let operation = AttemptOperation::Rollback {
+            attempt_id: rollback.attempt_id.clone(),
+            release_id: rollback.release_id.clone(),
+            from_version: rollback.from_version.clone(),
+            target_version: rollback.target_version.clone(),
+            retry_count: rollback.retry_count,
+        };
+        self.begin_attempt(&effective, operation)?;
+
+        let delay = update_delay_seconds(&self.identity.instance_id, &rollback.attempt_id);
+        self.send_status(
+            &effective,
+            UpdateStatus::Waiting,
+            Some(format!(
+                "rollback will start after a {delay} second spread delay"
+            )),
+            outbound,
+        )?;
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+
+        let package_path = if rollback.package.is_some() {
+            self.send_status(&effective, UpdateStatus::Downloading, None, outbound)?;
+            let server_download = async {
+                let checksum_sha256 = self.download_checksum(&effective).await?;
+                let downloaded = self
+                    .download_to_temporary(
+                        &effective,
+                        PackageType::Standalone,
+                        &format!("rollback-{}", rollback.attempt_id),
+                    )
+                    .await?;
+                self.send_status(&effective, UpdateStatus::Verifying, None, outbound)?;
+                verify_download(
+                    &effective,
+                    PackageType::Standalone,
+                    &downloaded,
+                    &checksum_sha256,
+                )?;
+                replace_file(&downloaded.temporary_path, &downloaded.final_path)?;
+                Result::<PathBuf>::Ok(downloaded.final_path)
+            }
+            .await;
+            match server_download {
+                Ok(path) => path,
+                Err(server_error) => {
+                    let Some(local) = local_baseline else {
+                        return Err(server_error.context("server rollback package failed"));
+                    };
+                    verify_package_at_rest(
+                        &local.path,
+                        local.package_type,
+                        local.size_bytes,
+                        &local.sha256,
+                    )
+                    .context("local rollback baseline verification failed")?;
+                    let local_effective = rollback_effective_offer(rollback, None, Some(&local))?;
+                    self.replace_current_attempt_offer(&effective, &local_effective)?;
+                    effective = local_effective;
+                    self.send_status(
+                        &effective,
+                        UpdateStatus::Verifying,
+                        Some(format!(
+                            "server rollback package failed; using local baseline: {server_error:#}"
+                        )),
+                        outbound,
+                    )?;
+                    local.path
+                }
+            }
+        } else {
+            let local = local_baseline.context("local rollback baseline disappeared")?;
+            self.send_status(
+                &effective,
+                UpdateStatus::Verifying,
+                Some("using locally cached rollback baseline".to_string()),
+                outbound,
+            )?;
+            verify_package_at_rest(
+                &local.path,
+                local.package_type,
+                local.size_bytes,
+                &local.sha256,
+            )?;
+            local.path
+        };
+        self.set_package_path(&effective, package_path)?;
+
+        self.activity.start_draining();
+        let active = self.activity.active_count();
+        if active > 0 {
+            self.send_status(
+                &effective,
+                UpdateStatus::WaitingIdle,
+                Some(format!(
+                    "waiting for {active} active command or terminal session(s)"
+                )),
+                outbound,
+            )?;
+        }
+        self.activity.wait_until_idle().await;
+        Ok(PrepareResult::ReadyToApply { offer: effective })
     }
 
     pub fn launch_prepared_update(&self, offer: &UpdateOffer, outbound: &AgentEventSender) -> bool {
@@ -706,10 +998,7 @@ impl UpdateManager {
             let package_path = state
                 .attempt
                 .as_ref()
-                .filter(|attempt| {
-                    attempt.offer.artifact_id == offer.artifact_id
-                        && attempt.offer.retry_count == offer.retry_count
-                })
+                .filter(|attempt| offer_generation_matches(&attempt.offer, offer))
                 .and_then(|attempt| attempt.package_path.clone())
                 .ok_or_else(|| anyhow!("prepared update package is missing from update state"))?;
             self.spawn_updater(offer, package_path)
@@ -801,10 +1090,107 @@ impl UpdateManager {
         offer.package_type.parse()
     }
 
+    fn validate_rollback_offer(&self, offer: &RollbackOffer) -> Result<()> {
+        if !self.capability.update_privileged {
+            bail!("agent lacks root or administrator privileges required for rollback");
+        }
+        if self.capability.package_type.as_deref() != Some(PackageType::Standalone.as_str()) {
+            bail!("this process is not a managed standalone installation");
+        }
+        if offer.instance_id != self.identity.instance_id {
+            bail!("rollback instruction targets a different agent instance");
+        }
+        for (name, value) in [
+            ("attempt_id", offer.attempt_id.as_str()),
+            ("release_id", offer.release_id.as_str()),
+        ] {
+            if value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                bail!("rollback {name} is invalid");
+            }
+        }
+        if offer.retry_count < 0 {
+            bail!("rollback retry count must not be negative");
+        }
+        Version::parse(&offer.from_version)
+            .with_context(|| format!("invalid rollback source version {}", offer.from_version))?;
+        Version::parse(&offer.target_version)
+            .with_context(|| format!("invalid rollback target version {}", offer.target_version))?;
+        if let Some(package) = &offer.package {
+            self.validate_rollback_package(package)?;
+        }
+        verify_rollback_signature_policy(offer, self.config.server_endpoint()?.is_https())
+    }
+
+    fn validate_rollback_package(&self, package: &RollbackPackage) -> Result<()> {
+        let local_package_type = self
+            .capability
+            .package_type
+            .as_deref()
+            .context("local update package type is unavailable")?;
+        if package.package_type != local_package_type {
+            bail!(
+                "rollback package type mismatch: agent requires {local_package_type}, offer is {}",
+                package.package_type
+            );
+        }
+        let local_arch = self
+            .capability
+            .native_arch
+            .as_deref()
+            .context("local native architecture is unavailable")?;
+        if package.native_arch != local_arch {
+            bail!(
+                "rollback native architecture mismatch: agent requires {local_arch}, offer is {}",
+                package.native_arch
+            );
+        }
+        if package.target_os != standalone_target_os() {
+            bail!(
+                "rollback target operating system mismatch: agent requires {}, offer is {}",
+                standalone_target_os(),
+                package.target_os
+            );
+        }
+        if package.size_bytes <= 0
+            || package.sha256.len() != 64
+            || !package.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("rollback package integrity metadata is invalid");
+        }
+        let expected_download_url = format!(
+            "/api/agent/update/artifacts/{}/download",
+            package.artifact_id
+        );
+        if package.download_url != expected_download_url {
+            bail!("rollback download URL must be an agent update API path");
+        }
+        Ok(())
+    }
+
+    fn local_rollback_package(&self, version: &str) -> Option<CachedPackage> {
+        let state = read_update_state(&self.paths.state_file).ok()?;
+        state.rollback_package.filter(|package| {
+            package.version == version
+                && package.package_type == PackageType::Standalone
+                && self
+                    .capability
+                    .native_arch
+                    .as_deref()
+                    .is_some_and(|arch| arch == package.native_arch)
+                && package.path.is_file()
+        })
+    }
+
     async fn download_to_temporary(
         &self,
         offer: &UpdateOffer,
         package_type: PackageType,
+        component: &str,
     ) -> Result<DownloadedPackage> {
         let expected_size = u64::try_from(offer.size_bytes).context("invalid package size")?;
         let available = available_space(&self.paths.packages).with_context(|| {
@@ -820,7 +1206,7 @@ impl UpdateManager {
             );
         }
 
-        let basename = safe_component(&offer.artifact_id);
+        let basename = safe_component(component);
         let final_path = self
             .paths
             .packages
@@ -916,10 +1302,11 @@ impl UpdateManager {
         parse_checksum_sidecar(contents)
     }
 
-    fn begin_attempt(&self, offer: &UpdateOffer) -> Result<()> {
+    fn begin_attempt(&self, offer: &UpdateOffer, operation: AttemptOperation) -> Result<()> {
         let mut state = read_update_state(&self.paths.state_file)?;
         state.attempt = Some(PersistedAttempt {
             offer: offer.clone(),
+            operation,
             manual: false,
             status: UpdateStatus::Waiting,
             message: None,
@@ -938,19 +1325,37 @@ impl UpdateManager {
         message: Option<String>,
         outbound: &AgentEventSender,
     ) -> Result<()> {
+        self.send_status_for_attempt(Some(offer), status, message, outbound)
+    }
+
+    fn send_status_for_current_attempt(
+        &self,
+        status: UpdateStatus,
+        message: Option<String>,
+        outbound: &AgentEventSender,
+    ) -> Result<()> {
+        self.send_status_for_attempt(None, status, message, outbound)
+    }
+
+    fn send_status_for_attempt(
+        &self,
+        expected: Option<&UpdateOffer>,
+        status: UpdateStatus,
+        message: Option<String>,
+        outbound: &AgentEventSender,
+    ) -> Result<()> {
         let mut state = read_update_state(&self.paths.state_file)?;
         let attempt = state
             .attempt
             .as_mut()
             .filter(|attempt| {
-                attempt.offer.artifact_id == offer.artifact_id
-                    && attempt.offer.retry_count == offer.retry_count
+                expected.is_none_or(|expected| offer_generation_matches(&attempt.offer, expected))
             })
             .ok_or_else(|| {
+                let expected = expected.map(offer_generation_label);
                 anyhow!(
-                    "update attempt {} generation {} is no longer current",
-                    offer.artifact_id,
-                    offer.retry_count
+                    "update attempt {} is no longer current",
+                    expected.as_deref().unwrap_or("current")
                 )
             })?;
         attempt.status = status;
@@ -962,20 +1367,32 @@ impl UpdateManager {
         ) {
             attempt.phase = AttemptPhase::Completed;
         }
+        let outbound_message = attempt_status_message(attempt, status, message);
         write_update_state(&self.paths.state_file, &state)?;
-        let _ = outbound.send(update_status_message(offer, status, message));
+        let _ = outbound.send(outbound_message);
         Ok(())
     }
 
     fn set_package_path(&self, offer: &UpdateOffer, path: PathBuf) -> Result<()> {
-        mutate_attempt(
-            &self.paths.state_file,
-            &offer.artifact_id,
-            offer.retry_count,
-            |attempt| {
-                attempt.package_path = Some(path);
-            },
-        )
+        mutate_attempt(&self.paths.state_file, offer, |attempt| {
+            attempt.package_path = Some(path);
+        })
+    }
+
+    fn replace_current_attempt_offer(
+        &self,
+        previous: &UpdateOffer,
+        replacement: &UpdateOffer,
+    ) -> Result<()> {
+        let mut state = read_update_state(&self.paths.state_file)?;
+        let attempt = state
+            .attempt
+            .as_mut()
+            .filter(|attempt| offer_generation_matches(&attempt.offer, previous))
+            .ok_or_else(|| anyhow!("rollback attempt is no longer current"))?;
+        attempt.offer = replacement.clone();
+        attempt.updated_at = now_ts();
+        write_update_state(&self.paths.state_file, &state)
     }
 
     fn mark_handoff_started(
@@ -988,21 +1405,16 @@ impl UpdateManager {
         let attempt = state
             .attempt
             .as_mut()
-            .filter(|attempt| {
-                attempt.offer.artifact_id == offer.artifact_id
-                    && attempt.offer.retry_count == offer.retry_count
-            })
+            .filter(|attempt| offer_generation_matches(&attempt.offer, offer))
             .ok_or_else(|| anyhow!("prepared update attempt is missing from update state"))?;
         attempt.status = UpdateStatus::AwaitingRestart;
         attempt.message = message.clone();
         attempt.phase = AttemptPhase::Target;
         attempt.updated_at = now_ts();
+        let outbound_message =
+            attempt_status_message(attempt, UpdateStatus::AwaitingRestart, message.clone());
         write_update_state(&self.paths.state_file, &state)?;
-        let _ = outbound.send(update_status_message(
-            offer,
-            UpdateStatus::AwaitingRestart,
-            message,
-        ));
+        let _ = outbound.send(outbound_message);
         Ok(())
     }
 
@@ -1021,11 +1433,14 @@ impl UpdateManager {
         let mut previous_package = state
             .attempt
             .as_ref()
-            .filter(|attempt| {
-                attempt.offer.artifact_id == offer.artifact_id
-                    && attempt.offer.retry_count == offer.retry_count
-            })
+            .filter(|attempt| offer_generation_matches(&attempt.offer, offer))
             .and_then(|attempt| attempt.previous_package.clone());
+        let operation = state
+            .attempt
+            .as_ref()
+            .filter(|attempt| offer_generation_matches(&attempt.offer, offer))
+            .map(|attempt| attempt.operation.clone())
+            .ok_or_else(|| anyhow!("prepared update attempt is missing from update state"))?;
         if previous_package.is_none()
             && offer.package_type == PackageType::Standalone.as_str()
             && installed_executable.is_file()
@@ -1050,17 +1465,13 @@ impl UpdateManager {
             });
         }
         if let Some(attempt) = &mut state.attempt
-            && attempt.offer.artifact_id == offer.artifact_id
-            && attempt.offer.retry_count == offer.retry_count
+            && offer_generation_matches(&attempt.offer, offer)
             && attempt.previous_package.is_none()
         {
             attempt.previous_package = previous_package.clone();
             write_update_state(&self.paths.state_file, &state)?;
         }
-        let component = safe_component(&format!(
-            "{}-retry-{}",
-            offer.artifact_id, offer.retry_count
-        ));
+        let component = safe_component(&offer_storage_component(offer));
         let plan_path = self.paths.root.join(format!("apply-{component}.json"));
         let executable_suffix = std::env::consts::EXE_SUFFIX;
         let updater_path = self
@@ -1069,6 +1480,7 @@ impl UpdateManager {
             .join(format!("updater-{component}{executable_suffix}"));
         let plan = ApplyPlan {
             offer: offer.clone(),
+            operation,
             package_path,
             previous_package,
             state_file: self.paths.state_file.clone(),
@@ -1160,6 +1572,34 @@ fn safe_component(value: &str) -> String {
     }
 }
 
+fn same_offer_attempt(left: &UpdateOffer, right: &UpdateOffer) -> bool {
+    match (&left.attempt_id, &right.attempt_id) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => left.artifact_id == right.artifact_id,
+        _ => false,
+    }
+}
+
+fn offer_generation_matches(left: &UpdateOffer, right: &UpdateOffer) -> bool {
+    same_offer_attempt(left, right) && left.retry_count == right.retry_count
+}
+
+fn offer_generation_label(offer: &UpdateOffer) -> String {
+    format!(
+        "{} generation {}",
+        offer.attempt_id.as_deref().unwrap_or(&offer.artifact_id),
+        offer.retry_count
+    )
+}
+
+fn offer_storage_component(offer: &UpdateOffer) -> String {
+    format!(
+        "{}-retry-{}",
+        offer.attempt_id.as_deref().unwrap_or(&offer.artifact_id),
+        offer.retry_count
+    )
+}
+
 async fn secure_new_file(path: &Path) -> Result<tokio::fs::File> {
     let mut options = tokio::fs::OpenOptions::new();
     options.create_new(true).write(true);
@@ -1223,6 +1663,7 @@ fn update_status_message(
     message: Option<String>,
 ) -> AgentInbound {
     AgentInbound::UpdateStatus {
+        attempt_id: offer.attempt_id.clone(),
         release_id: offer.release_id.clone(),
         artifact_id: offer.artifact_id.clone(),
         version: offer.version.clone(),
@@ -1232,19 +1673,144 @@ fn update_status_message(
     }
 }
 
+fn rollback_status_message(
+    offer: &RollbackOffer,
+    status: UpdateStatus,
+    message: Option<String>,
+) -> AgentInbound {
+    AgentInbound::RollbackStatus {
+        attempt_id: offer.attempt_id.clone(),
+        retry_count: offer.retry_count,
+        status,
+        message,
+    }
+}
+
+fn attempt_status_message(
+    attempt: &PersistedAttempt,
+    status: UpdateStatus,
+    message: Option<String>,
+) -> AgentInbound {
+    match &attempt.operation {
+        AttemptOperation::Upgrade => update_status_message(&attempt.offer, status, message),
+        AttemptOperation::Rollback {
+            attempt_id,
+            retry_count,
+            ..
+        } => AgentInbound::RollbackStatus {
+            attempt_id: attempt_id.clone(),
+            retry_count: *retry_count,
+            status,
+            message,
+        },
+    }
+}
+
+fn target_success_status(operation: &AttemptOperation) -> UpdateStatus {
+    match operation {
+        AttemptOperation::Upgrade => UpdateStatus::Succeeded,
+        AttemptOperation::Rollback { .. } => UpdateStatus::RollbackSucceeded,
+    }
+}
+
+fn restored_previous_status(operation: &AttemptOperation) -> UpdateStatus {
+    match operation {
+        AttemptOperation::Upgrade => UpdateStatus::RollbackSucceeded,
+        AttemptOperation::Rollback { .. } => UpdateStatus::Failed,
+    }
+}
+
+fn cached_package_from_attempt(attempt: &PersistedAttempt) -> Result<CachedPackage> {
+    let package_type: PackageType = attempt.offer.package_type.parse()?;
+    let package_path = attempt
+        .package_path
+        .clone()
+        .ok_or_else(|| anyhow!("installed update package is missing from state"))?;
+    Ok(CachedPackage {
+        artifact_id: attempt.offer.artifact_id.clone(),
+        version: attempt.offer.version.clone(),
+        package_type,
+        native_arch: attempt.offer.native_arch.clone(),
+        path: package_path,
+        retry_count: attempt.offer.retry_count,
+        size_bytes: u64::try_from(attempt.offer.size_bytes)
+            .context("invalid installed package size")?,
+        sha256: attempt.offer.sha256.clone(),
+    })
+}
+
+fn rotate_successful_package_state(
+    state: &mut UpdateState,
+    attempt: &PersistedAttempt,
+) -> Result<Option<PathBuf>> {
+    let target = cached_package_from_attempt(attempt)?;
+    let next_baseline = attempt.previous_package.clone();
+    let stale = state
+        .rollback_package
+        .as_ref()
+        .map(|package| package.path.clone())
+        .filter(|path| path != &target.path)
+        .filter(|path| {
+            next_baseline
+                .as_ref()
+                .is_none_or(|package| path != &package.path)
+        });
+    state.current_package = Some(target);
+    state.rollback_package = next_baseline;
+    Ok(stale)
+}
+
+fn rollback_effective_offer(
+    rollback: &RollbackOffer,
+    server_package: Option<&RollbackPackage>,
+    local_package: Option<&CachedPackage>,
+) -> Result<UpdateOffer> {
+    if let Some(package) = server_package {
+        return Ok(UpdateOffer {
+            attempt_id: Some(rollback.attempt_id.clone()),
+            release_id: rollback.release_id.clone(),
+            version: rollback.target_version.clone(),
+            artifact_id: package.artifact_id.clone(),
+            download_url: package.download_url.clone(),
+            sha256: package.sha256.clone(),
+            size_bytes: package.size_bytes,
+            package_type: package.package_type.clone(),
+            native_arch: package.native_arch.clone(),
+            target_os: Some(package.target_os.clone()),
+            signature_key_id: None,
+            signature: None,
+            retry_count: rollback.retry_count,
+        });
+    }
+    let package = local_package.context("local rollback package is unavailable")?;
+    Ok(UpdateOffer {
+        attempt_id: Some(rollback.attempt_id.clone()),
+        release_id: rollback.release_id.clone(),
+        version: rollback.target_version.clone(),
+        artifact_id: package.artifact_id.clone(),
+        download_url: format!("local://{}", package.path.display()),
+        sha256: package.sha256.clone(),
+        size_bytes: i64::try_from(package.size_bytes)
+            .context("local rollback package is too large")?,
+        package_type: package.package_type.as_str().to_string(),
+        native_arch: package.native_arch.clone(),
+        target_os: Some(standalone_target_os().to_string()),
+        signature_key_id: None,
+        signature: None,
+        retry_count: rollback.retry_count,
+    })
+}
+
 fn mutate_attempt(
     state_file: &Path,
-    artifact_id: &str,
-    retry_count: i64,
+    expected: &UpdateOffer,
     mutate: impl FnOnce(&mut PersistedAttempt),
 ) -> Result<()> {
     let mut state = read_update_state(state_file)?;
     let attempt = state
         .attempt
         .as_mut()
-        .filter(|attempt| {
-            attempt.offer.artifact_id == artifact_id && attempt.offer.retry_count == retry_count
-        })
+        .filter(|attempt| offer_generation_matches(&attempt.offer, expected))
         .ok_or_else(|| anyhow!("update attempt is no longer current"))?;
     mutate(attempt);
     attempt.updated_at = now_ts();
@@ -1550,10 +2116,10 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
 
 fn ensure_plan_generation_is_current(plan: &ApplyPlan) -> Result<()> {
     let state = read_update_state(&plan.state_file)?;
-    let current = state.attempt.as_ref().is_some_and(|attempt| {
-        attempt.offer.artifact_id == plan.offer.artifact_id
-            && attempt.offer.retry_count == plan.offer.retry_count
-    });
+    let current = state
+        .attempt
+        .as_ref()
+        .is_some_and(|attempt| offer_generation_matches(&attempt.offer, &plan.offer));
     if !current {
         bail!(
             "update plan {} generation {} is stale",
@@ -1567,8 +2133,7 @@ fn ensure_plan_generation_is_current(plan: &ApplyPlan) -> Result<()> {
 fn ensure_plan_handoff_is_active(plan: &ApplyPlan) -> Result<()> {
     let state = read_update_state(&plan.state_file)?;
     let active = state.attempt.as_ref().is_some_and(|attempt| {
-        attempt.offer.artifact_id == plan.offer.artifact_id
-            && attempt.offer.retry_count == plan.offer.retry_count
+        offer_generation_matches(&attempt.offer, &plan.offer)
             && attempt.phase == AttemptPhase::Target
             && matches!(
                 attempt.status,
@@ -1651,63 +2216,73 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
     }
 
     let _ = fs::remove_file(&plan.package_path);
+    let final_status = restored_previous_status(&plan.operation);
+    let final_message = match &plan.operation {
+        AttemptOperation::Upgrade => reason,
+        AttemptOperation::Rollback { .. } => format!(
+            "rollback target failed; restored agent {}: {reason}",
+            previous.version
+        ),
+    };
     persist_apply_status(
         plan,
-        UpdateStatus::RollbackSucceeded,
+        final_status,
         AttemptPhase::Completed,
-        Some(reason),
+        Some(final_message),
     )?;
-    crate::logging::info(format_args!(
-        "agent rollback to {} succeeded",
-        previous.version
-    ));
-    Ok(())
+    if matches!(&plan.operation, AttemptOperation::Upgrade) {
+        crate::logging::info(format_args!(
+            "agent rollback to {} succeeded",
+            previous.version
+        ));
+        Ok(())
+    } else {
+        bail!(
+            "rollback target failed and agent {} was restored",
+            previous.version
+        )
+    }
 }
 
 fn complete_target_update(plan: &ApplyPlan, package_type: PackageType) -> Result<()> {
     let mut state = read_update_state(&plan.state_file)?;
-    let previous_path = plan
-        .previous_package
+    let plan_is_current = state
+        .attempt
         .as_ref()
-        .map(|value| value.path.clone());
-    let target_already_cached = state.current_package.as_ref().is_some_and(|package| {
-        package.artifact_id == plan.offer.artifact_id
-            && package.retry_count == plan.offer.retry_count
-    });
-    let plan_is_current = state.attempt.as_ref().is_some_and(|attempt| {
-        attempt.offer.artifact_id == plan.offer.artifact_id
-            && attempt.offer.retry_count == plan.offer.retry_count
-    });
-    if !target_already_cached && !plan_is_current {
+        .is_some_and(|attempt| offer_generation_matches(&attempt.offer, &plan.offer));
+    if !plan_is_current {
         return Ok(());
     }
-    if !target_already_cached {
-        state.current_package = Some(CachedPackage {
-            artifact_id: plan.offer.artifact_id.clone(),
-            version: plan.offer.version.clone(),
-            package_type,
-            native_arch: plan.offer.native_arch.clone(),
-            path: plan.package_path.clone(),
-            retry_count: plan.offer.retry_count,
-            size_bytes: u64::try_from(plan.offer.size_bytes)
-                .context("invalid installed package size")?,
-            sha256: plan.offer.sha256.clone(),
+    let attempt = state
+        .attempt
+        .as_ref()
+        .cloned()
+        .context("current update attempt disappeared")?;
+    let mut target = cached_package_from_attempt(&attempt)?;
+    target.package_type = package_type;
+    let stale = state
+        .rollback_package
+        .as_ref()
+        .map(|package| package.path.clone())
+        .filter(|path| path != &target.path)
+        .filter(|path| {
+            plan.previous_package
+                .as_ref()
+                .is_none_or(|package| path != &package.path)
         });
-        if let Some(attempt) = &mut state.attempt
-            && attempt.offer.artifact_id == plan.offer.artifact_id
-            && attempt.offer.retry_count == plan.offer.retry_count
-        {
-            attempt.status = UpdateStatus::Succeeded;
-            attempt.message = None;
-            attempt.phase = AttemptPhase::Completed;
-            attempt.updated_at = now_ts();
+    state.current_package = Some(target);
+    state.rollback_package = plan.previous_package.clone();
+    if let Some(current_attempt) = &mut state.attempt {
+        current_attempt.status = target_success_status(&plan.operation);
+        if matches!(&plan.operation, AttemptOperation::Upgrade) {
+            current_attempt.message = None;
         }
-        write_update_state(&plan.state_file, &state)?;
+        current_attempt.phase = AttemptPhase::Completed;
+        current_attempt.updated_at = now_ts();
     }
-    if let Some(previous_path) = previous_path
-        && previous_path != plan.package_path
-    {
-        let _ = fs::remove_file(previous_path);
+    write_update_state(&plan.state_file, &state)?;
+    if let Some(path) = stale {
+        let _ = fs::remove_file(path);
     }
     Ok(())
 }
@@ -1719,18 +2294,30 @@ fn persist_apply_status(
     message: Option<String>,
 ) -> Result<()> {
     let mut state = read_update_state(&plan.state_file)?;
-    let Some(attempt) = state.attempt.as_mut().filter(|attempt| {
-        attempt.offer.artifact_id == plan.offer.artifact_id
-            && attempt.offer.retry_count == plan.offer.retry_count
-    }) else {
+    let Some(attempt) = state
+        .attempt
+        .as_mut()
+        .filter(|attempt| offer_generation_matches(&attempt.offer, &plan.offer))
+    else {
         return Ok(());
     };
     let finalized_for_same_phase = attempt.phase == AttemptPhase::Completed
         && matches!(
             (attempt.status, phase),
             (UpdateStatus::Succeeded, AttemptPhase::Target)
+                | (UpdateStatus::RollbackSucceeded, AttemptPhase::Target)
                 | (UpdateStatus::RollbackSucceeded, AttemptPhase::Rollback)
+                | (UpdateStatus::Failed, AttemptPhase::Rollback)
         );
+    if attempt.phase == AttemptPhase::Completed
+        && matches!(
+            attempt.status,
+            UpdateStatus::Succeeded | UpdateStatus::RollbackSucceeded | UpdateStatus::Failed
+        )
+        && attempt.status == status
+    {
+        return Ok(());
+    }
     if finalized_for_same_phase
         && !matches!(
             status,
@@ -2082,6 +2669,31 @@ fn verify_update_signature_policy(offer: &UpdateOffer, server_is_https: bool) ->
     )
 }
 
+fn verify_rollback_signature_policy(offer: &RollbackOffer, server_is_https: bool) -> Result<()> {
+    let embedded_key = embedded_update_verifying_key()?;
+    verify_rollback_signature_policy_with_key(
+        offer,
+        server_is_https,
+        embedded_key
+            .as_ref()
+            .map(|(key_id, key)| (key_id.as_str(), key)),
+    )
+}
+
+fn verify_rollback_signature_policy_with_key(
+    offer: &RollbackOffer,
+    server_is_https: bool,
+    embedded_key: Option<(&str, &VerifyingKey)>,
+) -> Result<()> {
+    match embedded_key {
+        Some((key_id, verifying_key)) => verify_rollback_signature(offer, key_id, verifying_key),
+        None if server_is_https => Ok(()),
+        None => bail!(
+            "automatic rollback over HTTP requires an Ed25519 public key embedded with OM_UPDATE_PUBLIC_KEY"
+        ),
+    }
+}
+
 fn verify_update_signature_policy_with_key(
     offer: &UpdateOffer,
     server_is_https: bool,
@@ -2145,6 +2757,33 @@ fn verify_update_signature(
         .context("update signature verification failed")
 }
 
+fn verify_rollback_signature(
+    offer: &RollbackOffer,
+    expected_key_id: &str,
+    verifying_key: &VerifyingKey,
+) -> Result<()> {
+    let key_id = offer
+        .signature_key_id
+        .as_deref()
+        .context("signed rollback offer is missing signature_key_id")?;
+    if !valid_signature_key_id(key_id) || key_id != expected_key_id {
+        bail!("rollback signature key ID is not trusted");
+    }
+    let encoded_signature = offer
+        .signature
+        .as_deref()
+        .context("signed rollback offer is missing signature")?;
+    let signature_bytes = BASE64_STANDARD
+        .decode(encoded_signature)
+        .context("rollback signature is not valid Base64")?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .context("rollback signature must decode to 64 bytes")?;
+    let payload = rollback_signature_payload(offer)?;
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .context("rollback signature verification failed")
+}
+
 fn valid_signature_key_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -2180,6 +2819,61 @@ fn update_signature_payload(offer: &UpdateOffer) -> Result<String> {
         offer.native_arch,
         offer.size_bytes,
         offer.sha256.to_ascii_lowercase(),
+    ))
+}
+
+fn rollback_signature_payload(offer: &RollbackOffer) -> Result<String> {
+    let (artifact_id, target_os, package_type, native_arch, size_bytes, sha256) = offer
+        .package
+        .as_ref()
+        .map(|package| {
+            (
+                package.artifact_id.as_str(),
+                package.target_os.as_str(),
+                package.package_type.as_str(),
+                package.native_arch.as_str(),
+                package.size_bytes,
+                package.sha256.as_str(),
+            )
+        })
+        .unwrap_or(("", "", "", "", 0, ""));
+    for (name, value) in [
+        ("attempt_id", offer.attempt_id.as_str()),
+        ("release_id", offer.release_id.as_str()),
+        ("instance_id", offer.instance_id.as_str()),
+        ("from_version", offer.from_version.as_str()),
+        ("target_version", offer.target_version.as_str()),
+        ("artifact_id", artifact_id),
+        ("target_os", target_os),
+        ("package_type", package_type),
+        ("native_arch", native_arch),
+        ("sha256", sha256),
+    ] {
+        if value
+            .bytes()
+            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+        {
+            bail!("rollback signature field {name} is invalid");
+        }
+    }
+    if offer.attempt_id.is_empty()
+        || offer.release_id.is_empty()
+        || offer.instance_id.is_empty()
+        || offer.from_version.is_empty()
+        || offer.target_version.is_empty()
+        || offer.retry_count < 0
+    {
+        bail!("rollback signature fields are incomplete");
+    }
+    Ok(format!(
+        "{ROLLBACK_SIGNATURE_DOMAIN}\nattempt_id={}\nrelease_id={}\ninstance_id={}\nfrom_version={}\ntarget_version={}\nretry_count={}\nartifact_id={artifact_id}\ntarget_os={target_os}\npackage_type={package_type}\nnative_arch={native_arch}\nsize_bytes={size_bytes}\nsha256={}\n",
+        offer.attempt_id,
+        offer.release_id,
+        offer.instance_id,
+        offer.from_version,
+        offer.target_version,
+        offer.retry_count,
+        sha256.to_ascii_lowercase(),
     ))
 }
 
@@ -2649,6 +3343,7 @@ mod tests {
     fn signed_test_offer() -> (UpdateOffer, SigningKey) {
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let mut offer = UpdateOffer {
+            attempt_id: None,
             release_id: "release-signed".to_string(),
             version: "1.2.3".to_string(),
             artifact_id: "artifact-signed".to_string(),
@@ -2663,6 +3358,33 @@ mod tests {
             retry_count: 0,
         };
         let payload = update_signature_payload(&offer).unwrap();
+        offer.signature =
+            Some(BASE64_STANDARD.encode(signing_key.sign(payload.as_bytes()).to_bytes()));
+        (offer, signing_key)
+    }
+
+    fn signed_test_rollback_offer() -> (RollbackOffer, SigningKey) {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let mut offer = RollbackOffer {
+            attempt_id: "rollback-attempt-1".to_string(),
+            release_id: "release-rollback".to_string(),
+            instance_id: "instance-rollback".to_string(),
+            from_version: "2.0.0".to_string(),
+            target_version: "1.2.3".to_string(),
+            retry_count: 3,
+            package: Some(RollbackPackage {
+                artifact_id: "artifact-baseline".to_string(),
+                download_url: "/api/agent/update/artifacts/artifact-baseline/download".to_string(),
+                sha256: "A".repeat(64),
+                size_bytes: 42,
+                package_type: "standalone".to_string(),
+                native_arch: standalone_native_arch(),
+                target_os: standalone_target_os().to_string(),
+            }),
+            signature_key_id: Some("release-v1".to_string()),
+            signature: None,
+        };
+        let payload = rollback_signature_payload(&offer).unwrap();
         offer.signature =
             Some(BASE64_STANDARD.encode(signing_key.sign(payload.as_bytes()).to_bytes()));
         (offer, signing_key)
@@ -2754,6 +3476,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verifies_domain_separated_rollback_signatures() {
+        let (offer, signing_key) = signed_test_rollback_offer();
+        assert_eq!(
+            rollback_signature_payload(&offer).unwrap(),
+            format!(
+                "operation-monitoring-agent-rollback-v1\nattempt_id=rollback-attempt-1\nrelease_id=release-rollback\ninstance_id=instance-rollback\nfrom_version=2.0.0\ntarget_version=1.2.3\nretry_count=3\nartifact_id=artifact-baseline\ntarget_os={}\npackage_type=standalone\nnative_arch={}\nsize_bytes=42\nsha256={}\n",
+                standalone_target_os(),
+                standalone_native_arch(),
+                "a".repeat(64),
+            )
+        );
+        verify_rollback_signature(&offer, "release-v1", &signing_key.verifying_key()).unwrap();
+        assert!(
+            verify_rollback_signature_policy_with_key(
+                &offer,
+                false,
+                Some(("release-v1", &signing_key.verifying_key())),
+            )
+            .is_ok()
+        );
+
+        let mut tampered = offer.clone();
+        tampered.instance_id = "other-instance".to_string();
+        assert!(
+            verify_rollback_signature(&tampered, "release-v1", &signing_key.verifying_key())
+                .is_err()
+        );
+
+        let (update_offer, _) = signed_test_offer();
+        let mut wrong_domain = offer.clone();
+        wrong_domain.signature = update_offer.signature;
+        assert!(
+            verify_rollback_signature(&wrong_domain, "release-v1", &signing_key.verifying_key())
+                .is_err()
+        );
+
+        let mut unsigned = offer;
+        unsigned.signature = None;
+        assert!(
+            verify_rollback_signature_policy_with_key(
+                &unsigned,
+                true,
+                Some(("release-v1", &signing_key.verifying_key())),
+            )
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn rejects_invalid_offers_before_persisting_update_state() {
         let directory =
@@ -2813,6 +3584,71 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
+    #[tokio::test]
+    async fn rejects_downgrade_through_a_normal_update_offer() {
+        let directory =
+            std::env::temp_dir().join(format!("om-update-downgrade-{}", uuid::Uuid::new_v4()));
+        let config = AgentConfig {
+            server: "https://monitor.example".to_string(),
+            identity_file: None,
+            report_interval: 5,
+            state_dir: None,
+            log_file: None,
+            log_max_bytes: 10 * 1024 * 1024,
+            log_history: 3,
+            update_dir: Some(directory.clone()),
+        };
+        let paths = UpdatePaths::from_config(&config).unwrap();
+        paths.prepare().unwrap();
+        let manager = UpdateManager {
+            config,
+            identity: Identity {
+                instance_id: "downgrade-test".to_string(),
+                secret: "secret-test".to_string(),
+                credential_version: 1,
+                previous_secret: None,
+            },
+            client: Client::new(),
+            activity: ActivityTracker::default(),
+            capability: UpdateCapability {
+                package_type: Some("standalone".to_string()),
+                native_arch: Some(standalone_native_arch()),
+                update_privileged: true,
+            },
+            paths,
+        };
+        let offer = UpdateOffer {
+            attempt_id: Some("downgrade-attempt".to_string()),
+            release_id: "release-downgrade".to_string(),
+            version: "0.0.0".to_string(),
+            artifact_id: "artifact-downgrade".to_string(),
+            download_url: "/api/agent/update/artifacts/artifact-downgrade/download".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 42,
+            package_type: "standalone".to_string(),
+            native_arch: standalone_native_arch(),
+            target_os: Some(standalone_target_os().to_string()),
+            signature_key_id: None,
+            signature: None,
+            retry_count: 0,
+        };
+        let (outbound, mut events, _failed) = AgentEventSender::channel(4);
+
+        assert!(matches!(
+            manager.prepare(offer, outbound).await,
+            PrepareResult::Finished
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentInbound::UpdateStatus {
+                status: UpdateStatus::Failed,
+                message: Some(message),
+                ..
+            }) if message.contains("refusing automatic downgrade")
+        ));
+        let _ = fs::remove_dir_all(directory);
+    }
+
     #[test]
     fn parses_forced_update_package_versions() {
         assert_eq!(
@@ -2837,6 +3673,7 @@ mod tests {
         fs::write(&path, package).unwrap();
         let digest = format!("{:x}", Sha256::digest(package));
         let offer = UpdateOffer {
+            attempt_id: None,
             release_id: "release-checksum".to_string(),
             version: "9.9.9".to_string(),
             artifact_id: "artifact-checksum".to_string(),
@@ -2911,6 +3748,7 @@ mod tests {
             paths: paths.clone(),
         };
         let offer = UpdateOffer {
+            attempt_id: None,
             release_id: "release-handoff".to_string(),
             version: "9.9.9".to_string(),
             artifact_id: "artifact-handoff".to_string(),
@@ -2939,8 +3777,10 @@ mod tests {
             &UpdateState {
                 schema_version: UPDATE_SCHEMA_VERSION,
                 current_package: Some(previous.clone()),
+                rollback_package: None,
                 attempt: Some(PersistedAttempt {
                     offer: offer.clone(),
+                    operation: AttemptOperation::Upgrade,
                     manual: false,
                     status: UpdateStatus::Verifying,
                     message: None,
@@ -3121,6 +3961,7 @@ mod tests {
         fs::write(&source, b"replacement-agent").unwrap();
         let plan = ApplyPlan {
             offer: UpdateOffer {
+                attempt_id: None,
                 release_id: "manual-release".to_string(),
                 version: "9.9.9".to_string(),
                 artifact_id: "manual-artifact".to_string(),
@@ -3135,6 +3976,7 @@ mod tests {
                 retry_count: 0,
             },
             package_path: source.clone(),
+            operation: AttemptOperation::Upgrade,
             previous_package: None,
             state_file: directory.join("state.json"),
             health_file: directory.join("health.json"),
@@ -3173,6 +4015,7 @@ mod tests {
             sha256: "b".repeat(64),
         };
         let old_offer = UpdateOffer {
+            attempt_id: Some("attempt-old".to_string()),
             release_id: "release-target".to_string(),
             version: "1.0.0".to_string(),
             artifact_id: "artifact-target".to_string(),
@@ -3187,14 +4030,16 @@ mod tests {
             retry_count: 0,
         };
         let mut new_offer = old_offer.clone();
-        new_offer.retry_count = 1;
+        new_offer.attempt_id = Some("attempt-new".to_string());
         write_update_state(
             &state_file,
             &UpdateState {
                 schema_version: UPDATE_SCHEMA_VERSION,
                 current_package: Some(previous.clone()),
+                rollback_package: None,
                 attempt: Some(PersistedAttempt {
                     offer: new_offer,
+                    operation: AttemptOperation::Upgrade,
                     manual: false,
                     status: UpdateStatus::Waiting,
                     message: None,
@@ -3208,6 +4053,7 @@ mod tests {
         .unwrap();
         let old_plan = ApplyPlan {
             offer: old_offer,
+            operation: AttemptOperation::Upgrade,
             package_path: target_path,
             previous_package: Some(previous),
             state_file: state_file.clone(),
@@ -3240,7 +4086,10 @@ mod tests {
         complete_target_update(&old_plan, PackageType::Standalone).unwrap();
 
         let state = read_update_state(&state_file).unwrap();
-        assert_eq!(state.attempt.unwrap().offer.retry_count, 1);
+        assert_eq!(
+            state.attempt.unwrap().offer.attempt_id.as_deref(),
+            Some("attempt-new")
+        );
         assert_eq!(
             state.current_package.unwrap().artifact_id,
             "artifact-previous"
@@ -3344,6 +4193,7 @@ mod tests {
             sha256: "b".repeat(64),
         };
         let offer = UpdateOffer {
+            attempt_id: None,
             release_id: "release-target".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             artifact_id: "artifact-target".to_string(),
@@ -3362,8 +4212,10 @@ mod tests {
             &UpdateState {
                 schema_version: UPDATE_SCHEMA_VERSION,
                 current_package: Some(previous.clone()),
+                rollback_package: None,
                 attempt: Some(PersistedAttempt {
                     offer: offer.clone(),
+                    operation: AttemptOperation::Upgrade,
                     manual: false,
                     status: UpdateStatus::AwaitingRestart,
                     message: Some("waiting for restart".to_string()),
@@ -3431,6 +4283,7 @@ mod tests {
         next_offer.version = "9.9.9".to_string();
         next_state.attempt = Some(PersistedAttempt {
             offer: next_offer,
+            operation: AttemptOperation::Upgrade,
             manual: false,
             status: UpdateStatus::Waiting,
             message: None,
@@ -3443,6 +4296,7 @@ mod tests {
 
         let plan = ApplyPlan {
             offer,
+            operation: AttemptOperation::Upgrade,
             package_path: target_path,
             previous_package: Some(previous),
             state_file: paths.state_file.clone(),
@@ -3454,7 +4308,7 @@ mod tests {
             installed_executable: None,
         };
         complete_target_update(&plan, PackageType::Standalone).unwrap();
-        assert!(!previous_path.exists());
+        assert!(previous_path.exists());
         assert_eq!(
             read_update_state(&paths.state_file)
                 .unwrap()
@@ -3463,6 +4317,150 @@ mod tests {
                 .map(|attempt| attempt.offer.artifact_id.as_str()),
             Some("artifact-next")
         );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn rollback_restart_recovers_status_and_rotates_one_baseline_generation() {
+        let directory =
+            std::env::temp_dir().join(format!("om-rollback-restart-{}", uuid::Uuid::new_v4()));
+        let config = AgentConfig {
+            server: "http://127.0.0.1:13500".to_string(),
+            identity_file: None,
+            report_interval: 5,
+            state_dir: None,
+            log_file: None,
+            log_max_bytes: 10 * 1024 * 1024,
+            log_history: 3,
+            update_dir: Some(directory.clone()),
+        };
+        let paths = UpdatePaths::from_config(&config).unwrap();
+        paths.prepare().unwrap();
+        let manager = UpdateManager {
+            config,
+            identity: Identity {
+                instance_id: "instance-rollback".to_string(),
+                secret: "secret-rollback".to_string(),
+                credential_version: 1,
+                previous_secret: None,
+            },
+            client: Client::new(),
+            activity: ActivityTracker::default(),
+            capability: UpdateCapability {
+                package_type: Some("standalone".to_string()),
+                native_arch: Some(standalone_native_arch()),
+                update_privileged: true,
+            },
+            paths: paths.clone(),
+        };
+        let source_path = paths.packages.join("source.standalone");
+        let target_path = paths.packages.join("target.standalone");
+        let stale_path = paths.packages.join("stale.standalone");
+        fs::write(&source_path, b"source").unwrap();
+        fs::write(&target_path, b"target").unwrap();
+        fs::write(&stale_path, b"stale").unwrap();
+        let source = CachedPackage {
+            artifact_id: "artifact-source".to_string(),
+            version: "9.9.9".to_string(),
+            package_type: PackageType::Standalone,
+            native_arch: standalone_native_arch(),
+            path: source_path.clone(),
+            retry_count: 0,
+            size_bytes: 6,
+            sha256: "b".repeat(64),
+        };
+        let stale = CachedPackage {
+            artifact_id: "artifact-stale".to_string(),
+            version: "0.0.1".to_string(),
+            package_type: PackageType::Standalone,
+            native_arch: standalone_native_arch(),
+            path: stale_path.clone(),
+            retry_count: 0,
+            size_bytes: 5,
+            sha256: "c".repeat(64),
+        };
+        let offer = UpdateOffer {
+            attempt_id: Some("rollback-attempt-1".to_string()),
+            release_id: "release-rollback".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            artifact_id: "artifact-target".to_string(),
+            download_url: "local://target.standalone".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 6,
+            package_type: "standalone".to_string(),
+            native_arch: standalone_native_arch(),
+            target_os: Some(standalone_target_os().to_string()),
+            signature_key_id: None,
+            signature: None,
+            retry_count: 2,
+        };
+        write_update_state(
+            &paths.state_file,
+            &UpdateState {
+                schema_version: UPDATE_SCHEMA_VERSION,
+                current_package: Some(source.clone()),
+                rollback_package: Some(stale),
+                attempt: Some(PersistedAttempt {
+                    offer: offer.clone(),
+                    operation: AttemptOperation::Rollback {
+                        attempt_id: "rollback-attempt-1".to_string(),
+                        release_id: "release-rollback".to_string(),
+                        from_version: "9.9.9".to_string(),
+                        target_version: env!("CARGO_PKG_VERSION").to_string(),
+                        retry_count: 2,
+                    },
+                    manual: false,
+                    status: UpdateStatus::AwaitingRestart,
+                    message: Some("rollback target installed".to_string()),
+                    package_path: Some(target_path.clone()),
+                    previous_package: Some(source.clone()),
+                    phase: AttemptPhase::Target,
+                    updated_at: now_ts(),
+                }),
+            },
+        )
+        .unwrap();
+
+        let status = manager.connected_status().unwrap().unwrap();
+        assert!(matches!(
+            status,
+            AgentInbound::RollbackStatus {
+                attempt_id,
+                retry_count: 2,
+                status: UpdateStatus::RollbackSucceeded,
+                message: Some(message),
+            } if attempt_id == "rollback-attempt-1" && message == "rollback target installed"
+        ));
+        let state = read_update_state(&paths.state_file).unwrap();
+        assert_eq!(
+            state.current_package.as_ref().map(|package| &package.path),
+            Some(&target_path)
+        );
+        assert_eq!(
+            state.rollback_package.as_ref().map(|package| &package.path),
+            Some(&source_path)
+        );
+        assert!(matches!(
+            state.attempt,
+            Some(PersistedAttempt {
+                operation: AttemptOperation::Rollback { .. },
+                status: UpdateStatus::RollbackSucceeded,
+                phase: AttemptPhase::Completed,
+                ..
+            })
+        ));
+        assert!(target_path.exists());
+        assert!(source_path.exists());
+        assert!(!stale_path.exists());
+
+        assert!(matches!(
+            manager.connected_status().unwrap(),
+            Some(AgentInbound::RollbackStatus {
+                status: UpdateStatus::RollbackSucceeded,
+                ..
+            })
+        ));
+        assert!(!stale_path.exists());
         let _ = fs::remove_dir_all(directory);
     }
 

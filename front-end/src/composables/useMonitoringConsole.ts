@@ -9,6 +9,7 @@ import type {
   AgentArtifactUploadResult,
   AgentRelease,
   AgentReleaseForm,
+  AgentRolloutCandidate,
   AgentUpdateAttempt,
   AdminUser,
   AdminUsersResponse,
@@ -33,7 +34,20 @@ type TrafficSnapshot = {
   capturedAt: number
 }
 
-type AgentUpdateOperation = 'creating' | 'saving' | 'uploading' | 'publishing' | 'deleting' | 'retrying' | null
+type AgentUpdateOperation =
+  | 'creating'
+  | 'saving'
+  | 'uploading'
+  | 'publishing'
+  | 'deleting'
+  | 'retrying'
+  | 'targeting'
+  | 'pausing'
+  | 'resuming'
+  | 'promoting'
+  | 'rolling_back'
+  | 'reupgrading'
+  | null
 
 const COMMAND_JOB_POLL_INTERVAL_MS = 750
 const COMMAND_JOB_POLL_RETRY_MS = 2000
@@ -56,6 +70,8 @@ export function useMonitoringConsole() {
   const logs = ref<ActionLog[]>([])
   const agentReleases = ref<AgentRelease[]>([])
   const agentUpdateAttempts = ref<AgentUpdateAttempt[]>([])
+  const agentRolloutCandidates = ref<Record<string, AgentRolloutCandidate[]>>({})
+  const agentRolloutCandidatesLoading = ref('')
   const adminUsers = ref<AdminUser[]>([])
   const authEnrollments = ref<PendingAuthEnrollment[]>([])
   const activeAuthEnrollment = ref<AuthEnrollment | null>(null)
@@ -394,8 +410,35 @@ export function useMonitoringConsole() {
         covered_instances: 0,
         missing_artifact_instances: 0,
         unprivileged_instances: 0,
+        selected_instances: 0,
+      },
+      rollback_coverage: release.rollback_coverage || {
+        succeeded_upgrades: 0,
+        rollback_supported: 0,
+        server_package_available: 0,
+        local_package_available: 0,
+        unavailable: 0,
+        active_rollbacks: 0,
+        failed_rollbacks: 0,
       },
     }))
+  }
+
+  async function loadAgentRolloutCandidates(releaseId: string) {
+    if (agentRolloutCandidatesLoading.value === releaseId) return false
+    agentRolloutCandidatesLoading.value = releaseId
+    const success = await guarded(async () => {
+      agentRolloutCandidates.value = {
+        ...agentRolloutCandidates.value,
+        [releaseId]: await api<AgentRolloutCandidate[]>(
+          `/api/admin/agent-releases/${releaseId}/rollout/candidates`,
+        ),
+      }
+    })
+    if (agentRolloutCandidatesLoading.value === releaseId) {
+      agentRolloutCandidatesLoading.value = ''
+    }
+    return success
   }
 
   function refreshAll() {
@@ -896,14 +939,82 @@ export function useMonitoringConsole() {
     }, '可执行文件已移除')
   }
 
-  function publishAgentRelease(release: AgentRelease) {
+  function publishAgentRelease(release: AgentRelease, instanceIds: string[] = []) {
     const additionalBatch = release.status === 'published'
     return runAgentUpdateTask('publishing', release.id, async () => {
       await api<AgentRelease>(`/api/admin/agent-releases/${release.id}/publish`, {
         method: 'POST',
+        body: JSON.stringify({ instance_ids: instanceIds }),
       })
       await loadAgentUpdates()
     }, additionalBatch ? `${release.version} 的新增更新包已发布` : `${release.version} 已发布`)
+  }
+
+  function addAgentRolloutTargets(release: AgentRelease, instanceIds: string[]) {
+    return runAgentUpdateTask('targeting', release.id, async () => {
+      await api<AgentRelease>(`/api/admin/agent-releases/${release.id}/rollout/targets`, {
+        method: 'POST',
+        body: JSON.stringify({ instance_ids: instanceIds }),
+      })
+      await loadAgentUpdates()
+      await loadAgentRolloutCandidates(release.id)
+    }, `已为 ${release.version} 添加 ${instanceIds.length} 个灰度实例`)
+  }
+
+  function pauseAgentRollout(release: AgentRelease) {
+    return runAgentUpdateTask('pausing', release.id, async () => {
+      await api<AgentRelease>(`/api/admin/agent-releases/${release.id}/rollout/pause`, {
+        method: 'POST',
+      })
+      await loadAgentUpdates()
+    }, `${release.version} 已暂停下发新任务`)
+  }
+
+  function resumeAgentRollout(release: AgentRelease) {
+    return runAgentUpdateTask('resuming', release.id, async () => {
+      await api<AgentRelease>(`/api/admin/agent-releases/${release.id}/rollout/resume`, {
+        method: 'POST',
+      })
+      await loadAgentUpdates()
+    }, `${release.version} 已恢复发布`)
+  }
+
+  function promoteAgentRollout(release: AgentRelease) {
+    return runAgentUpdateTask('promoting', release.id, async () => {
+      await api<AgentRelease>(`/api/admin/agent-releases/${release.id}/rollout/promote`, {
+        method: 'POST',
+      })
+      await loadAgentUpdates()
+    }, `${release.version} 已晋级全量`)
+  }
+
+  function rollbackAgentRelease(release: AgentRelease) {
+    return runAgentUpdateTask('rolling_back', release.id, async () => {
+      await api<AgentRelease>(`/api/admin/agent-releases/${release.id}/rollback`, {
+        method: 'POST',
+      })
+      await loadAgentUpdates()
+    }, `${release.version} 已开始批量回滚`)
+  }
+
+  function rollbackAgentInstance(release: AgentRelease, attempt: AgentUpdateAttempt) {
+    return runAgentUpdateTask('rolling_back', attempt.id, async () => {
+      await api<AgentRelease>(
+        `/api/admin/agent-releases/${release.id}/instances/${attempt.instance_id}/rollback`,
+        { method: 'POST' },
+      )
+      await loadAgentUpdates()
+    }, '已安排实例回滚')
+  }
+
+  function reupgradeAgentInstance(release: AgentRelease, attempt: AgentUpdateAttempt) {
+    return runAgentUpdateTask('reupgrading', attempt.id, async () => {
+      await api<AgentRelease>(
+        `/api/admin/agent-releases/${release.id}/instances/${attempt.instance_id}/reupgrade`,
+        { method: 'POST' },
+      )
+      await loadAgentUpdates()
+    }, '已安排实例重新升级')
   }
 
   function deleteAgentRelease(release: AgentRelease) {
@@ -1048,6 +1159,8 @@ export function useMonitoringConsole() {
     logs,
     agentReleases,
     agentUpdateAttempts,
+    agentRolloutCandidates,
+    agentRolloutCandidatesLoading,
     adminUsers,
     authEnrollments,
     activeAuthEnrollment,
@@ -1117,11 +1230,19 @@ export function useMonitoringConsole() {
     deleteAdminUser,
     revokeAuthenticatorDevice,
     loadAgentUpdates,
+    loadAgentRolloutCandidates,
     createAgentRelease,
     saveAgentRelease,
     uploadAgentArtifact,
     deleteAgentArtifact,
     publishAgentRelease,
+    addAgentRolloutTargets,
+    pauseAgentRollout,
+    resumeAgentRollout,
+    promoteAgentRollout,
+    rollbackAgentRelease,
+    rollbackAgentInstance,
+    reupgradeAgentInstance,
     deleteAgentRelease,
     retryAgentUpdateAttempt,
     selectBackgroundImage,

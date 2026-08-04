@@ -26,6 +26,10 @@ pub struct AgentRegisterRequest {
     #[serde(default)]
     pub update_privileged: Option<bool>,
     #[serde(default)]
+    pub rollback_supported: Option<bool>,
+    #[serde(default)]
+    pub rollback_version: Option<String>,
+    #[serde(default)]
     pub device_profile: Option<DeviceProfile>,
 }
 
@@ -50,6 +54,10 @@ pub struct AgentReportRequest {
     pub native_arch: Option<String>,
     #[serde(default)]
     pub update_privileged: Option<bool>,
+    #[serde(default)]
+    pub rollback_supported: Option<bool>,
+    #[serde(default)]
+    pub rollback_version: Option<String>,
     #[serde(default)]
     pub device_profile: Option<DeviceProfile>,
     pub metrics: MetricPayload,
@@ -542,6 +550,8 @@ pub struct InstanceRecord {
     pub package_type: String,
     pub native_arch: String,
     pub update_privileged: i64,
+    pub rollback_supported: i64,
+    pub rollback_version: String,
     pub approved: i64,
     pub disabled: i64,
     pub first_seen: i64,
@@ -743,12 +753,25 @@ pub struct CreateAgentReleaseRequest {
     pub notes: String,
 }
 
+#[derive(Deserialize, Default)]
+pub struct PublishAgentReleaseRequest {
+    #[serde(default)]
+    pub instance_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AgentReleaseTargetsRequest {
+    pub instance_ids: Vec<String>,
+}
+
 #[derive(Serialize, FromRow, Clone)]
 pub struct AgentReleaseRecord {
     pub id: String,
     pub version: String,
     pub notes: String,
     pub status: String,
+    pub rollout_state: String,
+    pub rollout_updated_at: Option<i64>,
     pub created_at: i64,
     pub published_at: Option<i64>,
 }
@@ -774,8 +797,10 @@ pub struct AgentArtifactRecord {
 pub struct AgentUpdateAttemptRecord {
     pub id: String,
     pub release_id: String,
-    pub artifact_id: String,
+    pub artifact_id: Option<String>,
     pub instance_id: String,
+    pub operation: String,
+    pub parent_attempt_id: Option<String>,
     pub from_version: String,
     pub target_version: String,
     pub status: String,
@@ -792,6 +817,18 @@ pub struct AgentReleaseCoverage {
     pub covered_instances: i64,
     pub missing_artifact_instances: i64,
     pub unprivileged_instances: i64,
+    pub selected_instances: i64,
+}
+
+#[derive(Serialize)]
+pub struct AgentRollbackCoverage {
+    pub succeeded_upgrades: i64,
+    pub rollback_supported: i64,
+    pub server_package_available: i64,
+    pub local_package_available: i64,
+    pub unavailable: i64,
+    pub active_rollbacks: i64,
+    pub failed_rollbacks: i64,
 }
 
 #[derive(Serialize)]
@@ -801,6 +838,27 @@ pub struct AgentReleaseDetail {
     pub artifacts: Vec<AgentArtifactRecord>,
     pub attempts: Vec<AgentUpdateAttemptRecord>,
     pub coverage: AgentReleaseCoverage,
+    pub rollback_coverage: AgentRollbackCoverage,
+}
+
+#[derive(Serialize)]
+pub struct AgentRolloutCandidate {
+    pub instance_id: String,
+    pub name: String,
+    pub hostname: String,
+    pub os: String,
+    pub package_type: String,
+    pub native_arch: String,
+    pub agent_version: String,
+    pub online: bool,
+    pub update_privileged: bool,
+    pub selected: bool,
+    pub eligible: bool,
+    pub reason: String,
+    pub active_operation: Option<String>,
+    pub active_status: Option<String>,
+    pub rollback_supported: bool,
+    pub rollback_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -810,6 +868,8 @@ pub struct UpdateAttemptsQuery {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentUpdateOffer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
     pub release_id: String,
     pub version: String,
     pub artifact_id: String,
@@ -828,9 +888,38 @@ pub struct AgentUpdateOffer {
     pub retry_count: i64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentRollbackPackage {
+    pub artifact_id: String,
+    pub download_url: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub package_type: String,
+    pub native_arch: String,
+    pub target_os: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentRollbackOffer {
+    pub attempt_id: String,
+    pub release_id: String,
+    pub instance_id: String,
+    pub from_version: String,
+    pub target_version: String,
+    pub retry_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<AgentRollbackPackage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct AgentUpdateManifest {
     pub update: Option<AgentUpdateOffer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<AgentRollbackOffer>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1046,6 +1135,8 @@ pub enum AgentOutbound {
         session_id: String,
     },
     UpdateAvailable {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
         release_id: String,
         version: String,
         artifact_id: String,
@@ -1062,6 +1153,9 @@ pub enum AgentOutbound {
         signature: Option<String>,
         #[serde(default)]
         retry_count: i64,
+    },
+    RollbackAvailable {
+        offer: AgentRollbackOffer,
     },
 }
 
@@ -1082,6 +1176,10 @@ pub enum AgentInbound {
         native_arch: Option<String>,
         #[serde(default)]
         update_privileged: Option<bool>,
+        #[serde(default)]
+        rollback_supported: Option<bool>,
+        #[serde(default)]
+        rollback_version: Option<String>,
         #[serde(default)]
         docker_status: Option<DockerStatus>,
         metrics: MetricPayload,
@@ -1145,10 +1243,18 @@ pub enum AgentInbound {
         reason: Option<String>,
     },
     UpdateStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
         release_id: String,
         artifact_id: String,
         version: String,
         #[serde(default)]
+        retry_count: i64,
+        status: String,
+        message: Option<String>,
+    },
+    RollbackStatus {
+        attempt_id: String,
         retry_count: i64,
         status: String,
         message: Option<String>,

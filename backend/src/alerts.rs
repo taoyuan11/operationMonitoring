@@ -5,11 +5,18 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     routing::{get, patch, post, put},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use hmac::{Hmac, Mac};
+use lettre::{
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    address::Address,
+    message::{Mailbox, header::ContentType},
+    transport::smtp::authentication::Credentials,
+};
 use reqwest::{Client, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -38,8 +45,15 @@ const MAX_HEADER_NAME_BYTES: usize = 128;
 const MAX_HEADER_VALUE_BYTES: usize = 4_096;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024;
 const WEBHOOK_TIMEOUT_SECONDS: u64 = 10;
+const SMTP_TIMEOUT_SECONDS: u64 = 15;
+const MAX_EMAIL_RECIPIENTS: usize = 100;
+const MAX_EMAIL_FIELD_BYTES: usize = 512;
+const MAX_NOTIFICATION_TEXT_BYTES: usize = 16 * 1024;
+const MAX_WECOM_TEXT_BYTES: usize = 1_900;
+const MAX_TELEGRAM_CHAT_ID_BYTES: usize = 256;
 const STARTUP_RECONNECT_GRACE_SECONDS: i64 = 60;
-const DELIVERY_LEASE_SECONDS: i64 = 30;
+const DELIVERY_LEASE_SECONDS: i64 = 180;
+const DELIVERY_WORKER_COUNT: usize = 4;
 const DELIVERY_RETRY_DELAYS: [i64; 4] = [60, 5 * 60, 15 * 60, 60 * 60];
 
 #[derive(Clone, Debug)]
@@ -134,9 +148,11 @@ struct MaintenanceResponse {
 struct ChannelRow {
     id: String,
     name: String,
+    channel_type: String,
     url_ciphertext: String,
     secret_ciphertext: Option<String>,
     headers_ciphertext: String,
+    config_ciphertext: Option<String>,
     enabled: bool,
     created_at: i64,
     updated_at: i64,
@@ -146,12 +162,39 @@ struct ChannelRow {
 struct ChannelResponse {
     id: String,
     name: String,
+    channel_type: String,
     masked_url: String,
     header_names: Vec<String>,
     has_secret: bool,
+    smtp_host: Option<String>,
+    smtp_port: Option<u16>,
+    security: Option<String>,
+    username: Option<String>,
+    from_address: Option<String>,
+    from_name: Option<String>,
+    recipients: Option<Vec<String>>,
+    has_password: bool,
+    chat_id: Option<String>,
     enabled: bool,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct EmailChannelConfig {
+    smtp_host: String,
+    smtp_port: u16,
+    security: String,
+    username: Option<String>,
+    password: Option<String>,
+    from_address: String,
+    from_name: Option<String>,
+    recipients: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct TelegramChannelConfig {
+    chat_id: String,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -257,11 +300,23 @@ struct MaintenanceRequest {
 #[derive(Clone, Debug, Deserialize)]
 struct ChannelRequest {
     name: String,
+    channel_type: Option<String>,
     url: Option<String>,
     secret: Option<String>,
     #[serde(default)]
     clear_secret: bool,
     headers: Option<BTreeMap<String, String>>,
+    smtp_host: Option<String>,
+    smtp_port: Option<u16>,
+    security: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    #[serde(default)]
+    clear_password: bool,
+    from_address: Option<String>,
+    from_name: Option<String>,
+    recipients: Option<Vec<String>>,
+    chat_id: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -321,9 +376,15 @@ pub fn router() -> Router<AppState> {
         .route("/webhook-channels", get(list_channels).post(create_channel))
         .route(
             "/webhook-channels/{id}",
-            put(update_channel).delete(delete_channel),
+            get(get_channel).put(update_channel).delete(delete_channel),
         )
         .route("/webhook-channels/{id}/test", post(test_channel))
+        .route("/channels", get(list_channels).post(create_channel))
+        .route(
+            "/channels/{id}",
+            get(get_channel).put(update_channel).delete(delete_channel),
+        )
+        .route("/channels/{id}/test", post(test_channel))
         .route("/deliveries", get(list_deliveries))
         .route("/deliveries/{id}", get(get_delivery))
         .route("/deliveries/{id}/retry", post(retry_delivery))
@@ -366,14 +427,35 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
         CREATE TABLE IF NOT EXISTS alert_webhook_channels (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            channel_type TEXT NOT NULL DEFAULT 'generic_webhook'
+                CONSTRAINT alert_webhook_channels_type_check
+                CHECK(channel_type IN ('generic_webhook', 'email', 'feishu', 'wecom', 'dingtalk', 'slack', 'msteams', 'telegram', 'discord')),
             url_ciphertext TEXT NOT NULL,
             secret_ciphertext TEXT,
             headers_ciphertext TEXT NOT NULL,
+            config_ciphertext TEXT,
             enabled BOOLEAN NOT NULL DEFAULT TRUE,
             created_at BIGINT NOT NULL,
             updated_at BIGINT NOT NULL,
             deleted_at BIGINT
         );
+        ALTER TABLE alert_webhook_channels
+            ADD COLUMN IF NOT EXISTS channel_type TEXT NOT NULL DEFAULT 'generic_webhook';
+        ALTER TABLE alert_webhook_channels
+            ADD COLUMN IF NOT EXISTS config_ciphertext TEXT;
+        UPDATE alert_webhook_channels
+            SET channel_type='generic_webhook' WHERE channel_type IS NULL;
+        ALTER TABLE alert_webhook_channels
+            ALTER COLUMN channel_type SET DEFAULT 'generic_webhook';
+        ALTER TABLE alert_webhook_channels
+            ALTER COLUMN channel_type SET NOT NULL;
+        ALTER TABLE alert_webhook_channels
+            DROP CONSTRAINT IF EXISTS alert_webhook_channels_type_check;
+        ALTER TABLE alert_webhook_channels
+            DROP CONSTRAINT IF EXISTS alert_webhook_channels_channel_type_check;
+        ALTER TABLE alert_webhook_channels
+            ADD CONSTRAINT alert_webhook_channels_type_check
+            CHECK(channel_type IN ('generic_webhook', 'email', 'feishu', 'wecom', 'dingtalk', 'slack', 'msteams', 'telegram', 'discord'));
         CREATE TABLE IF NOT EXISTS alert_rule_channels (
             rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
             channel_id TEXT NOT NULL REFERENCES alert_webhook_channels(id),
@@ -482,6 +564,8 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
             ON alert_deliveries(status, next_attempt_at, lease_until);
         CREATE INDEX IF NOT EXISTS idx_alert_deliveries_event
             ON alert_deliveries(event_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_alert_deliveries_lifecycle_order
+            ON alert_deliveries(event_id, channel_id, status, created_at, id);
         ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS lease_token TEXT;
         CREATE TABLE IF NOT EXISTS alert_delivery_attempts (
             id TEXT PRIMARY KEY,
@@ -606,7 +690,7 @@ async fn validate_rule_links(
         .await?;
         if !exists {
             return Err(AppError::bad_request(format!(
-                "Webhook 渠道 {channel_id} 不存在"
+                "通知渠道 {channel_id} 不存在"
             )));
         }
     }
@@ -1174,6 +1258,7 @@ async fn insert_delivery_tx(
     event: &EventRow,
     channel_id: &str,
     channel_name: &str,
+    channel_type: &str,
     kind: &str,
     suppression: Option<&str>,
     actor: Option<&str>,
@@ -1200,7 +1285,11 @@ async fn insert_delivery_tx(
     .bind(kind)
     .bind(status)
     .bind(delivery_payload(event, kind, actor, note))
-    .bind(json!({"id": channel_id, "name": channel_name}))
+    .bind(json!({
+        "id": channel_id,
+        "name": channel_name,
+        "channel_type": channel_type,
+    }))
     .bind(suppression.unwrap_or_default())
     .bind(suppression.is_none().then_some(now))
     .bind(now)
@@ -1219,19 +1308,20 @@ async fn enqueue_event_lifecycle_tx(
     note: Option<&str>,
     now: i64,
 ) -> AppResult<()> {
-    let channels = sqlx::query_as::<_, (String, String)>(
+    let channels = sqlx::query_as::<_, (String, String, String)>(
         r#"
-        SELECT c.id, c.name
+        SELECT c.id, c.name, c.channel_type
         FROM alert_event_channels ec
         JOIN alert_webhook_channels c ON c.id = ec.channel_id
         WHERE ec.event_id = $1 AND c.enabled = TRUE AND c.deleted_at IS NULL
         ORDER BY c.id
+        FOR SHARE OF c
         "#,
     )
     .bind(&event.id)
     .fetch_all(&mut **tx)
     .await?;
-    for (channel_id, channel_name) in channels {
+    for (channel_id, channel_name, channel_type) in channels {
         if kind == "alert.firing" {
             let already_deliverable: bool = sqlx::query_scalar(
                 r#"
@@ -1273,6 +1363,7 @@ async fn enqueue_event_lifecycle_tx(
             event,
             &channel_id,
             &channel_name,
+            &channel_type,
             kind,
             suppression,
             actor,
@@ -1311,6 +1402,19 @@ async fn resolve_event_tx(
     .bind(reason)
     .bind(event.current_value)
     .bind(event.last_observed_at)
+    .bind(&event.id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE alert_deliveries SET status='suppressed',
+            suppression_reason='event_resolved_before_delivery',
+            next_attempt_at=NULL,lease_until=NULL,lease_token=NULL,
+            completed_at=$1,updated_at=$1
+        WHERE event_id=$2 AND kind='alert.firing' AND status='pending'
+        "#,
+    )
+    .bind(now)
     .bind(&event.id)
     .execute(&mut **tx)
     .await?;
@@ -2415,6 +2519,200 @@ fn validate_webhook_headers(
     Ok(normalized)
 }
 
+fn validate_channel_type(value: &str) -> AppResult<String> {
+    let value = value.trim();
+    if matches!(
+        value,
+        "generic_webhook"
+            | "email"
+            | "feishu"
+            | "wecom"
+            | "dingtalk"
+            | "slack"
+            | "msteams"
+            | "telegram"
+            | "discord"
+    ) {
+        Ok(value.to_string())
+    } else {
+        Err(AppError::bad_request("不支持的通知渠道类型"))
+    }
+}
+
+fn channel_type_for_create(value: Option<&str>) -> AppResult<String> {
+    validate_channel_type(value.unwrap_or("generic_webhook"))
+}
+
+fn channel_type_for_update(value: Option<&str>, existing: &str) -> AppResult<String> {
+    let requested = validate_channel_type(value.unwrap_or(existing))?;
+    if requested != existing {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "通知渠道类型创建后不可修改",
+        ));
+    }
+    Ok(requested)
+}
+
+fn normalized_optional(
+    value: Option<&str>,
+    max_bytes: usize,
+    label: &str,
+) -> AppResult<Option<String>> {
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
+    if value.is_some_and(|value| value.len() > max_bytes || value.contains(['\r', '\n'])) {
+        return Err(AppError::bad_request(format!("{label}格式无效或过长")));
+    }
+    Ok(value.map(str::to_string))
+}
+
+fn normalized_password(value: Option<&str>) -> AppResult<Option<String>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > MAX_EMAIL_FIELD_BYTES {
+        return Err(AppError::bad_request("SMTP 密码过长"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn validate_email_config(mut config: EmailChannelConfig) -> AppResult<EmailChannelConfig> {
+    config.smtp_host = config.smtp_host.trim().to_string();
+    if config.smtp_host.is_empty()
+        || config.smtp_host.len() > 255
+        || config.smtp_host.chars().any(char::is_whitespace)
+    {
+        return Err(AppError::bad_request("SMTP 主机格式无效"));
+    }
+    if config.smtp_port == 0 {
+        return Err(AppError::bad_request("SMTP 端口必须大于 0"));
+    }
+    if !matches!(config.security.as_str(), "starttls" | "smtps") {
+        return Err(AppError::bad_request(
+            "SMTP security 必须是 starttls 或 smtps",
+        ));
+    }
+    config.username = normalized_optional(
+        config.username.as_deref(),
+        MAX_EMAIL_FIELD_BYTES,
+        "SMTP 用户名",
+    )?;
+    config.password = normalized_password(config.password.as_deref())?;
+    if config.username.is_some() != config.password.is_some() {
+        return Err(AppError::bad_request(
+            "SMTP 用户名和密码必须同时配置或同时清除",
+        ));
+    }
+    config.from_address = config.from_address.trim().to_string();
+    config
+        .from_address
+        .parse::<Address>()
+        .map_err(|_| AppError::bad_request("发件人地址格式无效"))?;
+    config.from_name =
+        normalized_optional(config.from_name.as_deref(), MAX_NAME_BYTES, "发件人名称")?;
+    if config.recipients.is_empty() || config.recipients.len() > MAX_EMAIL_RECIPIENTS {
+        return Err(AppError::bad_request(format!(
+            "邮件收件人数量必须在 1 到 {MAX_EMAIL_RECIPIENTS} 之间"
+        )));
+    }
+    let mut recipients = Vec::with_capacity(config.recipients.len());
+    for recipient in config.recipients {
+        let recipient = recipient.trim().to_string();
+        recipient
+            .parse::<Address>()
+            .map_err(|_| AppError::bad_request(format!("收件人地址无效: {recipient}")))?;
+        if !recipients
+            .iter()
+            .any(|known: &String| known.eq_ignore_ascii_case(&recipient))
+        {
+            recipients.push(recipient);
+        }
+    }
+    config.recipients = recipients;
+    Ok(config)
+}
+
+fn email_request_config(
+    payload: &ChannelRequest,
+    previous: Option<&EmailChannelConfig>,
+) -> AppResult<EmailChannelConfig> {
+    let required = |value: Option<&str>, previous: Option<&str>, label: &str| {
+        value
+            .or(previous)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| AppError::bad_request(format!("邮件渠道必须提供{label}")))
+    };
+    let username = normalized_optional(
+        payload
+            .username
+            .as_deref()
+            .or_else(|| previous.and_then(|config| config.username.as_deref())),
+        MAX_EMAIL_FIELD_BYTES,
+        "SMTP 用户名",
+    )?;
+    let password = if payload.clear_password {
+        None
+    } else {
+        normalized_password(
+            payload
+                .password
+                .as_deref()
+                .or_else(|| previous.and_then(|config| config.password.as_deref())),
+        )?
+    };
+    let username = if payload.clear_password {
+        None
+    } else {
+        username
+    };
+    validate_email_config(EmailChannelConfig {
+        smtp_host: required(
+            payload.smtp_host.as_deref(),
+            previous.map(|config| config.smtp_host.as_str()),
+            " SMTP 主机",
+        )?,
+        smtp_port: payload
+            .smtp_port
+            .or_else(|| previous.map(|config| config.smtp_port))
+            .ok_or_else(|| AppError::bad_request("邮件渠道必须提供 SMTP 端口"))?,
+        security: required(
+            payload.security.as_deref(),
+            previous.map(|config| config.security.as_str()),
+            " security",
+        )?,
+        username,
+        password,
+        from_address: required(
+            payload.from_address.as_deref(),
+            previous.map(|config| config.from_address.as_str()),
+            "发件人地址",
+        )?,
+        from_name: payload
+            .from_name
+            .clone()
+            .or_else(|| previous.and_then(|config| config.from_name.clone())),
+        recipients: payload
+            .recipients
+            .clone()
+            .or_else(|| previous.map(|config| config.recipients.clone()))
+            .ok_or_else(|| AppError::bad_request("邮件渠道必须提供收件人"))?,
+    })
+}
+
+fn email_fields_present(payload: &ChannelRequest) -> bool {
+    payload.smtp_host.is_some()
+        || payload.smtp_port.is_some()
+        || payload.security.is_some()
+        || payload.username.is_some()
+        || payload.password.is_some()
+        || payload.clear_password
+        || payload.from_address.is_some()
+        || payload.from_name.is_some()
+        || payload.recipients.is_some()
+}
+
 fn mask_webhook_url(value: &str) -> String {
     let Ok(url) = Url::parse(value) else {
         return "***".to_string();
@@ -2446,15 +2744,78 @@ fn decrypt_headers(state: &AppState, ciphertext: &str) -> AppResult<BTreeMap<Str
         .map_err(|error| anyhow::anyhow!("invalid encrypted webhook headers: {error}"))?)
 }
 
+fn decrypt_email_config(state: &AppState, row: &ChannelRow) -> AppResult<EmailChannelConfig> {
+    let ciphertext = row
+        .config_ciphertext
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("email channel configuration is missing"))?;
+    let plaintext = decrypt_string(state, ciphertext)?;
+    let config = serde_json::from_str::<EmailChannelConfig>(&plaintext)
+        .map_err(|error| anyhow::anyhow!("invalid encrypted email channel config: {error}"))?;
+    validate_email_config(config)
+}
+
+fn decrypt_telegram_config(state: &AppState, row: &ChannelRow) -> AppResult<TelegramChannelConfig> {
+    let ciphertext = row
+        .config_ciphertext
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Telegram channel configuration is missing"))?;
+    let plaintext = decrypt_string(state, ciphertext)?;
+    let config = serde_json::from_str::<TelegramChannelConfig>(&plaintext)
+        .map_err(|error| anyhow::anyhow!("invalid encrypted Telegram channel config: {error}"))?;
+    let chat_id = normalized_chat_id(Some(&config.chat_id))?
+        .ok_or_else(|| anyhow::anyhow!("Telegram chat_id is missing"))?;
+    Ok(TelegramChannelConfig { chat_id })
+}
+
 fn channel_response(state: &AppState, row: ChannelRow) -> AppResult<ChannelResponse> {
-    let url = decrypt_string(state, &row.url_ciphertext)?;
-    let headers = decrypt_headers(state, &row.headers_ciphertext)?;
+    let email = if row.channel_type == "email" {
+        Some(decrypt_email_config(state, &row)?)
+    } else {
+        None
+    };
+    let telegram = if row.channel_type == "telegram" {
+        Some(decrypt_telegram_config(state, &row)?)
+    } else {
+        None
+    };
+    let (masked_url, header_names) = if let Some(config) = email.as_ref() {
+        (
+            format!(
+                "{}://{}:{}",
+                config.security, config.smtp_host, config.smtp_port
+            ),
+            Vec::new(),
+        )
+    } else {
+        let url = decrypt_string(state, &row.url_ciphertext)?;
+        let headers = if row.channel_type == "generic_webhook" {
+            decrypt_headers(state, &row.headers_ciphertext)?
+                .into_keys()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (mask_webhook_url(&url), headers)
+    };
     Ok(ChannelResponse {
         id: row.id,
         name: row.name,
-        masked_url: mask_webhook_url(&url),
-        header_names: headers.into_keys().collect(),
+        channel_type: row.channel_type,
+        masked_url,
+        header_names,
         has_secret: row.secret_ciphertext.is_some(),
+        smtp_host: email.as_ref().map(|config| config.smtp_host.clone()),
+        smtp_port: email.as_ref().map(|config| config.smtp_port),
+        security: email.as_ref().map(|config| config.security.clone()),
+        username: email.as_ref().and_then(|config| config.username.clone()),
+        from_address: email.as_ref().map(|config| config.from_address.clone()),
+        from_name: email.as_ref().and_then(|config| config.from_name.clone()),
+        recipients: email.as_ref().map(|config| config.recipients.clone()),
+        has_password: email
+            .as_ref()
+            .is_some_and(|config| config.password.is_some()),
+        chat_id: telegram.as_ref().map(|config| config.chat_id.clone()),
         enabled: row.enabled,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -2468,26 +2829,37 @@ async fn load_channel(db: &PgPool, id: &str) -> AppResult<ChannelRow> {
     .bind(id)
     .fetch_optional(db)
     .await?
-    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Webhook 渠道不存在"))
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "通知渠道不存在"))
 }
 
 async fn list_channels(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<PageQuery>,
 ) -> AppResult<Json<Page<ChannelResponse>>> {
     require_admin(&state, &headers).await?;
     let (page, page_size, offset) = normalize_page(query.page, query.page_size);
-    let total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM alert_webhook_channels WHERE deleted_at IS NULL")
-            .fetch_one(&state.db)
-            .await?;
-    let rows = sqlx::query_as::<_, ChannelRow>(
+    let legacy = is_legacy_channel_uri(&uri);
+    let total: i64 = sqlx::query_scalar(
         r#"
-        SELECT * FROM alert_webhook_channels WHERE deleted_at IS NULL
-        ORDER BY updated_at DESC,id LIMIT $1 OFFSET $2
+        SELECT COUNT(*) FROM alert_webhook_channels
+        WHERE deleted_at IS NULL
+          AND ($1::BOOLEAN = FALSE OR channel_type = 'generic_webhook')
         "#,
     )
+    .bind(legacy)
+    .fetch_one(&state.db)
+    .await?;
+    let rows = sqlx::query_as::<_, ChannelRow>(
+        r#"
+        SELECT * FROM alert_webhook_channels
+        WHERE deleted_at IS NULL
+          AND ($1::BOOLEAN = FALSE OR channel_type = 'generic_webhook')
+        ORDER BY updated_at DESC,id LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(legacy)
     .bind(page_size)
     .bind(offset)
     .fetch_all(&state.db)
@@ -2505,41 +2877,269 @@ async fn list_channels(
     }))
 }
 
+async fn get_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<Json<ChannelResponse>> {
+    require_admin(&state, &headers).await?;
+    let channel = load_channel(&state.db, &id).await?;
+    ensure_channel_uri_supports(&uri, &channel.channel_type)?;
+    Ok(Json(channel_response(&state, channel)?))
+}
+
+fn encrypted_json<T: Serialize>(state: &AppState, value: &T) -> AppResult<String> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| anyhow::anyhow!("failed to serialize channel config: {error}"))?;
+    Ok(state.auth_cipher.encrypt(&encoded)?)
+}
+
+fn validate_specialized_http_fields(payload: &ChannelRequest, allow_secret: bool) -> AppResult<()> {
+    if payload
+        .headers
+        .as_ref()
+        .is_some_and(|headers| !headers.is_empty())
+    {
+        return Err(AppError::bad_request("平台机器人渠道不支持自定义请求头"));
+    }
+    if !allow_secret
+        && payload
+            .secret
+            .as_deref()
+            .is_some_and(|secret| !secret.trim().is_empty())
+    {
+        return Err(AppError::bad_request("该渠道类型不支持签名密钥"));
+    }
+    Ok(())
+}
+
+fn validate_platform_fields(payload: &ChannelRequest, allow_secret: bool) -> AppResult<()> {
+    if email_fields_present(payload) {
+        return Err(AppError::bad_request("平台机器人渠道不能设置 SMTP 字段"));
+    }
+    validate_specialized_http_fields(payload, allow_secret)?;
+    if payload
+        .chat_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(AppError::bad_request("该渠道类型不支持 Telegram Chat ID"));
+    }
+    Ok(())
+}
+
+fn validate_email_only_fields(payload: &ChannelRequest) -> AppResult<()> {
+    if payload
+        .url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+        || payload
+            .secret
+            .as_deref()
+            .is_some_and(|secret| !secret.trim().is_empty())
+        || payload
+            .headers
+            .as_ref()
+            .is_some_and(|headers| !headers.is_empty())
+        || payload
+            .chat_id
+            .as_deref()
+            .is_some_and(|chat_id| !chat_id.trim().is_empty())
+    {
+        return Err(AppError::bad_request(
+            "邮件渠道不能设置 Webhook URL、签名密钥或自定义请求头",
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_secret(value: Option<&str>) -> AppResult<Option<&str>> {
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
+    if value.is_some_and(|value| value.len() > MAX_HEADER_VALUE_BYTES) {
+        return Err(AppError::bad_request("渠道签名密钥过长"));
+    }
+    Ok(value)
+}
+
+fn normalized_chat_id(value: Option<&str>) -> AppResult<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > MAX_TELEGRAM_CHAT_ID_BYTES
+        || value.contains(['\r', '\n'])
+        || value.chars().any(char::is_control)
+    {
+        return Err(AppError::bad_request("Telegram Chat ID 格式无效或过长"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn is_legacy_channel_uri(uri: &axum::http::Uri) -> bool {
+    uri.path()
+        .split('/')
+        .any(|segment| segment == "webhook-channels")
+}
+
+fn ensure_channel_uri_supports(uri: &axum::http::Uri, channel_type: &str) -> AppResult<()> {
+    if is_legacy_channel_uri(uri) && channel_type != "generic_webhook" {
+        return Err(AppError::bad_request(
+            "旧版 Webhook 接口仅支持 generic_webhook 渠道",
+        ));
+    }
+    Ok(())
+}
+
 async fn create_channel(
     State(state): State<AppState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Json(payload): Json<ChannelRequest>,
 ) -> AppResult<(StatusCode, Json<ChannelResponse>)> {
     let admin = require_admin(&state, &headers).await?;
-    let name = trimmed(&payload.name, MAX_NAME_BYTES, "Webhook 名称")?;
-    let url = validate_webhook_url(
-        payload
-            .url
-            .as_deref()
-            .ok_or_else(|| AppError::bad_request("创建 Webhook 时必须提供 URL"))?,
-    )?;
-    let custom_headers = validate_webhook_headers(&payload.headers.unwrap_or_default())?;
-    let secret = payload
-        .secret
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if secret.is_some_and(|value| value.len() > MAX_HEADER_VALUE_BYTES) {
-        return Err(AppError::bad_request("Webhook HMAC 密钥过长"));
-    }
+    let name = trimmed(&payload.name, MAX_NAME_BYTES, "通知渠道名称")?;
+    let channel_type = channel_type_for_create(payload.channel_type.as_deref())?;
+    ensure_channel_uri_supports(&uri, &channel_type)?;
+    let empty_headers = BTreeMap::new();
+    let (url, secret, custom_headers, config_ciphertext) =
+        match channel_type.as_str() {
+            "generic_webhook" => {
+                if email_fields_present(&payload) {
+                    return Err(AppError::bad_request("Webhook 渠道不能设置 SMTP 字段"));
+                }
+                if payload
+                    .chat_id
+                    .as_deref()
+                    .is_some_and(|chat_id| !chat_id.trim().is_empty())
+                {
+                    return Err(AppError::bad_request(
+                        "Webhook 渠道不能设置 Telegram Chat ID",
+                    ));
+                }
+                let url = validate_webhook_url(
+                    payload
+                        .url
+                        .as_deref()
+                        .ok_or_else(|| AppError::bad_request("创建 Webhook 时必须提供 URL"))?,
+                )?;
+                let headers =
+                    validate_webhook_headers(payload.headers.as_ref().unwrap_or(&empty_headers))?;
+                let secret = if payload.clear_secret {
+                    None
+                } else {
+                    normalized_secret(payload.secret.as_deref())?
+                };
+                (url, secret, headers, None)
+            }
+            "feishu" => {
+                validate_platform_fields(&payload, true)?;
+                let url = validate_webhook_url(
+                    payload
+                        .url
+                        .as_deref()
+                        .ok_or_else(|| AppError::bad_request("创建飞书渠道时必须提供 URL"))?,
+                )?;
+                let secret = if payload.clear_secret {
+                    None
+                } else {
+                    normalized_secret(payload.secret.as_deref())?
+                };
+                (url, secret, BTreeMap::new(), None)
+            }
+            "wecom" => {
+                validate_platform_fields(&payload, false)?;
+                let url = validate_webhook_url(
+                    payload
+                        .url
+                        .as_deref()
+                        .ok_or_else(|| AppError::bad_request("创建企业微信渠道时必须提供 URL"))?,
+                )?;
+                (url, None, BTreeMap::new(), None)
+            }
+            "dingtalk" => {
+                validate_platform_fields(&payload, true)?;
+                let url = validate_webhook_url(
+                    payload
+                        .url
+                        .as_deref()
+                        .ok_or_else(|| AppError::bad_request("创建钉钉渠道时必须提供 URL"))?,
+                )?;
+                let secret = if payload.clear_secret {
+                    None
+                } else {
+                    normalized_secret(payload.secret.as_deref())?
+                };
+                (url, secret, BTreeMap::new(), None)
+            }
+            "slack" => {
+                validate_platform_fields(&payload, false)?;
+                let url = validate_webhook_url(
+                    payload
+                        .url
+                        .as_deref()
+                        .ok_or_else(|| AppError::bad_request("创建 Slack 渠道时必须提供 URL"))?,
+                )?;
+                (url, None, BTreeMap::new(), None)
+            }
+            "msteams" => {
+                validate_platform_fields(&payload, false)?;
+                let url = validate_webhook_url(payload.url.as_deref().ok_or_else(|| {
+                    AppError::bad_request("创建 Microsoft Teams 渠道时必须提供 URL")
+                })?)?;
+                (url, None, BTreeMap::new(), None)
+            }
+            "discord" => {
+                validate_platform_fields(&payload, false)?;
+                let url =
+                    validate_webhook_url(payload.url.as_deref().ok_or_else(|| {
+                        AppError::bad_request("创建 Discord 渠道时必须提供 URL")
+                    })?)?;
+                (url, None, BTreeMap::new(), None)
+            }
+            "telegram" => {
+                if email_fields_present(&payload) {
+                    return Err(AppError::bad_request("Telegram 渠道不能设置 SMTP 字段"));
+                }
+                validate_specialized_http_fields(&payload, false)?;
+                let url =
+                    validate_webhook_url(payload.url.as_deref().ok_or_else(|| {
+                        AppError::bad_request("创建 Telegram 渠道时必须提供 URL")
+                    })?)?;
+                let chat_id = normalized_chat_id(payload.chat_id.as_deref())?
+                    .ok_or_else(|| AppError::bad_request("创建 Telegram 渠道时必须提供 Chat ID"))?;
+                (
+                    url,
+                    None,
+                    BTreeMap::new(),
+                    Some(encrypted_json(&state, &TelegramChannelConfig { chat_id })?),
+                )
+            }
+            "email" => {
+                validate_email_only_fields(&payload)?;
+                let config = email_request_config(&payload, None)?;
+                (
+                    String::new(),
+                    None,
+                    BTreeMap::new(),
+                    Some(encrypted_json(&state, &config)?),
+                )
+            }
+            _ => unreachable!("validated channel type"),
+        };
     let id = Uuid::new_v4().to_string();
     let now = now_ts();
     let mut tx = state.db.begin().await?;
     sqlx::query(
         r#"
         INSERT INTO alert_webhook_channels(
-            id,name,url_ciphertext,secret_ciphertext,headers_ciphertext,
-            enabled,created_at,updated_at
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$7)
+            id,name,channel_type,url_ciphertext,secret_ciphertext,headers_ciphertext,
+            config_ciphertext,enabled,created_at,updated_at
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
         "#,
     )
     .bind(&id)
     .bind(name)
+    .bind(&channel_type)
     .bind(state.auth_cipher.encrypt(url.as_bytes())?)
     .bind(
         secret
@@ -2553,18 +3153,12 @@ async fn create_channel(
                 .as_bytes(),
         )?,
     )
+    .bind(config_ciphertext)
     .bind(payload.enabled)
     .bind(now)
     .execute(&mut *tx)
     .await?;
-    audit_action_tx(
-        &mut tx,
-        &admin,
-        "alert_webhook_create",
-        &id,
-        "创建 Webhook 渠道",
-    )
-    .await?;
+    audit_action_tx(&mut tx, &admin, "alert_webhook_create", &id, "创建通知渠道").await?;
     tx.commit().await?;
     Ok((
         StatusCode::CREATED,
@@ -2579,71 +3173,200 @@ async fn update_channel(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
     Json(payload): Json<ChannelRequest>,
 ) -> AppResult<Json<ChannelResponse>> {
     let admin = require_admin(&state, &headers).await?;
     let old = load_channel(&state.db, &id).await?;
-    let name = trimmed(&payload.name, MAX_NAME_BYTES, "Webhook 名称")?;
-    let url_ciphertext = if let Some(url) = payload.url.as_deref() {
-        state
-            .auth_cipher
-            .encrypt(validate_webhook_url(url)?.as_bytes())?
-    } else {
-        old.url_ciphertext
-    };
-    let headers_ciphertext = if let Some(headers) = payload.headers.as_ref() {
-        let headers = validate_webhook_headers(headers)?;
-        state.auth_cipher.encrypt(
-            serde_json::to_string(&headers)
-                .map_err(anyhow::Error::from)?
-                .as_bytes(),
-        )?
-    } else {
-        old.headers_ciphertext
-    };
-    let secret_ciphertext = if payload.clear_secret {
-        None
-    } else if let Some(secret) = payload.secret.as_deref() {
-        let secret = secret.trim();
-        if secret.len() > MAX_HEADER_VALUE_BYTES {
-            return Err(AppError::bad_request("Webhook HMAC 密钥过长"));
-        }
-        if secret.is_empty() {
-            old.secret_ciphertext
-        } else {
-            Some(state.auth_cipher.encrypt(secret.as_bytes())?)
-        }
-    } else {
-        old.secret_ciphertext
-    };
+    ensure_channel_uri_supports(&uri, &old.channel_type)?;
+    channel_type_for_update(payload.channel_type.as_deref(), &old.channel_type)?;
+    let name = trimmed(&payload.name, MAX_NAME_BYTES, "通知渠道名称")?;
+    let (url_ciphertext, secret_ciphertext, headers_ciphertext, config_ciphertext) =
+        match old.channel_type.as_str() {
+            "generic_webhook" => {
+                if email_fields_present(&payload) {
+                    return Err(AppError::bad_request("Webhook 渠道不能设置 SMTP 字段"));
+                }
+                if payload
+                    .chat_id
+                    .as_deref()
+                    .is_some_and(|chat_id| !chat_id.trim().is_empty())
+                {
+                    return Err(AppError::bad_request(
+                        "Webhook 渠道不能设置 Telegram Chat ID",
+                    ));
+                }
+                let url = payload
+                    .url
+                    .as_deref()
+                    .map(validate_webhook_url)
+                    .transpose()?;
+                let headers = payload
+                    .headers
+                    .as_ref()
+                    .map(validate_webhook_headers)
+                    .transpose()?;
+                let secret = normalized_secret(payload.secret.as_deref())?;
+                (
+                    url.map(|url| state.auth_cipher.encrypt(url.as_bytes()))
+                        .transpose()?
+                        .unwrap_or(old.url_ciphertext),
+                    if payload.clear_secret {
+                        None
+                    } else {
+                        secret
+                            .map(|secret| state.auth_cipher.encrypt(secret.as_bytes()))
+                            .transpose()?
+                            .or(old.secret_ciphertext)
+                    },
+                    headers
+                        .map(|headers| encrypted_json(&state, &headers))
+                        .transpose()?
+                        .unwrap_or(old.headers_ciphertext),
+                    None,
+                )
+            }
+            "feishu" => {
+                validate_platform_fields(&payload, true)?;
+                let url = payload
+                    .url
+                    .as_deref()
+                    .map(validate_webhook_url)
+                    .transpose()?;
+                let secret = normalized_secret(payload.secret.as_deref())?;
+                (
+                    url.map(|url| state.auth_cipher.encrypt(url.as_bytes()))
+                        .transpose()?
+                        .unwrap_or(old.url_ciphertext),
+                    if payload.clear_secret {
+                        None
+                    } else {
+                        secret
+                            .map(|secret| state.auth_cipher.encrypt(secret.as_bytes()))
+                            .transpose()?
+                            .or(old.secret_ciphertext)
+                    },
+                    encrypted_json(&state, &BTreeMap::<String, String>::new())?,
+                    None,
+                )
+            }
+            "wecom" | "slack" | "msteams" | "discord" => {
+                validate_platform_fields(&payload, false)?;
+                let url = payload
+                    .url
+                    .as_deref()
+                    .map(validate_webhook_url)
+                    .transpose()?;
+                (
+                    url.map(|url| state.auth_cipher.encrypt(url.as_bytes()))
+                        .transpose()?
+                        .unwrap_or(old.url_ciphertext),
+                    None,
+                    encrypted_json(&state, &BTreeMap::<String, String>::new())?,
+                    None,
+                )
+            }
+            "dingtalk" => {
+                validate_platform_fields(&payload, true)?;
+                let url = payload
+                    .url
+                    .as_deref()
+                    .map(validate_webhook_url)
+                    .transpose()?;
+                let secret = normalized_secret(payload.secret.as_deref())?;
+                (
+                    url.map(|url| state.auth_cipher.encrypt(url.as_bytes()))
+                        .transpose()?
+                        .unwrap_or(old.url_ciphertext),
+                    if payload.clear_secret {
+                        None
+                    } else {
+                        secret
+                            .map(|secret| state.auth_cipher.encrypt(secret.as_bytes()))
+                            .transpose()?
+                            .or(old.secret_ciphertext)
+                    },
+                    encrypted_json(&state, &BTreeMap::<String, String>::new())?,
+                    None,
+                )
+            }
+            "telegram" => {
+                if email_fields_present(&payload) {
+                    return Err(AppError::bad_request("Telegram 渠道不能设置 SMTP 字段"));
+                }
+                validate_specialized_http_fields(&payload, false)?;
+                let url = payload
+                    .url
+                    .as_deref()
+                    .map(validate_webhook_url)
+                    .transpose()?;
+                let old_config = decrypt_telegram_config(&state, &old)?;
+                let chat_id = normalized_chat_id(payload.chat_id.as_deref())?
+                    .or(Some(old_config.chat_id))
+                    .ok_or_else(|| AppError::bad_request("Telegram 渠道必须提供 Chat ID"))?;
+                (
+                    url.map(|url| state.auth_cipher.encrypt(url.as_bytes()))
+                        .transpose()?
+                        .unwrap_or(old.url_ciphertext),
+                    None,
+                    encrypted_json(&state, &BTreeMap::<String, String>::new())?,
+                    Some(encrypted_json(&state, &TelegramChannelConfig { chat_id })?),
+                )
+            }
+            "email" => {
+                validate_email_only_fields(&payload)?;
+                let old_config = decrypt_email_config(&state, &old)?;
+                let config = if email_fields_present(&payload) {
+                    email_request_config(&payload, Some(&old_config))?
+                } else {
+                    old_config
+                };
+                (
+                    old.url_ciphertext,
+                    None,
+                    old.headers_ciphertext,
+                    Some(encrypted_json(&state, &config)?),
+                )
+            }
+            _ => return Err(AppError::bad_request("通知渠道类型无效")),
+        };
     let mut tx = state.db.begin().await?;
     let result = sqlx::query(
         r#"
         UPDATE alert_webhook_channels SET name=$1,url_ciphertext=$2,
-            secret_ciphertext=$3,headers_ciphertext=$4,enabled=$5,updated_at=$6
-        WHERE id=$7 AND deleted_at IS NULL
+            secret_ciphertext=$3,headers_ciphertext=$4,config_ciphertext=$5,
+            enabled=$6,updated_at=$7
+        WHERE id=$8 AND deleted_at IS NULL
         "#,
     )
     .bind(name)
     .bind(url_ciphertext)
     .bind(secret_ciphertext)
     .bind(headers_ciphertext)
+    .bind(config_ciphertext)
     .bind(payload.enabled)
     .bind(now_ts())
     .bind(&id)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "Webhook 渠道不存在"));
+        return Err(AppError::new(StatusCode::NOT_FOUND, "通知渠道不存在"));
     }
-    audit_action_tx(
-        &mut tx,
-        &admin,
-        "alert_webhook_update",
-        &id,
-        "更新 Webhook 渠道",
-    )
-    .await?;
+    if !payload.enabled {
+        sqlx::query(
+            r#"
+            UPDATE alert_deliveries SET status='failed',last_error='channel_disabled',
+                next_attempt_at=NULL,lease_until=NULL,lease_token=NULL,
+                completed_at=$1,updated_at=$1
+            WHERE channel_id=$2 AND status='pending'
+            "#,
+        )
+        .bind(now_ts())
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    audit_action_tx(&mut tx, &admin, "alert_webhook_update", &id, "更新通知渠道").await?;
     tx.commit().await?;
     Ok(Json(channel_response(
         &state,
@@ -2655,8 +3378,11 @@ async fn delete_channel(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> AppResult<StatusCode> {
     let admin = require_admin(&state, &headers).await?;
+    let channel = load_channel(&state.db, &id).await?;
+    ensure_channel_uri_supports(&uri, &channel.channel_type)?;
     let now = now_ts();
     let mut tx = state.db.begin().await?;
     let result = sqlx::query(
@@ -2670,7 +3396,7 @@ async fn delete_channel(
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "Webhook 渠道不存在"));
+        return Err(AppError::new(StatusCode::NOT_FOUND, "通知渠道不存在"));
     }
     sqlx::query("DELETE FROM alert_rule_channels WHERE channel_id=$1")
         .bind(&id)
@@ -2681,21 +3407,14 @@ async fn delete_channel(
         UPDATE alert_deliveries SET status='failed',last_error='channel_deleted',
             next_attempt_at=NULL,lease_until=NULL,lease_token=NULL,
             completed_at=$1,updated_at=$1
-        WHERE channel_id=$2 AND status IN ('pending','processing')
+        WHERE channel_id=$2 AND status='pending'
         "#,
     )
     .bind(now)
     .bind(&id)
     .execute(&mut *tx)
     .await?;
-    audit_action_tx(
-        &mut tx,
-        &admin,
-        "alert_webhook_delete",
-        &id,
-        "删除 Webhook 渠道",
-    )
-    .await?;
+    audit_action_tx(&mut tx, &admin, "alert_webhook_delete", &id, "删除通知渠道").await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2704,15 +3423,23 @@ async fn test_channel(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> AppResult<(StatusCode, Json<DeliveryRow>)> {
     let admin = require_admin(&state, &headers).await?;
-    let channel = load_channel(&state.db, &id).await?;
+    let mut tx = state.db.begin().await?;
+    let channel = sqlx::query_as::<_, ChannelRow>(
+        "SELECT * FROM alert_webhook_channels WHERE id=$1 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "通知渠道不存在"))?;
+    ensure_channel_uri_supports(&uri, &channel.channel_type)?;
     if !channel.enabled {
-        return Err(AppError::new(StatusCode::CONFLICT, "Webhook 渠道已停用"));
+        return Err(AppError::new(StatusCode::CONFLICT, "通知渠道已停用"));
     }
     let delivery_id = Uuid::new_v4().to_string();
     let now = now_ts();
-    let mut tx = state.db.begin().await?;
     sqlx::query(
         r#"
         INSERT INTO alert_deliveries(
@@ -2729,18 +3456,15 @@ async fn test_channel(
         "created_at": now,
         "actor": {"username": admin.username, "user_id": admin.user_id},
     }))
-    .bind(json!({"id": id, "name": channel.name}))
+    .bind(json!({
+        "id": id,
+        "name": channel.name,
+        "channel_type": channel.channel_type,
+    }))
     .bind(now)
     .execute(&mut *tx)
     .await?;
-    audit_action_tx(
-        &mut tx,
-        &admin,
-        "alert_webhook_test",
-        &id,
-        "测试 Webhook 渠道",
-    )
-    .await?;
+    audit_action_tx(&mut tx, &admin, "alert_webhook_test", &id, "测试通知渠道").await?;
     tx.commit().await?;
     let delivery = sqlx::query_as::<_, DeliveryRow>("SELECT * FROM alert_deliveries WHERE id=$1")
         .bind(&delivery_id)
@@ -2810,7 +3534,7 @@ async fn delivery_detail(db: &PgPool, id: &str) -> AppResult<DeliveryDetail> {
         .bind(id)
         .fetch_optional(db)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Webhook 投递不存在"))?;
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "通知投递不存在"))?;
     let attempts = sqlx::query_as::<_, DeliveryAttemptRow>(
         "SELECT * FROM alert_delivery_attempts WHERE delivery_id=$1 ORDER BY created_at,id",
     )
@@ -2838,14 +3562,7 @@ async fn retry_delivery(
     let now = now_ts();
     let mut tx = state.db.begin().await?;
     reset_failed_delivery_tx(&mut tx, &id, now).await?;
-    audit_action_tx(
-        &mut tx,
-        &admin,
-        "alert_delivery_retry",
-        &id,
-        "重试 Webhook 投递",
-    )
-    .await?;
+    audit_action_tx(&mut tx, &admin, "alert_delivery_retry", &id, "重试通知投递").await?;
     tx.commit().await?;
     Ok(Json(delivery_detail(&state.db, &id).await?))
 }
@@ -2855,15 +3572,29 @@ async fn reset_failed_delivery_tx(
     id: &str,
     now: i64,
 ) -> AppResult<()> {
-    let delivery = sqlx::query_as::<_, (String, String)>(
-        "SELECT status,channel_id FROM alert_deliveries WHERE id=$1 FOR UPDATE",
+    let delivery = sqlx::query_as::<_, (String, String, Option<String>, String)>(
+        "SELECT status,channel_id,event_id,kind FROM alert_deliveries WHERE id=$1 FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut **tx)
     .await?
-    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Webhook 投递不存在"))?;
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "通知投递不存在"))?;
     if delivery.0 != "failed" {
         return Err(AppError::new(StatusCode::CONFLICT, "只有失败投递可以重试"));
+    }
+    if let Some(event_id) = delivery.2.as_deref() {
+        let event_status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM alert_events WHERE id=$1 FOR SHARE",
+        )
+        .bind(event_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if lifecycle_has_advanced(&delivery.3, event_status.as_deref()) {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                "事件已进入后续生命周期，无法重试旧投递",
+            ));
+        }
     }
     let channel = sqlx::query_as::<_, (bool, Option<i64>)>(
         "SELECT enabled,deleted_at FROM alert_webhook_channels WHERE id=$1 FOR SHARE",
@@ -2875,13 +3606,13 @@ async fn reset_failed_delivery_tx(
         None | Some((_, Some(_))) => {
             return Err(AppError::new(
                 StatusCode::CONFLICT,
-                "Webhook 渠道已删除，无法重试",
+                "通知渠道已删除，无法重试",
             ));
         }
         Some((false, None)) => {
             return Err(AppError::new(
                 StatusCode::CONFLICT,
-                "Webhook 渠道已停用，无法重试",
+                "通知渠道已停用，无法重试",
             ));
         }
         Some((true, None)) => {}
@@ -2907,6 +3638,14 @@ async fn reset_failed_delivery_tx(
     Ok(())
 }
 
+fn lifecycle_has_advanced(delivery_kind: &str, event_status: Option<&str>) -> bool {
+    matches!(
+        (delivery_kind, event_status),
+        ("alert.firing", Some("acknowledged" | "resolved"))
+            | ("alert.acknowledged", Some("resolved"))
+    )
+}
+
 fn webhook_signature(secret: &[u8], timestamp: i64, body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(timestamp.to_string().as_bytes());
@@ -2927,13 +3666,39 @@ async fn claim_delivery(db: &PgPool, now: i64) -> AppResult<Option<DeliveryRow>>
     let row = sqlx::query_as::<_, DeliveryRow>(
         r#"
         WITH candidate AS (
-            SELECT id FROM alert_deliveries
+            SELECT queued.id FROM alert_deliveries queued
             WHERE (
-                status='pending' AND COALESCE(next_attempt_at,0) <= $1
-            ) OR (
-                status='processing' AND COALESCE(lease_until,0) <= $1
+                (queued.status='pending' AND COALESCE(queued.next_attempt_at,0) <= $1)
+                OR (queued.status='processing' AND COALESCE(queued.lease_until,0) <= $1)
             )
-            ORDER BY COALESCE(next_attempt_at,created_at),created_at,id
+              AND NOT EXISTS (
+                SELECT 1 FROM alert_deliveries earlier
+                WHERE queued.event_id IS NOT NULL
+                  AND earlier.event_id=queued.event_id
+                  AND earlier.channel_id=queued.channel_id
+                  AND earlier.status IN ('pending','processing')
+                  AND earlier.id <> queued.id
+                  AND ROW(
+                    earlier.created_at,
+                    CASE earlier.kind
+                      WHEN 'alert.firing' THEN 1
+                      WHEN 'alert.acknowledged' THEN 2
+                      WHEN 'alert.resolved' THEN 3
+                      ELSE 4
+                    END,
+                    earlier.id
+                  ) < ROW(
+                    queued.created_at,
+                    CASE queued.kind
+                      WHEN 'alert.firing' THEN 1
+                      WHEN 'alert.acknowledged' THEN 2
+                      WHEN 'alert.resolved' THEN 3
+                      ELSE 4
+                    END,
+                    queued.id
+                  )
+              )
+            ORDER BY COALESCE(queued.next_attempt_at,queued.created_at),queued.created_at,queued.id
             FOR UPDATE SKIP LOCKED
             LIMIT 1
         )
@@ -2974,6 +3739,29 @@ async fn start_delivery_attempt(
     .await?)
 }
 
+async fn release_delivery_claim(
+    db: &PgPool,
+    delivery: &DeliveryRow,
+    retry_at: i64,
+) -> AppResult<()> {
+    let Some(lease_token) = delivery.lease_token.as_deref() else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"
+        UPDATE alert_deliveries SET status='pending',next_attempt_at=$1,
+            lease_until=NULL,lease_token=NULL,updated_at=$1
+        WHERE id=$2 AND status='processing' AND lease_token=$3
+        "#,
+    )
+    .bind(retry_at)
+    .bind(&delivery.id)
+    .bind(lease_token)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 async fn current_delivery_suppression(
     db: &PgPool,
     delivery: &DeliveryRow,
@@ -2985,15 +3773,19 @@ async fn current_delivery_suppression(
     let Some(event_id) = delivery.event_id.as_deref() else {
         return Ok(None);
     };
-    let Some((rule_id, instance_id, metric)) = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT rule_id,instance_id,metric FROM alert_events WHERE id=$1",
-    )
-    .bind(event_id)
-    .fetch_optional(db)
-    .await?
+    let Some((rule_id, instance_id, metric, event_status)) =
+        sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT rule_id,instance_id,metric,status FROM alert_events WHERE id=$1",
+        )
+        .bind(event_id)
+        .fetch_optional(db)
+        .await?
     else {
         return Ok(None);
     };
+    if event_status == "resolved" {
+        return Ok(Some("event_resolved_before_delivery".to_string()));
+    }
     let maintenance = sqlx::query_as::<_, (String, String)>(
         r#"
         SELECT w.name,w.reason FROM alert_maintenance_windows w
@@ -3095,6 +3887,442 @@ struct WebhookAttemptOutcome {
     response_excerpt: String,
 }
 
+fn payload_string(payload: &Value, section: &str, field: &str) -> Option<String> {
+    let value = payload.get(section)?.get(field)?;
+    match value {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn lifecycle_label(kind: &str) -> &str {
+    match kind {
+        "alert.firing" => "告警触发",
+        "alert.acknowledged" => "告警已确认",
+        "alert.resolved" => "告警已恢复",
+        "webhook.test" => "通知渠道测试",
+        _ => "告警通知",
+    }
+}
+
+fn single_line(value: &str, max_bytes: usize) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    crate::audit::truncate(normalized.trim(), max_bytes)
+}
+
+fn notification_text(payload: &Value) -> String {
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("alert.notification");
+    if kind == "webhook.test" {
+        return "operationMonitoring 通知渠道测试\n测试投递已由管理员发起。".to_string();
+    }
+
+    let label = lifecycle_label(kind);
+    let node = payload_string(payload, "node", "name")
+        .or_else(|| payload_string(payload, "node", "hostname"))
+        .or_else(|| payload_string(payload, "event", "instance_id"))
+        .unwrap_or_else(|| "未知节点".to_string());
+    let rule = payload_string(payload, "rule", "name").unwrap_or_else(|| "未知规则".to_string());
+    let metric = payload_string(payload, "event", "metric").unwrap_or_else(|| "unknown".into());
+    let severity = payload_string(payload, "event", "severity").unwrap_or_else(|| "unknown".into());
+    let current =
+        payload_string(payload, "event", "current_value").unwrap_or_else(|| "未知".into());
+    let threshold =
+        payload_string(payload, "event", "threshold").unwrap_or_else(|| "不适用".into());
+
+    let mut lines = vec![
+        format!("operationMonitoring {label}"),
+        format!("节点: {node}"),
+        format!("规则: {rule}"),
+        format!("级别: {severity}"),
+        format!("指标: {metric}"),
+        format!("当前值: {current}"),
+        format!("阈值: {threshold}"),
+    ];
+    if let Some(actor) = payload
+        .get("actor")
+        .and_then(|actor| actor.as_str().or_else(|| actor.get("username")?.as_str()))
+    {
+        lines.push(format!("操作者: {actor}"));
+    }
+    if let Some(note) = payload
+        .get("note")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("备注: {note}"));
+    }
+    if let Some(reason) = payload_string(payload, "event", "resolution_reason") {
+        lines.push(format!("恢复原因: {reason}"));
+    }
+    crate::audit::truncate(&lines.join("\n"), MAX_NOTIFICATION_TEXT_BYTES)
+}
+
+fn email_notification_content(payload: &Value) -> (String, String) {
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("alert.notification");
+    if kind == "webhook.test" {
+        return (
+            "[operationMonitoring] 通知渠道测试".to_string(),
+            notification_text(payload),
+        );
+    }
+    let severity = payload_string(payload, "event", "severity").unwrap_or_else(|| "unknown".into());
+    let node = payload_string(payload, "node", "name")
+        .or_else(|| payload_string(payload, "node", "hostname"))
+        .or_else(|| payload_string(payload, "event", "instance_id"))
+        .unwrap_or_else(|| "未知节点".to_string());
+    let rule = payload_string(payload, "rule", "name").unwrap_or_else(|| "未知规则".to_string());
+    let subject = format!(
+        "[operationMonitoring][{severity}] {}: {node} / {rule}",
+        lifecycle_label(kind)
+    );
+    (single_line(&subject, 240), notification_text(payload))
+}
+
+fn feishu_signature(secret: &str, timestamp: i64) -> String {
+    let key = format!("{timestamp}\n{secret}");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(&[]);
+    BASE64_STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn feishu_body(payload: &Value, secret: Option<&str>, timestamp: i64) -> Value {
+    let mut body = json!({
+        "msg_type": "text",
+        "content": {"text": notification_text(payload)},
+    });
+    if let Some(secret) = secret {
+        let object = body.as_object_mut().expect("Feishu payload is an object");
+        object.insert(
+            "timestamp".to_string(),
+            Value::String(timestamp.to_string()),
+        );
+        object.insert(
+            "sign".to_string(),
+            Value::String(feishu_signature(secret, timestamp)),
+        );
+    }
+    body
+}
+
+fn dingtalk_signature(secret: &str, timestamp: i64) -> String {
+    let message = format!("{timestamp}\n{secret}");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(message.as_bytes());
+    BASE64_STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn dingtalk_timestamp(timestamp: i64) -> i64 {
+    timestamp.saturating_mul(1_000)
+}
+
+fn dingtalk_body(payload: &Value) -> Value {
+    json!({
+        "msgtype": "text",
+        "text": {"content": notification_text(payload)},
+    })
+}
+
+fn wecom_body(payload: &Value) -> Value {
+    let content = notification_text(payload);
+    json!({
+        "msgtype": "text",
+        "text": {"content": crate::audit::truncate(&content, MAX_WECOM_TEXT_BYTES)},
+    })
+}
+
+fn slack_body(payload: &Value) -> Value {
+    json!({"text": notification_text(payload)})
+}
+
+fn msteams_body(payload: &Value) -> Value {
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("alert.notification");
+    json!({
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "summary": format!("operationMonitoring {}", lifecycle_label(kind)),
+        "themeColor": if kind == "alert.firing" { "D64545" } else { "2E7D5B" },
+        "text": notification_text(payload),
+    })
+}
+
+fn telegram_body(payload: &Value, chat_id: &str) -> Value {
+    json!({
+        "chat_id": chat_id,
+        "text": crate::audit::truncate(&notification_text(payload), 4 * 1024),
+        "disable_web_page_preview": true,
+    })
+}
+
+fn discord_body(payload: &Value) -> Value {
+    json!({
+        "content": crate::audit::truncate(&notification_text(payload), 2_000),
+        "allowed_mentions": {"parse": []},
+    })
+}
+
+fn response_code(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
+}
+
+fn channel_response_error(channel_type: &str, status: StatusCode, body: &[u8]) -> Option<String> {
+    if !status.is_success() {
+        return Some(format!("http_status_{}", status.as_u16()));
+    }
+    match channel_type {
+        "generic_webhook" => None,
+        "feishu" => {
+            let Ok(value) = serde_json::from_slice::<Value>(body) else {
+                return Some("feishu_invalid_response".to_string());
+            };
+            let code = response_code(&value, "code");
+            let status_code = response_code(&value, "StatusCode");
+            match code.or(status_code) {
+                Some(0) => None,
+                Some(code) => Some(format!("feishu_code_{code}")),
+                None => Some("feishu_invalid_response".to_string()),
+            }
+        }
+        "wecom" => {
+            let Ok(value) = serde_json::from_slice::<Value>(body) else {
+                return Some("wecom_invalid_response".to_string());
+            };
+            match response_code(&value, "errcode") {
+                Some(0) => None,
+                Some(code) => Some(format!("wecom_errcode_{code}")),
+                None => Some("wecom_invalid_response".to_string()),
+            }
+        }
+        "dingtalk" => {
+            let Ok(value) = serde_json::from_slice::<Value>(body) else {
+                return Some("dingtalk_invalid_response".to_string());
+            };
+            match response_code(&value, "errcode") {
+                Some(0) => None,
+                Some(code) => Some(format!("dingtalk_errcode_{code}")),
+                None => Some("dingtalk_invalid_response".to_string()),
+            }
+        }
+        "telegram" => {
+            let Ok(value) = serde_json::from_slice::<Value>(body) else {
+                return Some("telegram_invalid_response".to_string());
+            };
+            match value.get("ok").and_then(Value::as_bool) {
+                Some(true) => None,
+                Some(false) => response_code(&value, "error_code")
+                    .map(|code| format!("telegram_error_code_{code}"))
+                    .or_else(|| Some("telegram_api_error".to_string())),
+                None => Some("telegram_invalid_response".to_string()),
+            }
+        }
+        "slack" | "msteams" => None,
+        "discord" => None,
+        _ => Some("unsupported_http_channel_type".to_string()),
+    }
+}
+
+async fn send_http_channel(
+    client: &Client,
+    state: &AppState,
+    channel: &ChannelRow,
+    delivery: &DeliveryRow,
+) -> AppResult<(StatusCode, String, Option<String>)> {
+    let url = decrypt_string(state, &channel.url_ciphertext)?;
+    let url = validate_webhook_url(&url)?;
+    let timestamp = now_ts();
+    let mut request = client.post(&url).header("content-type", "application/json");
+    let body = match channel.channel_type.as_str() {
+        "generic_webhook" => {
+            let body = serde_json::to_vec(&delivery.payload)
+                .map_err(|error| anyhow::anyhow!("failed to serialize webhook payload: {error}"))?;
+            request = request
+                .header("x-om-timestamp", timestamp.to_string())
+                .header("x-om-delivery-id", &delivery.id);
+            for (name, value) in decrypt_headers(state, &channel.headers_ciphertext)? {
+                request = request.header(name, value);
+            }
+            if let Some(ciphertext) = channel.secret_ciphertext.as_deref() {
+                let secret = state.auth_cipher.decrypt(ciphertext)?;
+                request = request.header(
+                    "x-om-signature",
+                    webhook_signature(&secret, timestamp, &body),
+                );
+            }
+            body
+        }
+        "feishu" => {
+            let secret = channel
+                .secret_ciphertext
+                .as_deref()
+                .map(|ciphertext| decrypt_string(state, ciphertext))
+                .transpose()?;
+            serde_json::to_vec(&feishu_body(
+                &delivery.payload,
+                secret.as_deref(),
+                timestamp,
+            ))
+            .map_err(|error| anyhow::anyhow!("failed to serialize Feishu payload: {error}"))?
+        }
+        "wecom" => serde_json::to_vec(&wecom_body(&delivery.payload))
+            .map_err(|error| anyhow::anyhow!("failed to serialize WeCom payload: {error}"))?,
+        "dingtalk" => {
+            if let Some(ciphertext) = channel.secret_ciphertext.as_deref() {
+                let secret = decrypt_string(state, ciphertext)?;
+                // DingTalk's signed robot API expects milliseconds, while the
+                // generic delivery timestamp remains Unix seconds.
+                let signed_timestamp = dingtalk_timestamp(timestamp);
+                let mut signed_url = Url::parse(&url)
+                    .map_err(|_| AppError::bad_request("钉钉 Webhook URL 格式无效"))?;
+                signed_url
+                    .query_pairs_mut()
+                    .append_pair("timestamp", &signed_timestamp.to_string())
+                    .append_pair("sign", &dingtalk_signature(&secret, signed_timestamp));
+                request = client
+                    .post(signed_url)
+                    .header("content-type", "application/json");
+            }
+            serde_json::to_vec(&dingtalk_body(&delivery.payload))
+                .map_err(|error| anyhow::anyhow!("failed to serialize DingTalk payload: {error}"))?
+        }
+        "slack" => serde_json::to_vec(&slack_body(&delivery.payload))
+            .map_err(|error| anyhow::anyhow!("failed to serialize Slack payload: {error}"))?,
+        "msteams" => serde_json::to_vec(&msteams_body(&delivery.payload)).map_err(|error| {
+            anyhow::anyhow!("failed to serialize Microsoft Teams payload: {error}")
+        })?,
+        "telegram" => {
+            let config = decrypt_telegram_config(state, channel)?;
+            serde_json::to_vec(&telegram_body(&delivery.payload, &config.chat_id))
+                .map_err(|error| anyhow::anyhow!("failed to serialize Telegram payload: {error}"))?
+        }
+        "discord" => serde_json::to_vec(&discord_body(&delivery.payload))
+            .map_err(|error| anyhow::anyhow!("failed to serialize Discord payload: {error}"))?,
+        _ => return Err(AppError::bad_request("该渠道不是 HTTP 通知渠道")),
+    };
+    let mut response = request.body(body).send().await.map_err(|error| {
+        AppError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("webhook request failed: {}", error.without_url()),
+        )
+    })?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        AppError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("failed to read webhook response: {}", error.without_url()),
+        )
+    })? {
+        let remaining = MAX_RESPONSE_BYTES.saturating_sub(bytes.len());
+        if remaining == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if bytes.len() >= MAX_RESPONSE_BYTES {
+            break;
+        }
+    }
+    let response_excerpt =
+        crate::audit::truncate(&String::from_utf8_lossy(&bytes), MAX_RESPONSE_BYTES);
+    let error = channel_response_error(&channel.channel_type, status, &bytes);
+    Ok((status, response_excerpt, error))
+}
+
+async fn send_email_channel(
+    state: &AppState,
+    channel: &ChannelRow,
+    delivery: &DeliveryRow,
+) -> AppResult<String> {
+    let config = decrypt_email_config(state, channel)?;
+    let (subject, body) = email_notification_content(&delivery.payload);
+    let from_address = config
+        .from_address
+        .parse::<Address>()
+        .map_err(|_| AppError::new(StatusCode::BAD_GATEWAY, "smtp_message_build_failed"))?;
+    let mut message = Message::builder()
+        .from(Mailbox::new(config.from_name.clone(), from_address))
+        .subject(subject)
+        .message_id(Some(format!(
+            "<{}@operation-monitoring.local>",
+            delivery.id
+        )))
+        .header(ContentType::TEXT_PLAIN);
+    for recipient in &config.recipients {
+        let address = recipient
+            .parse::<Address>()
+            .map_err(|_| AppError::new(StatusCode::BAD_GATEWAY, "smtp_message_build_failed"))?;
+        message = message.to(Mailbox::new(None, address));
+    }
+    let message = message
+        .body(body)
+        .map_err(|_| AppError::new(StatusCode::BAD_GATEWAY, "smtp_message_build_failed"))?;
+    let mut transport = match config.security.as_str() {
+        "starttls" => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host),
+        "smtps" => AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host),
+        _ => return Err(AppError::bad_request("SMTP security 配置无效")),
+    }
+    .map_err(|error| AppError::new(StatusCode::BAD_GATEWAY, smtp_delivery_error_code(&error)))?
+    .port(config.smtp_port)
+    .timeout(Some(Duration::from_secs(SMTP_TIMEOUT_SECONDS)));
+    if let (Some(username), Some(password)) = (config.username, config.password) {
+        transport = transport.credentials(Credentials::new(username, password));
+    }
+    let transport = transport.build::<Tokio1Executor>();
+    match tokio::time::timeout(
+        Duration::from_secs(SMTP_TIMEOUT_SECONDS),
+        transport.send(message),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok("smtp_accepted".to_string()),
+        Ok(Err(error)) => Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            smtp_delivery_error_code(&error),
+        )),
+        Err(_) => Err(AppError::new(StatusCode::GATEWAY_TIMEOUT, "smtp_timeout")),
+    }
+}
+
+fn smtp_delivery_error_code(error: &lettre::transport::smtp::Error) -> String {
+    if error.is_timeout() {
+        "smtp_timeout".to_string()
+    } else if error.is_tls() {
+        "smtp_tls_failed".to_string()
+    } else if let Some(status) = error.status() {
+        format!("smtp_status_{status}")
+    } else if error.is_transient() {
+        "smtp_transient".to_string()
+    } else if error.is_permanent() {
+        "smtp_permanent".to_string()
+    } else {
+        "smtp_send_failed".to_string()
+    }
+}
+
 async fn send_webhook(
     client: &Client,
     state: &AppState,
@@ -3104,69 +4332,25 @@ async fn send_webhook(
     let outcome = async {
         let channel = load_channel(&state.db, &delivery.channel_id).await?;
         if !channel.enabled {
-            return Err(AppError::new(StatusCode::CONFLICT, "Webhook 渠道已停用"));
+            return Err(AppError::new(StatusCode::CONFLICT, "通知渠道已停用"));
         }
-        let url = decrypt_string(state, &channel.url_ciphertext)?;
-        let url = validate_webhook_url(&url)?;
-        let headers = decrypt_headers(state, &channel.headers_ciphertext)?;
-        let body = serde_json::to_vec(&delivery.payload)
-            .map_err(|error| anyhow::anyhow!("failed to serialize webhook payload: {error}"))?;
-        let timestamp = now_ts();
-        let mut request = client
-            .post(url)
-            .header("content-type", "application/json")
-            .header("x-om-timestamp", timestamp.to_string())
-            .header("x-om-delivery-id", &delivery.id)
-            .body(body.clone());
-        for (name, value) in headers {
-            request = request.header(name, value);
+        if channel.channel_type == "email" {
+            let response_excerpt = send_email_channel(state, &channel, delivery).await?;
+            Ok::<_, AppError>((None, response_excerpt, None))
+        } else {
+            let (status, response_excerpt, error) =
+                send_http_channel(client, state, &channel, delivery).await?;
+            Ok((Some(i64::from(status.as_u16())), response_excerpt, error))
         }
-        if let Some(ciphertext) = channel.secret_ciphertext.as_deref() {
-            let secret = state.auth_cipher.decrypt(ciphertext)?;
-            request = request.header(
-                "x-om-signature",
-                webhook_signature(&secret, timestamp, &body),
-            );
-        }
-        let mut response = request.send().await.map_err(|error| {
-            AppError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("webhook request failed: {}", error.without_url()),
-            )
-        })?;
-        let status = response.status();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|error| {
-            AppError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("failed to read webhook response: {}", error.without_url()),
-            )
-        })? {
-            let remaining = MAX_RESPONSE_BYTES.saturating_sub(bytes.len());
-            if remaining == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-            if bytes.len() >= MAX_RESPONSE_BYTES {
-                break;
-            }
-        }
-        let response_excerpt =
-            crate::audit::truncate(&String::from_utf8_lossy(&bytes), MAX_RESPONSE_BYTES);
-        Ok::<_, AppError>((status, response_excerpt))
     }
     .await;
     let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
     match outcome {
-        Ok((status, response_excerpt)) => WebhookAttemptOutcome {
-            succeeded: status.is_success(),
-            http_status: Some(i64::from(status.as_u16())),
+        Ok((http_status, response_excerpt, error)) => WebhookAttemptOutcome {
+            succeeded: error.is_none(),
+            http_status,
             duration_ms,
-            error: if status.is_success() {
-                String::new()
-            } else {
-                format!("http_status_{}", status.as_u16())
-            },
+            error: error.unwrap_or_default(),
             response_excerpt,
         },
         Err(error) => WebhookAttemptOutcome {
@@ -3220,6 +4404,32 @@ async fn finish_delivery_attempt(
     .bind(now)
     .execute(&mut *tx)
     .await?;
+    let channel_state = sqlx::query_as::<_, (bool, Option<i64>)>(
+        "SELECT enabled,deleted_at FROM alert_webhook_channels WHERE id=$1 FOR SHARE",
+    )
+    .bind(&delivery.channel_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let inactive_channel_error = match channel_state {
+        Some((_, Some(_))) | None => Some("channel_deleted"),
+        Some((false, None)) => Some("channel_disabled"),
+        Some((true, None)) => None,
+    };
+    let event_resolved = if !outcome.succeeded && delivery.kind == "alert.firing" {
+        if let Some(event_id) = delivery.event_id.as_deref() {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT status='resolved' FROM alert_events WHERE id=$1 FOR SHARE",
+            )
+            .bind(event_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     if outcome.succeeded {
         sqlx::query(
             r#"
@@ -3228,6 +4438,36 @@ async fn finish_delivery_attempt(
             WHERE id=$2 AND status='processing' AND lease_token=$3
             "#,
         )
+        .bind(now)
+        .bind(&delivery.id)
+        .bind(lease_token)
+        .execute(&mut *tx)
+        .await?;
+    } else if event_resolved {
+        sqlx::query(
+            r#"
+            UPDATE alert_deliveries SET status='suppressed',
+                suppression_reason='event_resolved_before_delivery',
+                next_attempt_at=NULL,lease_until=NULL,lease_token=NULL,
+                last_error=$1,completed_at=$2,updated_at=$2
+            WHERE id=$3 AND status='processing' AND lease_token=$4
+            "#,
+        )
+        .bind(&outcome.error)
+        .bind(now)
+        .bind(&delivery.id)
+        .bind(lease_token)
+        .execute(&mut *tx)
+        .await?;
+    } else if let Some(channel_error) = inactive_channel_error {
+        sqlx::query(
+            r#"
+            UPDATE alert_deliveries SET status='failed',next_attempt_at=NULL,
+                lease_until=NULL,lease_token=NULL,last_error=$1,completed_at=$2,updated_at=$2
+            WHERE id=$3 AND status='processing' AND lease_token=$4
+            "#,
+        )
+        .bind(channel_error)
         .bind(now)
         .bind(&delivery.id)
         .bind(lease_token)
@@ -3274,18 +4514,7 @@ fn retry_delay_after(cycle_attempts: i64) -> Option<i64> {
     Some(DELIVERY_RETRY_DELAYS[(cycle_attempts - 1) as usize])
 }
 
-pub async fn webhook_delivery_loop(state: AppState) {
-    let client = match Client::builder()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECONDS))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            error!(?error, "failed to initialize alert webhook client");
-            return;
-        }
-    };
+async fn notification_delivery_worker(state: AppState, client: Client) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -3295,7 +4524,7 @@ pub async fn webhook_delivery_loop(state: AppState) {
                 Ok(Some(delivery)) => delivery,
                 Ok(None) => break,
                 Err(error) => {
-                    warn!(?error, "failed to claim alert webhook delivery");
+                    warn!(?error, "failed to claim alert notification delivery");
                     break;
                 }
             };
@@ -3304,38 +4533,17 @@ pub async fn webhook_delivery_loop(state: AppState) {
                     if let Err(error) =
                         mark_delivery_suppressed(&state.db, &delivery, &reason, now_ts()).await
                     {
-                        warn!(?error, delivery_id=%delivery.id, "failed to suppress webhook delivery");
+                        warn!(?error, delivery_id=%delivery.id, "failed to suppress notification delivery");
                     }
                     continue;
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    warn!(?error, delivery_id=%delivery.id, "failed to recheck webhook suppression");
-                    let Some(delivery) = (match start_delivery_attempt(
-                        &state.db,
-                        &delivery,
-                        now_ts(),
-                    )
-                    .await
+                    warn!(?error, delivery_id=%delivery.id, "failed to recheck notification suppression");
+                    if let Err(error) =
+                        release_delivery_claim(&state.db, &delivery, now_ts() + 1).await
                     {
-                        Ok(delivery) => delivery,
-                        Err(error) => {
-                            warn!(?error, delivery_id=%delivery.id, "failed to start webhook attempt");
-                            continue;
-                        }
-                    }) else {
-                        continue;
-                    };
-                    let outcome = WebhookAttemptOutcome {
-                        succeeded: false,
-                        http_status: None,
-                        duration_ms: 0,
-                        error: "suppression_check_failed".to_string(),
-                        response_excerpt: String::new(),
-                    };
-                    if let Err(error) = finish_delivery_attempt(&state.db, &delivery, outcome).await
-                    {
-                        warn!(?error, delivery_id=%delivery.id, "failed to record webhook attempt");
+                        warn!(?error, delivery_id=%delivery.id, "failed to release notification claim");
                     }
                     continue;
                 }
@@ -3344,7 +4552,7 @@ pub async fn webhook_delivery_loop(state: AppState) {
             {
                 Ok(delivery) => delivery,
                 Err(error) => {
-                    warn!(?error, delivery_id=%delivery.id, "failed to start webhook attempt");
+                    warn!(?error, delivery_id=%delivery.id, "failed to start notification attempt");
                     continue;
                 }
             }) else {
@@ -3352,9 +4560,32 @@ pub async fn webhook_delivery_loop(state: AppState) {
             };
             let outcome = send_webhook(&client, &state, &delivery).await;
             if let Err(error) = finish_delivery_attempt(&state.db, &delivery, outcome).await {
-                warn!(?error, delivery_id=%delivery.id, "failed to record webhook attempt");
+                warn!(?error, delivery_id=%delivery.id, "failed to record notification attempt");
             }
         }
+    }
+}
+
+pub async fn webhook_delivery_loop(state: AppState) {
+    let client = match Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECONDS))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            error!(?error, "failed to initialize alert notification client");
+            return;
+        }
+    };
+
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..DELIVERY_WORKER_COUNT {
+        workers.spawn(notification_delivery_worker(state.clone(), client.clone()));
+    }
+    while let Some(result) = workers.join_next().await {
+        error!(?result, "alert notification worker stopped unexpectedly");
+        workers.spawn(notification_delivery_worker(state.clone(), client.clone()));
     }
 }
 
@@ -3559,13 +4790,15 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO alert_webhook_channels(
-                id,name,url_ciphertext,secret_ciphertext,headers_ciphertext,
-                enabled,created_at,updated_at
-            ) VALUES($1,'Test webhook',$2,$3,$4,TRUE,100,100)
+                id,name,channel_type,url_ciphertext,secret_ciphertext,headers_ciphertext,
+                config_ciphertext,enabled,created_at,updated_at
+            ) VALUES($1,'Test webhook','generic_webhook',$2,$3,$4,NULL,TRUE,100,100)
             ON CONFLICT(id) DO UPDATE SET
+                channel_type='generic_webhook',
                 url_ciphertext=EXCLUDED.url_ciphertext,
                 secret_ciphertext=EXCLUDED.secret_ciphertext,
                 headers_ciphertext=EXCLUDED.headers_ciphertext,
+                config_ciphertext=NULL,
                 enabled=TRUE,deleted_at=NULL,updated_at=EXCLUDED.updated_at
             "#,
         )
@@ -3586,7 +4819,11 @@ mod tests {
             kind: "webhook.test".to_string(),
             status: "processing".to_string(),
             payload: json!({"version": 1, "type": "webhook.test", "value": "payload"}),
-            channel_snapshot: json!({"id": channel_id, "name": "Test webhook"}),
+            channel_snapshot: json!({
+                "id": channel_id,
+                "name": "Test webhook",
+                "channel_type": "generic_webhook",
+            }),
             suppression_reason: String::new(),
             attempts_count: 1,
             cycle_attempts: 1,
@@ -3736,6 +4973,253 @@ mod tests {
     }
 
     #[test]
+    fn legacy_channels_default_to_generic_and_channel_type_is_immutable() {
+        let payload: ChannelRequest = serde_json::from_value(json!({
+            "name": "legacy",
+            "url": "https://hooks.example.test/notify"
+        }))
+        .expect("deserialize legacy channel request");
+        assert_eq!(
+            channel_type_for_create(payload.channel_type.as_deref()).unwrap(),
+            "generic_webhook"
+        );
+        assert_eq!(channel_type_for_update(None, "email").unwrap(), "email");
+        assert!(channel_type_for_update(Some("wecom"), "feishu").is_err());
+    }
+
+    #[test]
+    fn validates_email_tls_credentials_and_preserves_password_bytes() {
+        let config = EmailChannelConfig {
+            smtp_host: "smtp.example.test".to_string(),
+            smtp_port: 587,
+            security: "starttls".to_string(),
+            username: Some("mailer".to_string()),
+            password: Some("  password with spaces  ".to_string()),
+            from_address: "alerts@example.test".to_string(),
+            from_name: Some("Operations".to_string()),
+            recipients: vec![
+                "admin@example.test".to_string(),
+                "ADMIN@example.test".to_string(),
+            ],
+        };
+        let validated = validate_email_config(config.clone()).expect("valid email config");
+        assert_eq!(validated.password, config.password);
+        assert_eq!(validated.recipients, vec!["admin@example.test"]);
+
+        let mut invalid = config.clone();
+        invalid.security = "plaintext".to_string();
+        assert!(validate_email_config(invalid).is_err());
+        let mut invalid = config;
+        invalid.password = None;
+        assert!(validate_email_config(invalid).is_err());
+    }
+
+    #[test]
+    fn platform_adapters_use_expected_payloads_and_signatures() {
+        let payload = json!({
+            "type": "alert.firing",
+            "event": {
+                "severity": "critical",
+                "metric": "cpu_percent",
+                "instance_id": "node-1",
+                "current_value": 95.5,
+                "threshold": 90
+            },
+            "rule": {"name": "High CPU"},
+            "node": {"name": "API node"}
+        });
+        let feishu = feishu_body(&payload, Some("test"), 1_700_000_000);
+        assert_eq!(feishu["msg_type"], "text");
+        assert_eq!(feishu["timestamp"], "1700000000");
+        assert_eq!(
+            feishu["sign"],
+            "eSJQnOl8XqPTMPHWz9e5IzeHS/tqoc68g2967ekIPmg="
+        );
+        assert!(
+            feishu["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("API node")
+        );
+
+        let wecom = wecom_body(&payload);
+        assert_eq!(wecom["msgtype"], "text");
+        assert!(
+            wecom["text"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("High CPU")
+        );
+
+        let long_payload = json!({
+            "type": "alert.acknowledged",
+            "event": {"instance_id": "node-1"},
+            "note": "告".repeat(2_000),
+        });
+        let long_wecom = wecom_body(&long_payload);
+        let content = long_wecom["text"]["content"].as_str().unwrap();
+        assert!(content.len() <= MAX_WECOM_TEXT_BYTES);
+        assert!(content.is_char_boundary(content.len()));
+    }
+
+    #[test]
+    fn common_platform_adapters_use_expected_payloads() {
+        let payload = json!({
+            "type": "alert.firing",
+            "event": {
+                "severity": "critical",
+                "metric": "cpu_percent",
+                "instance_id": "node-1",
+                "current_value": 95.5,
+                "threshold": 90
+            },
+            "rule": {"name": "High CPU"},
+            "node": {"name": "API node"}
+        });
+        let ding = dingtalk_body(&payload);
+        assert_eq!(ding["msgtype"], "text");
+        assert!(
+            ding["text"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("API node")
+        );
+        assert_eq!(
+            dingtalk_signature("secret", 1_700_000_000),
+            "vli3/GfD4kJTUyxxBD82mmmq4rnrfhhcCjvn2rP9x7o="
+        );
+        assert_eq!(
+            dingtalk_timestamp(1_700_000_000),
+            1_700_000_000_000,
+            "DingTalk timestamps are millisecond Unix timestamps"
+        );
+
+        let slack = slack_body(&payload);
+        assert!(slack["text"].as_str().unwrap().contains("High CPU"));
+
+        let teams = msteams_body(&payload);
+        assert_eq!(teams["@type"], "MessageCard");
+        assert_eq!(teams["themeColor"], "D64545");
+
+        let telegram = telegram_body(&payload, "-100123");
+        assert_eq!(telegram["chat_id"], "-100123");
+        assert!(telegram["text"].as_str().unwrap().contains("critical"));
+
+        let discord = discord_body(&payload);
+        assert!(discord["content"].as_str().unwrap().contains("cpu_percent"));
+        assert_eq!(discord["allowed_mentions"]["parse"], json!([]));
+    }
+
+    #[test]
+    fn common_platform_business_codes_control_delivery_success() {
+        assert_eq!(
+            channel_response_error("dingtalk", StatusCode::OK, br#"{"errcode":0}"#),
+            None
+        );
+        assert_eq!(
+            channel_response_error("dingtalk", StatusCode::OK, br#"{"errcode":310000}"#),
+            Some("dingtalk_errcode_310000".to_string())
+        );
+        assert_eq!(
+            channel_response_error("telegram", StatusCode::OK, br#"{"ok":true}"#),
+            None
+        );
+        assert_eq!(
+            channel_response_error(
+                "telegram",
+                StatusCode::OK,
+                br#"{"ok":false,"error_code":400}"#,
+            ),
+            Some("telegram_error_code_400".to_string())
+        );
+        assert_eq!(channel_response_error("slack", StatusCode::OK, b"ok"), None);
+        assert_eq!(
+            channel_response_error("slack", StatusCode::OK, b"invalid_payload"),
+            None
+        );
+        assert_eq!(
+            channel_response_error("msteams", StatusCode::OK, br#"{"accepted":true}"#),
+            None
+        );
+        assert_eq!(
+            channel_response_error("discord", StatusCode::NO_CONTENT, b""),
+            None
+        );
+    }
+
+    #[test]
+    fn validates_common_channel_types_and_telegram_chat_id() {
+        for channel_type in ["dingtalk", "slack", "msteams", "telegram", "discord"] {
+            assert_eq!(validate_channel_type(channel_type).unwrap(), channel_type);
+        }
+        assert_eq!(
+            normalized_chat_id(Some(" -100123 ")).unwrap(),
+            Some("-100123".to_string())
+        );
+        assert!(normalized_chat_id(Some("bad\nid")).is_err());
+        assert!(normalized_chat_id(Some(&"x".repeat(MAX_TELEGRAM_CHAT_ID_BYTES + 1))).is_err());
+    }
+
+    #[test]
+    fn platform_business_codes_control_delivery_success() {
+        assert_eq!(
+            channel_response_error("feishu", StatusCode::OK, br#"{"code":0}"#),
+            None
+        );
+        assert_eq!(
+            channel_response_error(
+                "feishu",
+                StatusCode::OK,
+                br#"{"code":19001,"StatusCode":0}"#,
+            ),
+            Some("feishu_code_19001".to_string())
+        );
+        assert_eq!(
+            channel_response_error("feishu", StatusCode::OK, br#"{"StatusCode":0}"#),
+            None
+        );
+        assert_eq!(
+            channel_response_error("feishu", StatusCode::OK, br#"{"code":19001}"#),
+            Some("feishu_code_19001".to_string())
+        );
+        assert_eq!(
+            channel_response_error("wecom", StatusCode::OK, br#"{"errcode":0}"#),
+            None
+        );
+        assert_eq!(
+            channel_response_error("wecom", StatusCode::OK, br#"{"errcode":40013}"#),
+            Some("wecom_errcode_40013".to_string())
+        );
+        assert_eq!(
+            channel_response_error("generic_webhook", StatusCode::NO_CONTENT, b""),
+            None
+        );
+    }
+
+    #[test]
+    fn email_content_is_readable_lifecycle_text() {
+        let payload = json!({
+            "type": "alert.resolved",
+            "event": {
+                "severity": "warning",
+                "metric": "memory_percent",
+                "instance_id": "node-1",
+                "current_value": 72.5,
+                "threshold": 90,
+                "resolution_reason": "condition_recovered"
+            },
+            "rule": {"name": "Memory pressure"},
+            "node": {"name": "Database node"}
+        });
+        let (subject, body) = email_notification_content(&payload);
+        assert!(subject.contains("告警已恢复"));
+        assert!(subject.contains("Database node"));
+        assert!(body.contains("规则: Memory pressure"));
+        assert!(body.contains("恢复原因: condition_recovered"));
+        assert!(!body.starts_with('{'));
+    }
+
+    #[test]
     fn masks_webhook_queries_and_paths() {
         assert_eq!(
             mask_webhook_url("https://hooks.example.test/secret/path?token=sensitive"),
@@ -3810,6 +5294,19 @@ mod tests {
         assert_eq!(retry_delay_after(4), Some(60 * 60));
         assert_eq!(retry_delay_after(5), None);
         assert_eq!(retry_delay_after(0), None);
+    }
+
+    #[test]
+    fn stale_lifecycle_deliveries_cannot_be_manually_replayed() {
+        assert!(!lifecycle_has_advanced("alert.firing", Some("firing")));
+        assert!(lifecycle_has_advanced("alert.firing", Some("acknowledged")));
+        assert!(lifecycle_has_advanced("alert.firing", Some("resolved")));
+        assert!(lifecycle_has_advanced(
+            "alert.acknowledged",
+            Some("resolved")
+        ));
+        assert!(!lifecycle_has_advanced("alert.resolved", Some("resolved")));
+        assert!(!lifecycle_has_advanced("webhook.test", None));
     }
 
     #[tokio::test]
@@ -4179,6 +5676,350 @@ mod tests {
                 ("alert.resolved".to_string(), 1),
             ]
         );
+
+        drop_test_schema(db, bootstrap, schema).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn postgres_schema_migrates_legacy_channel_type_check() {
+        let (db, bootstrap, schema) = isolated_test_pool("om_alerts_channel_migration").await;
+        create_alert_prerequisites(&db).await;
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE alert_webhook_channels (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                channel_type TEXT NOT NULL DEFAULT 'generic_webhook'
+                    CHECK(channel_type IN ('generic_webhook', 'email', 'feishu', 'wecom')),
+                url_ciphertext TEXT NOT NULL,
+                secret_ciphertext TEXT,
+                headers_ciphertext TEXT NOT NULL,
+                config_ciphertext TEXT,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                deleted_at BIGINT
+            );
+            INSERT INTO alert_webhook_channels(
+                id,name,channel_type,url_ciphertext,headers_ciphertext,
+                enabled,created_at,updated_at
+            ) VALUES('legacy-feishu','Legacy Feishu','feishu','url','headers',TRUE,100,100)
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("create legacy four-type notification channel table");
+
+        let legacy_constraint: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid='alert_webhook_channels'::regclass
+                  AND conname='alert_webhook_channels_channel_type_check'
+            )
+            "#,
+        )
+        .fetch_one(&db)
+        .await
+        .expect("inspect legacy automatically named channel constraint");
+        assert!(legacy_constraint);
+
+        ensure_schema(&db)
+            .await
+            .expect("migrate legacy notification channel constraint");
+        for channel_type in ["dingtalk", "slack", "msteams", "telegram", "discord"] {
+            sqlx::query(
+                r#"
+                INSERT INTO alert_webhook_channels(
+                    id,name,channel_type,url_ciphertext,headers_ciphertext,
+                    enabled,created_at,updated_at
+                ) VALUES($1,$1,$1,'url','headers',TRUE,200,200)
+                "#,
+            )
+            .bind(channel_type)
+            .execute(&db)
+            .await
+            .unwrap_or_else(|error| panic!("insert migrated {channel_type} channel: {error}"));
+        }
+        ensure_schema(&db)
+            .await
+            .expect("rerun migrated notification channel schema idempotently");
+
+        let constraints = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT conname FROM pg_constraint
+            WHERE conrelid='alert_webhook_channels'::regclass AND contype='c'
+            ORDER BY conname
+            "#,
+        )
+        .fetch_all(&db)
+        .await
+        .expect("load migrated channel constraints");
+        assert_eq!(
+            constraints,
+            vec!["alert_webhook_channels_type_check".to_string()]
+        );
+
+        drop_test_schema(db, bootstrap, schema).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn lifecycle_deliveries_are_claimed_in_order_and_release_without_attempts() {
+        let (db, bootstrap, schema) = isolated_test_pool("om_alerts_delivery_order").await;
+        create_alert_prerequisites(&db).await;
+        ensure_schema(&db).await.expect("create alert schema");
+        let state = test_state(db.clone());
+        insert_test_instance(&db, "node-order", "Ordered Node").await;
+        insert_test_rule(&db, "rule-order").await;
+        set_test_channel(
+            &state,
+            "channel-order",
+            "http://127.0.0.1/unused",
+            None,
+            &BTreeMap::new(),
+        )
+        .await;
+        let observed_at = now_ts();
+        sqlx::query(
+            r#"
+            INSERT INTO alert_events(
+                id,rule_id,instance_id,status,severity,metric,rule_snapshot,node_snapshot,
+                threshold,duration_seconds,current_value,first_observed_at,fired_at,last_observed_at
+            ) VALUES(
+                'event-order','rule-order','node-order','firing','critical','cpu_percent',
+                '{}'::JSONB,'{}'::JSONB,90,0,95,$1,$1,$1
+            )
+            "#,
+        )
+        .bind(observed_at)
+        .execute(&db)
+        .await
+        .expect("insert event for ordered lifecycle deliveries");
+        sqlx::query(
+            r#"
+            INSERT INTO alert_deliveries(
+                id,event_id,channel_id,kind,status,payload,channel_snapshot,
+                next_attempt_at,created_at,updated_at
+            ) VALUES
+                ('z-firing','event-order','channel-order','alert.firing','pending','{}'::JSONB,'{}'::JSONB,$1,$1,$1),
+                ('a-ack','event-order','channel-order','alert.acknowledged','pending','{}'::JSONB,'{}'::JSONB,$1,$1,$1),
+                ('m-resolved','event-order','channel-order','alert.resolved','pending','{}'::JSONB,'{}'::JSONB,$1,$1,$1)
+            "#,
+        )
+        .bind(observed_at)
+        .execute(&db)
+        .await
+        .expect("insert ordered lifecycle deliveries");
+
+        let (first, competing) = tokio::join!(
+            claim_delivery(&db, observed_at),
+            claim_delivery(&db, observed_at),
+        );
+        let first = first.expect("claim firing delivery");
+        let competing = competing.expect("run competing claim");
+        assert_ne!(first.is_some(), competing.is_some());
+        let first = first
+            .or(competing)
+            .expect("one worker claims firing delivery");
+        assert_eq!(first.kind, "alert.firing");
+        assert_eq!(
+            first.lease_until,
+            Some(observed_at + DELIVERY_LEASE_SECONDS)
+        );
+        assert!(
+            claim_delivery(&db, observed_at)
+                .await
+                .expect("check blocked acknowledgement")
+                .is_none()
+        );
+        let first = start_delivery_attempt(&db, &first, observed_at)
+            .await
+            .expect("start firing attempt")
+            .expect("firing lease remains active");
+        finish_delivery_attempt(
+            &db,
+            &first,
+            WebhookAttemptOutcome {
+                succeeded: true,
+                http_status: Some(204),
+                duration_ms: 1,
+                error: String::new(),
+                response_excerpt: String::new(),
+            },
+        )
+        .await
+        .expect("finish firing attempt");
+
+        let acknowledgement = claim_delivery(&db, observed_at)
+            .await
+            .expect("claim acknowledgement")
+            .expect("acknowledgement becomes available");
+        assert_eq!(acknowledgement.kind, "alert.acknowledged");
+        let acknowledgement = start_delivery_attempt(&db, &acknowledgement, observed_at)
+            .await
+            .expect("start acknowledgement attempt")
+            .expect("acknowledgement lease remains active");
+        finish_delivery_attempt(
+            &db,
+            &acknowledgement,
+            WebhookAttemptOutcome {
+                succeeded: true,
+                http_status: Some(204),
+                duration_ms: 1,
+                error: String::new(),
+                response_excerpt: String::new(),
+            },
+        )
+        .await
+        .expect("finish acknowledgement attempt");
+
+        let resolved = claim_delivery(&db, observed_at)
+            .await
+            .expect("claim resolution")
+            .expect("resolution becomes available");
+        assert_eq!(resolved.kind, "alert.resolved");
+        release_delivery_claim(&db, &resolved, observed_at + 1)
+            .await
+            .expect("release resolution after a pre-send database failure");
+        let released = sqlx::query_as::<_, (String, i64, i64, Option<String>)>(
+            "SELECT status,attempts_count,next_attempt_at,lease_token FROM alert_deliveries WHERE id=$1",
+        )
+        .bind(&resolved.id)
+        .fetch_one(&db)
+        .await
+        .expect("load released resolution delivery");
+        assert_eq!(released, ("pending".to_string(), 0, observed_at + 1, None));
+
+        let resolved = claim_delivery(&db, observed_at + 1)
+            .await
+            .expect("reclaim released resolution")
+            .expect("released resolution becomes available");
+        let resolved = start_delivery_attempt(&db, &resolved, observed_at + 1)
+            .await
+            .expect("start released resolution")
+            .expect("released resolution lease remains active");
+        finish_delivery_attempt(
+            &db,
+            &resolved,
+            WebhookAttemptOutcome {
+                succeeded: true,
+                http_status: Some(204),
+                duration_ms: 1,
+                error: String::new(),
+                response_excerpt: String::new(),
+            },
+        )
+        .await
+        .expect("finish released resolution");
+
+        insert_test_instance(&db, "node-recovery", "Recovery Node").await;
+        sqlx::query(
+            r#"
+            INSERT INTO alert_events(
+                id,rule_id,instance_id,status,severity,metric,rule_snapshot,node_snapshot,
+                threshold,duration_seconds,current_value,first_observed_at,fired_at,last_observed_at
+            ) VALUES(
+                'event-recovery','rule-order','node-recovery','firing','critical','cpu_percent',
+                '{}'::JSONB,'{}'::JSONB,90,0,95,$1,$1,$1
+            )
+            "#,
+        )
+        .bind(observed_at + 2)
+        .execute(&db)
+        .await
+        .expect("insert recovering event");
+        sqlx::query(
+            "INSERT INTO alert_event_channels(event_id,channel_id) VALUES('event-recovery','channel-order')",
+        )
+        .execute(&db)
+        .await
+        .expect("link recovery event channel");
+        sqlx::query(
+            r#"
+            INSERT INTO alert_deliveries(
+                id,event_id,channel_id,kind,status,payload,channel_snapshot,
+                attempts_count,cycle_attempts,next_attempt_at,created_at,updated_at
+            ) VALUES(
+                'retrying-firing','event-recovery','channel-order','alert.firing','pending',
+                '{}'::JSONB,'{}'::JSONB,3,3,$1,$1,$1
+            )
+            "#,
+        )
+        .bind(observed_at + 2)
+        .execute(&db)
+        .await
+        .expect("insert firing delivery near final retry");
+        let firing = claim_delivery(&db, observed_at + 2)
+            .await
+            .expect("claim retrying firing")
+            .expect("retrying firing becomes available");
+        let firing = start_delivery_attempt(&db, &firing, observed_at + 2)
+            .await
+            .expect("start fourth firing attempt")
+            .expect("firing lease remains active");
+        finish_delivery_attempt(
+            &db,
+            &firing,
+            WebhookAttemptOutcome {
+                succeeded: false,
+                http_status: Some(500),
+                duration_ms: 1,
+                error: "http_status_500".to_string(),
+                response_excerpt: "failure".to_string(),
+            },
+        )
+        .await
+        .expect("schedule final firing retry");
+        let deferred_until: i64 = sqlx::query_scalar(
+            "SELECT next_attempt_at FROM alert_deliveries WHERE id='retrying-firing'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("load deferred firing retry");
+        assert!(deferred_until > observed_at + 60 * 60 - 5);
+
+        let mut recovery_tx = db.begin().await.expect("begin event recovery");
+        let event = sqlx::query_as::<_, EventRow>(
+            "SELECT * FROM alert_events WHERE id='event-recovery' FOR UPDATE",
+        )
+        .fetch_one(&mut *recovery_tx)
+        .await
+        .expect("lock recovering event");
+        resolve_event_tx(
+            &mut recovery_tx,
+            event,
+            observed_at + 3,
+            "condition_recovered",
+            Some((40.0, observed_at + 3)),
+        )
+        .await
+        .expect("resolve event with deferred firing");
+        recovery_tx.commit().await.expect("commit event recovery");
+        let superseded = sqlx::query_as::<_, (String, String, Option<i64>)>(
+            "SELECT status,suppression_reason,next_attempt_at FROM alert_deliveries WHERE id='retrying-firing'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("load superseded firing delivery");
+        assert_eq!(
+            superseded,
+            (
+                "suppressed".to_string(),
+                "event_resolved_before_delivery".to_string(),
+                None,
+            )
+        );
+        let recovery = claim_delivery(&db, observed_at + 3)
+            .await
+            .expect("claim recovery without waiting for stale firing")
+            .expect("recovery delivery becomes available immediately");
+        assert_eq!(recovery.kind, "alert.resolved");
+        assert_eq!(recovery.event_id.as_deref(), Some("event-recovery"));
+        release_delivery_claim(&db, &recovery, observed_at + 4)
+            .await
+            .expect("release recovery test delivery");
 
         drop_test_schema(db, bootstrap, schema).await;
     }

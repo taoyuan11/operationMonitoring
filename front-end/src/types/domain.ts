@@ -548,25 +548,68 @@ export type AlertMaintenanceInput = Pick<
   'name' | 'reason' | 'scope' | 'target_ids' | 'starts_at' | 'ends_at' | 'enabled'
 >
 
-export type AlertWebhookChannel = {
+// HTTP robot integrations use the same encrypted endpoint/secret contract in the backend.
+// Keep the provider names explicit so the UI can render provider-specific guidance while
+// preserving a stable channel type in rules and delivery snapshots.
+export type AlertChannelType =
+  | 'generic_webhook'
+  | 'email'
+  | 'feishu'
+  | 'wecom'
+  | 'dingtalk'
+  | 'slack'
+  | 'msteams'
+  | 'telegram'
+  | 'discord'
+export type AlertEmailSecurity = 'starttls' | 'smtps'
+
+export type AlertEmailChannelInput = {
+  smtp_host?: string
+  smtp_port?: number
+  security?: AlertEmailSecurity
+  username?: string
+  password?: string
+  clear_password: boolean
+  from_address?: string
+  from_name?: string
+  recipients?: string[]
+}
+
+export type AlertNotificationChannel = {
   id: string
   name: string
+  channel_type: AlertChannelType
   masked_url: string
   header_names: string[]
   has_secret: boolean
+  smtp_host?: string | null
+  smtp_port?: number | null
+  security?: AlertEmailSecurity | null
+  username?: string | null
+  has_password: boolean
+  from_address?: string | null
+  from_name?: string | null
+  recipients?: string[] | null
+  chat_id?: string | null
   enabled: boolean
   created_at: number
   updated_at: number
 }
 
-export type AlertWebhookChannelInput = {
+export type AlertNotificationChannelInput = AlertEmailChannelInput & {
   name: string
+  channel_type?: AlertChannelType
   url?: string
   secret?: string
   clear_secret: boolean
   headers?: Record<string, string>
+  chat_id?: string
   enabled: boolean
 }
+
+// Keep compatibility aliases for consumers that still use the original names.
+export type AlertWebhookChannel = AlertNotificationChannel
+export type AlertWebhookChannelInput = AlertNotificationChannelInput
 
 export type AlertDeliveryAttempt = {
   id: string

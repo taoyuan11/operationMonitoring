@@ -8,17 +8,20 @@ import type {
   AlertEventQuery,
   AlertMaintenanceInput,
   AlertMaintenanceWindow,
+  AlertNotificationChannel,
+  AlertNotificationChannelInput,
   AlertPage,
   AlertRule,
   AlertRuleInput,
   AlertSummary,
-  AlertWebhookChannel,
-  AlertWebhookChannelInput,
 } from '../types/domain'
 
 export type AlertApiRequest = <T>(path: string, options?: RequestInit) => Promise<T>
 
 const prefix = '/api/admin/alerts'
+
+type AlertChannelResponse = Omit<AlertNotificationChannel, 'channel_type' | 'has_password'> &
+  Partial<Pick<AlertNotificationChannel, 'channel_type' | 'has_password'>>
 
 function pageQuery(page: number, pageSize: number) {
   const params = new URLSearchParams()
@@ -188,37 +191,59 @@ export function deleteAlertMaintenance(id: string, request: AlertApiRequest = ap
   return request<void>(`${prefix}/maintenance-windows/${id}`, { method: 'DELETE' })
 }
 
-export async function listAlertChannels(page = 1, pageSize = 200, request: AlertApiRequest = api) {
-  const response = await request<AlertPage<AlertWebhookChannel>>(
-    pathWithQuery('/webhook-channels', pageQuery(page, pageSize)),
-  )
-  return normalizePage(response, page, pageSize)
+export function normalizeAlertChannel(channel: AlertChannelResponse): AlertNotificationChannel {
+  return {
+    ...channel,
+    channel_type: channel.channel_type || 'generic_webhook',
+    has_password: channel.has_password || false,
+  }
 }
 
-export function createAlertChannel(payload: AlertWebhookChannelInput, request: AlertApiRequest = api) {
-  return request<AlertWebhookChannel>(`${prefix}/webhook-channels`, {
+export function parseAlertEmailRecipients(value: string) {
+  return value.split(/[\n,;]/).reduce<string[]>((recipients, value) => {
+    const recipient = value.trim()
+    if (recipient && !recipients.some((known) => known.toLowerCase() === recipient.toLowerCase())) {
+      recipients.push(recipient)
+    }
+    return recipients
+  }, [])
+}
+
+export async function listAlertChannels(page = 1, pageSize = 200, request: AlertApiRequest = api) {
+  const response = await request<AlertPage<AlertChannelResponse>>(
+    pathWithQuery('/channels', pageQuery(page, pageSize)),
+  )
+  return normalizePage(
+    { ...response, items: (response.items || []).map(normalizeAlertChannel) },
+    page,
+    pageSize,
+  )
+}
+
+export function createAlertChannel(payload: AlertNotificationChannelInput, request: AlertApiRequest = api) {
+  return request<AlertChannelResponse>(`${prefix}/channels`, {
     method: 'POST',
     body: JSON.stringify(payload),
-  })
+  }).then(normalizeAlertChannel)
 }
 
 export function updateAlertChannel(
   id: string,
-  payload: AlertWebhookChannelInput,
+  payload: AlertNotificationChannelInput,
   request: AlertApiRequest = api,
 ) {
-  return request<AlertWebhookChannel>(`${prefix}/webhook-channels/${id}`, {
+  return request<AlertChannelResponse>(`${prefix}/channels/${id}`, {
     method: 'PUT',
     body: JSON.stringify(payload),
-  })
+  }).then(normalizeAlertChannel)
 }
 
 export function deleteAlertChannel(id: string, request: AlertApiRequest = api) {
-  return request<void>(`${prefix}/webhook-channels/${id}`, { method: 'DELETE' })
+  return request<void>(`${prefix}/channels/${id}`, { method: 'DELETE' })
 }
 
 export function testAlertChannel(id: string, request: AlertApiRequest = api) {
-  return request<AlertDelivery>(`${prefix}/webhook-channels/${id}/test`, { method: 'POST' })
+  return request<AlertDelivery>(`${prefix}/channels/${id}/test`, { method: 'POST' })
 }
 
 export async function listAlertDeliveries(query: AlertDeliveryQuery, request: AlertApiRequest = api) {

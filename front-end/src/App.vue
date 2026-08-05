@@ -18,8 +18,8 @@ import type {
   AgentRelease,
   AgentUpdateAttempt,
   AlertMaintenanceWindow,
+  AlertNotificationChannel,
   AlertRule,
-  AlertWebhookChannel,
   AppPage,
   AuthenticatorDevice,
   CommandRecord,
@@ -359,9 +359,9 @@ function requestDeleteMaintenance(window: AlertMaintenanceWindow) {
   }
 }
 
-function requestDeleteAlertChannel(channel: AlertWebhookChannel) {
+function requestDeleteAlertChannel(channel: AlertNotificationChannel) {
   confirmation.value = {
-    title: '删除 Webhook',
+    title: '删除通知渠道',
     message: `将删除“${channel.name}”，已产生的投递历史仍会保留。`,
     confirmLabel: '确认删除',
     tone: 'danger',

@@ -15,6 +15,7 @@ import {
   listAlertEvents,
   listAlertMaintenance,
   listAlertRules,
+  parseAlertEmailRecipients,
   retryAlertDelivery,
   setAlertRuleEnabled,
   testAlertChannel,
@@ -24,22 +25,24 @@ import {
   type AlertApiRequest,
 } from '../api/alerts'
 import type {
+  AlertChannelType,
   AlertCenterTab,
   AlertDelivery,
   AlertDeliveryDetail,
   AlertDeliveryQuery,
+  AlertEmailSecurity,
   AlertEvent,
   AlertEventDetail,
   AlertEventQuery,
   AlertMaintenanceInput,
   AlertMaintenanceWindow,
   AlertMetric,
+  AlertNotificationChannel,
+  AlertNotificationChannelInput,
   AlertPage,
   AlertRule,
   AlertRuleInput,
   AlertSummary,
-  AlertWebhookChannel,
-  AlertWebhookChannelInput,
 } from '../types/domain'
 
 type AlertingOptions = {
@@ -52,6 +55,32 @@ export type AlertHeaderDraft = {
   id: number
   name: string
   value: string
+}
+
+type AlertChannelForm = {
+  name: string
+  channel_type: AlertChannelType
+  url: string
+  secret: string
+  clear_secret: boolean
+  replace_headers: boolean
+  enabled: boolean
+  headers: AlertHeaderDraft[]
+  smtp_host: string
+  smtp_port: number
+  security: AlertEmailSecurity
+  username: string
+  password: string
+  has_password: boolean
+  clear_password: boolean
+  from_address: string
+  from_name: string
+  recipients: string
+  chat_id: string
+}
+
+function channelUsesSecret(type: AlertChannelType) {
+  return type === 'generic_webhook' || type === 'feishu' || type === 'dingtalk'
 }
 
 const EMPTY_SUMMARY: AlertSummary = {
@@ -136,13 +165,37 @@ function defaultMaintenanceInput(): AlertMaintenanceInput {
   }
 }
 
+function defaultChannelForm(): AlertChannelForm {
+  return {
+    name: '',
+    channel_type: 'generic_webhook',
+    url: '',
+    secret: '',
+    clear_secret: false,
+    replace_headers: false,
+    enabled: true,
+    headers: [],
+    smtp_host: '',
+    smtp_port: 587,
+    security: 'starttls',
+    username: '',
+    password: '',
+    has_password: false,
+    clear_password: false,
+    from_address: '',
+    from_name: '',
+    recipients: '',
+    chat_id: '',
+  }
+}
+
 export function useAlertingConsole(options: AlertingOptions) {
   const activeTab = ref<AlertCenterTab>('events')
   const summary = ref<AlertSummary>({ ...EMPTY_SUMMARY })
   const events = ref<AlertPage<AlertEvent>>(EMPTY_PAGE())
   const rules = ref<AlertPage<AlertRule>>(EMPTY_PAGE(200))
   const maintenance = ref<AlertPage<AlertMaintenanceWindow>>(EMPTY_PAGE(200))
-  const channels = ref<AlertPage<AlertWebhookChannel>>(EMPTY_PAGE(200))
+  const channels = ref<AlertPage<AlertNotificationChannel>>(EMPTY_PAGE(200))
   const deliveries = ref<AlertPage<AlertDelivery>>(EMPTY_PAGE())
   const eventDetail = ref<AlertEventDetail | null>(null)
   const deliveryDetail = ref<AlertDeliveryDetail | null>(null)
@@ -153,15 +206,7 @@ export function useAlertingConsole(options: AlertingOptions) {
   const deliveryQuery = reactive<AlertDeliveryQuery>(defaultDeliveryQuery())
   const ruleForm = reactive<AlertRuleInput>(defaultRuleInput())
   const maintenanceForm = reactive<AlertMaintenanceInput>(defaultMaintenanceInput())
-  const channelForm = reactive({
-    name: '',
-    url: '',
-    secret: '',
-    clear_secret: false,
-    replace_headers: false,
-    enabled: true,
-    headers: [] as AlertHeaderDraft[],
-  })
+  const channelForm = reactive<AlertChannelForm>(defaultChannelForm())
   const editingRuleId = ref('')
   const editingMaintenanceId = ref('')
   const editingChannelId = ref('')
@@ -623,40 +668,93 @@ export function useAlertingConsole(options: AlertingOptions) {
     channelForm.headers = channelForm.headers.filter((header) => header.id !== id)
   }
 
-  function editChannel(channel: AlertWebhookChannel) {
+  function selectChannelType(channelType: AlertChannelType) {
+    if (editingChannelId.value || channelForm.channel_type === channelType) return
+    const name = channelForm.name
+    const enabled = channelForm.enabled
+    Object.assign(channelForm, defaultChannelForm(), {
+      name,
+      enabled,
+      channel_type: channelType,
+    })
+  }
+
+  function editChannel(channel: AlertNotificationChannel) {
     editingChannelId.value = channel.id
     Object.assign(channelForm, {
       name: channel.name,
+      channel_type: channel.channel_type,
       url: '',
       secret: '',
       clear_secret: false,
       replace_headers: false,
       enabled: channel.enabled,
       headers: [],
+      smtp_host: channel.smtp_host || '',
+      smtp_port: channel.smtp_port || (channel.security === 'smtps' ? 465 : 587),
+      security: channel.security || 'starttls',
+      username: channel.username || '',
+      password: '',
+      has_password: channel.has_password,
+      clear_password: false,
+      from_address: channel.from_address || '',
+      from_name: channel.from_name || '',
+      recipients: (channel.recipients || []).join('\n'),
+      chat_id: channel.chat_id || '',
     })
   }
 
   function resetChannelForm() {
     editingChannelId.value = ''
-    Object.assign(channelForm, {
-      name: '',
-      url: '',
-      secret: '',
-      clear_secret: false,
-      replace_headers: false,
-      enabled: true,
-      headers: [],
-    })
+    Object.assign(channelForm, defaultChannelForm())
   }
 
   async function saveChannel() {
     const id = editingChannelId.value
     if (!channelForm.name.trim()) {
-      errorMessage.value = '请输入 Webhook 名称'
+      errorMessage.value = '请输入渠道名称'
       return false
     }
-    if (!id && !channelForm.url.trim()) {
-      errorMessage.value = '请输入 Webhook URL'
+    const isEmail = channelForm.channel_type === 'email'
+    if (!isEmail && !id && !channelForm.url.trim()) {
+      errorMessage.value = '请输入渠道 URL'
+      return false
+    }
+    const recipients = parseAlertEmailRecipients(channelForm.recipients)
+    const isTelegram = channelForm.channel_type === 'telegram'
+    if (isEmail && !channelForm.smtp_host.trim()) {
+      errorMessage.value = '请输入 SMTP 服务器'
+      return false
+    }
+    if (isEmail && (!Number.isInteger(channelForm.smtp_port) || channelForm.smtp_port < 1 || channelForm.smtp_port > 65535)) {
+      errorMessage.value = 'SMTP 端口必须是 1 到 65535 之间的整数'
+      return false
+    }
+    if (isEmail && !channelForm.from_address.trim()) {
+      errorMessage.value = '请输入发件邮箱'
+      return false
+    }
+    if (isEmail && !recipients.length) {
+      errorMessage.value = '请至少填写一个收件人'
+      return false
+    }
+    if (isEmail && recipients.length > 100) {
+      errorMessage.value = '收件人不能超过 100 个'
+      return false
+    }
+    if (isTelegram && !channelForm.chat_id.trim()) {
+      errorMessage.value = '请输入 Telegram Chat ID'
+      return false
+    }
+    const username = channelForm.username.trim()
+    const password = channelForm.password
+    const hasPasswordInput = Boolean(password.trim())
+    const clearPassword = isEmail && channelForm.clear_password && !hasPasswordInput
+    const hasEffectivePassword = Boolean(
+      hasPasswordInput || (id && channelForm.has_password && !clearPassword),
+    )
+    if (isEmail && !clearPassword && Boolean(username) !== hasEffectivePassword) {
+      errorMessage.value = 'SMTP 用户名和密码必须同时配置或同时清除'
       return false
     }
     const headers: Record<string, string> = {}
@@ -665,20 +763,39 @@ export function useAlertingConsole(options: AlertingOptions) {
       if (!name) continue
       headers[name] = header.value
     }
-    const payload: AlertWebhookChannelInput = {
+    const payload: AlertNotificationChannelInput = {
       name: channelForm.name.trim(),
+      channel_type: channelForm.channel_type,
       enabled: channelForm.enabled,
-      clear_secret: channelForm.clear_secret && !channelForm.secret.trim(),
+      clear_secret: !isEmail && channelUsesSecret(channelForm.channel_type)
+        && channelForm.clear_secret && !channelForm.secret.trim(),
+      clear_password: clearPassword,
     }
-    if (channelForm.url.trim()) payload.url = channelForm.url.trim()
-    if (channelForm.secret.trim()) payload.secret = channelForm.secret.trim()
-    if (!id || channelForm.replace_headers) payload.headers = headers
+    if (isEmail) {
+      payload.smtp_host = channelForm.smtp_host.trim()
+      payload.smtp_port = channelForm.smtp_port
+      payload.security = channelForm.security
+      payload.username = clearPassword ? '' : username
+      payload.from_address = channelForm.from_address.trim()
+      payload.from_name = channelForm.from_name.trim()
+      payload.recipients = recipients
+      if (hasPasswordInput) payload.password = password
+    } else {
+      if (channelForm.url.trim()) payload.url = channelForm.url.trim()
+      if (isTelegram) payload.chat_id = channelForm.chat_id.trim()
+      if (channelUsesSecret(channelForm.channel_type) && channelForm.secret.trim()) {
+        payload.secret = channelForm.secret.trim()
+      }
+      if (channelForm.channel_type === 'generic_webhook' && (!id || channelForm.replace_headers)) {
+        payload.headers = headers
+      }
+    }
     const response = await run(
       id ? `channel:${id}:save` : 'channel:create',
       () => id
         ? updateAlertChannel(id, payload, options.request)
         : createAlertChannel(payload, options.request),
-      id ? 'Webhook 已更新' : 'Webhook 已创建',
+      id ? '通知渠道已更新' : '通知渠道已创建',
     )
     if (!response) return false
     resetChannelForm()
@@ -686,14 +803,14 @@ export function useAlertingConsole(options: AlertingOptions) {
     return true
   }
 
-  async function removeChannel(channel: AlertWebhookChannel) {
+  async function removeChannel(channel: AlertNotificationChannel) {
     const response = await run(
       `channel:${channel.id}:delete`,
       async () => {
         await deleteAlertChannel(channel.id, options.request)
         return true
       },
-      'Webhook 已删除',
+      '通知渠道已删除',
     )
     if (!response) return false
     if (editingChannelId.value === channel.id) resetChannelForm()
@@ -701,7 +818,7 @@ export function useAlertingConsole(options: AlertingOptions) {
     return true
   }
 
-  async function testChannel(channel: AlertWebhookChannel) {
+  async function testChannel(channel: AlertNotificationChannel) {
     const response = await run(
       `channel:${channel.id}:test`,
       () => testAlertChannel(channel.id, options.request),
@@ -822,6 +939,7 @@ export function useAlertingConsole(options: AlertingOptions) {
     removeMaintenance,
     addHeader,
     removeHeader,
+    selectChannelType,
     editChannel,
     resetChannelForm,
     saveChannel,

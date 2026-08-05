@@ -516,9 +516,26 @@ cd instanceEnd && cargo fmt --check && cargo test && cargo check
 生效时也会抑制同节点的资源首报；维护结束或节点重新上线后，新的有效观察确认异常仍
 存在时会补发首报。告警及投递记录默认保留 180 天，活动事件不会被自动清理。
 
-Webhook 渠道按规则选择，发送 `alert.firing`、`alert.acknowledged`、
-`alert.resolved` 和 `webhook.test` 四类版本化 JSON。事件通知负载包含规则与节点的
-触发时快照、观察值、阈值、持续时间、操作者及恢复原因，例如：
+每条规则可以选择零到多个通知渠道，当前支持：
+
+- 通用 Webhook：发送版本化 JSON，可配置自定义请求头和 HMAC-SHA256 密钥。
+- SMTP 邮件：使用固定的中文主题和纯文本正文，支持多个收件人。
+- 飞书自定义机器人：发送文本消息，并支持机器人“签名校验”密钥。
+- 企业微信群机器人：发送文本消息到群机器人 Webhook。
+- 钉钉自定义机器人：发送文本消息，支持机器人加签（毫秒 `timestamp`、`sign` 查询参数）。
+- Slack Incoming Webhook：发送纯文本消息。
+- Microsoft Teams Workflow Webhook：发送 MessageCard 文本卡片。
+- Telegram Bot API：发送文本消息，需要填写 Bot API `sendMessage` URL 和 Chat ID。
+- Discord Webhook：发送文本消息，并禁用 `@everyone` 等隐式提及。
+
+统一渠道管理接口位于 `/api/admin/alerts/channels`；原有
+`/api/admin/alerts/webhook-channels` 继续保留，并且只操作通用 Webhook，旧客户端无需
+同步升级。
+
+所有渠道共用 `alert.firing`、`alert.acknowledged`、`alert.resolved` 和
+`webhook.test` 四类生命周期、持久化投递队列、失败重试及尝试历史。通用 Webhook
+的事件负载包含规则与节点的触发时快照、观察值、阈值、持续时间、操作者及恢复原因，
+例如：
 
 ```json
 {
@@ -540,7 +557,7 @@ Webhook 渠道按规则选择，发送 `alert.firing`、`alert.acknowledged`、
 }
 ```
 
-配置签名密钥后，请求包含：
+通用 Webhook 配置签名密钥后，请求包含：
 
 ```text
 X-OM-Timestamp: <Unix 秒>
@@ -548,16 +565,22 @@ X-OM-Delivery-ID: <稳定投递 ID>
 X-OM-Signature: sha256=<HMAC-SHA256(secret, timestamp + "." + raw_body)>
 ```
 
-URL、签名密钥和自定义请求头使用管理员认证密钥加密保存，接口不会回显明文。投递只把
-HTTP 2xx 视为成功，禁用重定向并按固定退避重试；持久化 worker 使用带 fencing 令牌的
-租约认领，进程恢复后不会让过期 worker 覆盖新投递结果。所有尝试均可在告警中心查询。为适配
-自托管集成，管理员可以配置内网 HTTP/HTTPS 地址；这意味着告警管理员拥有后端出站
-访问能力，应只向可信目标投递，并避免在 Webhook 响应中返回敏感信息。该功能不改变
-Agent 通信协议，不需要为了启用告警升级实例端。
+SMTP 仅支持必须升级到 TLS 的 STARTTLS 和隐式 TLS（SMTPS），不提供明文或跳过证书
+校验模式。SMTP 密码、Webhook URL、签名密钥、自定义请求头以及邮件配置均使用管理员
+认证密钥加密保存；API 不返回密码、签名密钥、完整机器人 token 或请求头值。飞书、企业
+微信、钉钉和 Telegram 投递会同时校验 HTTP 状态与平台业务响应，避免将 HTTP 200 的拒绝
+响应记为成功；通用 Webhook、Slack、Microsoft Teams 和 Discord 按 HTTP 2xx 记为成功。
+
+HTTP 通知禁用重定向并限制总超时，失败后按固定退避重试；持久化 worker 使用带
+fencing 令牌的租约认领，同一事件和渠道的首报、确认、恢复严格串行，进程恢复后不会让
+过期 worker 覆盖新投递结果。所有尝试均可在告警中心查询。全部 HTTP 通知渠道都允许
+内网 HTTP/HTTPS 地址，这意味着告警管理员拥有后端出站访问能力，应只向可信目标投递，
+并避免在响应中返回敏感信息。该功能不改变 Agent 通信协议，不需要为了启用告警升级
+实例端。
 
 ## 后续增强
 
 - 增加历史趋势图和指标明细页。
-- 增加周期维护窗口、节点分组以及邮件、短信等通知渠道。
+- 增加周期维护窗口、节点分组以及短信、电话等通知渠道。
 - 增加登录失败限制、密码哈希和更细粒度权限。
 - 增加 CI 中的多平台 standalone 可执行文件构建、签名和发布流水线。

@@ -112,6 +112,9 @@
 .alert-segmented { display: flex; gap: 3px; padding: 3px; background: var(--surface-inset); border: 1px solid var(--line); border-radius: 6px; }
 .alert-segmented button { min-height: 31px; flex: 1; padding: 0 8px; color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 4px; font-size: 10px; }
 .alert-segmented button.active { color: var(--accent-strong); background: var(--panel); border-color: var(--accent-border); }
+.alert-channel-type-segmented { display: grid; grid-template-columns: repeat(auto-fit, minmax(94px, 1fr)); }
+.alert-channel-type-segmented button { display: flex; min-width: 0; align-items: center; justify-content: center; gap: 4px; padding: 0 4px; }
+.alert-channel-type-segmented button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .alert-checkbox-list { display: grid; max-height: 154px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; overflow-y: auto; padding: 5px; background: var(--surface-inset); border: 1px solid var(--line); border-radius: 6px; }
 .alert-checkbox-list label { display: grid; min-width: 0; min-height: 36px; grid-template-columns: 17px minmax(0, 1fr); align-items: center; gap: 6px; padding: 5px 7px; background: var(--panel-soft); border: 1px solid transparent; border-radius: 4px; cursor: pointer; }
 .alert-checkbox-list label:has(input:checked) { border-color: var(--accent-border); }
@@ -152,7 +155,18 @@
 .webhook-header-editor > .text-button { align-self: flex-start; min-height: 32px; }
 .webhook-channel-list article { display: grid; grid-template-columns: 36px minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 11px; background: var(--surface-grid); border: 1px solid var(--line); border-radius: 6px; }
 .webhook-channel-icon { display: inline-flex; width: 36px; height: 36px; align-items: center; justify-content: center; color: var(--cyan-text); background: rgba(85, 184, 207, .08); border: 1px solid rgba(85, 184, 207, .18); border-radius: 6px; }
+.webhook-channel-icon.email { color: var(--success-text); background: rgba(73, 200, 159, .08); border-color: rgba(73, 200, 159, .18); }
+.webhook-channel-icon.feishu { color: #b9b2df; background: rgba(169, 164, 223, .08); border-color: rgba(169, 164, 223, .18); }
+.webhook-channel-icon.wecom { color: var(--success-text); background: rgba(73, 200, 159, .08); border-color: rgba(73, 200, 159, .18); }
+.webhook-channel-icon.dingtalk { color: #5aa8ff; background: rgba(90, 168, 255, .08); border-color: rgba(90, 168, 255, .18); }
+.webhook-channel-icon.slack { color: #e28cd4; background: rgba(226, 140, 212, .08); border-color: rgba(226, 140, 212, .18); }
+.webhook-channel-icon.msteams { color: #8ea8ec; background: rgba(142, 168, 236, .08); border-color: rgba(142, 168, 236, .18); }
+.webhook-channel-icon.telegram { color: #58b7dc; background: rgba(88, 183, 220, .08); border-color: rgba(88, 183, 220, .18); }
+.webhook-channel-icon.discord { color: #9f9de8; background: rgba(159, 157, 232, .08); border-color: rgba(159, 157, 232, .18); }
 .webhook-channel-list article > div:nth-child(2) { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.channel-title { display: flex; min-width: 0; align-items: center; gap: 6px; }
+.channel-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.channel-title i { flex: 0 0 auto; padding: 2px 5px; color: var(--muted-strong); background: var(--surface-inset); border: 1px solid var(--line); border-radius: 4px; font-size: 8px; font-style: normal; }
 .webhook-channel-list strong { color: var(--text-strong); font-size: 11px; }
 .webhook-channel-list code { overflow: hidden; color: var(--accent-strong); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .webhook-channel-list small { overflow-wrap: anywhere; color: var(--muted); font-size: 8px; line-height: 1.4; }
@@ -225,6 +239,7 @@
   .alert-delivery-detail { grid-column: 1 / -1; grid-row: 5; margin: 0; padding: 11px; }
   .alert-pagination { margin-top: 9px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
   .alert-form-grid { grid-template-columns: 1fr; }
+  .alert-channel-type-segmented { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .alert-presets { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .alert-rule-list article { grid-template-columns: 32px minmax(0, 1fr) 34px; }
   .alert-rule-list article > .row-actions { grid-column: 1 / -1; justify-content: flex-end; }

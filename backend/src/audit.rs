@@ -653,18 +653,15 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
         migration.commit().await?;
     }
 
-    // Legacy rows are restored as `running` during the one-time migration. Only
-    // mark running events as interrupted when this is a subsequent restart.
-    let restart_running = migrated.is_some() && !legacy_exists;
-    if restart_running {
-        let restarted_at = now_ts();
-        sqlx::query(
-            "UPDATE audit_events SET status = 'failed', error_code = 'backend_restarted', error_reason = '后端服务重启', completed_at = $1 WHERE status = 'running' AND completed_at IS NULL",
-        )
-        .bind(restarted_at)
-        .execute(db)
-        .await?;
-    }
+    // Any event still running at startup was interrupted, including rows restored
+    // from legacy session tables during this invocation.
+    let restarted_at = now_ts();
+    sqlx::query(
+        "UPDATE audit_events SET status = 'failed', error_code = 'backend_restarted', error_reason = '后端服务重启', completed_at = $1 WHERE status = 'running' AND completed_at IS NULL",
+    )
+    .bind(restarted_at)
+    .execute(db)
+    .await?;
     sqlx::query(
         "INSERT INTO settings(key, value) VALUES('audit_retention_days', $1) ON CONFLICT(key) DO NOTHING",
     )
@@ -1382,8 +1379,15 @@ mod tests {
             sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE status = 'running'")
                 .fetch_one(&db)
                 .await
-                .expect("count restored running sessions");
-        assert_eq!(running, 2);
+                .expect("count running sessions after migration");
+        assert_eq!(running, 0);
+        let restarted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE error_code = 'backend_restarted' AND status = 'failed' AND completed_at IS NOT NULL",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count sessions interrupted during migration");
+        assert_eq!(restarted, 2);
         let snapshot: Value =
             sqlx::query_scalar("SELECT node_snapshot FROM audit_events WHERE session_id = 'ssh-1'")
                 .fetch_one(&db)
@@ -1422,16 +1426,24 @@ mod tests {
         .expect("load snapshot after node deletion");
         assert_eq!(preserved_snapshot["hostname"], "host-1");
 
+        sqlx::query(
+            "INSERT INTO audit_events(id, status, created_at) VALUES('current-running', 'running', 2000)",
+        )
+        .execute(&db)
+        .await
+        .expect("insert current running audit");
         ensure_schema(&db)
             .await
             .expect("recover running audits after backend restart");
-        let restarted: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_events WHERE error_code = 'backend_restarted' AND status = 'failed'",
+        let restarted: (String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT status, error_code, completed_at FROM audit_events WHERE id = 'current-running'",
         )
         .fetch_one(&db)
         .await
-        .expect("count restarted sessions");
-        assert_eq!(restarted, 2);
+        .expect("load audit interrupted by subsequent restart");
+        assert_eq!(restarted.0, "failed");
+        assert_eq!(restarted.1.as_deref(), Some("backend_restarted"));
+        assert!(restarted.2.is_some());
 
         drop_test_schema(db, bootstrap, schema).await;
     }

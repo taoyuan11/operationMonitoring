@@ -55,6 +55,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DISK_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CHECKSUM_FILE_BYTES: usize = 4096;
 const MAX_AGENT_UPDATE_RETRY_COUNT: i64 = 100;
+const FIRST_BASELINE_PRESERVING_UPDATER_VERSION: &str = "0.1.23";
 const LEGACY_UPDATE_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-update-v1";
 const UPDATE_SIGNATURE_V2_DOMAIN: &str = "operation-monitoring-agent-update-v2";
 const ROLLBACK_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-rollback-v1";
@@ -1038,6 +1039,7 @@ impl UpdateManager {
         if !self.capability.update_privileged {
             bail!("agent lacks root or administrator privileges required for updates");
         }
+        validate_update_instance_binding(offer, &self.identity.instance_id)?;
         let Some(local_package_type) = self.capability.package_type.as_deref() else {
             bail!("this process is not a managed standalone installation");
         };
@@ -1747,7 +1749,7 @@ fn rotate_successful_package_state(
     attempt: &PersistedAttempt,
 ) -> Result<Option<PathBuf>> {
     let target = cached_package_from_attempt(attempt)?;
-    let next_baseline = attempt.previous_package.clone();
+    let next_baseline = preserve_baseline_for_legacy_updater(attempt)?;
     let stale = state
         .rollback_package
         .as_ref()
@@ -1761,6 +1763,76 @@ fn rotate_successful_package_state(
     state.current_package = Some(target);
     state.rollback_package = next_baseline;
     Ok(stale)
+}
+
+fn preserve_baseline_for_legacy_updater(
+    attempt: &PersistedAttempt,
+) -> Result<Option<CachedPackage>> {
+    let Some(mut previous) = attempt.previous_package.clone() else {
+        return Ok(None);
+    };
+    if !matches!(attempt.operation, AttemptOperation::Upgrade)
+        || !legacy_updater_removes_previous_package(&previous.version)
+    {
+        return Ok(Some(previous));
+    }
+
+    let parent = previous
+        .path
+        .parent()
+        .context("cached rollback package has no parent directory")?;
+    let component = safe_component(&format!(
+        "{}-retry-{}-{}",
+        previous.artifact_id, previous.retry_count, previous.sha256
+    ));
+    let preserved_path = parent.join(format!(
+        "standalone-baseline-{component}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    if preserved_path == previous.path {
+        return Ok(Some(previous));
+    }
+
+    if verify_package_at_rest(
+        &preserved_path,
+        previous.package_type,
+        previous.size_bytes,
+        &previous.sha256,
+    )
+    .is_err()
+    {
+        let temporary = parent.join(format!(".standalone-baseline-{}.tmp", uuid::Uuid::new_v4()));
+        let copied = (|| {
+            if fs::hard_link(&previous.path, &temporary).is_err() {
+                fs::copy(&previous.path, &temporary).with_context(|| {
+                    format!(
+                        "failed to preserve rollback package {}",
+                        previous.path.display()
+                    )
+                })?;
+            }
+            set_owner_only_executable(&temporary)?;
+            verify_package_at_rest(
+                &temporary,
+                previous.package_type,
+                previous.size_bytes,
+                &previous.sha256,
+            )?;
+            replace_file(&temporary, &preserved_path)
+        })();
+        if copied.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        copied?;
+    }
+    previous.path = preserved_path;
+    Ok(Some(previous))
+}
+
+fn legacy_updater_removes_previous_package(version: &str) -> bool {
+    let first_safe = Version::parse(FIRST_BASELINE_PRESERVING_UPDATER_VERSION)
+        .expect("baseline-preserving updater version must be valid SemVer");
+    Version::parse(version).map_or(true, |version| version < first_safe)
 }
 
 fn rollback_effective_offer(
@@ -2253,6 +2325,24 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
 
 fn complete_target_update(plan: &ApplyPlan, package_type: PackageType) -> Result<()> {
     let mut state = read_update_state(&plan.state_file)?;
+    let target_already_cached = state.current_package.as_ref().is_some_and(|package| {
+        package.artifact_id == plan.offer.artifact_id
+            && package.retry_count == plan.offer.retry_count
+    });
+    if target_already_cached {
+        if let (Some(previous), Some(preserved)) =
+            (&plan.previous_package, state.rollback_package.as_ref())
+            && previous.path != plan.package_path
+            && previous.path != preserved.path
+            && state
+                .current_package
+                .as_ref()
+                .is_none_or(|current| previous.path != current.path)
+        {
+            let _ = fs::remove_file(&previous.path);
+        }
+        return Ok(());
+    }
     let plan_is_current = state
         .attempt
         .as_ref()
@@ -2721,6 +2811,20 @@ fn verify_update_signature_policy_with_key(
     }
 }
 
+fn validate_update_instance_binding(offer: &UpdateOffer, instance_id: &str) -> Result<()> {
+    if offer.signature_v2.is_none() {
+        return Ok(());
+    }
+    let target_instance = offer
+        .instance_id
+        .as_deref()
+        .context("update metadata v2 offer is missing instance_id")?;
+    if target_instance != instance_id {
+        bail!("update instruction targets a different agent instance");
+    }
+    Ok(())
+}
+
 fn embedded_update_verifying_key() -> Result<Option<(String, VerifyingKey)>> {
     let Some(encoded_key) = option_env!("OM_UPDATE_PUBLIC_KEY") else {
         return Ok(None);
@@ -2867,12 +2971,17 @@ fn update_signature_payload_v2(offer: &UpdateOffer) -> Result<String> {
         .attempt_id
         .as_deref()
         .context("signed update offer is missing attempt_id")?;
+    let instance_id = offer
+        .instance_id
+        .as_deref()
+        .context("signed update offer is missing instance_id")?;
     let target_os = offer
         .target_os
         .as_deref()
         .context("signed update offer is missing target_os")?;
     for (name, value) in [
         ("attempt_id", attempt_id),
+        ("instance_id", instance_id),
         ("release_id", offer.release_id.as_str()),
         ("version", offer.version.as_str()),
         ("artifact_id", offer.artifact_id.as_str()),
@@ -2894,7 +3003,7 @@ fn update_signature_payload_v2(offer: &UpdateOffer) -> Result<String> {
         bail!("update v2 signature numeric fields are invalid");
     }
     Ok(format!(
-        "{UPDATE_SIGNATURE_V2_DOMAIN}\nattempt_id={attempt_id}\nrelease_id={}\nversion={}\nretry_count={}\nartifact_id={}\ndownload_url={}\ntarget_os={target_os}\npackage_type={}\nnative_arch={}\nsize_bytes={}\nsha256={}\n",
+        "{UPDATE_SIGNATURE_V2_DOMAIN}\nattempt_id={attempt_id}\ninstance_id={instance_id}\nrelease_id={}\nversion={}\nretry_count={}\nartifact_id={}\ndownload_url={}\ntarget_os={target_os}\npackage_type={}\nnative_arch={}\nsize_bytes={}\nsha256={}\n",
         offer.release_id,
         offer.version,
         offer.retry_count,
@@ -3429,7 +3538,7 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let mut offer = UpdateOffer {
             attempt_id: Some("attempt-signed".to_string()),
-            instance_id: None,
+            instance_id: Some("instance-signed".to_string()),
             release_id: "release-signed".to_string(),
             version: "1.2.3".to_string(),
             artifact_id: "artifact-signed".to_string(),
@@ -3533,7 +3642,7 @@ mod tests {
         assert_eq!(
             update_signature_payload_v2(&offer).unwrap(),
             format!(
-                "operation-monitoring-agent-update-v2\nattempt_id=attempt-signed\nrelease_id=release-signed\nversion=1.2.3\nretry_count=0\nartifact_id=artifact-signed\ndownload_url=/api/agent/update/artifacts/artifact-signed/download\ntarget_os={}\npackage_type=standalone\nnative_arch={}\nsize_bytes=42\nsha256={}\n",
+                "operation-monitoring-agent-update-v2\nattempt_id=attempt-signed\ninstance_id=instance-signed\nrelease_id=release-signed\nversion=1.2.3\nretry_count=0\nartifact_id=artifact-signed\ndownload_url=/api/agent/update/artifacts/artifact-signed/download\ntarget_os={}\npackage_type=standalone\nnative_arch={}\nsize_bytes=42\nsha256={}\n",
                 standalone_target_os(),
                 standalone_native_arch(),
                 "a".repeat(64)
@@ -3560,6 +3669,13 @@ mod tests {
         );
 
         let mut tampered = offer.clone();
+        tampered.instance_id = Some("instance-other".to_string());
+        assert!(
+            verify_update_signature_v2(&tampered, "release-v1", &signing_key.verifying_key())
+                .is_err()
+        );
+
+        let mut tampered = offer.clone();
         tampered.artifact_id = "artifact-other".to_string();
         tampered.download_url = "/api/agent/update/artifacts/artifact-other/download".to_string();
         assert!(
@@ -3569,6 +3685,25 @@ mod tests {
         assert!(
             verify_update_signature_v2(&offer, "other-key", &signing_key.verifying_key()).is_err()
         );
+    }
+
+    #[test]
+    fn v2_updates_are_bound_to_the_current_instance_but_legacy_https_offers_are_not() {
+        let (offer, _) = signed_test_offer();
+        assert!(validate_update_instance_binding(&offer, "instance-signed").is_ok());
+
+        let mut other_instance = offer.clone();
+        other_instance.instance_id = Some("instance-other".to_string());
+        assert!(validate_update_instance_binding(&other_instance, "instance-signed").is_err());
+
+        let mut missing_instance = offer.clone();
+        missing_instance.instance_id = None;
+        assert!(validate_update_instance_binding(&missing_instance, "instance-signed").is_err());
+
+        let mut legacy = offer;
+        legacy.signature_v2 = None;
+        legacy.instance_id = None;
+        assert!(validate_update_instance_binding(&legacy, "instance-signed").is_ok());
     }
 
     #[test]
@@ -3685,7 +3820,7 @@ mod tests {
         let manager = UpdateManager {
             config,
             identity: Identity {
-                instance_id: "invalid-offer-test".to_string(),
+                instance_id: "instance-signed".to_string(),
                 secret: "secret-test".to_string(),
                 credential_version: 1,
                 previous_secret: None,
@@ -4324,24 +4459,26 @@ mod tests {
             activity: ActivityTracker::default(),
             capability: UpdateCapability {
                 package_type: Some("standalone".to_string()),
-                native_arch: Some("arm64".to_string()),
+                native_arch: Some(standalone_native_arch()),
                 update_privileged: true,
             },
             paths: paths.clone(),
         };
         let previous_path = paths.packages.join("previous.standalone");
         let target_path = paths.packages.join("target.standalone");
-        fs::write(&previous_path, b"previous").unwrap();
+        fs::copy(std::env::current_exe().unwrap(), &previous_path).unwrap();
+        set_owner_only_executable(&previous_path).unwrap();
+        let (previous_size, previous_sha256) = file_integrity(&previous_path).unwrap();
         fs::write(&target_path, b"target").unwrap();
         let previous = CachedPackage {
             artifact_id: "artifact-previous".to_string(),
-            version: "0.0.1".to_string(),
+            version: "0.1.22".to_string(),
             package_type: PackageType::Standalone,
-            native_arch: "arm64".to_string(),
+            native_arch: standalone_native_arch(),
             path: previous_path.clone(),
             retry_count: 0,
-            size_bytes: 8,
-            sha256: "b".repeat(64),
+            size_bytes: previous_size,
+            sha256: previous_sha256,
         };
         let offer = UpdateOffer {
             attempt_id: None,
@@ -4353,7 +4490,7 @@ mod tests {
             sha256: "a".repeat(64),
             size_bytes: 6,
             package_type: "standalone".to_string(),
-            native_arch: "arm64".to_string(),
+            native_arch: standalone_native_arch(),
             target_os: Some(standalone_target_os().to_string()),
             signature_key_id: None,
             signature: None,
@@ -4395,6 +4532,9 @@ mod tests {
             state.current_package.as_ref().map(|value| &value.path),
             Some(&target_path)
         );
+        let baseline_path = state.rollback_package.as_ref().unwrap().path.clone();
+        assert_ne!(baseline_path, previous_path);
+        assert!(baseline_path.exists());
         assert!(matches!(
             state.attempt.as_ref(),
             Some(PersistedAttempt {
@@ -4411,6 +4551,8 @@ mod tests {
             0,
             Duration::from_millis(10),
         ));
+        fs::remove_file(&previous_path).unwrap();
+        assert_eq!(manager.rollback_version().as_deref(), Some("0.1.22"));
 
         let mut manual_state = read_update_state(&paths.state_file).unwrap();
         let manual_attempt = manual_state.attempt.as_mut().unwrap();
@@ -4461,7 +4603,8 @@ mod tests {
             installed_executable: None,
         };
         complete_target_update(&plan, PackageType::Standalone).unwrap();
-        assert!(previous_path.exists());
+        assert!(!previous_path.exists());
+        assert!(baseline_path.exists());
         assert_eq!(
             read_update_state(&paths.state_file)
                 .unwrap()

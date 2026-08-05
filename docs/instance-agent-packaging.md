@@ -28,23 +28,23 @@ instanceEnd/dist/standalone/
 产物名称包含 `instanceEnd/Cargo.toml` 中的版本号，例如：
 
 ```text
-om-agent_0.1.5_linux_x86_64.bin
-om-agent_0.1.5_linux_x86_64.bin.sha256
-om-agent_0.1.5_windows_x64.exe
-om-agent_0.1.5_windows_x64.exe.sha256
-om-agent_0.1.5_macos_arm64.bin
-om-agent_0.1.5_macos_arm64.bin.sha256
+om-agent_<version>_linux_x86_64.bin
+om-agent_<version>_linux_x86_64.bin.sha256
+om-agent_<version>_windows_x64.exe
+om-agent_<version>_windows_x64.exe.sha256
+om-agent_<version>_macos_arm64.bin
+om-agent_<version>_macos_arm64.bin.sha256
 ```
 
 ## 2. 打包前准备
 
 ### 2.1 更新版本号
 
-修改 `instanceEnd/Cargo.toml`：
+修改 `instanceEnd/Cargo.toml`，将 `<version>` 替换为本次发布的 SemVer：
 
 ```toml
 [package]
-version = "0.1.5"
+version = "<version>"
 ```
 
 版本变更后更新并检查锁文件：
@@ -73,7 +73,7 @@ export OM_UPDATE_PUBLIC_KEY_ID='release-v1'
 两个变量必须同时设置或同时省略。Cargo 的编译期检查会拒绝无效 Base64、长度错误、
 无效 Ed25519 公钥和非法 key ID；省略两者生成的产物仅允许通过 HTTPS 自动更新。
 
-### 2.2 安装 Rust
+### 2.3 安装 Rust
 
 Linux/macOS 推荐使用 rustup：
 
@@ -94,7 +94,7 @@ cargo --version
 
 项目当前要求的最低 Rust 版本以 `instanceEnd/Cargo.toml` 的 `rust-version` 为准。
 
-### 2.3 安装全部 Rust targets
+### 2.4 安装全部 Rust targets
 
 在 Linux 或 macOS 的 Bash 中执行：
 
@@ -416,9 +416,10 @@ Remove-Item Env:OM_STANDALONE_BUILDER
 
 ```bash
 cd instanceEnd/dist/standalone
-sha256sum -c om-agent_0.1.5_linux_x86_64.bin.sha256
-file om-agent_0.1.5_linux_x86_64.bin
-readelf --version-info om-agent_0.1.5_linux_x86_64.bin \
+AGENT_VERSION='<version>'
+sha256sum -c "om-agent_${AGENT_VERSION}_linux_x86_64.bin.sha256"
+file "om-agent_${AGENT_VERSION}_linux_x86_64.bin"
+readelf --version-info "om-agent_${AGENT_VERSION}_linux_x86_64.bin" \
   | grep -o 'GLIBC_[0-9.]*' \
   | sort -V \
   | tail -n 1
@@ -430,16 +431,18 @@ GNU/Linux 产物的最后一条命令应输出 `GLIBC_2.17` 或更低版本。Ba
 
 ```bash
 cd instanceEnd/dist/standalone
-shasum -a 256 -c om-agent_0.1.5_macos_arm64.bin.sha256
-file om-agent_0.1.5_macos_arm64.bin
+AGENT_VERSION='<version>'
+shasum -a 256 -c "om-agent_${AGENT_VERSION}_macos_arm64.bin.sha256"
+file "om-agent_${AGENT_VERSION}_macos_arm64.bin"
 ```
 
 ### 7.3 Windows
 
 ```powershell
 cd instanceEnd\dist\standalone
-Get-FileHash .\om-agent_0.1.5_windows_x64.exe -Algorithm SHA256
-Get-Content .\om-agent_0.1.5_windows_x64.exe.sha256
+$AgentVersion = '<version>'
+Get-FileHash ".\om-agent_${AgentVersion}_windows_x64.exe" -Algorithm SHA256
+Get-Content ".\om-agent_${AgentVersion}_windows_x64.exe.sha256"
 ```
 
 应确认计算结果与 `.sha256` 文件中的摘要完全相同。

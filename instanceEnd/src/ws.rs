@@ -540,6 +540,7 @@ async fn handle_agent_socket(
                             }
                             AgentOutbound::UpdateAvailable {
                                 attempt_id,
+                                instance_id,
                                 release_id,
                                 version,
                                 artifact_id,
@@ -556,6 +557,7 @@ async fn handle_agent_socket(
                             } => {
                                 let offer = UpdateOffer {
                                     attempt_id,
+                                    instance_id,
                                     release_id,
                                     version,
                                     artifact_id,

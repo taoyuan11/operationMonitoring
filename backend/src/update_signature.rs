@@ -236,6 +236,7 @@ mod tests {
     fn offer() -> AgentUpdateOffer {
         AgentUpdateOffer {
             attempt_id: Some("attempt-1".to_string()),
+            instance_id: Some("instance-1".to_string()),
             release_id: "release-1".to_string(),
             version: "1.2.3".to_string(),
             artifact_id: "artifact-1".to_string(),
@@ -291,7 +292,7 @@ mod tests {
         assert_eq!(
             update_signature_payload_v2(&offer).unwrap(),
             format!(
-                "operation-monitoring-agent-update-v2\nattempt_id=attempt-1\nrelease_id=release-1\nversion=1.2.3\nretry_count=0\nartifact_id=artifact-1\ndownload_url=/api/agent/update/artifacts/artifact-1/download\ntarget_os=linux\npackage_type=standalone\nnative_arch=x86_64\nsize_bytes=42\nsha256={}\n",
+                "operation-monitoring-agent-update-v2\nattempt_id=attempt-1\ninstance_id=instance-1\nrelease_id=release-1\nversion=1.2.3\nretry_count=0\nartifact_id=artifact-1\ndownload_url=/api/agent/update/artifacts/artifact-1/download\ntarget_os=linux\npackage_type=standalone\nnative_arch=x86_64\nsize_bytes=42\nsha256={}\n",
                 "a".repeat(64)
             )
         );
@@ -309,6 +310,10 @@ mod tests {
         for tampered in [
             AgentUpdateOffer {
                 attempt_id: Some("attempt-2".to_string()),
+                ..offer.clone()
+            },
+            AgentUpdateOffer {
+                instance_id: Some("instance-2".to_string()),
                 ..offer.clone()
             },
             AgentUpdateOffer {

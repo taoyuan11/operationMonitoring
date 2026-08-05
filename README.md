@@ -318,17 +318,20 @@ om-agent_<version>_macos_arm64.bin.sha256
 
 ### 首次分发和安装
 
-将对应平台的 `.bin` 或 `.exe` 直接提供给目标机器。Unix 平台下载后添加执行权限，再运行安装命令：
+将对应平台的 `.bin` 或 `.exe` 直接提供给目标机器。以下命令中的 `<version>` 应替换为
+本次发布的 SemVer。Unix 平台下载后添加执行权限，再运行安装命令：
 
 ```bash
-chmod +x om-agent_0.1.0_linux_x86_64.bin
-./om-agent_0.1.0_linux_x86_64.bin install
+AGENT_VERSION='<version>'
+chmod +x "om-agent_${AGENT_VERSION}_linux_x86_64.bin"
+"./om-agent_${AGENT_VERSION}_linux_x86_64.bin" install
 ```
 
 无人值守部署：
 
 ```bash
-./om-agent_0.1.0_linux_x86_64.bin install \
+AGENT_VERSION='<version>'
+"./om-agent_${AGENT_VERSION}_linux_x86_64.bin" install \
   --non-interactive --yes \
   --server https://monitor.example.com
 ```
@@ -336,7 +339,8 @@ chmod +x om-agent_0.1.0_linux_x86_64.bin
 Windows 请在 PowerShell 或命令提示符中运行下载的 `.exe`：
 
 ```powershell
-.\om-agent_0.1.0_windows_x64.exe install
+$AgentVersion = '<version>'
+& ".\om-agent_${AgentVersion}_windows_x64.exe" install
 ```
 
 安装命令会自动请求管理员权限、复制到系统目录、注册开机自启并让 `om-agent` 在命令行全局可用：

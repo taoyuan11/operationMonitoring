@@ -3275,6 +3275,7 @@ async fn active_upgrade_offer(
         state,
         AgentUpdateOffer {
             attempt_id: Some(candidate.attempt_id),
+            instance_id: Some(instance.id.clone()),
             download_url: format!(
                 "/api/agent/update/artifacts/{}/download",
                 candidate.artifact_id
@@ -3474,6 +3475,7 @@ fn signed_offer(state: &AppState, mut offer: AgentUpdateOffer) -> AppResult<Agen
 fn outbound_offer(offer: AgentUpdateOffer) -> AgentOutbound {
     AgentOutbound::UpdateAvailable {
         attempt_id: offer.attempt_id,
+        instance_id: offer.instance_id,
         release_id: offer.release_id,
         version: offer.version,
         artifact_id: offer.artifact_id,
@@ -3988,6 +3990,37 @@ mod tests {
     }
 
     #[test]
+    fn outbound_update_offer_preserves_instance_binding() {
+        let outbound = outbound_offer(AgentUpdateOffer {
+            attempt_id: Some("attempt-1".to_string()),
+            instance_id: Some("instance-1".to_string()),
+            release_id: "release-1".to_string(),
+            version: "1.2.3".to_string(),
+            artifact_id: "artifact-1".to_string(),
+            download_url: "/api/agent/update/artifacts/artifact-1/download".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 42,
+            package_type: "standalone".to_string(),
+            native_arch: "x86_64".to_string(),
+            target_os: Some("linux".to_string()),
+            signature_key_id: Some("release-v1".to_string()),
+            signature: Some("legacy-signature".to_string()),
+            signature_v2: Some("v2-signature".to_string()),
+            retry_count: 0,
+        });
+        let AgentOutbound::UpdateAvailable {
+            attempt_id,
+            instance_id,
+            ..
+        } = outbound
+        else {
+            panic!("expected update_available message");
+        };
+        assert_eq!(attempt_id.as_deref(), Some("attempt-1"));
+        assert_eq!(instance_id.as_deref(), Some("instance-1"));
+    }
+
+    #[test]
     fn recognizes_supported_standalone_executable_signatures() {
         assert!(package_signature_matches(
             "linux",
@@ -4206,6 +4239,7 @@ mod tests {
             .expect("hand off initial canary")
             .expect("initial canary offer");
         assert_eq!(handed_off.version, "2.0.0");
+        assert_eq!(handed_off.instance_id.as_deref(), Some("canary-agent"));
 
         let _ = set_rollout_paused(&state, &headers, &release_id, true)
             .await

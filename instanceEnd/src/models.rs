@@ -920,6 +920,8 @@ mod tests {
     fn update_offer_matches_the_backend_websocket_shape() {
         let value = json!({
             "type": "update_available",
+            "attempt_id": "attempt-1",
+            "instance_id": "instance-1",
             "release_id": "release-1",
             "version": "1.2.3",
             "artifact_id": "artifact-1",
@@ -939,19 +941,25 @@ mod tests {
         assert!(matches!(
             message,
             AgentOutbound::UpdateAvailable {
+                attempt_id: Some(attempt_id),
+                instance_id: Some(instance_id),
                 version,
                 target_os: Some(target_os),
                 signature_key_id: Some(signature_key_id),
                 signature_v2: Some(signature_v2),
                 retry_count: 2,
                 ..
-            } if version == "1.2.3"
+            } if attempt_id == "attempt-1"
+                && instance_id == "instance-1"
+                && version == "1.2.3"
                 && target_os == "linux"
                 && signature_key_id == "release-v1"
                 && signature_v2 == "c2lnbmF0dXJlLXYy"
         ));
 
         let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("attempt_id");
+        legacy.as_object_mut().unwrap().remove("instance_id");
         legacy.as_object_mut().unwrap().remove("retry_count");
         legacy.as_object_mut().unwrap().remove("target_os");
         legacy.as_object_mut().unwrap().remove("signature_key_id");
@@ -960,6 +968,8 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<AgentOutbound>(legacy).unwrap(),
             AgentOutbound::UpdateAvailable {
+                attempt_id: None,
+                instance_id: None,
                 target_os: None,
                 signature_key_id: None,
                 signature: None,

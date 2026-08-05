@@ -259,6 +259,8 @@ OM_UPDATE_PUBLIC_KEY_ID='release-v1' \
 配置。未嵌入公钥的 Agent 只允许通过 HTTPS 自动更新；嵌入公钥后，HTTP 和 HTTPS
 都会要求后端使用匹配的密钥签名。后端签名密钥的生成和 Compose 配置见
 [部署指南](docs/deployment.md#agent-更新签名)。
+两个变量必须同时设置或同时省略；Cargo 会在编译时校验 Base64、32 字节 Ed25519
+公钥和 key ID，配置不完整或无效时直接终止构建。
 
 在 Linux 或 macOS 的 Bash 环境中，可以构建单个目标，也可以依次构建全部 10 个支持目标：
 
@@ -382,7 +384,9 @@ Agent 会流式下载文件，校验大小、平台文件签名和 SHA-256，等
 签名字段，实例 ID、原始实例密钥和更新状态文件也保持兼容。历史版本本身不具备验签
 代码，因此它通过纯 HTTP 执行的第一次远程升级无法获得签名保护；这一次必须使用
 HTTPS，或离线核对产物后执行本地 `om-agent update`。升级到嵌入公钥的 `0.1.22`
-后，后续 HTTP 与 HTTPS 自动更新都可验证签名。未携带 `agent_rollback_v1` 的旧 Agent
+后，后续 HTTP 与 HTTPS 自动更新都可验证签名。服务端会同时提供兼容 `0.1.22` 的
+产物签名和 `0.1.23` 使用的完整元数据签名；`0.1.23` 在 HTTP 下拒绝缺少完整元数据
+签名的更新。未携带 `agent_rollback_v1` 的旧 Agent
 不会执行主动回滚，也不会伪造回滚能力；升级后重新注册或上报指标即可恢复真实能力和本地基线版本。
 
 自动更新无法使用时，可先通过实例文件管理上传匹配系统与架构的新 Agent，再从前端终端或命令执行器调用本地强制更新：
@@ -471,7 +475,8 @@ URL。`OM_ALLOW_LEGACY_AGENT_WS_AUTH` 默认必须保持 `false`；它只用于�
 私钥。设置后，后端会对 HTTP 清单和 WebSocket 推送中的更新元数据签名，并在启动日志
 中输出可嵌入 Agent 的公钥。`OM_UPDATE_SIGNING_KEY_ID` 必须与构建 Agent 时的
 `OM_UPDATE_PUBLIC_KEY_ID` 一致。未配置签名器时，旧 Agent 和未嵌入公钥的 HTTPS
-Agent 仍可更新，但嵌入公钥的 Agent 会拒绝所有未签名更新。
+Agent 仍可更新，但嵌入公钥的 Agent 会拒绝所有未签名更新。服务端同时生成兼容旧
+Agent 的 v1 签名和绑定任务 ID、发布 ID、产物 ID、下载路径及重试代次的 v2 签名。
 
 `OM_FILE_TRANSFER_MAX_BYTES` 限制单个远程上传或下载文件的大小，默认 1 GiB。反向代理的请求体上限必须不小于该值；Docker 前端默认将 `NGINX_CLIENT_MAX_BODY_SIZE` 设置为 `1g`，并关闭 API 请求与响应缓冲以保持流式传输。远程文件操作拥有与 Agent 服务进程相同的系统权限，生产环境应严格保护管理员账号和 TOTP 设备。
 

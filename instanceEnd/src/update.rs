@@ -54,8 +54,9 @@ const WINDOWS_FILE_REPLACE_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DISK_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CHECKSUM_FILE_BYTES: usize = 4096;
-const DEFAULT_UPDATE_SIGNATURE_KEY_ID: &str = "default";
-const UPDATE_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-update-v1";
+const MAX_AGENT_UPDATE_RETRY_COUNT: i64 = 100;
+const LEGACY_UPDATE_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-update-v1";
+const UPDATE_SIGNATURE_V2_DOMAIN: &str = "operation-monitoring-agent-update-v2";
 const ROLLBACK_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-rollback-v1";
 
 static UPDATE_CAPABILITY: OnceLock<UpdateCapability> = OnceLock::new();
@@ -321,6 +322,7 @@ pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
     };
     let offer = UpdateOffer {
         attempt_id: None,
+        instance_id: None,
         release_id: format!("manual-{operation_id}"),
         version: version.clone(),
         artifact_id: format!("manual-{operation_id}"),
@@ -332,6 +334,7 @@ pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
         target_os: Some(standalone_target_os().to_string()),
         signature_key_id: None,
         signature: None,
+        signature_v2: None,
         retry_count: 0,
     };
 
@@ -1064,8 +1067,8 @@ impl UpdateManager {
         if offer.size_bytes <= 0 {
             bail!("update package size must be positive");
         }
-        if offer.retry_count < 0 {
-            bail!("update retry count must not be negative");
+        if !(0..=MAX_AGENT_UPDATE_RETRY_COUNT).contains(&offer.retry_count) {
+            bail!("update retry count must be between 0 and {MAX_AGENT_UPDATE_RETRY_COUNT}");
         }
         if offer.sha256.len() != 64 || !offer.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("update package SHA-256 is invalid");
@@ -1113,8 +1116,8 @@ impl UpdateManager {
                 bail!("rollback {name} is invalid");
             }
         }
-        if offer.retry_count < 0 {
-            bail!("rollback retry count must not be negative");
+        if !(0..=MAX_AGENT_UPDATE_RETRY_COUNT).contains(&offer.retry_count) {
+            bail!("rollback retry count must be between 0 and {MAX_AGENT_UPDATE_RETRY_COUNT}");
         }
         Version::parse(&offer.from_version)
             .with_context(|| format!("invalid rollback source version {}", offer.from_version))?;
@@ -1768,6 +1771,7 @@ fn rollback_effective_offer(
     if let Some(package) = server_package {
         return Ok(UpdateOffer {
             attempt_id: Some(rollback.attempt_id.clone()),
+            instance_id: None,
             release_id: rollback.release_id.clone(),
             version: rollback.target_version.clone(),
             artifact_id: package.artifact_id.clone(),
@@ -1779,12 +1783,14 @@ fn rollback_effective_offer(
             target_os: Some(package.target_os.clone()),
             signature_key_id: None,
             signature: None,
+            signature_v2: None,
             retry_count: rollback.retry_count,
         });
     }
     let package = local_package.context("local rollback package is unavailable")?;
     Ok(UpdateOffer {
         attempt_id: Some(rollback.attempt_id.clone()),
+        instance_id: None,
         release_id: rollback.release_id.clone(),
         version: rollback.target_version.clone(),
         artifact_id: package.artifact_id.clone(),
@@ -1797,6 +1803,7 @@ fn rollback_effective_offer(
         target_os: Some(standalone_target_os().to_string()),
         signature_key_id: None,
         signature: None,
+        signature_v2: None,
         retry_count: rollback.retry_count,
     })
 }
@@ -2700,7 +2707,13 @@ fn verify_update_signature_policy_with_key(
     embedded_key: Option<(&str, &VerifyingKey)>,
 ) -> Result<()> {
     match embedded_key {
-        Some((key_id, verifying_key)) => verify_update_signature(offer, key_id, verifying_key),
+        Some((key_id, verifying_key)) if offer.signature_v2.is_some() => {
+            verify_update_signature_v2(offer, key_id, verifying_key)
+        }
+        Some((key_id, verifying_key)) if server_is_https => {
+            verify_legacy_update_signature(offer, key_id, verifying_key)
+        }
+        Some(_) => bail!("automatic updates over HTTP require an update metadata v2 signature"),
         None if server_is_https => Ok(()),
         None => bail!(
             "automatic updates over HTTP require an Ed25519 public key embedded with OM_UPDATE_PUBLIC_KEY"
@@ -2721,7 +2734,7 @@ fn embedded_update_verifying_key() -> Result<Option<(String, VerifyingKey)>> {
     let verifying_key = VerifyingKey::from_bytes(&key_bytes)
         .context("embedded OM_UPDATE_PUBLIC_KEY is not a valid Ed25519 public key")?;
     let key_id = option_env!("OM_UPDATE_PUBLIC_KEY_ID")
-        .unwrap_or(DEFAULT_UPDATE_SIGNATURE_KEY_ID)
+        .context("embedded OM_UPDATE_PUBLIC_KEY_ID is missing")?
         .trim()
         .to_string();
     if !valid_signature_key_id(&key_id) {
@@ -2730,7 +2743,7 @@ fn embedded_update_verifying_key() -> Result<Option<(String, VerifyingKey)>> {
     Ok(Some((key_id, verifying_key)))
 }
 
-fn verify_update_signature(
+fn verify_legacy_update_signature(
     offer: &UpdateOffer,
     expected_key_id: &str,
     verifying_key: &VerifyingKey,
@@ -2751,10 +2764,37 @@ fn verify_update_signature(
         .context("update signature is not valid Base64")?;
     let signature = Signature::from_slice(&signature_bytes)
         .context("update signature must decode to 64 bytes")?;
-    let payload = update_signature_payload(offer)?;
+    let payload = legacy_update_signature_payload(offer)?;
     verifying_key
         .verify(payload.as_bytes(), &signature)
-        .context("update signature verification failed")
+        .context("legacy update signature verification failed")
+}
+
+fn verify_update_signature_v2(
+    offer: &UpdateOffer,
+    expected_key_id: &str,
+    verifying_key: &VerifyingKey,
+) -> Result<()> {
+    let key_id = offer
+        .signature_key_id
+        .as_deref()
+        .context("signed update offer is missing signature_key_id")?;
+    if !valid_signature_key_id(key_id) || key_id != expected_key_id {
+        bail!("update signature key ID is not trusted");
+    }
+    let encoded_signature = offer
+        .signature_v2
+        .as_deref()
+        .context("signed update offer is missing signature_v2")?;
+    let signature_bytes = BASE64_STANDARD
+        .decode(encoded_signature)
+        .context("update signature_v2 is not valid Base64")?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .context("update signature_v2 must decode to 64 bytes")?;
+    let payload = update_signature_payload_v2(offer)?;
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .context("update metadata v2 signature verification failed")
 }
 
 fn verify_rollback_signature(
@@ -2792,7 +2832,7 @@ fn valid_signature_key_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn update_signature_payload(offer: &UpdateOffer) -> Result<String> {
+fn legacy_update_signature_payload(offer: &UpdateOffer) -> Result<String> {
     let target_os = offer
         .target_os
         .as_deref()
@@ -2813,8 +2853,53 @@ fn update_signature_payload(offer: &UpdateOffer) -> Result<String> {
         }
     }
     Ok(format!(
-        "{UPDATE_SIGNATURE_DOMAIN}\nversion={}\ntarget_os={target_os}\npackage_type={}\nnative_arch={}\nsize_bytes={}\nsha256={}\n",
+        "{LEGACY_UPDATE_SIGNATURE_DOMAIN}\nversion={}\ntarget_os={target_os}\npackage_type={}\nnative_arch={}\nsize_bytes={}\nsha256={}\n",
         offer.version,
+        offer.package_type,
+        offer.native_arch,
+        offer.size_bytes,
+        offer.sha256.to_ascii_lowercase(),
+    ))
+}
+
+fn update_signature_payload_v2(offer: &UpdateOffer) -> Result<String> {
+    let attempt_id = offer
+        .attempt_id
+        .as_deref()
+        .context("signed update offer is missing attempt_id")?;
+    let target_os = offer
+        .target_os
+        .as_deref()
+        .context("signed update offer is missing target_os")?;
+    for (name, value) in [
+        ("attempt_id", attempt_id),
+        ("release_id", offer.release_id.as_str()),
+        ("version", offer.version.as_str()),
+        ("artifact_id", offer.artifact_id.as_str()),
+        ("download_url", offer.download_url.as_str()),
+        ("target_os", target_os),
+        ("package_type", offer.package_type.as_str()),
+        ("native_arch", offer.native_arch.as_str()),
+        ("sha256", offer.sha256.as_str()),
+    ] {
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+        {
+            bail!("update v2 signature field {name} is invalid");
+        }
+    }
+    if offer.size_bytes <= 0 || !(0..=MAX_AGENT_UPDATE_RETRY_COUNT).contains(&offer.retry_count) {
+        bail!("update v2 signature numeric fields are invalid");
+    }
+    Ok(format!(
+        "{UPDATE_SIGNATURE_V2_DOMAIN}\nattempt_id={attempt_id}\nrelease_id={}\nversion={}\nretry_count={}\nartifact_id={}\ndownload_url={}\ntarget_os={target_os}\npackage_type={}\nnative_arch={}\nsize_bytes={}\nsha256={}\n",
+        offer.release_id,
+        offer.version,
+        offer.retry_count,
+        offer.artifact_id,
+        offer.download_url,
         offer.package_type,
         offer.native_arch,
         offer.size_bytes,
@@ -3343,7 +3428,8 @@ mod tests {
     fn signed_test_offer() -> (UpdateOffer, SigningKey) {
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let mut offer = UpdateOffer {
-            attempt_id: None,
+            attempt_id: Some("attempt-signed".to_string()),
+            instance_id: None,
             release_id: "release-signed".to_string(),
             version: "1.2.3".to_string(),
             artifact_id: "artifact-signed".to_string(),
@@ -3355,11 +3441,15 @@ mod tests {
             target_os: Some(standalone_target_os().to_string()),
             signature_key_id: Some("release-v1".to_string()),
             signature: None,
+            signature_v2: None,
             retry_count: 0,
         };
-        let payload = update_signature_payload(&offer).unwrap();
+        let payload = legacy_update_signature_payload(&offer).unwrap();
         offer.signature =
             Some(BASE64_STANDARD.encode(signing_key.sign(payload.as_bytes()).to_bytes()));
+        let payload_v2 = update_signature_payload_v2(&offer).unwrap();
+        offer.signature_v2 =
+            Some(BASE64_STANDARD.encode(signing_key.sign(payload_v2.as_bytes()).to_bytes()));
         (offer, signing_key)
     }
 
@@ -3426,9 +3516,9 @@ mod tests {
     }
 
     #[test]
-    fn verifies_domain_separated_update_signatures() {
+    fn verifies_legacy_and_metadata_bound_update_signatures() {
         let (offer, signing_key) = signed_test_offer();
-        let payload = update_signature_payload(&offer).unwrap();
+        let payload = legacy_update_signature_payload(&offer).unwrap();
         assert_eq!(
             payload,
             format!(
@@ -3438,15 +3528,46 @@ mod tests {
                 "a".repeat(64)
             )
         );
-        verify_update_signature(&offer, "release-v1", &signing_key.verifying_key()).unwrap();
+        verify_legacy_update_signature(&offer, "release-v1", &signing_key.verifying_key()).unwrap();
+
+        assert_eq!(
+            update_signature_payload_v2(&offer).unwrap(),
+            format!(
+                "operation-monitoring-agent-update-v2\nattempt_id=attempt-signed\nrelease_id=release-signed\nversion=1.2.3\nretry_count=0\nartifact_id=artifact-signed\ndownload_url=/api/agent/update/artifacts/artifact-signed/download\ntarget_os={}\npackage_type=standalone\nnative_arch={}\nsize_bytes=42\nsha256={}\n",
+                standalone_target_os(),
+                standalone_native_arch(),
+                "a".repeat(64)
+            )
+        );
+        verify_update_signature_v2(&offer, "release-v1", &signing_key.verifying_key()).unwrap();
 
         let mut tampered = offer.clone();
-        tampered.sha256 = "b".repeat(64);
+        tampered.retry_count = 1;
         assert!(
-            verify_update_signature(&tampered, "release-v1", &signing_key.verifying_key()).is_err()
+            verify_update_signature_v2(&tampered, "release-v1", &signing_key.verifying_key())
+                .is_err()
+        );
+
+        let mut out_of_range = offer.clone();
+        out_of_range.retry_count = MAX_AGENT_UPDATE_RETRY_COUNT + 1;
+        assert!(update_signature_payload_v2(&out_of_range).is_err());
+
+        let mut tampered = offer.clone();
+        tampered.attempt_id = Some("attempt-other".to_string());
+        assert!(
+            verify_update_signature_v2(&tampered, "release-v1", &signing_key.verifying_key())
+                .is_err()
+        );
+
+        let mut tampered = offer.clone();
+        tampered.artifact_id = "artifact-other".to_string();
+        tampered.download_url = "/api/agent/update/artifacts/artifact-other/download".to_string();
+        assert!(
+            verify_update_signature_v2(&tampered, "release-v1", &signing_key.verifying_key())
+                .is_err()
         );
         assert!(
-            verify_update_signature(&offer, "other-key", &signing_key.verifying_key()).is_err()
+            verify_update_signature_v2(&offer, "other-key", &signing_key.verifying_key()).is_err()
         );
     }
 
@@ -3464,8 +3585,28 @@ mod tests {
             .is_ok()
         );
 
+        let mut legacy = offer.clone();
+        legacy.signature_v2 = None;
+        assert!(
+            verify_update_signature_policy_with_key(
+                &legacy,
+                false,
+                Some(("release-v1", &signing_key.verifying_key()))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_update_signature_policy_with_key(
+                &legacy,
+                true,
+                Some(("release-v1", &signing_key.verifying_key()))
+            )
+            .is_ok()
+        );
+
         let mut unsigned = offer;
         unsigned.signature = None;
+        unsigned.signature_v2 = None;
         assert!(
             verify_update_signature_policy_with_key(
                 &unsigned,
@@ -3619,6 +3760,7 @@ mod tests {
         };
         let offer = UpdateOffer {
             attempt_id: Some("downgrade-attempt".to_string()),
+            instance_id: None,
             release_id: "release-downgrade".to_string(),
             version: "0.0.0".to_string(),
             artifact_id: "artifact-downgrade".to_string(),
@@ -3630,6 +3772,7 @@ mod tests {
             target_os: Some(standalone_target_os().to_string()),
             signature_key_id: None,
             signature: None,
+            signature_v2: None,
             retry_count: 0,
         };
         let (outbound, mut events, _failed) = AgentEventSender::channel(4);
@@ -3674,6 +3817,7 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(package));
         let offer = UpdateOffer {
             attempt_id: None,
+            instance_id: None,
             release_id: "release-checksum".to_string(),
             version: "9.9.9".to_string(),
             artifact_id: "artifact-checksum".to_string(),
@@ -3685,6 +3829,7 @@ mod tests {
             target_os: Some(standalone_target_os().to_string()),
             signature_key_id: None,
             signature: None,
+            signature_v2: None,
             retry_count: 0,
         };
         let downloaded = DownloadedPackage {
@@ -3749,6 +3894,7 @@ mod tests {
         };
         let offer = UpdateOffer {
             attempt_id: None,
+            instance_id: None,
             release_id: "release-handoff".to_string(),
             version: "9.9.9".to_string(),
             artifact_id: "artifact-handoff".to_string(),
@@ -3760,6 +3906,7 @@ mod tests {
             target_os: Some(standalone_target_os().to_string()),
             signature_key_id: None,
             signature: None,
+            signature_v2: None,
             retry_count: 0,
         };
         let previous = CachedPackage {
@@ -3962,6 +4109,7 @@ mod tests {
         let plan = ApplyPlan {
             offer: UpdateOffer {
                 attempt_id: None,
+                instance_id: None,
                 release_id: "manual-release".to_string(),
                 version: "9.9.9".to_string(),
                 artifact_id: "manual-artifact".to_string(),
@@ -3973,6 +4121,7 @@ mod tests {
                 target_os: Some(standalone_target_os().to_string()),
                 signature_key_id: None,
                 signature: None,
+                signature_v2: None,
                 retry_count: 0,
             },
             package_path: source.clone(),
@@ -4016,6 +4165,7 @@ mod tests {
         };
         let old_offer = UpdateOffer {
             attempt_id: Some("attempt-old".to_string()),
+            instance_id: None,
             release_id: "release-target".to_string(),
             version: "1.0.0".to_string(),
             artifact_id: "artifact-target".to_string(),
@@ -4027,6 +4177,7 @@ mod tests {
             target_os: Some(standalone_target_os().to_string()),
             signature_key_id: None,
             signature: None,
+            signature_v2: None,
             retry_count: 0,
         };
         let mut new_offer = old_offer.clone();
@@ -4194,6 +4345,7 @@ mod tests {
         };
         let offer = UpdateOffer {
             attempt_id: None,
+            instance_id: None,
             release_id: "release-target".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             artifact_id: "artifact-target".to_string(),
@@ -4205,6 +4357,7 @@ mod tests {
             target_os: Some(standalone_target_os().to_string()),
             signature_key_id: None,
             signature: None,
+            signature_v2: None,
             retry_count: 0,
         };
         write_update_state(
@@ -4381,6 +4534,7 @@ mod tests {
         };
         let offer = UpdateOffer {
             attempt_id: Some("rollback-attempt-1".to_string()),
+            instance_id: None,
             release_id: "release-rollback".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             artifact_id: "artifact-target".to_string(),
@@ -4392,6 +4546,7 @@ mod tests {
             target_os: Some(standalone_target_os().to_string()),
             signature_key_id: None,
             signature: None,
+            signature_v2: None,
             retry_count: 2,
         };
         write_update_state(

@@ -551,6 +551,7 @@ async fn handle_agent_socket(
                                 target_os,
                                 signature_key_id,
                                 signature,
+                                signature_v2,
                                 retry_count,
                             } => {
                                 let offer = UpdateOffer {
@@ -566,6 +567,7 @@ async fn handle_agent_socket(
                                     target_os,
                                     signature_key_id,
                                     signature,
+                                    signature_v2,
                                     retry_count,
                                 };
                                 if active_update.is_none() {

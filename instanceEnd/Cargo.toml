@@ -1,6 +1,6 @@
 [package]
 name = "instanceEnd"
-version = "0.1.22"
+version = "0.1.23"
 edition = "2024"
 rust-version = "1.89"
 
@@ -62,6 +62,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_Threading",
 ] }
+
+[build-dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 
 [profile.release]
 codegen-units = 1

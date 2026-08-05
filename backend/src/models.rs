@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+pub const MAX_AGENT_UPDATE_RETRY_COUNT: i64 = 100;
+
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
@@ -866,6 +868,8 @@ pub struct UpdateAttemptsQuery {
 pub struct AgentUpdateOffer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     pub release_id: String,
     pub version: String,
     pub artifact_id: String,
@@ -880,6 +884,8 @@ pub struct AgentUpdateOffer {
     pub signature_key_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_v2: Option<String>,
     #[serde(default)]
     pub retry_count: i64,
 }
@@ -1133,6 +1139,8 @@ pub enum AgentOutbound {
     UpdateAvailable {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
         release_id: String,
         version: String,
         artifact_id: String,
@@ -1147,6 +1155,8 @@ pub enum AgentOutbound {
         signature_key_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature_v2: Option<String>,
         #[serde(default)]
         retry_count: i64,
     },

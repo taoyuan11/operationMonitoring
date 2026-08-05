@@ -4,9 +4,10 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signer, SigningKey};
 
-use crate::models::{AgentRollbackOffer, AgentUpdateOffer};
+use crate::models::{AgentRollbackOffer, AgentUpdateOffer, MAX_AGENT_UPDATE_RETRY_COUNT};
 
-const UPDATE_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-update-v1";
+const LEGACY_UPDATE_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-update-v1";
+const UPDATE_SIGNATURE_V2_DOMAIN: &str = "operation-monitoring-agent-update-v2";
 const ROLLBACK_SIGNATURE_DOMAIN: &str = "operation-monitoring-agent-rollback-v1";
 
 #[derive(Clone)]
@@ -25,10 +26,13 @@ impl UpdateSigner {
     }
 
     pub fn sign_offer(&self, offer: &mut AgentUpdateOffer) -> Result<()> {
-        let payload = update_signature_payload(offer)?;
-        let signature = self.signing_key.sign(payload.as_bytes());
+        let legacy_payload = legacy_update_signature_payload(offer)?;
+        let payload_v2 = update_signature_payload_v2(offer)?;
         offer.signature_key_id = Some(self.key_id.clone());
-        offer.signature = Some(STANDARD.encode(signature.to_bytes()));
+        offer.signature =
+            Some(STANDARD.encode(self.signing_key.sign(legacy_payload.as_bytes()).to_bytes()));
+        offer.signature_v2 =
+            Some(STANDARD.encode(self.signing_key.sign(payload_v2.as_bytes()).to_bytes()));
         Ok(())
     }
 
@@ -86,7 +90,7 @@ fn valid_signature_key_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn update_signature_payload(offer: &AgentUpdateOffer) -> Result<String> {
+fn legacy_update_signature_payload(offer: &AgentUpdateOffer) -> Result<String> {
     let target_os = offer
         .target_os
         .as_deref()
@@ -107,8 +111,58 @@ fn update_signature_payload(offer: &AgentUpdateOffer) -> Result<String> {
         }
     }
     Ok(format!(
-        "{UPDATE_SIGNATURE_DOMAIN}\nversion={}\ntarget_os={target_os}\npackage_type={}\nnative_arch={}\nsize_bytes={}\nsha256={}\n",
+        "{LEGACY_UPDATE_SIGNATURE_DOMAIN}\nversion={}\ntarget_os={target_os}\npackage_type={}\nnative_arch={}\nsize_bytes={}\nsha256={}\n",
         offer.version,
+        offer.package_type,
+        offer.native_arch,
+        offer.size_bytes,
+        offer.sha256.to_ascii_lowercase(),
+    ))
+}
+
+fn update_signature_payload_v2(offer: &AgentUpdateOffer) -> Result<String> {
+    let attempt_id = offer
+        .attempt_id
+        .as_deref()
+        .context("signed update offer is missing attempt_id")?;
+    let instance_id = offer
+        .instance_id
+        .as_deref()
+        .context("signed update offer is missing instance_id")?;
+    let target_os = offer
+        .target_os
+        .as_deref()
+        .context("signed update offer is missing target_os")?;
+    for (name, value) in [
+        ("attempt_id", attempt_id),
+        ("instance_id", instance_id),
+        ("release_id", offer.release_id.as_str()),
+        ("version", offer.version.as_str()),
+        ("artifact_id", offer.artifact_id.as_str()),
+        ("download_url", offer.download_url.as_str()),
+        ("target_os", target_os),
+        ("package_type", offer.package_type.as_str()),
+        ("native_arch", offer.native_arch.as_str()),
+        ("sha256", offer.sha256.as_str()),
+    ] {
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+        {
+            bail!("update v2 signature field {name} is invalid");
+        }
+    }
+    if offer.size_bytes <= 0 || !(0..=MAX_AGENT_UPDATE_RETRY_COUNT).contains(&offer.retry_count) {
+        bail!("update v2 signature numeric fields are invalid");
+    }
+    Ok(format!(
+        "{UPDATE_SIGNATURE_V2_DOMAIN}\nattempt_id={attempt_id}\ninstance_id={instance_id}\nrelease_id={}\nversion={}\nretry_count={}\nartifact_id={}\ndownload_url={}\ntarget_os={target_os}\npackage_type={}\nnative_arch={}\nsize_bytes={}\nsha256={}\n",
+        offer.release_id,
+        offer.version,
+        offer.retry_count,
+        offer.artifact_id,
+        offer.download_url,
         offer.package_type,
         offer.native_arch,
         offer.size_bytes,
@@ -193,19 +247,20 @@ mod tests {
             target_os: Some("linux".to_string()),
             signature_key_id: None,
             signature: None,
+            signature_v2: None,
             retry_count: 0,
         }
     }
 
     #[test]
-    fn signs_the_agent_canonical_payload() {
+    fn signs_legacy_and_metadata_bound_update_payloads() {
         let signer = UpdateSigner {
             key_id: "release-v1".to_string(),
             signing_key: SigningKey::from_bytes(&[7_u8; 32]),
         };
         let mut offer = offer();
         assert_eq!(
-            update_signature_payload(&offer).unwrap(),
+            legacy_update_signature_payload(&offer).unwrap(),
             format!(
                 "operation-monitoring-agent-update-v1\nversion=1.2.3\ntarget_os=linux\npackage_type=standalone\nnative_arch=x86_64\nsize_bytes=42\nsha256={}\n",
                 "a".repeat(64)
@@ -213,7 +268,7 @@ mod tests {
         );
         signer.sign_offer(&mut offer).unwrap();
         assert_eq!(offer.signature_key_id.as_deref(), Some("release-v1"));
-        let signature = Signature::from_slice(
+        let legacy_signature = Signature::from_slice(
             &STANDARD
                 .decode(offer.signature.as_deref().unwrap())
                 .unwrap(),
@@ -229,20 +284,59 @@ mod tests {
         .unwrap();
         verifying_key
             .verify(
-                update_signature_payload(&offer).unwrap().as_bytes(),
-                &signature,
+                legacy_update_signature_payload(&offer).unwrap().as_bytes(),
+                &legacy_signature,
             )
             .unwrap();
-
-        offer.size_bytes += 1;
-        assert!(
-            verifying_key
-                .verify(
-                    update_signature_payload(&offer).unwrap().as_bytes(),
-                    &signature,
-                )
-                .is_err()
+        assert_eq!(
+            update_signature_payload_v2(&offer).unwrap(),
+            format!(
+                "operation-monitoring-agent-update-v2\nattempt_id=attempt-1\nrelease_id=release-1\nversion=1.2.3\nretry_count=0\nartifact_id=artifact-1\ndownload_url=/api/agent/update/artifacts/artifact-1/download\ntarget_os=linux\npackage_type=standalone\nnative_arch=x86_64\nsize_bytes=42\nsha256={}\n",
+                "a".repeat(64)
+            )
         );
+        let signature_v2 = Signature::from_slice(
+            &STANDARD
+                .decode(offer.signature_v2.as_deref().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let original_payload = update_signature_payload_v2(&offer).unwrap();
+        verifying_key
+            .verify(original_payload.as_bytes(), &signature_v2)
+            .unwrap();
+
+        for tampered in [
+            AgentUpdateOffer {
+                attempt_id: Some("attempt-2".to_string()),
+                ..offer.clone()
+            },
+            AgentUpdateOffer {
+                release_id: "release-2".to_string(),
+                ..offer.clone()
+            },
+            AgentUpdateOffer {
+                artifact_id: "artifact-2".to_string(),
+                ..offer.clone()
+            },
+            AgentUpdateOffer {
+                download_url: "/api/agent/update/artifacts/artifact-2/download".to_string(),
+                ..offer.clone()
+            },
+            AgentUpdateOffer {
+                retry_count: 1,
+                ..offer.clone()
+            },
+        ] {
+            assert!(
+                verifying_key
+                    .verify(
+                        update_signature_payload_v2(&tampered).unwrap().as_bytes(),
+                        &signature_v2,
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]

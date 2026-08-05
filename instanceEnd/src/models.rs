@@ -451,6 +451,8 @@ pub struct HostProfile {
 pub struct UpdateOffer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     pub release_id: String,
     pub version: String,
     pub artifact_id: String,
@@ -465,6 +467,8 @@ pub struct UpdateOffer {
     pub signature_key_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_v2: Option<String>,
     #[serde(default)]
     pub retry_count: i64,
 }
@@ -712,6 +716,8 @@ pub enum AgentOutbound {
     UpdateAvailable {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
         release_id: String,
         version: String,
         artifact_id: String,
@@ -726,6 +732,8 @@ pub enum AgentOutbound {
         signature_key_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature_v2: Option<String>,
         #[serde(default)]
         retry_count: i64,
     },
@@ -923,6 +931,7 @@ mod tests {
             "target_os": "linux",
             "signature_key_id": "release-v1",
             "signature": "c2lnbmF0dXJl",
+            "signature_v2": "c2lnbmF0dXJlLXYy",
             "retry_count": 2
         });
 
@@ -933,11 +942,13 @@ mod tests {
                 version,
                 target_os: Some(target_os),
                 signature_key_id: Some(signature_key_id),
+                signature_v2: Some(signature_v2),
                 retry_count: 2,
                 ..
             } if version == "1.2.3"
                 && target_os == "linux"
                 && signature_key_id == "release-v1"
+                && signature_v2 == "c2lnbmF0dXJlLXYy"
         ));
 
         let mut legacy = value;
@@ -945,12 +956,14 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("target_os");
         legacy.as_object_mut().unwrap().remove("signature_key_id");
         legacy.as_object_mut().unwrap().remove("signature");
+        legacy.as_object_mut().unwrap().remove("signature_v2");
         assert!(matches!(
             serde_json::from_value::<AgentOutbound>(legacy).unwrap(),
             AgentOutbound::UpdateAvailable {
                 target_os: None,
                 signature_key_id: None,
                 signature: None,
+                signature_v2: None,
                 retry_count: 0,
                 ..
             }

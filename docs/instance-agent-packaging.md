@@ -70,6 +70,8 @@ export OM_UPDATE_PUBLIC_KEY_ID='release-v1'
 32 字节 Ed25519 公钥，key ID 必须与后端 `OM_UPDATE_SIGNING_KEY_ID` 完全一致。不要把
 后端私钥放入构建环境或 Agent 二进制。更换公钥需要先发布同时信任新密钥的过渡版本；
 当前版本只支持一个嵌入公钥，不能直接无缝轮换。
+两个变量必须同时设置或同时省略。Cargo 的编译期检查会拒绝无效 Base64、长度错误、
+无效 Ed25519 公钥和非法 key ID；省略两者生成的产物仅允许通过 HTTPS 自动更新。
 
 ### 2.2 安装 Rust
 

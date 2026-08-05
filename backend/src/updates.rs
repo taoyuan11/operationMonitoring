@@ -28,8 +28,8 @@ use crate::{
         AgentArtifactRecord, AgentOutbound, AgentReleaseCoverage, AgentReleaseDetail,
         AgentReleaseRecord, AgentReleaseTargetsRequest, AgentRollbackCoverage, AgentRollbackOffer,
         AgentRollbackPackage, AgentRolloutCandidate, AgentUpdateAttemptRecord, AgentUpdateManifest,
-        AgentUpdateOffer, CreateAgentReleaseRequest, InstanceRecord, PublishAgentReleaseRequest,
-        UpdateAttemptsQuery,
+        AgentUpdateOffer, CreateAgentReleaseRequest, InstanceRecord, MAX_AGENT_UPDATE_RETRY_COUNT,
+        PublishAgentReleaseRequest, UpdateAttemptsQuery,
     },
     state::AppState,
     utils::now_ts,
@@ -1170,8 +1170,19 @@ pub async fn admin_retry_agent_update(
     Path(attempt_id): Path<String>,
 ) -> AppResult<Json<AgentUpdateAttemptRecord>> {
     let admin = require_admin(&state, &headers).await?;
-    let attempt = get_attempt(&state, &attempt_id).await?;
-    let release = get_release(&state, &attempt.release_id).await?;
+    let observed_attempt = get_attempt(&state, &attempt_id).await?;
+    let now = now_ts();
+    let mut transaction = state.db.begin().await?;
+    // Rollout controls lock the release before touching attempts. Using the same order makes a
+    // concurrent retry either commit before rollback cancellation or observe the rollback state.
+    let release = locked_release(&mut transaction, &observed_attempt.release_id).await?;
+    let attempt = locked_attempt(&mut transaction, &attempt_id).await?;
+    if attempt.release_id != release.id {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "更新记录所属版本已发生变化，请刷新后重试",
+        ));
+    }
     let retryable = match attempt.operation.as_str() {
         "upgrade" => matches!(attempt.status.as_str(), "failed" | "rollback_succeeded"),
         "rollback" => attempt.status == "failed",
@@ -1202,11 +1213,23 @@ pub async fn admin_retry_agent_update(
             "当前版本的发布流程不允许重试该更新记录",
         ));
     }
+    if attempt.retry_count >= MAX_AGENT_UPDATE_RETRY_COUNT {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            format!("更新记录最多只能重试 {MAX_AGENT_UPDATE_RETRY_COUNT} 次"),
+        ));
+    }
     let rollback_artifact_id = if attempt.operation == "upgrade" {
         require_latest_retry_candidate(&state, &attempt).await?;
         None
     } else {
-        let instance = get_instance(&state.db, &attempt.instance_id).await?;
+        let instance = locked_instance(&mut transaction, &attempt.instance_id).await?;
+        if instance.agent_version != attempt.from_version {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                "实例当前版本与回滚记录不一致，不能重试",
+            ));
+        }
         if instance.rollback_supported != 1 {
             return Err(AppError::new(
                 StatusCode::CONFLICT,
@@ -1220,8 +1243,6 @@ pub async fn admin_retry_agent_update(
         }
         artifact.map(|artifact| artifact.id)
     };
-    let now = now_ts();
-    let mut transaction = state.db.begin().await?;
     if attempt.operation == "rollback" && release.rollout_state == "rollback_partial" {
         ensure_no_other_controlled_release(&mut transaction, &attempt.release_id).await?;
         let activated = sqlx::query(
@@ -1264,7 +1285,7 @@ pub async fn admin_retry_agent_update(
         UPDATE agent_update_attempts
         SET artifact_id = COALESCE($1, artifact_id), status = 'pending', message = '', retry_count = retry_count + 1,
             updated_at = $2, completed_at = NULL
-        WHERE id = $3 AND status = $4 AND retry_count = $5
+        WHERE id = $3 AND status = $4 AND retry_count = $5 AND retry_count < $6
         "#,
     )
     .bind(rollback_artifact_id.as_deref())
@@ -1272,6 +1293,7 @@ pub async fn admin_retry_agent_update(
     .bind(&attempt_id)
     .bind(&attempt.status)
     .bind(attempt.retry_count)
+    .bind(MAX_AGENT_UPDATE_RETRY_COUNT)
     .execute(&mut *transaction)
     .await;
     let retried = map_unique_conflict(retried, "实例已有其他活动更新任务，完成后才能重试")?;
@@ -2633,7 +2655,44 @@ async fn locked_release(
     .bind(release_id)
     .fetch_optional(&mut **transaction)
     .await?
-    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Agent 版本不存在"))
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Agent 版本不存在"))
+}
+
+async fn locked_attempt(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt_id: &str,
+) -> AppResult<AgentUpdateAttemptRecord> {
+    sqlx::query_as::<_, AgentUpdateAttemptRecord>(
+        r#"
+        SELECT id, release_id, artifact_id, instance_id, operation, parent_attempt_id,
+               from_version, target_version, status, message, retry_count, created_at,
+               updated_at, completed_at
+        FROM agent_update_attempts WHERE id = $1 FOR UPDATE
+        "#,
+    )
+    .bind(attempt_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Agent 更新记录不存在"))
+}
+
+async fn locked_instance(
+    transaction: &mut Transaction<'_, Postgres>,
+    instance_id: &str,
+) -> AppResult<InstanceRecord> {
+    sqlx::query_as::<_, InstanceRecord>(
+        r#"
+        SELECT id, secret, name, region, country_code, country, province_code, province, city,
+               remark, hostname, os, arch, agent_version, package_type, native_arch,
+               update_privileged, rollback_supported, rollback_version, approved, disabled,
+               first_seen, last_seen
+        FROM instances WHERE id = $1 FOR UPDATE
+        "#,
+    )
+    .bind(instance_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "实例不存在"))
 }
 
 async fn ensure_no_other_controlled_release(
@@ -3230,6 +3289,7 @@ async fn active_upgrade_offer(
             target_os: Some(candidate.os),
             signature_key_id: None,
             signature: None,
+            signature_v2: None,
             retry_count: candidate.retry_count,
         },
     )
@@ -3425,6 +3485,7 @@ fn outbound_offer(offer: AgentUpdateOffer) -> AgentOutbound {
         target_os: offer.target_os,
         signature_key_id: offer.signature_key_id,
         signature: offer.signature,
+        signature_v2: offer.signature_v2,
         retry_count: offer.retry_count,
     }
 }
@@ -5075,6 +5136,156 @@ mod tests {
                 .await
                 .expect("read attempt");
         assert_eq!(status, "failed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn retry_rechecks_the_locked_release_state() {
+        let state = test_state().await;
+        let headers = admin_headers(&state).await;
+        insert_instance(
+            &state,
+            "rollback-race-agent",
+            "ubuntu",
+            "standalone",
+            "amd64",
+        )
+        .await;
+        insert_release(&state, "2.0.0", "standalone", "amd64").await;
+        let attempt_id = insert_upgrade_attempt(
+            &state,
+            "release-2.0.0",
+            "artifact-2.0.0-amd64",
+            "rollback-race-agent",
+            "1.0.0",
+            "2.0.0",
+            "failed",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE agent_releases SET rollout_state = 'rollback_active' WHERE id = 'release-2.0.0'",
+        )
+        .execute(&state.db)
+        .await
+        .expect("activate rollback before retry");
+
+        let error =
+            match admin_retry_agent_update(State(state.clone()), headers, Path(attempt_id.clone()))
+                .await
+            {
+                Ok(_) => panic!("rollback-active release must reject an upgrade retry"),
+                Err(error) => error,
+            };
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        let stored: (String, i64) =
+            sqlx::query_as("SELECT status, retry_count FROM agent_update_attempts WHERE id = $1")
+                .bind(attempt_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("load rejected retry");
+        assert_eq!(stored, ("failed".to_string(), 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn rollback_retry_rejects_an_instance_that_changed_version() {
+        let state = test_state().await;
+        let headers = admin_headers(&state).await;
+        insert_instance(
+            &state,
+            "stale-rollback-agent",
+            "ubuntu",
+            "standalone",
+            "amd64",
+        )
+        .await;
+        insert_release(&state, "1.0.0", "standalone", "amd64").await;
+        insert_release(&state, "2.0.0", "standalone", "amd64").await;
+        set_instance_version_and_rollback(&state, "stale-rollback-agent", "3.0.0", true, "1.0.0")
+            .await;
+        let parent_id = insert_upgrade_attempt(
+            &state,
+            "release-2.0.0",
+            "artifact-2.0.0-amd64",
+            "stale-rollback-agent",
+            "1.0.0",
+            "2.0.0",
+            "succeeded",
+        )
+        .await;
+        let attempt_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO agent_update_attempts(
+                id, release_id, artifact_id, instance_id, operation, parent_attempt_id,
+                from_version, target_version, status, retry_count, created_at, updated_at,
+                completed_at
+            ) VALUES($1, 'release-2.0.0', NULL, 'stale-rollback-agent', 'rollback', $2,
+                     '2.0.0', '1.0.0', 'failed', 0, 2, 2, 2)
+            "#,
+        )
+        .bind(&attempt_id)
+        .bind(parent_id)
+        .execute(&state.db)
+        .await
+        .expect("insert failed rollback attempt");
+
+        let error =
+            match admin_retry_agent_update(State(state.clone()), headers, Path(attempt_id.clone()))
+                .await
+            {
+                Ok(_) => panic!("changed source version must reject rollback retry"),
+                Err(error) => error,
+            };
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM agent_update_attempts WHERE id = $1")
+                .bind(attempt_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("load stale rollback attempt");
+        assert_eq!(status, "failed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn retry_count_cannot_exceed_the_websocket_protocol_limit() {
+        let state = test_state().await;
+        let headers = admin_headers(&state).await;
+        insert_instance(&state, "retry-limit-agent", "ubuntu", "standalone", "amd64").await;
+        insert_release(&state, "2.0.0", "standalone", "amd64").await;
+        let attempt_id = insert_upgrade_attempt(
+            &state,
+            "release-2.0.0",
+            "artifact-2.0.0-amd64",
+            "retry-limit-agent",
+            "1.0.0",
+            "2.0.0",
+            "failed",
+        )
+        .await;
+        sqlx::query("UPDATE agent_update_attempts SET retry_count = $1 WHERE id = $2")
+            .bind(MAX_AGENT_UPDATE_RETRY_COUNT)
+            .bind(&attempt_id)
+            .execute(&state.db)
+            .await
+            .expect("set retry count to protocol limit");
+
+        let error =
+            match admin_retry_agent_update(State(state.clone()), headers, Path(attempt_id.clone()))
+                .await
+            {
+                Ok(_) => panic!("retry beyond the protocol limit must fail"),
+                Err(error) => error,
+            };
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        let stored: (String, i64) =
+            sqlx::query_as("SELECT status, retry_count FROM agent_update_attempts WHERE id = $1")
+                .bind(attempt_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("load capped retry");
+        assert_eq!(stored, ("failed".to_string(), MAX_AGENT_UPDATE_RETRY_COUNT));
     }
 
     #[tokio::test]

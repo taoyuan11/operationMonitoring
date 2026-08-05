@@ -27,7 +27,8 @@ use crate::{
         fail_connection_command_jobs,
     },
     models::{
-        AgentInbound, AgentOutbound, MetricPayload, TerminalClientMessage, TerminalServerMessage,
+        AgentInbound, AgentOutbound, MAX_AGENT_UPDATE_RETRY_COUNT, MetricPayload,
+        TerminalClientMessage, TerminalServerMessage,
     },
     remote_desktop::{close_connection_desktops, desktop_agent_closed, desktop_agent_opened},
     state::{AgentHandle, AgentOutboundSender, AppState, TerminalSessionHandle},
@@ -429,7 +430,7 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
                 || !id(release_id)
                 || !id(artifact_id)
                 || version.len() > 64
-                || !(0..=100).contains(retry_count)
+                || !(0..=MAX_AGENT_UPDATE_RETRY_COUNT).contains(retry_count)
                 || update_status.len() > 64
                 || message.as_ref().is_some_and(|value| !status(value))
             {
@@ -443,7 +444,7 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
             message,
         } => {
             if !id(attempt_id)
-                || !(0..=100).contains(retry_count)
+                || !(0..=MAX_AGENT_UPDATE_RETRY_COUNT).contains(retry_count)
                 || rollback_status.len() > 64
                 || message.as_ref().is_some_and(|value| !status(value))
             {

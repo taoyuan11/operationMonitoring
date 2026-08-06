@@ -65,6 +65,36 @@ semver_is_greater() {
   fi
 }
 
+backend_version_from_file() {
+  local version
+  version=$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/\1/p' "$1")
+  [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    || die 'Unable to determine a stable backend version from backend/Cargo.toml'
+  printf '%s\n' "$version"
+}
+
+backend_version() {
+  backend_version_from_file "$ROOT/backend/Cargo.toml"
+}
+
+backend_version_at_tag() {
+  local tag=$1 manifest version
+  manifest=$(git show "refs/tags/$tag:backend/Cargo.toml") \
+    || die "Unable to read backend/Cargo.toml from tag $tag"
+  version=$(printf '%s\n' "$manifest" | sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/\1/p')
+  [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    || die "Unable to determine a stable backend version from tag $tag"
+  printf '%s\n' "$version"
+}
+
+require_forward_backend_upgrade() {
+  local current_version=$1
+  local target_version=$2
+  if ! semver_is_greater "$target_version" "$current_version"; then
+    die "Refusing non-forward backend update from $current_version to $target_version; backend version rollback is unsupported."
+  fi
+}
+
 latest_remote_tag() {
   local remote_tags ref tag latest=
 
@@ -96,7 +126,7 @@ deploy() {
 }
 
 update() {
-  local latest_tag previous_commit
+  local latest_tag previous_commit current_version target_backend_version
 
   require_command git
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
@@ -112,10 +142,15 @@ update() {
 
   printf '%s\n' 'Reminder: back up PostgreSQL and persistent volumes before updating.'
   latest_tag=$(latest_remote_tag)
+  current_version=$(backend_version)
   previous_commit=$(git rev-parse --short HEAD)
 
-  printf 'Updating from commit %s to tag %s\n' "$previous_commit" "$latest_tag"
   git fetch --force origin "refs/tags/$latest_tag:refs/tags/$latest_tag"
+  target_backend_version=$(backend_version_at_tag "$latest_tag")
+  require_forward_backend_upgrade "$current_version" "$target_backend_version"
+
+  printf 'Updating backend from %s to %s (tag %s, commit %s)\n' \
+    "$current_version" "$target_backend_version" "$latest_tag" "$previous_commit"
   git checkout --detach "refs/tags/$latest_tag"
 
   validate_compose_file

@@ -14,7 +14,7 @@ docker compose -f docker-compose.with-db.yml up -d --build
 docker compose -f docker-compose.with-db.yml ps
 ```
 
-默认 PostgreSQL 只在 Compose 网络内开放。需要连接已有或托管 PostgreSQL 时，改用 `docker-compose.yml`，显式设置 `OM_DATABASE_URL` 和 `OM_DATABASE_PASSWORD`，并确保 URL 中的主机名能从后端容器访问。完整的数据库模式、HTTPS、持久化、备份、升级及故障处理步骤见[Docker Compose 部署指南](../docs/deployment.md)。
+默认 PostgreSQL 只在 Compose 网络内开放。需要连接已有或托管 PostgreSQL 时，改用 `docker-compose.yml`，显式设置 `OM_DATABASE_URL` 和 `OM_DATABASE_PASSWORD`，并确保 URL 中的主机名能从后端容器访问。后端服务版本只支持向前升级，不提供版本降级或回滚操作；完整的数据库模式、HTTPS、持久化、备份、升级及故障处理步骤见[Docker Compose 部署指南](../docs/deployment.md)。
 
 ## 源码开发
 

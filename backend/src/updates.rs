@@ -1981,10 +1981,17 @@ async fn store_artifact(
     let final_dir = state.update_dir.join(release_id);
     let final_path = state.update_dir.join(&relative_path);
     let checksum_final_path = state.update_dir.join(&checksum_relative_path);
-    fs::create_dir_all(&final_dir).await?;
-    fs::rename(&received.temp_path, &final_path).await?;
+    if let Err(error) = fs::create_dir_all(&final_dir).await {
+        let _ = fs::remove_file(&received.temp_path).await;
+        return Err(error.into());
+    }
+    if let Err(error) = fs::rename(&received.temp_path, &final_path).await {
+        let _ = fs::remove_file(&received.temp_path).await;
+        return Err(error.into());
+    }
     if let Err(error) = fs::write(&checksum_final_path, &received.checksum_contents).await {
         let _ = fs::remove_file(&final_path).await;
+        let _ = fs::remove_file(&checksum_final_path).await;
         return Err(error.into());
     }
 
@@ -2002,65 +2009,46 @@ async fn store_artifact(
         status: "draft".to_string(),
         published_at: None,
     };
-    let mut transaction = match state.db.begin().await {
-        Ok(transaction) => transaction,
-        Err(error) => {
-            let _ = fs::remove_file(&final_path).await;
-            let _ = fs::remove_file(&checksum_final_path).await;
-            return Err(error.into());
+    let persisted: AppResult<()> = async {
+        let mut transaction = state.db.begin().await?;
+        let release_exists = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM agent_releases WHERE id = $1 FOR SHARE",
+        )
+        .bind(release_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if release_exists.is_none() {
+            return Err(AppError::new(StatusCode::NOT_FOUND, "Agent 版本不存在"));
         }
-    };
-    let release_exists =
-        sqlx::query_scalar::<_, String>("SELECT id FROM agent_releases WHERE id = $1 FOR SHARE")
-            .bind(release_id)
-            .fetch_optional(&mut *transaction)
-            .await?;
-    if release_exists.is_none() {
-        let _ = fs::remove_file(&final_path).await;
-        let _ = fs::remove_file(&checksum_final_path).await;
-        return Err(AppError::new(StatusCode::NOT_FOUND, "Agent 版本不存在"));
+        let result = sqlx::query(
+            r#"
+            INSERT INTO agent_artifacts(id, release_id, os, package_type, native_arch, file_name,
+                                        size_bytes, sha256, storage_path, created_at, status)
+            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft')
+            "#,
+        )
+        .bind(&artifact.id)
+        .bind(&artifact.release_id)
+        .bind(&artifact.os)
+        .bind(&artifact.package_type)
+        .bind(&artifact.native_arch)
+        .bind(&artifact.file_name)
+        .bind(artifact.size_bytes)
+        .bind(&artifact.sha256)
+        .bind(&artifact.storage_path)
+        .bind(artifact.created_at)
+        .execute(&mut *transaction)
+        .await;
+        let inserted = map_unique_conflict(result, "该版本已包含相同目标的可执行文件")?;
+        debug_assert_eq!(inserted.rows_affected(), 1);
+        transaction.commit().await?;
+        Ok(())
     }
-    let result = sqlx::query(
-        r#"
-        INSERT INTO agent_artifacts(id, release_id, os, package_type, native_arch, file_name,
-                                    size_bytes, sha256, storage_path, created_at, status)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft')
-        "#,
-    )
-    .bind(&artifact.id)
-    .bind(&artifact.release_id)
-    .bind(&artifact.os)
-    .bind(&artifact.package_type)
-    .bind(&artifact.native_arch)
-    .bind(&artifact.file_name)
-    .bind(artifact.size_bytes)
-    .bind(&artifact.sha256)
-    .bind(&artifact.storage_path)
-    .bind(artifact.created_at)
-    .execute(&mut *transaction)
     .await;
-    let inserted = match result {
-        Ok(inserted) => inserted,
-        Err(error) => {
-            let _ = fs::remove_file(&final_path).await;
-            let _ = fs::remove_file(&checksum_final_path).await;
-            if error
-                .as_database_error()
-                .is_some_and(|error| error.is_unique_violation())
-            {
-                return Err(AppError::new(
-                    StatusCode::CONFLICT,
-                    "该版本已包含相同目标的可执行文件",
-                ));
-            }
-            return Err(error.into());
-        }
-    };
-    debug_assert_eq!(inserted.rows_affected(), 1);
-    if let Err(error) = transaction.commit().await {
+    if let Err(error) = persisted {
         let _ = fs::remove_file(&final_path).await;
         let _ = fs::remove_file(&checksum_final_path).await;
-        return Err(error.into());
+        return Err(error);
     }
     Ok(artifact)
 }
@@ -3616,6 +3604,8 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
 
+    use sqlx::postgres::PgPoolOptions;
+
     use crate::{
         auth::{AuthCipher, SESSION_COOKIE, insert_session},
         config::Cli,
@@ -3638,6 +3628,29 @@ mod tests {
         }
     }
 
+    fn test_cli(database_url: String, root: &FsPath) -> Cli {
+        Cli {
+            bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
+            database_url,
+            database_password: None,
+            admin_password: Some("test-password-value".to_string()),
+            auth_secret_key: None,
+            auth_key_file: root.join("auth-secret.key"),
+            secure_cookies: false,
+            trust_proxy_headers: false,
+            trusted_proxy_cidrs: Vec::new(),
+            allow_legacy_agent_ws_auth: false,
+            reset_admin_auth: false,
+            confirm_reset_admin_auth: None,
+            upload_dir: root.join("uploads"),
+            update_dir: root.join("updates"),
+            update_signing_key_file: None,
+            update_signing_key_id: "default".to_string(),
+            agent_package_max_bytes: 1024 * 1024,
+            file_transfer_max_bytes: 1024 * 1024,
+        }
+    }
+
     async fn test_state() -> (AppState, TestResources) {
         let database = IsolatedTestDatabase::connect("om_update_test", 4).await;
         let database_url = database.database_url().to_string();
@@ -3649,26 +3662,7 @@ mod tests {
             .expect("create temporary update directory");
         let state = AppState::new(
             db,
-            Cli {
-                bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
-                database_url,
-                database_password: None,
-                admin_password: Some("test-password-value".to_string()),
-                auth_secret_key: None,
-                auth_key_file: root.join("auth-secret.key"),
-                secure_cookies: false,
-                trust_proxy_headers: false,
-                trusted_proxy_cidrs: Vec::new(),
-                allow_legacy_agent_ws_auth: false,
-                reset_admin_auth: false,
-                confirm_reset_admin_auth: None,
-                upload_dir: root.join("uploads"),
-                update_dir: root.join("updates"),
-                update_signing_key_file: None,
-                update_signing_key_id: "default".to_string(),
-                agent_package_max_bytes: 1024 * 1024,
-                file_transfer_max_bytes: 1024 * 1024,
-            },
+            test_cli(database_url, &root),
             AuthCipher::from_key(&[7_u8; 32]).expect("create test auth cipher"),
             None,
         );
@@ -4183,6 +4177,51 @@ mod tests {
                 .components()
                 .any(|component| !matches!(component, std::path::Component::Normal(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn storage_setup_failure_removes_the_temporary_artifact() {
+        let root = std::env::temp_dir().join(format!("om-artifact-cleanup-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)
+            .await
+            .expect("create artifact cleanup directory");
+        let update_dir = root.join("updates");
+        fs::write(&update_dir, b"not a directory")
+            .await
+            .expect("block update directory creation");
+        let temporary = root.join("pending.upload");
+        fs::write(&temporary, b"\x7fELFpayload")
+            .await
+            .expect("write temporary artifact");
+        let db = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/unused")
+            .expect("create lazy test pool");
+        let state = AppState::new(
+            db,
+            test_cli("postgresql://localhost/unused".to_string(), &root),
+            AuthCipher::from_key(&[7_u8; 32]).expect("create test auth cipher"),
+            None,
+        );
+        let checksum = "0".repeat(64);
+        let received = ReceivedArtifact {
+            os: "linux".to_string(),
+            package_type: "standalone".to_string(),
+            native_arch: "x86_64".to_string(),
+            file_name: "agent.bin".to_string(),
+            size_bytes: 11,
+            sha256: checksum.clone(),
+            checksum_file_name: "agent.bin.sha256".to_string(),
+            checksum_contents: format!("{checksum}  agent.bin\n"),
+            first_bytes: b"\x7fELFpayload".to_vec(),
+            temp_path: temporary.clone(),
+        };
+
+        let result = store_artifact(&state, "release-test", received).await;
+        assert!(result.is_err(), "invalid update storage must fail");
+        assert!(!temporary.exists());
+        fs::remove_dir_all(&root)
+            .await
+            .expect("remove artifact cleanup directory");
     }
 
     #[tokio::test]

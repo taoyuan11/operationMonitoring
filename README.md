@@ -85,7 +85,8 @@ Windows 网页终端优先使用 ConPTY。Windows Server 2016 没有系统级 Co
 
 脚本会校验 Compose 配置、构建镜像并在后台启动服务。使用外部 PostgreSQL 时执行
 `./deploy.sh deploy docker-compose.yml`。升级前完成数据备份，再执行
-`./deploy.sh update <Compose 文件>`；更新会拒绝有本地修改的工作区，并切换到远端版本号最高的稳定 TAG。
+`./deploy.sh update <Compose 文件>`；更新会拒绝有本地修改的工作区，只允许切换到严格高于
+当前后端版本的稳定 TAG。服务端版本升级不提供降级、回滚 API、命令或兼容保障，详见[Docker Compose 部署指南](docs/deployment.md)。
 
 默认地址：
 

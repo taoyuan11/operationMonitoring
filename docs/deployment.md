@@ -404,11 +404,11 @@ docker compose -f docker-compose.with-db.yml start backend
 docker compose -f docker-compose.with-db.yml ps
 ```
 
-恢复时先停止后端，使用 `pg_restore` 将逻辑备份恢复到已清空的目标数据库，再将文件卷内容恢复到同名卷。卷恢复属于覆盖操作，务必先保留当前卷快照，并在维护窗口验证数据库和认证密钥来自同一备份时间点。恢复完成后执行 `docker compose -f docker-compose.with-db.yml up -d` 并访问健康检查。
+恢复时先停止后端，使用 `pg_restore` 将逻辑备份恢复到已清空的目标数据库，再将文件卷内容恢复到同名卷。该流程仅用于数据库或存储损坏后的灾难恢复，不是应用版本回滚，也不保证恢复后的数据可被任意旧版本读取。卷恢复属于覆盖操作，务必先保留当前卷快照，并在维护窗口验证数据库和认证密钥来自同一备份时间点。恢复完成后执行 `docker compose -f docker-compose.with-db.yml up -d` 并访问健康检查。
 
-## 8. 升级和回滚
+## 8. 服务升级（仅向前）
 
-升级前备份 PostgreSQL 与三个卷，然后在仓库根目录执行：
+升级前备份 PostgreSQL 与三个卷作为灾难恢复材料，然后在仓库根目录执行：
 
 ```bash
 ./deploy.sh update docker-compose.with-db.yml
@@ -416,12 +416,14 @@ docker compose -f docker-compose.with-db.yml ps
 
 外部数据库模式改用 `./deploy.sh update docker-compose.yml`。更新脚本会拒绝存在本地修改的
 Git 工作区，从 `origin` 选择版本号最高、格式为 `主版本.次版本.修订号` 的稳定 TAG，并以
-detached HEAD 方式切换到该版本。随后脚本拉取仅使用镜像的服务、重新构建前后端并刷新容器；
-不会删除 Compose 命名卷，也不会自动备份或回滚。
+detached HEAD 方式切换到该版本。脚本会比较当前 `backend/Cargo.toml` 版本，只允许目标版本
+严格更高；目标版本相同或更低时直接拒绝，不提供降级或回滚入口。脚本不会删除 Compose
+命名卷，也不会自动恢复旧容器、旧代码或旧数据库。
 
 后端启动时会执行所需的表结构补齐。升级后检查健康接口、管理员登录、Agent WebSocket、
-文件上传和更新包下载。回滚代码前应确认新版本没有不可逆的数据结构变化；必要时先恢复升级前
-的 PostgreSQL 备份，再检出旧 TAG 并使用相同 Compose 文件重新构建镜像。
+文件上传和更新包下载。服务端版本升级是单向变更：后端不提供版本回滚 API、命令、自动
+回退或旧版本兼容保障。若新版本出现问题，只能查看日志、修复配置或数据问题并重新部署
+当前或更高版本；请不要将恢复备份、检出旧 TAG 或替换旧镜像当作受支持的回滚操作。
 
 ### 从标签 0.1.2 升级
 
@@ -429,7 +431,7 @@ detached HEAD 方式切换到该版本。随后脚本拉取仅使用镜像的服
 `target_os`、`signature_key_id`、`signature` 和 `signature_v2` 都是可选 JSON 字段，旧 Agent 会忽略；
 实例身份、原始实例密钥和更新状态文件无需转换。当前后端首次启动会把数据库中的实例
 密钥转换为单向 verifier，旧 Agent 仍发送原密钥并可正常认证。这个数据库转换不支持
-旧后端读取，因此回滚到标签 `0.1.2` 时必须同时恢复升级前的 PostgreSQL 备份。
+旧后端读取，因此本次迁移是单向的；`0.1.2` 等旧后端不属于受支持的回退目标。
 
 `0.1.20` 本身没有更新验签代码，所以它通过纯 HTTP 执行的第一次远程升级无法验证
 Ed25519 签名，即使新后端已经附带签名字段也一样。该次升级必须通过 HTTPS 完成，或

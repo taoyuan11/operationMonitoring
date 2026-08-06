@@ -112,7 +112,7 @@ OM_ADMIN_PASSWORD=replace-with-a-long-random-bootstrap-password
 | `POSTGRES_DB` | `operation_monitoring` | 自带数据库首次初始化的数据库名。 |
 | `POSTGRES_USER` | `operation_monitoring` | 自带数据库首次初始化的用户。 |
 | `OM_SECURE_COOKIES` | `false` | 未收到可信代理协议头时的 Cookie/Origin 协议回退值；纯 HTTPS 入口设为 `true`。可信代理请求会按 `X-Forwarded-Proto` 动态处理。 |
-| `OM_TRUST_PROXY_HEADERS` | Compose 默认为 `true` | 登录限流和请求协议使用代理传入的 `X-Real-IP`、`X-Forwarded-Proto`；仅可在后端无法被绕过代理直连时启用。 |
+| `OM_TRUST_PROXY_HEADERS` | Compose 默认为 `true` | 登录限流和请求协议使用代理传入的 `X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Proto`；仅可在后端无法被绕过代理直连时启用。 |
 | `OM_COMPOSE_NETWORK_CIDR` | `172.30.135.0/24` | Compose 专用网络；与现有网络冲突时必须连同网关和三个服务 IP 一起调整。 |
 | `OM_COMPOSE_GATEWAY_IP` | `172.30.135.1` | Compose 网络固定网关；宿主机反向代理经此地址连接后端，Compose 会自动将其 `/32` 追加到可信代理列表。 |
 | `OM_POSTGRES_IP` | `172.30.135.2` | 自带数据库模式中的 PostgreSQL 固定地址。 |
@@ -128,6 +128,7 @@ OM_ADMIN_PASSWORD=replace-with-a-long-random-bootstrap-password
 | `OM_FILE_TRANSFER_MAX_BYTES` | `1073741824` | 单个实例文件传输上限，默认 1 GiB。 |
 | `NGINX_CLIENT_MAX_BODY_SIZE` | `1g` | 前端 Nginx 请求体上限，必须不小于两个后端文件限制中的较大值。 |
 | `NGINX_TRUST_FORWARDED_PROTO` | `false` | 为 `true` 时仅保留可信入口传入的 `X-Forwarded-Proto: http/https`；前端端口必须只允许 Cloudflare Tunnel 或其他可信代理访问。 |
+| `NGINX_TRUST_CF_CONNECTING_IP` | `false` | 为 `true` 时把 Cloudflare 的 `CF-Connecting-IP` 转换为后端使用的客户端地址头；仅可在 Cloudflare Tunnel 是唯一前端入口时启用。 |
 | `RUST_LOG` | `backend=info,tower_http=info` | 后端日志级别。 |
 
 `OM_BIND`、`OM_UPLOAD_DIR`、`OM_UPDATE_DIR` 和认证密钥文件路径由 Compose 在容器内固定设置，除非同步修改 Compose 和卷映射，否则不要在 `.env` 中覆盖。
@@ -249,10 +250,14 @@ Cloudflare 会通过 `X-Forwarded-Proto` 告知访客实际使用的协议；要
 ```dotenv
 OM_SECURE_COOKIES=true
 NGINX_TRUST_FORWARDED_PROTO=true
+NGINX_TRUST_CF_CONNECTING_IP=true
 ```
 
 `NGINX_TRUST_FORWARDED_PROTO=true` 会让前端 Nginx 只接受值为 `http` 或 `https` 的入口协议，
-其他值仍回退到 Nginx 与后端之间的本地协议。启用后，不能把前端宿主机端口直接暴露给公网；
+其他值仍回退到 Nginx 与后端之间的本地协议。`NGINX_TRUST_CF_CONNECTING_IP=true` 会把
+Cloudflare 提供的访客地址覆盖写入发给后端的 `X-Real-IP` 和 `X-Forwarded-For`，并删除
+原始 `CF-Connecting-IP`。其他情况下，前端 Nginx 会覆盖而不是追加客户端提供的
+`X-Forwarded-For`，避免伪造可信代理链。启用后，不能把前端宿主机端口直接暴露给公网；
 如果 `cloudflared` 运行在宿主机上，请使用：
 
 ```dotenv
@@ -328,8 +333,8 @@ OM_UPDATE_PUBLIC_KEY_ID='release-v1' \
 直接更换后，已嵌入旧公钥的 Agent 将无法自动更新。当前版本只支持一个公钥，不要在
 没有过渡版本的情况下轮换签名密钥。
 两个 Agent 变量必须同时设置或同时省略，编译会验证公钥和 key ID。服务端同时发送
-兼容 `0.1.22` 的 v1 签名和绑定任务 ID、发布 ID、产物 ID、下载路径及重试代次的 v2
-签名；`0.1.23` 在 HTTP 下强制验证 v2，在 HTTPS 下仍可验证旧服务端的 v1 签名。
+兼容 `0.1.22` 的 v1 签名和绑定任务 ID、实例 ID、发布 ID、产物 ID、下载路径及重试代次的
+v2 签名；`0.1.23` 在 HTTP 下强制验证 v2，在 HTTPS 下仍可验证旧服务端的 v1 签名。
 
 直接运行后端时可在宿主机生成密钥，并将绝对路径传给后端：
 

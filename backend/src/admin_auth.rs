@@ -1284,18 +1284,67 @@ pub(crate) fn resolved_client_ip(
     headers: &HeaderMap,
     peer_ip: IpAddr,
 ) -> IpAddr {
-    if !trust_proxy_headers
-        || !trusted_proxy_cidrs
-            .iter()
-            .any(|network| network.contains(&peer_ip))
-    {
+    if !trust_proxy_headers || !is_trusted_proxy(peer_ip, trusted_proxy_cidrs) {
         return peer_ip;
     }
-    headers
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(peer_ip)
+
+    match forwarded_for_client_ip(headers, peer_ip, trusted_proxy_cidrs) {
+        ForwardedForResult::Resolved(client_ip) => return client_ip,
+        ForwardedForResult::Missing => {}
+        ForwardedForResult::Invalid => return peer_ip,
+    }
+    single_ip_header(headers, "x-real-ip").unwrap_or(peer_ip)
+}
+
+fn is_trusted_proxy(peer_ip: IpAddr, trusted_proxy_cidrs: &[ipnet::IpNet]) -> bool {
+    trusted_proxy_cidrs
+        .iter()
+        .any(|network| network.contains(&peer_ip))
+}
+
+fn single_ip_header(headers: &HeaderMap, name: &'static str) -> Option<IpAddr> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()?.trim().parse().ok()
+}
+
+enum ForwardedForResult {
+    Missing,
+    Resolved(IpAddr),
+    Invalid,
+}
+
+fn forwarded_for_client_ip(
+    headers: &HeaderMap,
+    peer_ip: IpAddr,
+    trusted_proxy_cidrs: &[ipnet::IpNet],
+) -> ForwardedForResult {
+    let mut found_forwarded_ip = false;
+    let mut client_ip = peer_ip;
+    // Values to the left of the first untrusted hop may have been supplied by the client.
+    for value in headers.get_all("x-forwarded-for").iter().rev() {
+        let Ok(value) = value.to_str() else {
+            return ForwardedForResult::Invalid;
+        };
+        for part in value.rsplit(',') {
+            if !is_trusted_proxy(client_ip, trusted_proxy_cidrs) {
+                return ForwardedForResult::Resolved(client_ip);
+            }
+            let Ok(forwarded_ip) = part.trim().parse::<IpAddr>() else {
+                return ForwardedForResult::Invalid;
+            };
+            client_ip = forwarded_ip;
+            found_forwarded_ip = true;
+        }
+    }
+    if found_forwarded_ip {
+        ForwardedForResult::Resolved(client_ip)
+    } else {
+        ForwardedForResult::Missing
+    }
 }
 
 #[cfg(test)]
@@ -1303,13 +1352,12 @@ mod tests {
     use std::{net::SocketAddr, path::PathBuf};
 
     use axum::{Json, extract::State, http::StatusCode};
-    use sqlx::postgres::PgPoolOptions;
 
     use super::*;
     use crate::{
         auth::{AuthCipher, totp_code_at},
         config::Cli,
-        db::init_db,
+        db::{IsolatedTestDatabase, init_db},
         state::AuthAttempt,
     };
 
@@ -1345,6 +1393,72 @@ mod tests {
         assert_eq!(
             resolved_client_ip(true, &trusted_proxy_cidrs, &headers, peer_ip),
             forwarded_ip
+        );
+    }
+
+    #[test]
+    fn login_source_does_not_trust_cloudflare_header_directly() {
+        let trusted_proxy: IpAddr = "172.30.135.3".parse().unwrap();
+        let untrusted_peer: IpAddr = "192.0.2.10".parse().unwrap();
+        let trusted_proxy_cidrs = ["172.30.135.3/32".parse().unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "203.0.113.8".parse().unwrap());
+
+        assert_eq!(
+            resolved_client_ip(true, &trusted_proxy_cidrs, &headers, trusted_proxy),
+            trusted_proxy
+        );
+        assert_eq!(
+            resolved_client_ip(true, &trusted_proxy_cidrs, &headers, untrusted_peer),
+            untrusted_peer
+        );
+    }
+
+    #[test]
+    fn login_source_walks_forwarded_chain_from_trusted_proxies() {
+        let frontend_proxy: IpAddr = "172.30.135.3".parse().unwrap();
+        let client_ip: IpAddr = "198.51.100.4".parse().unwrap();
+        let trusted_proxy_cidrs = ["172.30.135.0/24".parse().unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.4, 172.30.135.7".parse().unwrap(),
+        );
+
+        assert_eq!(
+            resolved_client_ip(true, &trusted_proxy_cidrs, &headers, frontend_proxy),
+            client_ip
+        );
+    }
+
+    #[test]
+    fn login_source_does_not_walk_past_an_untrusted_forwarder() {
+        let frontend_proxy: IpAddr = "172.30.135.3".parse().unwrap();
+        let direct_client: IpAddr = "198.51.100.4".parse().unwrap();
+        let trusted_proxy_cidrs = ["172.30.135.0/24".parse().unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "invalid-spoofed-value, 198.51.100.4".parse().unwrap(),
+        );
+
+        assert_eq!(
+            resolved_client_ip(true, &trusted_proxy_cidrs, &headers, frontend_proxy),
+            direct_client
+        );
+    }
+
+    #[test]
+    fn login_source_ignores_malformed_forwarded_headers() {
+        let trusted_proxy: IpAddr = "172.30.135.3".parse().unwrap();
+        let trusted_proxy_cidrs = ["172.30.135.3/32".parse().unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.8, invalid".parse().unwrap());
+        headers.insert("x-real-ip", "198.51.100.7".parse().unwrap());
+
+        assert_eq!(
+            resolved_client_ip(true, &trusted_proxy_cidrs, &headers, trusted_proxy),
+            trusted_proxy
         );
     }
 
@@ -1416,37 +1530,38 @@ mod tests {
         assert!(attempts.contains_key("blocked"));
     }
 
-    async fn test_state() -> AppState {
-        let db = PgPoolOptions::new()
-            .max_connections(1)
-            .connect("postgresql://localhost/postgres")
-            .await
-            .expect("connect database");
+    async fn test_state(prefix: &str) -> (AppState, IsolatedTestDatabase) {
+        let test_db = IsolatedTestDatabase::connect(prefix, 1).await;
+        let database_url = test_db.database_url().to_string();
+        let db = test_db.pool();
         init_db(&db).await.expect("initialize database");
-        AppState::new(
-            db,
-            Cli {
-                bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
-                database_url: "postgresql://localhost/postgres".to_string(),
-                database_password: None,
-                admin_password: Some("bootstrap-password".to_string()),
-                auth_secret_key: None,
-                auth_key_file: PathBuf::from("unused-test-auth-key"),
-                secure_cookies: false,
-                trust_proxy_headers: false,
-                trusted_proxy_cidrs: Vec::new(),
-                allow_legacy_agent_ws_auth: false,
-                reset_admin_auth: false,
-                confirm_reset_admin_auth: None,
-                upload_dir: PathBuf::from("unused-uploads"),
-                update_dir: PathBuf::from("unused-updates"),
-                update_signing_key_file: None,
-                update_signing_key_id: "default".to_string(),
-                agent_package_max_bytes: 1024,
-                file_transfer_max_bytes: 1024,
-            },
-            AuthCipher::from_key(&[9_u8; 32]).expect("create cipher"),
-            None,
+        (
+            AppState::new(
+                db,
+                Cli {
+                    bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
+                    database_url,
+                    database_password: None,
+                    admin_password: Some("bootstrap-password".to_string()),
+                    auth_secret_key: None,
+                    auth_key_file: PathBuf::from("unused-test-auth-key"),
+                    secure_cookies: false,
+                    trust_proxy_headers: false,
+                    trusted_proxy_cidrs: Vec::new(),
+                    allow_legacy_agent_ws_auth: false,
+                    reset_admin_auth: false,
+                    confirm_reset_admin_auth: None,
+                    upload_dir: PathBuf::from("unused-uploads"),
+                    update_dir: PathBuf::from("unused-updates"),
+                    update_signing_key_file: None,
+                    update_signing_key_id: "default".to_string(),
+                    agent_package_max_bytes: 1024,
+                    file_transfer_max_bytes: 1024,
+                },
+                AuthCipher::from_key(&[9_u8; 32]).expect("create cipher"),
+                None,
+            ),
+            test_db,
         )
     }
 
@@ -1481,7 +1596,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn totp_login_binds_session_and_disables_bootstrap_password() {
-        let state = test_state().await;
+        let (state, test_db) = test_state("om_admin_auth_totp").await;
         let secret = b"12345678901234567890";
         insert_user_with_device(&state, "user-1", "Admin.One", secret).await;
         let code = totp_code_at(secret, now_ts());
@@ -1557,12 +1672,13 @@ mod tests {
         .await
         .expect_err("bootstrap must stay disabled");
         assert_eq!(error.status, StatusCode::CONFLICT);
+        test_db.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn refuses_to_remove_the_last_login_path() {
-        let state = test_state().await;
+        let (state, test_db) = test_state("om_admin_auth_login_path").await;
         insert_user_with_device(&state, "user-1", "admin-one", b"first-secret").await;
         let mut transaction = state.db.begin().await.expect("begin transaction");
         assert!(
@@ -1581,12 +1697,13 @@ mod tests {
             .await
             .expect("second device remains available");
         transaction.commit().await.expect("commit transaction");
+        test_db.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn reset_removes_authentication_without_erasing_audit_history() {
-        let state = test_state().await;
+        let (state, test_db) = test_state("om_admin_auth_reset").await;
         insert_user_with_device(&state, "user-1", "admin-one", b"first-secret").await;
         reset_admin_auth(&state.db)
             .await
@@ -1603,5 +1720,6 @@ mod tests {
         .expect("count logs");
         assert_eq!(users, 0);
         assert_eq!(logs, 1);
+        test_db.cleanup().await;
     }
 }

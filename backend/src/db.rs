@@ -39,6 +39,80 @@ struct InstanceMetricRecord {
     metric: MetricRecord,
 }
 
+#[cfg(test)]
+pub(crate) struct IsolatedTestDatabase {
+    pool: PgPool,
+    bootstrap: PgPool,
+    database_url: String,
+    schema: String,
+}
+
+#[cfg(test)]
+impl IsolatedTestDatabase {
+    pub(crate) async fn connect(prefix: &str, max_connections: u32) -> Self {
+        assert!(
+            !prefix.is_empty()
+                && prefix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+            "test schema prefix must contain only lowercase ASCII letters and underscores"
+        );
+        let database_url = std::env::var("OM_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string());
+        let schema = format!("{prefix}_{}", Uuid::new_v4().simple());
+        let bootstrap = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect test database");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&bootstrap)
+            .await
+            .expect("create isolated test schema");
+
+        let connection_schema = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .after_connect(move |connection, _metadata| {
+                let schema = connection_schema.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                        .bind(schema)
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&database_url)
+            .await
+            .expect("connect isolated test schema");
+
+        Self {
+            pool,
+            bootstrap,
+            database_url,
+            schema,
+        }
+    }
+
+    pub(crate) fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
+    pub(crate) fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    pub(crate) async fn cleanup(self) {
+        self.pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
+            .execute(&self.bootstrap)
+            .await
+            .expect("drop isolated test schema");
+        self.bootstrap.close().await;
+    }
+}
+
 pub async fn connect_db(database_url: &str, password: Option<&str>) -> anyhow::Result<PgPool> {
     let mut options = PgConnectOptions::from_str(database_url)?;
     if let Some(password) = password {
@@ -1740,11 +1814,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn agent_metadata_preserves_profiles_and_replaces_explicit_capabilities() {
-        let db = PgPoolOptions::new()
-            .max_connections(1)
-            .connect("postgresql://localhost/postgres")
-            .await
-            .expect("connect database");
+        let test_db = IsolatedTestDatabase::connect("om_db_metadata", 1).await;
+        let db = test_db.pool();
         init_db(&db).await.expect("initialize database");
         let instance_id = format!("metadata-test-{}", Uuid::new_v4());
         sqlx::query(
@@ -1823,16 +1894,14 @@ mod tests {
             .execute(&db)
             .await
             .expect("delete test instance");
+        test_db.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn pending_instance_secret_cannot_be_replaced() {
-        let db = PgPoolOptions::new()
-            .max_connections(1)
-            .connect("postgresql://localhost/postgres")
-            .await
-            .expect("connect database");
+        let test_db = IsolatedTestDatabase::connect("om_db_pending_secret", 1).await;
+        let db = test_db.pool();
         init_db(&db).await.expect("initialize database");
         let original = registration_payload();
         register_or_touch_pending(&db, &original, "test-source")
@@ -1853,16 +1922,14 @@ mod tests {
                 .await
                 .expect("load pending secret");
         assert_eq!(stored_secret, agent_secret_verifier(&original.secret));
+        test_db.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn init_db_migrates_existing_instance_locations() {
-        let db = PgPoolOptions::new()
-            .max_connections(1)
-            .connect("postgresql://localhost/postgres")
-            .await
-            .expect("connect in-memory database");
+        let test_db = IsolatedTestDatabase::connect("om_db_location_migration", 1).await;
+        let db = test_db.pool();
 
         sqlx::query(
             r#"
@@ -1920,16 +1987,14 @@ mod tests {
         .await
         .expect("load migrated column type");
         assert_eq!(approved_type, "bigint");
+        test_db.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn approved_instance_is_not_recreated_as_pending_by_concurrent_registration() {
-        let db = PgPoolOptions::new()
-            .max_connections(4)
-            .connect("postgresql://localhost/postgres")
-            .await
-            .expect("connect in-memory database");
+        let test_db = IsolatedTestDatabase::connect("om_db_concurrent_registration", 4).await;
+        let db = test_db.pool();
         init_db(&db).await.expect("initialize database");
         let payload = AgentRegisterRequest {
             instance_id: "agent-1".to_string(),
@@ -1970,5 +2035,6 @@ mod tests {
                 .await
                 .expect("count pending instances");
         assert_eq!(pending_count, 0);
+        test_db.cleanup().await;
     }
 }

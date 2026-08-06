@@ -4703,11 +4703,13 @@ mod tests {
     }
 
     fn test_state(db: PgPool) -> AppState {
+        let database_url = std::env::var("OM_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string());
         AppState::new(
             db,
             Cli {
                 bind: "127.0.0.1:0".parse().expect("test bind address"),
-                database_url: "postgresql://localhost/postgres".to_string(),
+                database_url,
                 database_password: None,
                 admin_password: Some("test-bootstrap-password".to_string()),
                 auth_secret_key: None,

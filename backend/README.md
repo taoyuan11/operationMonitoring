@@ -33,7 +33,8 @@ cargo run
 接口默认监听 `0.0.0.0:13500`，健康检查地址为 `http://127.0.0.1:13500/api/health`。
 只有后端无法被客户端绕过反向代理直接访问时，才可设置
 `OM_TRUST_PROXY_HEADERS=true`。连接来源还必须命中 `OM_TRUSTED_PROXY_CIDRS` 中
-逗号分隔的 CIDR，后端才会使用代理提供的 `X-Real-IP` 进行登录限流。
+逗号分隔的 CIDR，后端才会使用代理提供的 `X-Forwarded-For` 或 `X-Real-IP` 进行
+登录限流；多级代理链会从右向左剥离可信代理。
 `OM_ALLOW_LEGACY_AGENT_WS_AUTH` 仅可在将旧 Agent 升级到 `0.1.19` 的维护窗口临时
 启用，平时必须保持关闭，避免实例密钥重新进入 URL 和代理日志。
 
@@ -43,4 +44,12 @@ cargo run
 cargo fmt --check
 cargo test
 cargo check
+```
+
+需要执行依赖 PostgreSQL 的 ignored 测试时，使用专用空数据库并统一通过
+`OM_TEST_DATABASE_URL` 指定连接地址：
+
+```bash
+OM_TEST_DATABASE_URL=postgresql://localhost/operation_monitoring_test \
+  cargo test -- --ignored --test-threads=1
 ```

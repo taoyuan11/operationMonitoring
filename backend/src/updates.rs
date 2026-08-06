@@ -3616,55 +3616,38 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
 
-    use sqlx::postgres::PgPoolOptions;
-
     use crate::{
         auth::{AuthCipher, SESSION_COOKIE, insert_session},
         config::Cli,
-        db::init_db,
+        db::{IsolatedTestDatabase, init_db},
     };
 
-    async fn isolated_test_pool(database_url: &str) -> sqlx::PgPool {
-        let schema = format!("om_update_test_{}", Uuid::new_v4().simple());
-        let bootstrap = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(database_url)
-            .await
-            .expect("connect test database for schema creation");
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&bootstrap)
-            .await
-            .expect("create isolated test schema");
-        bootstrap.close().await;
-
-        let connection_schema = schema.clone();
-        PgPoolOptions::new()
-            .max_connections(4)
-            .after_connect(move |connection, _metadata| {
-                let schema = connection_schema.clone();
-                Box::pin(async move {
-                    sqlx::query("SELECT set_config('search_path', $1, false)")
-                        .bind(schema)
-                        .execute(connection)
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect(database_url)
-            .await
-            .expect("connect isolated test database")
+    struct TestResources {
+        database: IsolatedTestDatabase,
+        root: std::path::PathBuf,
     }
 
-    async fn test_state() -> AppState {
-        let database_url = std::env::var("OM_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string());
-        let db = isolated_test_pool(&database_url).await;
+    impl TestResources {
+        async fn cleanup(self) {
+            self.database.cleanup().await;
+            match fs::remove_dir_all(&self.root).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove temporary update directory: {error}"),
+            }
+        }
+    }
+
+    async fn test_state() -> (AppState, TestResources) {
+        let database = IsolatedTestDatabase::connect("om_update_test", 4).await;
+        let database_url = database.database_url().to_string();
+        let db = database.pool();
         init_db(&db).await.expect("initialize database");
         let root = std::env::temp_dir().join(format!("om-backend-update-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root)
             .await
             .expect("create temporary update directory");
-        AppState::new(
+        let state = AppState::new(
             db,
             Cli {
                 bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
@@ -3688,7 +3671,9 @@ mod tests {
             },
             AuthCipher::from_key(&[7_u8; 32]).expect("create test auth cipher"),
             None,
-        )
+        );
+        let resources = TestResources { database, root };
+        (state, resources)
     }
 
     async fn admin_headers(state: &AppState) -> HeaderMap {
@@ -4203,7 +4188,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn canary_pause_resume_and_full_rollout_cover_only_the_expected_instances() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let headers = admin_headers(&state).await;
         for instance_id in ["canary-agent", "batch-agent", "full-agent"] {
             insert_instance(&state, instance_id, "ubuntu", "standalone", "amd64").await;
@@ -4315,12 +4300,13 @@ mod tests {
             .expect("select full rollout for new instance")
             .expect("new instance receives full rollout");
         assert_eq!(new_offer.release_id, release_id);
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn batch_rollback_waits_for_an_in_progress_upgrade_then_queues_its_rollback() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let headers = admin_headers(&state).await;
         insert_instance(&state, "in-progress-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "1.0.0", "standalone", "amd64").await;
@@ -4384,12 +4370,13 @@ mod tests {
                 "1.0.0".to_string(),
             )
         );
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn controlled_releases_and_active_instance_tasks_cannot_compete() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(&state, "contended-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "2.0.0", "standalone", "amd64").await;
         let instance = get_instance(&state.db, "contended-agent")
@@ -4448,12 +4435,13 @@ mod tests {
             .rollback()
             .await
             .expect("rollback stable baseline check");
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn batch_rollback_uses_local_baselines_and_finishes_partial_when_some_are_unavailable() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         for instance_id in ["local-baseline-agent", "unsupported-agent"] {
             insert_instance(&state, instance_id, "ubuntu", "standalone", "amd64").await;
         }
@@ -4530,12 +4518,13 @@ mod tests {
         .await
         .expect("load partial rollback state");
         assert_eq!(rollout_state, "rollback_partial");
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn instance_rollback_excludes_then_reupgrade_creates_a_new_upgrade_history() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let headers = admin_headers(&state).await;
         insert_instance(&state, "reupgrade-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "1.0.0", "standalone", "amd64").await;
@@ -4604,12 +4593,13 @@ mod tests {
         assert_eq!(upgrades.len(), 2);
         assert!(upgrades.contains(&"succeeded".to_string()));
         assert!(upgrades.contains(&"pending".to_string()));
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn release_deletion_is_blocked_by_a_local_baseline_target_version_dependency() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(&state, "baseline-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "1.0.0", "standalone", "amd64").await;
         insert_release(&state, "2.0.0", "standalone", "amd64").await;
@@ -4638,14 +4628,14 @@ mod tests {
             .expect_err("target-version rollback dependency blocks deletion");
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert!(error.message.contains("回滚记录依赖"));
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn migration_preserves_published_rollouts_and_upgrade_history() {
-        let database_url = std::env::var("OM_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string());
-        let db = isolated_test_pool(&database_url).await;
+        let test_db = IsolatedTestDatabase::connect("om_update_migration", 4).await;
+        let db = test_db.pool();
         init_db(&db)
             .await
             .expect("initialize legacy fixture base tables");
@@ -4739,12 +4729,13 @@ mod tests {
         .execute(&db)
         .await
         .expect("legacy uniqueness constraint was removed");
+        test_db.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn deletes_published_release_storage_history_and_keeps_audit_log() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let fixture = insert_stored_release(&state, "published", Some("succeeded")).await;
 
         delete_agent_release(&state, "test-admin", "test-admin-id", &fixture.release_id)
@@ -4798,12 +4789,13 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.status, StatusCode::NOT_FOUND);
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn rejects_release_deletion_for_every_nonterminal_attempt_status() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         for status in [
             "pending",
             "waiting",
@@ -4848,12 +4840,13 @@ mod tests {
                 .await
                 .expect("clean blocked release fixture");
         }
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn draft_deletion_tolerates_missing_storage_and_missing_release_is_not_found() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let fixture = insert_stored_release(&state, "draft", None).await;
         fs::remove_dir_all(&fixture.release_dir)
             .await
@@ -4867,12 +4860,13 @@ mod tests {
                 .await
                 .expect_err("deleted release must no longer exist");
         assert_eq!(error.status, StatusCode::NOT_FOUND);
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn storage_cleanup_failure_does_not_roll_back_release_deletion() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let fixture = insert_stored_release(&state, "draft", None).await;
         fs::remove_dir_all(&fixture.release_dir)
             .await
@@ -4910,12 +4904,13 @@ mod tests {
         fs::remove_file(&fixture.release_dir)
             .await
             .expect("clean failure injection file");
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn deleting_latest_release_leaves_the_next_published_candidate_available() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let instance_id = Uuid::new_v4().to_string();
         insert_instance(&state, &instance_id, "linux", "standalone", "amd64").await;
         let version_seed = (Uuid::new_v4().as_u128() % 1_000_000_000) as u64 + 10_000;
@@ -4940,12 +4935,13 @@ mod tests {
             .expect("find fallback update")
             .expect("fallback release remains available");
         assert_eq!(offer.version, fallback_version);
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn selects_highest_matching_release_and_suppresses_failed_attempt() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(&state, "amd64-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "1.9.0", "standalone", "amd64").await;
         insert_release(&state, "1.10.0", "standalone", "amd64").await;
@@ -4994,12 +4990,13 @@ mod tests {
                 .version,
             "1.10.0"
         );
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn requires_an_exact_native_architecture_match() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(&state, "arm-agent", "ubuntu", "standalone", "arm64").await;
         insert_release(&state, "2.0.0", "standalone", "amd64").await;
         let instance = get_instance(&state.db, "arm-agent")
@@ -5012,12 +5009,13 @@ mod tests {
                 .expect("find update")
                 .is_none()
         );
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn reconciles_pre_handoff_attempt_after_offline_capability_change() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(&state, "changed-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "2.1.0", "standalone", "amd64").await;
 
@@ -5101,12 +5099,13 @@ mod tests {
         )
         .await
         .expect("reconciled offer status must match its stored attempt");
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn normalizes_openwrt_standalone_target_to_linux() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(
             &state,
             "router",
@@ -5128,12 +5127,13 @@ mod tests {
                 .version,
             "3.0.0"
         );
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn expires_agents_that_do_not_reconnect_after_installation() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(&state, "timed-out-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "4.0.0", "standalone", "amd64").await;
         let instance = get_instance(&state.db, "timed-out-agent")
@@ -5170,12 +5170,13 @@ mod tests {
                 .await
                 .expect("read attempt");
         assert_eq!(status, "failed");
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn retry_rechecks_the_locked_release_state() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let headers = admin_headers(&state).await;
         insert_instance(
             &state,
@@ -5218,12 +5219,13 @@ mod tests {
                 .await
                 .expect("load rejected retry");
         assert_eq!(stored, ("failed".to_string(), 0));
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn rollback_retry_rejects_an_instance_that_changed_version() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let headers = admin_headers(&state).await;
         insert_instance(
             &state,
@@ -5279,12 +5281,13 @@ mod tests {
                 .await
                 .expect("load stale rollback attempt");
         assert_eq!(status, "failed");
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn retry_count_cannot_exceed_the_websocket_protocol_limit() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         let headers = admin_headers(&state).await;
         insert_instance(&state, "retry-limit-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "2.0.0", "standalone", "amd64").await;
@@ -5320,12 +5323,13 @@ mod tests {
                 .await
                 .expect("load capped retry");
         assert_eq!(stored, ("failed".to_string(), MAX_AGENT_UPDATE_RETRY_COUNT));
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn rejects_retry_when_a_newer_matching_release_exists() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(&state, "retry-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "1.5.0", "standalone", "amd64").await;
         let instance = get_instance(&state.db, "retry-agent")
@@ -5366,12 +5370,13 @@ mod tests {
             .await
             .expect_err("superseded retry must fail");
         assert_eq!(error.status, StatusCode::CONFLICT);
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn failed_upgrade_is_not_automatically_requeued_for_the_same_release() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(
             &state,
             "no-automatic-retry-agent",
@@ -5417,12 +5422,13 @@ mod tests {
         .await
         .expect("count upgrade history");
         assert_eq!(attempts, 1);
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn ignores_status_from_an_older_retry_generation() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(&state, "generation-agent", "ubuntu", "standalone", "amd64").await;
         insert_release(&state, "2.5.0", "standalone", "amd64").await;
         let instance = get_instance(&state.db, "generation-agent")
@@ -5466,12 +5472,13 @@ mod tests {
         )
         .await
         .expect("current generation status is accepted");
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn terminal_update_status_cannot_regress_and_version_is_committed() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(
             &state,
             "terminal-state-agent",
@@ -5545,12 +5552,13 @@ mod tests {
                 .await
                 .expect("load committed agent version");
         assert_eq!(agent_version, offer.version);
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn explicit_retry_remains_pinned_when_a_new_release_is_published() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_instance(
             &state,
             "pinned-retry-agent",
@@ -5583,12 +5591,13 @@ mod tests {
         assert_eq!(retry.artifact_id, first.artifact_id);
         assert_eq!(retry.version, "1.5.0");
         assert_eq!(retry.retry_count, 1);
+        resources.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn stores_a_draft_artifact_after_publication_and_offers_it_only_after_publishing() {
-        let state = test_state().await;
+        let (state, resources) = test_state().await;
         insert_release(&state, "5.0.0", "standalone", "amd64").await;
         insert_instance(&state, "late-arm-agent", "ubuntu", "standalone", "arm64").await;
         let temporary = state.update_dir.join("late-upload.bin");
@@ -5651,6 +5660,7 @@ mod tests {
             .expect("published package is offered");
         assert_eq!(offer.artifact_id, artifact.id);
         assert_eq!(offer.version, "5.0.0");
+        resources.cleanup().await;
     }
 
     #[test]

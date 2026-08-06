@@ -3676,13 +3676,12 @@ mod tests {
     use std::{net::SocketAddr, path::PathBuf};
 
     use axum::http::header;
-    use sqlx::postgres::PgPoolOptions;
 
     use super::*;
     use crate::{
         auth::AuthCipher,
         config::Cli,
-        db::init_db,
+        db::{IsolatedTestDatabase, init_db},
         models::{
             DockerComposeConfigSummary, DockerComposeServiceSummary, DockerPortProtocol,
             DockerStatusState,
@@ -4054,17 +4053,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn offline_mutation_is_failed_audit_but_reads_and_missing_instances_are_not_audited() {
-        let db = PgPoolOptions::new()
-            .max_connections(1)
-            .connect("postgresql://localhost/postgres")
-            .await
-            .expect("connect database");
+        let test_db = IsolatedTestDatabase::connect("om_docker_offline_audit", 1).await;
+        let database_url = test_db.database_url().to_string();
+        let db = test_db.pool();
         init_db(&db).await.expect("initialize database");
         let state = AppState::new(
             db,
             Cli {
                 bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
-                database_url: "postgresql://localhost/postgres".to_string(),
+                database_url,
                 database_password: None,
                 admin_password: Some("test-password-value".to_string()),
                 auth_secret_key: None,
@@ -4165,7 +4162,7 @@ mod tests {
             .execute(&state.db)
             .await
             .expect("delete test instance");
-        state.db.close().await;
+        test_db.cleanup().await;
     }
 
     #[test]

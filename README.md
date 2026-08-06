@@ -438,6 +438,8 @@ OM_AGENT_PACKAGE_MAX_BYTES=268435456
 OM_FILE_TRANSFER_MAX_BYTES=1073741824
 # Set true when Cloudflare Tunnel/HTTPS proxy is the only frontend ingress.
 NGINX_TRUST_FORWARDED_PROTO=false
+# Set true only when Cloudflare Tunnel is the only frontend ingress.
+NGINX_TRUST_CF_CONNECTING_IP=false
 ```
 
 未设置 `OM_DATABASE_URL` 时，后端默认连接
@@ -459,7 +461,8 @@ Compose 为避免误用始终要求提供它。
 重新登录。
 
 `OM_TRUST_PROXY_HEADERS` 控制登录限流和协议判定是否读取反向代理提供的
-`X-Real-IP`、`X-Forwarded-Proto`；默认关闭。
+`X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Proto`；默认关闭。客户端地址会从
+`X-Forwarded-For` 右侧开始逐跳剥离可信代理，遇到首个不可信地址即停止。
 启用时，只有连接端地址命中 `OM_TRUSTED_PROXY_CIDRS` 中逗号分隔的 IP/CIDR 才会
 采信该请求头。应按实际代理网络配置最小范围，并确保客户端不能绕过代理直连后端。
 Compose 将后端宿主端口固定绑定到 `127.0.0.1`，并默认把 PostgreSQL、前端代理和
@@ -475,7 +478,10 @@ Compose 将后端宿主端口固定绑定到 `127.0.0.1`，并默认把 PostgreS
 Docker 前端默认用 Nginx 与后端之间的连接协议覆盖 `X-Forwarded-Proto`。使用 Cloudflare
 Tunnel 时，浏览器的 HTTPS 会先在 Tunnel 终止，内网连接通常是 HTTP；此时应将
 `NGINX_TRUST_FORWARDED_PROTO=true`，让前端保留 Cloudflare 传入的 `http`/`https` 协议，
-并确保前端端口只允许 `cloudflared` 或其他可信代理访问。纯 HTTPS 入口还应将
+同时设置 `NGINX_TRUST_CF_CONNECTING_IP=true`，将 Cloudflare 提供的访客地址转换为
+后端使用的通用代理头；其他情况下前端 Nginx 会覆盖客户端提供的 XFF 链。启用这两个
+开关时，前端端口必须只允许 `cloudflared` 访问。
+纯 HTTPS 入口还应将
 `OM_SECURE_COOKIES=true` 作为无协议头时的安全回退。
 
 Agent `0.1.19` 起通过 `Authorization` 请求头认证 WebSocket，实例密钥不再出现在
@@ -488,7 +494,8 @@ URL。`OM_ALLOW_LEGACY_AGENT_WS_AUTH` 默认必须保持 `false`；它只用于�
 中输出可嵌入 Agent 的公钥。`OM_UPDATE_SIGNING_KEY_ID` 必须与构建 Agent 时的
 `OM_UPDATE_PUBLIC_KEY_ID` 一致。未配置签名器时，旧 Agent 和未嵌入公钥的 HTTPS
 Agent 仍可更新，但嵌入公钥的 Agent 会拒绝所有未签名更新。服务端同时生成兼容旧
-Agent 的 v1 签名和绑定任务 ID、发布 ID、产物 ID、下载路径及重试代次的 v2 签名。
+Agent 的 v1 签名和绑定任务 ID、实例 ID、发布 ID、产物 ID、下载路径及重试代次的 v2
+签名。
 
 `OM_FILE_TRANSFER_MAX_BYTES` 限制单个远程上传或下载文件的大小，默认 1 GiB。反向代理的请求体上限必须不小于该值；Docker 前端默认将 `NGINX_CLIENT_MAX_BODY_SIZE` 设置为 `1g`，并关闭 API 请求与响应缓冲以保持流式传输。远程文件操作拥有与 Agent 服务进程相同的系统权限，生产环境应严格保护管理员账号和 TOTP 设备。
 

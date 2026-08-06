@@ -318,46 +318,47 @@ fn command_timeout_cutoff(now: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, net::SocketAddr, path::PathBuf};
-
-    use sqlx::postgres::PgPoolOptions;
+    use std::{net::SocketAddr, path::PathBuf};
 
     use super::*;
-    use crate::{auth::AuthCipher, config::Cli, db::init_db};
+    use crate::{
+        auth::AuthCipher,
+        config::Cli,
+        db::{IsolatedTestDatabase, init_db},
+    };
 
-    async fn test_state(max_connections: u32) -> AppState {
-        let database_url = env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string());
-        let db = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(&database_url)
-            .await
-            .expect("connect database");
+    async fn test_state(prefix: &str, max_connections: u32) -> (AppState, IsolatedTestDatabase) {
+        let test_db = IsolatedTestDatabase::connect(prefix, max_connections).await;
+        let database_url = test_db.database_url().to_string();
+        let db = test_db.pool();
         init_db(&db).await.expect("initialize database");
-        AppState::new(
-            db,
-            Cli {
-                bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
-                database_url,
-                database_password: None,
-                admin_password: Some("test-bootstrap-password".to_string()),
-                auth_secret_key: None,
-                auth_key_file: PathBuf::from("unused-test-auth-key"),
-                secure_cookies: false,
-                trust_proxy_headers: false,
-                trusted_proxy_cidrs: Vec::new(),
-                allow_legacy_agent_ws_auth: false,
-                reset_admin_auth: false,
-                confirm_reset_admin_auth: None,
-                upload_dir: PathBuf::from("unused-uploads"),
-                update_dir: PathBuf::from("unused-updates"),
-                update_signing_key_file: None,
-                update_signing_key_id: "default".to_string(),
-                agent_package_max_bytes: 1024,
-                file_transfer_max_bytes: 1024,
-            },
-            AuthCipher::from_key(&[3_u8; 32]).expect("create auth cipher"),
-            None,
+        (
+            AppState::new(
+                db,
+                Cli {
+                    bind: "127.0.0.1:0".parse::<SocketAddr>().expect("bind address"),
+                    database_url,
+                    database_password: None,
+                    admin_password: Some("test-bootstrap-password".to_string()),
+                    auth_secret_key: None,
+                    auth_key_file: PathBuf::from("unused-test-auth-key"),
+                    secure_cookies: false,
+                    trust_proxy_headers: false,
+                    trusted_proxy_cidrs: Vec::new(),
+                    allow_legacy_agent_ws_auth: false,
+                    reset_admin_auth: false,
+                    confirm_reset_admin_auth: None,
+                    upload_dir: PathBuf::from("unused-uploads"),
+                    update_dir: PathBuf::from("unused-updates"),
+                    update_signing_key_file: None,
+                    update_signing_key_id: "default".to_string(),
+                    agent_package_max_bytes: 1024,
+                    file_transfer_max_bytes: 1024,
+                },
+                AuthCipher::from_key(&[3_u8; 32]).expect("create auth cipher"),
+                None,
+            ),
+            test_db,
         )
     }
 
@@ -377,7 +378,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn command_results_require_matching_running_job_connection() {
-        let state = test_state(1).await;
+        let (state, test_db) = test_state("om_jobs_command_results", 1).await;
         let job_id = Uuid::new_v4().to_string();
         let terminal_job_id = Uuid::new_v4().to_string();
         let connection_id = Uuid::new_v4();
@@ -447,12 +448,13 @@ mod tests {
             .execute(&state.db)
             .await
             .expect("delete command jobs");
+        test_db.cleanup().await;
     }
 
     #[tokio::test]
     #[ignore = "requires isolated PostgreSQL test database"]
     async fn concurrent_command_creation_enforces_the_per_instance_limit() {
-        let state = test_state(8).await;
+        let (state, test_db) = test_state("om_jobs_concurrent_limit", 8).await;
         let instance_id = format!("command-limit-{}", Uuid::new_v4());
         sqlx::query(
             "INSERT INTO instances(id, secret, name, first_seen) VALUES($1, 'secret', 'Command limit test', $2)",
@@ -494,5 +496,6 @@ mod tests {
             .execute(&state.db)
             .await
             .expect("delete test instance");
+        test_db.cleanup().await;
     }
 }

@@ -13,6 +13,8 @@ pnpm-debug.log*
 .env.*
 !.env.example
 
+buildInstanceEnd.sh
+
 # Rust / Cargo
 debug/
 target/

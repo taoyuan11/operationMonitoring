@@ -127,6 +127,7 @@ OM_ADMIN_PASSWORD=replace-with-a-long-random-bootstrap-password
 | `OM_AGENT_PACKAGE_MAX_BYTES` | `268435456` | 单个 Agent 更新包上限，默认 256 MiB。 |
 | `OM_FILE_TRANSFER_MAX_BYTES` | `1073741824` | 单个实例文件传输上限，默认 1 GiB。 |
 | `NGINX_CLIENT_MAX_BODY_SIZE` | `1g` | 前端 Nginx 请求体上限，必须不小于两个后端文件限制中的较大值。 |
+| `NGINX_TRUST_FORWARDED_PROTO` | `false` | 为 `true` 时仅保留可信入口传入的 `X-Forwarded-Proto: http/https`；前端端口必须只允许 Cloudflare Tunnel 或其他可信代理访问。 |
 | `RUST_LOG` | `backend=info,tower_http=info` | 后端日志级别。 |
 
 `OM_BIND`、`OM_UPLOAD_DIR`、`OM_UPDATE_DIR` 和认证密钥文件路径由 Compose 在容器内固定设置，除非同步修改 Compose 和卷映射，否则不要在 `.env` 中覆盖。
@@ -238,6 +239,32 @@ docker compose -f docker-compose.with-db.yml up -d --force-recreate backend fron
 ```
 
 Agent 的 `OM_SERVER` 使用完整的外部地址，例如 `https://monitor.example.com`，不要追加 `/api`。
+
+### Cloudflare Tunnel
+
+Cloudflare Tunnel 会在浏览器与 `cloudflared` 之间终止 HTTPS，再用 HTTP 连接内网前端。
+Cloudflare 会通过 `X-Forwarded-Proto` 告知访客实际使用的协议；要让管理员登录的 Origin
+校验通过，在 `.env` 中启用：
+
+```dotenv
+OM_SECURE_COOKIES=true
+NGINX_TRUST_FORWARDED_PROTO=true
+```
+
+`NGINX_TRUST_FORWARDED_PROTO=true` 会让前端 Nginx 只接受值为 `http` 或 `https` 的入口协议，
+其他值仍回退到 Nginx 与后端之间的本地协议。启用后，不能把前端宿主机端口直接暴露给公网；
+如果 `cloudflared` 运行在宿主机上，请使用：
+
+```dotenv
+FRONTEND_PORT=127.0.0.1:13501
+```
+
+如果 `cloudflared` 运行在容器中，应使用仅该容器可访问的 Docker 网络或防火墙规则，并保持
+前端端口不对不可信客户端开放。修改配置后重新构建并创建前端和后端容器：
+
+```bash
+docker compose -f docker-compose.with-db.yml up -d --build --force-recreate backend frontend
+```
 
 ## 6. 持久化和密钥
 

@@ -41,6 +41,7 @@ services:
         condition: service_healthy
     environment:
       NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-1g}
+      NGINX_TRUST_FORWARDED_PROTO: ${NGINX_TRUST_FORWARDED_PROTO:-false}
     ports:
       - "${FRONTEND_PORT:-13501}:80"
     networks:

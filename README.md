@@ -436,6 +436,8 @@ OM_UPDATE_DIR=updates
 OM_UPDATE_SIGNING_KEY_ID=default
 OM_AGENT_PACKAGE_MAX_BYTES=268435456
 OM_FILE_TRANSFER_MAX_BYTES=1073741824
+# Set true when Cloudflare Tunnel/HTTPS proxy is the only frontend ingress.
+NGINX_TRUST_FORWARDED_PROTO=false
 ```
 
 未设置 `OM_DATABASE_URL` 时，后端默认连接
@@ -469,6 +471,12 @@ Compose 将后端宿主端口固定绑定到 `127.0.0.1`，并默认把 PostgreS
 `OM_TRUSTED_PROXY_CIDRS`，并确保网关和三个服务地址互不相同且都位于所选网段内。
 登录限流会同时按来源地址和数据库中的真实管理员账号计数；不存在的用户名不会占用
 账号限流容量。
+
+Docker 前端默认用 Nginx 与后端之间的连接协议覆盖 `X-Forwarded-Proto`。使用 Cloudflare
+Tunnel 时，浏览器的 HTTPS 会先在 Tunnel 终止，内网连接通常是 HTTP；此时应将
+`NGINX_TRUST_FORWARDED_PROTO=true`，让前端保留 Cloudflare 传入的 `http`/`https` 协议，
+并确保前端端口只允许 `cloudflared` 或其他可信代理访问。纯 HTTPS 入口还应将
+`OM_SECURE_COOKIES=true` 作为无协议头时的安全回退。
 
 Agent `0.1.19` 起通过 `Authorization` 请求头认证 WebSocket，实例密钥不再出现在
 URL。`OM_ALLOW_LEGACY_AGENT_WS_AUTH` 默认必须保持 `false`；它只用于升级旧 Agent

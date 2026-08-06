@@ -3,6 +3,14 @@ map $http_upgrade $connection_upgrade {
     '' close;
 }
 
+# Cloudflare Tunnel terminates HTTPS before connecting to this container. Only
+# preserve its protocol header when the frontend ingress is explicitly trusted.
+map "${NGINX_TRUST_FORWARDED_PROTO}:$http_x_forwarded_proto" $om_forwarded_proto {
+    default $scheme;
+    "true:http" http;
+    "true:https" https;
+}
+
 server {
     listen 80;
     server_name _;
@@ -21,7 +29,7 @@ server {
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto $om_forwarded_proto;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_request_buffering off;
@@ -35,7 +43,7 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Proto $om_forwarded_proto;
     }
 
     location / {

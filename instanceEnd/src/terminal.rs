@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::OsString,
     io::{self, Read, Write},
     sync::{
         Arc,
@@ -9,12 +10,10 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::Semaphore;
-
-#[cfg(windows)]
-use anyhow::Context as _;
 
 #[cfg(windows)]
 use std::{
@@ -43,6 +42,140 @@ const TERMINAL_WRITE_QUEUE_CAPACITY: usize = 16;
 const TERMINAL_PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(windows, test))]
 const TERMINAL_PIPE_QUEUE_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellKind {
+    #[cfg(any(windows, test))]
+    PowerShell,
+    #[cfg(any(windows, test))]
+    Cmd,
+    #[cfg(any(not(windows), test))]
+    Unix,
+}
+
+#[derive(Clone, Debug)]
+struct ShellCandidate {
+    name: &'static str,
+    program: OsString,
+    kind: ShellKind,
+}
+
+impl ShellCandidate {
+    fn new(name: &'static str, program: impl Into<OsString>, kind: ShellKind) -> Self {
+        Self {
+            name,
+            program: program.into(),
+            kind,
+        }
+    }
+
+    fn arguments(&self) -> &'static [&'static str] {
+        match self.kind {
+            #[cfg(any(windows, test))]
+            ShellKind::PowerShell => &["-NoLogo", "-NoExit"],
+            #[cfg(any(windows, test))]
+            ShellKind::Cmd => &["/D", "/Q", "/K", "chcp 65001>nul"],
+            #[cfg(any(not(windows), test))]
+            ShellKind::Unix => &["-i"],
+        }
+    }
+
+    fn command_builder(&self) -> CommandBuilder {
+        let mut command = CommandBuilder::new(&self.program);
+        command.args(self.arguments().iter().copied());
+        command
+    }
+
+    fn description(&self) -> String {
+        format!("{} ({})", self.name, self.program.to_string_lossy())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_shell_candidates(comspec: Option<OsString>) -> Vec<ShellCandidate> {
+    let mut candidates = vec![
+        ShellCandidate::new("PowerShell 7", "pwsh.exe", ShellKind::PowerShell),
+        ShellCandidate::new(
+            "Windows PowerShell",
+            "powershell.exe",
+            ShellKind::PowerShell,
+        ),
+    ];
+    if let Some(comspec) = comspec.filter(|value| !value.is_empty()) {
+        candidates.push(ShellCandidate::new(
+            "cmd (COMSPEC)",
+            comspec,
+            ShellKind::Cmd,
+        ));
+    }
+    candidates.push(ShellCandidate::new("cmd", "cmd.exe", ShellKind::Cmd));
+    candidates
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_shell_candidates() -> Vec<ShellCandidate> {
+    vec![
+        ShellCandidate::new("zsh", "/bin/zsh", ShellKind::Unix),
+        ShellCandidate::new("bash", "/bin/bash", ShellKind::Unix),
+        ShellCandidate::new("sh", "/bin/sh", ShellKind::Unix),
+    ]
+}
+
+#[cfg(any(all(not(windows), not(target_os = "macos")), test))]
+fn linux_shell_candidates() -> Vec<ShellCandidate> {
+    vec![
+        ShellCandidate::new("bash", "bash", ShellKind::Unix),
+        ShellCandidate::new("zsh", "zsh", ShellKind::Unix),
+        ShellCandidate::new("ash", "ash", ShellKind::Unix),
+        ShellCandidate::new("sh", "sh", ShellKind::Unix),
+    ]
+}
+
+fn platform_shell_candidates() -> Vec<ShellCandidate> {
+    #[cfg(windows)]
+    {
+        windows_shell_candidates(std::env::var_os("COMSPEC"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_shell_candidates()
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        linux_shell_candidates()
+    }
+}
+
+fn try_shell_candidates<T>(
+    candidates: &[ShellCandidate],
+    transport: &str,
+    mut start: impl FnMut(&ShellCandidate) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut failures = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        match start(candidate) {
+            Ok(terminal) => {
+                crate::logging::info(format_args!(
+                    "terminal selected {} using {transport}",
+                    candidate.description()
+                ));
+                return Ok(terminal);
+            }
+            Err(error) => {
+                let failure = format!("{}: {error:#}", candidate.description());
+                crate::logging::info(format_args!(
+                    "terminal could not start {failure}; trying the next shell"
+                ));
+                failures.push(failure);
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "none of the supported shells could be started using {transport}: {}",
+        failures.join("; ")
+    )
+}
 
 enum TerminalControl {
     Input(Vec<u8>),
@@ -411,12 +544,12 @@ fn open_terminal(cols: u16, rows: u16) -> anyhow::Result<RunningTerminal> {
             match open_pty_terminal(cols, rows) {
                 Ok(terminal) => return Ok(terminal),
                 Err(error) => crate::logging::error(format_args!(
-                    "ConPTY terminal initialization failed; falling back to a pipe-backed cmd terminal: {error:#}"
+                    "ConPTY terminal initialization failed; falling back to a pipe-backed terminal: {error:#}"
                 )),
             }
         } else {
             crate::logging::info(format_args!(
-                "ConPTY is unavailable on this Windows version; using a pipe-backed cmd terminal"
+                "ConPTY is unavailable on this Windows version; using a pipe-backed terminal"
             ));
         }
 
@@ -428,22 +561,62 @@ fn open_terminal(cols: u16, rows: u16) -> anyhow::Result<RunningTerminal> {
 }
 
 fn open_pty_terminal(cols: u16, rows: u16) -> anyhow::Result<RunningTerminal> {
-    let pair = native_pty_system().openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-    let mut command = interactive_shell();
+    let candidates = platform_shell_candidates();
+    let transport = if cfg!(windows) { "ConPTY" } else { "PTY" };
+    try_shell_candidates(&candidates, transport, |candidate| {
+        open_pty_terminal_with_shell(candidate, cols, rows)
+    })
+}
+
+fn open_pty_terminal_with_shell(
+    candidate: &ShellCandidate,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<RunningTerminal> {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .with_context(|| format!("failed to allocate a PTY for {}", candidate.description()))?;
+    let mut command = candidate.command_builder();
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
 
     let slave = pair.slave;
     let master = pair.master;
-    let child = slave.spawn_command(command)?;
+    let child = slave
+        .spawn_command(command)
+        .with_context(|| format!("failed to spawn {}", candidate.description()))?;
     drop(slave);
-    let reader = master.try_clone_reader()?;
-    let writer = master.take_writer()?;
+    let reader = match master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let mut process = TerminalProcess::Pty(child);
+            let _ = process.terminate();
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to open the output stream for {}",
+                    candidate.description()
+                )
+            });
+        }
+    };
+    let writer = match master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            let mut process = TerminalProcess::Pty(child);
+            let _ = process.terminate();
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to open the input stream for {}",
+                    candidate.description()
+                )
+            });
+        }
+    };
 
     Ok(RunningTerminal {
         process: TerminalProcess::Pty(child),
@@ -471,10 +644,17 @@ fn conpty_available() -> bool {
 
 #[cfg(windows)]
 fn open_pipe_terminal() -> anyhow::Result<RunningTerminal> {
-    let program = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-    let mut command = Command::new(program);
+    let candidates = platform_shell_candidates();
+    try_shell_candidates(&candidates, "pipe-backed terminal", |candidate| {
+        open_pipe_terminal_with_shell(candidate)
+    })
+}
+
+#[cfg(windows)]
+fn open_pipe_terminal_with_shell(candidate: &ShellCandidate) -> anyhow::Result<RunningTerminal> {
+    let mut command = Command::new(&candidate.program);
     command
-        .args(["/D", "/Q", "/K", "chcp 65001>nul"])
+        .args(candidate.arguments())
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
         .creation_flags(CREATE_NO_WINDOW.0)
@@ -484,19 +664,17 @@ fn open_pipe_terminal() -> anyhow::Result<RunningTerminal> {
 
     let mut child = command
         .spawn()
-        .context("failed to spawn cmd.exe with redirected standard handles")?;
-    let stdin = child
-        .stdin
-        .take()
-        .context("cmd.exe stdin pipe was not created")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("cmd.exe stdout pipe was not created")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("cmd.exe stderr pipe was not created")?;
+        .with_context(|| format!("failed to spawn {}", candidate.description()))?;
+    let (Some(stdin), Some(stdout), Some(stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!(
+            "redirected standard handles were not created for {}",
+            candidate.description()
+        );
+    };
 
     Ok(RunningTerminal {
         process: TerminalProcess::Pipe(child),
@@ -581,18 +759,83 @@ impl Read for PipeReader {
     }
 }
 
-#[cfg(windows)]
-fn interactive_shell() -> CommandBuilder {
-    let program = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-    let mut command = CommandBuilder::new(program);
-    command.args(["/D", "/Q", "/K", "chcp 65001>nul"]);
-    command
-}
+#[cfg(test)]
+mod shell_selection_tests {
+    use super::*;
 
-#[cfg(not(windows))]
-fn interactive_shell() -> CommandBuilder {
-    let program = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-    CommandBuilder::new(program)
+    fn candidate_names(candidates: &[ShellCandidate]) -> Vec<&'static str> {
+        candidates.iter().map(|candidate| candidate.name).collect()
+    }
+
+    #[test]
+    fn shell_candidates_follow_platform_priority() {
+        let windows = windows_shell_candidates(Some(r"C:\Windows\System32\cmd.exe".into()));
+        assert_eq!(
+            candidate_names(&windows),
+            ["PowerShell 7", "Windows PowerShell", "cmd (COMSPEC)", "cmd"]
+        );
+        assert_eq!(windows[0].arguments(), ["-NoLogo", "-NoExit"]);
+        assert_eq!(windows[2].arguments(), ["/D", "/Q", "/K", "chcp 65001>nul"]);
+
+        let macos = macos_shell_candidates();
+        assert_eq!(candidate_names(&macos), ["zsh", "bash", "sh"]);
+        assert_eq!(macos[0].program, OsString::from("/bin/zsh"));
+
+        let linux = linux_shell_candidates();
+        assert_eq!(candidate_names(&linux), ["bash", "zsh", "ash", "sh"]);
+        assert!(
+            linux
+                .iter()
+                .all(|candidate| candidate.arguments() == ["-i"])
+        );
+    }
+
+    #[test]
+    fn windows_candidates_fall_back_to_path_cmd_without_comspec() {
+        let candidates = windows_shell_candidates(None);
+        assert_eq!(
+            candidate_names(&candidates),
+            ["PowerShell 7", "Windows PowerShell", "cmd"]
+        );
+        assert_eq!(candidates[2].program, OsString::from("cmd.exe"));
+    }
+
+    #[test]
+    fn shell_selection_tries_candidates_until_one_starts() {
+        let candidates = linux_shell_candidates();
+        let mut attempted = Vec::new();
+        let selected = try_shell_candidates(&candidates, "test terminal", |candidate| {
+            attempted.push(candidate.name);
+            if candidate.name == "ash" {
+                Ok(candidate.name.to_string())
+            } else {
+                Err(anyhow::anyhow!("not installed"))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(selected, "ash");
+        assert_eq!(attempted, ["bash", "zsh", "ash"]);
+    }
+
+    #[test]
+    fn shell_selection_reports_every_failure() {
+        let candidates = macos_shell_candidates();
+        let error = try_shell_candidates(&candidates, "test terminal", |candidate| {
+            Err::<(), _>(anyhow::anyhow!("{} unavailable", candidate.name))
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("none of the supported shells"));
+        for candidate in candidates {
+            assert!(
+                error.contains(candidate.name),
+                "missing {} from {error}",
+                candidate.name
+            );
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

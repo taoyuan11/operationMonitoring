@@ -4,6 +4,7 @@ import AdminNavigation from './components/AdminNavigation.vue'
 import AdminPanel from './components/AdminPanel.vue'
 import AgentUpdatesPanel from './components/AgentUpdatesPanel.vue'
 import AlertCenterPanel from './components/AlertCenterPanel.vue'
+import AuditTrailPanel from './components/AuditTrailPanel.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import InstanceBoard from './components/InstanceBoard.vue'
 import LoginModal from './components/LoginModal.vue'
@@ -507,6 +508,19 @@ function confirmAction() {
             @delete-user="requestDeleteAdminUser"
             @revoke-device="requestRevokeAuthenticatorDevice"
           />
+          <AuditTrailPanel
+            v-else-if="currentPage === 'logs'"
+            :key="`audit-${consoleState.adminResetKey.value}`"
+            :audit="consoleState.audit.value"
+            :audit-query="consoleState.auditQuery"
+            :audit-loading="consoleState.auditLoading.value"
+            :audit-error="consoleState.auditError.value"
+            :audit-exporting="consoleState.auditExporting.value"
+            @audit-query-changed="consoleState.updateAuditQuery"
+            @audit-page-changed="consoleState.setAuditPage"
+            @refresh-audit="consoleState.loadAudit"
+            @export-audit="consoleState.exportAudit"
+          />
           <AdminPanel
             v-else
             :key="`admin-${consoleState.adminResetKey.value}`"
@@ -514,11 +528,6 @@ function confirmAction() {
             :pending-instances="consoleState.pendingInstances.value"
             :commands="consoleState.commands.value"
             :jobs="consoleState.jobs.value"
-            :audit="consoleState.audit.value"
-            :audit-query="consoleState.auditQuery"
-            :audit-loading="consoleState.auditLoading.value"
-            :audit-error="consoleState.auditError.value"
-            :audit-exporting="consoleState.auditExporting.value"
             :settings-form="consoleState.settingsForm"
             :resolved-theme="consoleState.resolvedTheme.value"
             :appearance-message="consoleState.appearanceMessage.value"
@@ -531,10 +540,6 @@ function confirmAction() {
             @create-command="consoleState.createCommand"
             @remove-command="requestRemoveCommand"
             @save-settings="consoleState.saveSettings"
-            @audit-query-changed="consoleState.updateAuditQuery"
-            @audit-page-changed="consoleState.setAuditPage"
-            @refresh-audit="consoleState.loadAudit"
-            @export-audit="consoleState.exportAudit"
             @save-appearance="consoleState.saveAppearance"
             @appearance-changed="consoleState.appearanceMessage.value = ''"
             @select-background-image="consoleState.selectBackgroundImage"

@@ -8,6 +8,11 @@ use std::{
     path::Path,
     process::{Command, ExitStatus},
 };
+#[cfg(target_os = "macos")]
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 #[cfg(windows)]
 const WINDOWS_SERVICE_NAME: &str = "operation-monitoring-agent";
@@ -15,6 +20,10 @@ const WINDOWS_SERVICE_NAME: &str = "operation-monitoring-agent";
 const SHORT_WINDOWS_SERVICE_NAME: &str = "om-agent";
 #[cfg(target_os = "macos")]
 const MACOS_SERVICE_LABEL: &str = "com.operation-monitoring.agent";
+#[cfg(target_os = "macos")]
+const MACOS_SERVICE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "macos")]
+const MACOS_SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn install(mut config: AgentConfig, non_interactive: bool, yes: bool) -> Result<()> {
     let explicit_server = env::args_os()
@@ -259,11 +268,18 @@ fn replace_symlink(target: &str, link: &str) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn bootout_macos_service() -> Result<()> {
     let target = format!("system/{MACOS_SERVICE_LABEL}");
-    let output = Command::new("launchctl")
+    let output = Command::new("/bin/launchctl")
         .args(["bootout", &target])
         .output()
         .context("failed to run launchctl")?;
-    if output.status.success() || macos_service_not_loaded(output.status.code()) {
+    if output.status.success() {
+        return wait_for_macos_service_unloaded(
+            MACOS_SERVICE_UNLOAD_TIMEOUT,
+            MACOS_SERVICE_POLL_INTERVAL,
+            query_macos_service_loaded,
+        );
+    }
+    if macos_service_not_loaded(output.status.code()) {
         return Ok(());
     }
 
@@ -282,6 +298,53 @@ fn bootout_macos_service() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn macos_service_not_loaded(exit_code: Option<i32>) -> bool {
     exit_code == Some(3)
+}
+#[cfg(target_os = "macos")]
+fn query_macos_service_loaded() -> Result<bool> {
+    let target = format!("system/{MACOS_SERVICE_LABEL}");
+    let output = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .output()
+        .context("failed to query launchd service state")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let details = format!("{stdout}\n{stderr}");
+    if macos_service_query_not_found(&details) {
+        return Ok(false);
+    }
+    bail!(
+        "launchctl print exited with {} while waiting for service removal: {}",
+        output.status,
+        details.trim()
+    )
+}
+#[cfg(target_os = "macos")]
+fn macos_service_query_not_found(details: &str) -> bool {
+    details.contains("Could not find service") || details.contains("service not found")
+}
+#[cfg(target_os = "macos")]
+fn wait_for_macos_service_unloaded(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut service_is_loaded: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if !service_is_loaded()? {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "launchd did not finish unloading {MACOS_SERVICE_LABEL} within {} seconds",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(poll_interval.min(timeout.saturating_sub(started.elapsed())));
+    }
 }
 fn private_file(path: impl AsRef<Path>, contents: &str) -> Result<()> {
     let path = path.as_ref();
@@ -1243,7 +1306,12 @@ mod tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
-    use super::{MACOS, macos_service_not_loaded};
+    use std::{cell::Cell, time::Duration};
+
+    use super::{
+        MACOS, macos_service_not_loaded, macos_service_query_not_found,
+        wait_for_macos_service_unloaded,
+    };
 
     #[test]
     fn accepts_only_launchctl_no_such_process_as_not_loaded() {
@@ -1256,6 +1324,36 @@ mod macos_tests {
     fn launch_daemon_uses_the_short_executable_name() {
         assert!(MACOS.contains("exec /usr/local/bin/om-agent service-run"));
         assert!(!MACOS.contains("exec /usr/local/bin/operation-monitoring-agent service-run"));
+    }
+
+    #[test]
+    fn recognizes_launchctl_print_missing_service_message() {
+        assert!(macos_service_query_not_found(
+            "Could not find service \"com.operation-monitoring.agent\" in domain for system"
+        ));
+        assert!(!macos_service_query_not_found("Operation not permitted"));
+    }
+
+    #[test]
+    fn waits_until_launchd_has_removed_the_service() {
+        let queries = Cell::new(0);
+
+        wait_for_macos_service_unloaded(Duration::from_secs(1), Duration::ZERO, || {
+            let current = queries.get() + 1;
+            queries.set(current);
+            Ok(current < 3)
+        })
+        .unwrap();
+
+        assert_eq!(queries.get(), 3);
+    }
+
+    #[test]
+    fn stops_waiting_when_launchd_removal_times_out() {
+        let error = wait_for_macos_service_unloaded(Duration::ZERO, Duration::ZERO, || Ok(true))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("did not finish unloading"));
     }
 }
 

@@ -420,6 +420,19 @@ detached HEAD 方式切换到该版本。脚本会比较当前 `backend/Cargo.to
 严格更高；目标版本相同或更低时直接拒绝，不提供降级或回滚入口。脚本不会删除 Compose
 命名卷，也不会自动恢复旧容器、旧代码或旧数据库。
 
+更新时脚本会先单独启动后端，等待数据库迁移和 `/api/health` 通过（默认最多 1800 秒），
+然后才启动前端。这样首次升级的大型 `metrics`/审计表回填不会被前端的 `depends_on` 健康检查
+提前判定为失败；等待超时或后端重启时，脚本会自动输出后端、健康检查和 PostgreSQL 日志。
+数据库规模较大时，可以通过脚本进程环境变量延长等待时间（该变量不是后端配置，也不需要写入
+Compose 文件）：
+
+```bash
+OM_DEPLOY_BACKEND_TIMEOUT_SECONDS=3600 ./deploy.sh update docker-compose.yml
+```
+
+镜像健康检查的启动宽限期为 5 分钟；后端在宽限期内仍会继续执行迁移，成功监听后会立即变为
+healthy。
+
 后端启动时会执行所需的表结构补齐。升级后检查健康接口、管理员登录、Agent WebSocket、
 文件上传和更新包下载。服务端版本升级是单向变更：后端不提供版本回滚 API、命令、自动
 回退或旧版本兼容保障。若新版本出现问题，只能查看日志、修复配置或数据问题并重新部署
@@ -492,6 +505,17 @@ docker compose -f docker-compose.with-db.yml up -d --build --force-recreate back
 ```bash
 docker compose -f docker-compose.with-db.yml logs --tail=200 backend
 ```
+
+升级期间如果日志没有显示进程退出，而容器仍处于 `starting` 或 `unhealthy`，先确认数据库迁移
+是否仍在执行，不要立即删除卷。使用部署脚本时它会自动等待并打印健康检查详情；手工启动时可
+查看容器状态：
+
+```bash
+docker inspect operation-monitoring-backend-1 \
+  --format '{{.State.Status}} restart={{.RestartCount}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
+```
+
+如果后端已经完成迁移但仍未健康，再按下面的数据库连接、权限和密钥文件项排查。
 
 自带数据库模式先检查 PostgreSQL 日志和健康状态：
 

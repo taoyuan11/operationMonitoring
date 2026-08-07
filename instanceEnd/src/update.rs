@@ -3394,6 +3394,7 @@ fn stop_standalone_service() -> Result<()> {
             program: "/bin/launchctl".into(),
             args: vec![
                 "bootout".into(),
+                "--wait".into(),
                 format!("system/{MACOS_SERVICE_LABEL}").into(),
             ],
         };

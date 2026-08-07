@@ -15,6 +15,10 @@ Examples:
   ./deploy.sh update docker-compose.yml
 
 The compose file may be an absolute path or a path relative to the project root.
+
+Environment:
+  OM_DEPLOY_BACKEND_TIMEOUT_SECONDS
+    Maximum time to wait for database migrations and backend health (default: 1800).
 USAGE
 }
 
@@ -118,11 +122,127 @@ validate_compose() {
   docker compose -f "$COMPOSE_FILE" config --quiet
 }
 
+backend_start_timeout_seconds() {
+  local timeout=${OM_DEPLOY_BACKEND_TIMEOUT_SECONDS:-1800}
+  [[ $timeout =~ ^[1-9][0-9]*$ ]] && ((10#$timeout >= 30)) \
+    || die 'OM_DEPLOY_BACKEND_TIMEOUT_SECONDS must be an integer of at least 30 seconds'
+  printf '%s\n' "$timeout"
+}
+
+compose_has_service() {
+  local expected=$1 service
+  while IFS= read -r service; do
+    [ "$service" = "$expected" ] && return 0
+  done < <(docker compose -f "$COMPOSE_FILE" config --services)
+  return 1
+}
+
+print_backend_diagnostics() {
+  local container_id
+
+  printf '\nBackend startup diagnostics:\n' >&2
+  docker compose -f "$COMPOSE_FILE" ps --all >&2 || true
+  docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200 backend >&2 || true
+
+  container_id=$(docker compose -f "$COMPOSE_FILE" ps --all -q backend 2>/dev/null || true)
+  if [ -n "$container_id" ]; then
+    docker inspect --format \
+      '{{.State.Status}} restart={{.RestartCount}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+      "$container_id" >&2 || true
+    docker inspect --format \
+      '{{range .State.Health.Log}}{{println .End "exit=" .ExitCode .Output}}{{end}}' \
+      "$container_id" >&2 || true
+  fi
+
+  if compose_has_service postgres; then
+    printf '\nPostgreSQL startup diagnostics:\n' >&2
+    docker compose -f "$COMPOSE_FILE" logs --no-color --tail=100 postgres >&2 || true
+  fi
+}
+
+wait_for_backend_health() {
+  local timeout start now last_report container_id inspection runtime health restart_count initial_restart_count
+  timeout=$(backend_start_timeout_seconds)
+
+  container_id=''
+  for _ in {1..30}; do
+    container_id=$(docker compose -f "$COMPOSE_FILE" ps --all -q backend 2>/dev/null || true)
+    [ -n "$container_id" ] && break
+    sleep 1
+  done
+  if [ -z "$container_id" ]; then
+    printf '%s\n' 'Backend container was not created.' >&2
+    return 1
+  fi
+
+  initial_restart_count=$(docker inspect --format '{{.RestartCount}}' "$container_id" 2>/dev/null || printf '0')
+  [[ $initial_restart_count =~ ^[0-9]+$ ]] || initial_restart_count=0
+
+  start=$(date +%s)
+  last_report=$start
+  printf 'Waiting up to %ss for backend health checks and database migrations...\n' "$timeout"
+  while :; do
+    inspection=$(docker inspect --format \
+      '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.RestartCount}}' \
+      "$container_id" 2>/dev/null) || {
+        printf '%s\n' 'Backend container disappeared while waiting for health.' >&2
+        return 1
+      }
+    IFS=' ' read -r runtime health restart_count <<< "$inspection"
+
+    if [ "$health" = healthy ]; then
+      printf 'Backend is healthy.\n'
+      return 0
+    fi
+    case "$runtime" in
+      exited|dead|removing|restarting|paused)
+        printf 'Backend container entered state %s before becoming healthy.\n' "$runtime" >&2
+        return 1
+        ;;
+    esac
+    if [[ $restart_count =~ ^[0-9]+$ ]] && ((restart_count > initial_restart_count)); then
+      printf 'Backend restarted during startup (restart count: %s -> %s).\n' \
+        "$initial_restart_count" "$restart_count" >&2
+      return 1
+    fi
+
+    now=$(date +%s)
+    if ((now - start >= timeout)); then
+      printf 'Backend did not become healthy within %ss (last health state: %s).\n' \
+        "$timeout" "$health" >&2
+      return 1
+    fi
+    if ((now - last_report >= 30)); then
+      printf 'Still waiting for backend (%ss elapsed, health: %s)...\n' \
+        "$((now - start))" "$health"
+      last_report=$now
+    fi
+    sleep 5
+  done
+}
+
+start_stack() {
+  backend_start_timeout_seconds >/dev/null
+  if ! docker compose -f "$COMPOSE_FILE" up -d --remove-orphans backend; then
+    print_backend_diagnostics
+    die 'Backend could not be started.'
+  fi
+  if ! wait_for_backend_health; then
+    print_backend_diagnostics
+    die 'Backend did not become healthy; the frontend was not started.'
+  fi
+  if ! docker compose -f "$COMPOSE_FILE" up -d --remove-orphans; then
+    print_backend_diagnostics
+    die 'The remaining services could not be started.'
+  fi
+  docker compose -f "$COMPOSE_FILE" ps
+}
+
 deploy() {
   printf 'Deploying with %s\n' "$COMPOSE_FILE"
   validate_compose
-  docker compose -f "$COMPOSE_FILE" up -d --build
-  docker compose -f "$COMPOSE_FILE" ps
+  docker compose -f "$COMPOSE_FILE" build
+  start_stack
 }
 
 update() {
@@ -157,8 +277,7 @@ update() {
   validate_compose
   docker compose -f "$COMPOSE_FILE" pull --ignore-buildable
   docker compose -f "$COMPOSE_FILE" build --pull
-  docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
-  docker compose -f "$COMPOSE_FILE" ps
+  start_stack
 }
 
 if [ "$#" -eq 1 ] && { [ "$1" = --help ] || [ "$1" = -h ]; }; then

@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   ArrowUpCircle,
   Check,
-  ChevronDown,
   CircleAlert,
   Clock3,
+  EllipsisVertical,
   FileArchive,
   LoaderCircle,
   PackageCheck,
@@ -25,6 +25,7 @@ import {
   X,
 } from 'lucide-vue-next'
 import AgentRolloutSelectorModal from './AgentRolloutSelectorModal.vue'
+import WorkspaceDrawer from './WorkspaceDrawer.vue'
 import type {
   AgentArtifactTarget,
   AgentArtifactUploadItem,
@@ -80,9 +81,14 @@ const fileInputKeys = reactive<Record<string, number>>({})
 const checksumInputKeys = reactive<Record<string, number>>({})
 const fileDragDepths = reactive<Record<string, number>>({})
 const fileDragActive = reactive<Record<string, boolean>>({})
-const collapsedReleases = reactive<Record<string, boolean>>({})
 const editingReleaseId = ref<string | null>(null)
 const rolloutSelector = ref<{ release: AgentRelease; mode: 'publish' | 'add' } | null>(null)
+const selectedReleaseId = ref<string | null>(null)
+const activeTab = ref<'attempts' | 'overview' | 'artifacts'>('attempts')
+const operationDrawer = ref<'create' | 'edit' | 'upload' | null>(null)
+const moreMenuOpen = ref(false)
+const moreMenuElement = ref<HTMLElement | null>(null)
+const moreMenuButton = ref<HTMLButtonElement | null>(null)
 const createReleaseFiles = ref<File[]>([])
 const createReleaseFileError = ref('')
 const createReleaseVersionSource = ref('')
@@ -136,6 +142,19 @@ const terminalAttemptStatuses = new Set<AgentUpdateAttemptStatus>([
 
 const publishedCount = computed(() => props.releases.filter((release) => release.status === 'published').length)
 const instancesById = computed(() => new Map(props.instances.map((instance) => [instance.id, instance])))
+const selectedRelease = computed(() => (
+  props.releases.find((release) => release.id === selectedReleaseId.value) || null
+))
+const operationDrawerTitle = computed(() => {
+  if (operationDrawer.value === 'create') return '新建 Agent 版本'
+  if (operationDrawer.value === 'edit') return `编辑 Agent ${selectedRelease.value?.version || ''}`
+  return `添加 Agent ${selectedRelease.value?.version || ''} 更新包`
+})
+const operationDrawerDescription = computed(() => {
+  if (operationDrawer.value === 'create') return '创建草稿，可同时选择更新包以继续上传。'
+  if (operationDrawer.value === 'edit') return '修改版本号和发布说明。'
+  return '为不同系统与原生架构上传可执行文件及其 SHA-256 校验文件。'
+})
 const createReleaseFileSummary = computed(() => {
   const packageCount = createReleaseFiles.value.filter((file) => !file.name.toLowerCase().endsWith('.sha256')).length
   const checksumCount = createReleaseFiles.value.length - packageCount
@@ -155,7 +174,10 @@ watch(
       if (!(release.id in batchDragDepths)) batchDragDepths[release.id] = 0
       if (!(release.id in batchDragActive)) batchDragActive[release.id] = false
       if (!(release.id in batchInputKeys)) batchInputKeys[release.id] = 0
-      if (!(release.id in collapsedReleases)) collapsedReleases[release.id] = true
+    }
+    if (!selectedReleaseId.value || !releases.some((release) => release.id === selectedReleaseId.value)) {
+      selectedReleaseId.value = releases[0]?.id || null
+      if (operationDrawer.value !== 'create') operationDrawer.value = null
     }
   },
   { immediate: true },
@@ -163,12 +185,27 @@ watch(
 
 watch(
   () => props.operation,
-  (operation) => {
-    if (!operation && props.message && editingReleaseId.value) {
+  (operation, previousOperation) => {
+    if (!operation && previousOperation === 'saving' && props.message && editingReleaseId.value) {
       editingReleaseId.value = null
+      operationDrawer.value = null
     }
   },
 )
+
+watch(selectedReleaseId, () => {
+  moreMenuOpen.value = false
+})
+
+onMounted(() => {
+  document.addEventListener('pointerdown', handleOutsidePointerDown)
+  document.addEventListener('keydown', handleMenuKeydown)
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', handleOutsidePointerDown)
+  document.removeEventListener('keydown', handleMenuKeydown)
+})
 
 function createUploadRow(os = 'linux', nativeArch = 'x86_64'): AgentArtifactUploadRow {
   uploadRowSequence += 1
@@ -376,7 +413,8 @@ function submitCreateRelease() {
 
 function completeCreateRelease(releaseId: string) {
   const files = createReleaseFiles.value
-  collapsedReleases[releaseId] = false
+  selectedReleaseId.value = releaseId
+  activeTab.value = files.length ? 'artifacts' : 'attempts'
   artifactUploadRows[releaseId] = [createUploadRow('linux', 'x86_64')]
   batchFileErrors[releaseId] = ''
   batchDragDepths[releaseId] = 0
@@ -388,6 +426,7 @@ function completeCreateRelease(releaseId: string) {
   createReleaseVersionSource.value = ''
   createReleaseVersionConflict.value = false
   createReleaseInputKey.value += 1
+  operationDrawer.value = files.length ? 'upload' : null
 }
 
 function assignBatchFiles(releaseId: string, files: File[]) {
@@ -619,19 +658,24 @@ function applyUploadResult(releaseId: string, result: AgentArtifactUploadResult)
   for (const row of rows) {
     if (failed.has(row.id)) row.error = failed.get(row.id) || '上传失败'
   }
-  artifactUploadRows[releaseId] = rows.length ? rows : [createUploadRow('linux', 'x86_64')]
+  const pendingRows = rows.filter((row) => row.file || row.checksum_file || row.error)
+  artifactUploadRows[releaseId] = pendingRows.length ? pendingRows : [createUploadRow('linux', 'x86_64')]
+  if (pendingRows.length === 0 && result.failures.length === 0) operationDrawer.value = null
 }
 
 function editRelease(release: AgentRelease) {
   draftEdits[release.id] = { version: release.version, notes: release.notes }
-  collapsedReleases[release.id] = false
+  selectedReleaseId.value = release.id
   editingReleaseId.value = release.id
+  operationDrawer.value = 'edit'
+  moreMenuOpen.value = false
 }
 
 function cancelEdit(releaseId: string) {
   const release = props.releases.find((item) => item.id === releaseId)
   if (release) draftEdits[releaseId] = { version: release.version, notes: release.notes }
   editingReleaseId.value = null
+  operationDrawer.value = null
 }
 
 function saveRelease(releaseId: string) {
@@ -660,6 +704,11 @@ function attemptStats(release: AgentRelease) {
 
 function activeAttemptCount(release: AgentRelease) {
   return attemptsFor(release).filter((attempt) => !terminalAttemptStatuses.has(attempt.status)).length
+}
+
+function canDeleteRelease(release: AgentRelease) {
+  return activeAttemptCount(release) === 0
+    && !attemptsFor(release).some((attempt) => attempt.operation === 'rollback')
 }
 
 function deleteReleaseTitle(release: AgentRelease) {
@@ -764,12 +813,95 @@ function isBusy(id: string) {
   return Boolean(props.operation) && props.busyId === id
 }
 
-function isReleaseCollapsed(releaseId: string) {
-  return collapsedReleases[releaseId] ?? true
+function selectRelease(releaseId: string) {
+  selectedReleaseId.value = releaseId
 }
 
-function toggleRelease(releaseId: string) {
-  collapsedReleases[releaseId] = !isReleaseCollapsed(releaseId)
+function openCreateDrawer() {
+  operationDrawer.value = 'create'
+  moreMenuOpen.value = false
+}
+
+function openUploadDrawer(release: AgentRelease) {
+  selectedReleaseId.value = release.id
+  activeTab.value = 'artifacts'
+  operationDrawer.value = 'upload'
+  moreMenuOpen.value = false
+}
+
+function closeOperationDrawer() {
+  if (props.operation) return
+  if (operationDrawer.value === 'edit' && editingReleaseId.value) {
+    const release = props.releases.find((item) => item.id === editingReleaseId.value)
+    if (release) draftEdits[release.id] = { version: release.version, notes: release.notes }
+    editingReleaseId.value = null
+  }
+  operationDrawer.value = null
+}
+
+async function toggleMoreMenu() {
+  moreMenuOpen.value = !moreMenuOpen.value
+  if (!moreMenuOpen.value) return
+  await nextTick()
+  menuItems()[0]?.focus()
+}
+
+function menuItems() {
+  return Array.from(
+    moreMenuElement.value?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not([disabled])') || [],
+  )
+}
+
+function closeMoreMenu(restoreFocus = false) {
+  if (!moreMenuOpen.value) return
+  moreMenuOpen.value = false
+  if (restoreFocus) void nextTick(() => moreMenuButton.value?.focus())
+}
+
+function handleMoreMenuKeydown(event: KeyboardEvent) {
+  const items = menuItems()
+  if (!items.length) return
+  const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement)
+  let nextIndex: number | null = null
+  if (event.key === 'ArrowDown') nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % items.length
+  if (event.key === 'ArrowUp') nextIndex = currentIndex < 0 ? items.length - 1 : (currentIndex - 1 + items.length) % items.length
+  if (event.key === 'Home') nextIndex = 0
+  if (event.key === 'End') nextIndex = items.length - 1
+  if (nextIndex === null) return
+  event.preventDefault()
+  items[nextIndex]?.focus()
+}
+
+function handleMoreMenuFocusout(event: FocusEvent) {
+  if (event.relatedTarget instanceof Node && moreMenuElement.value?.contains(event.relatedTarget)) return
+  closeMoreMenu()
+}
+
+function handleTabKeydown(event: KeyboardEvent) {
+  const tabs = ['attempts', 'overview', 'artifacts'] as const
+  const currentIndex = tabs.indexOf(activeTab.value)
+  let nextIndex: number | null = null
+  if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length
+  if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length
+  if (event.key === 'Home') nextIndex = 0
+  if (event.key === 'End') nextIndex = tabs.length - 1
+  if (nextIndex === null) return
+  event.preventDefault()
+  activeTab.value = tabs[nextIndex]
+  const tab = (event.currentTarget as HTMLElement).querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIndex]
+  void nextTick(() => tab?.focus())
+}
+
+function handleOutsidePointerDown(event: PointerEvent) {
+  if (moreMenuOpen.value && !moreMenuElement.value?.contains(event.target as Node)) {
+    closeMoreMenu()
+  }
+}
+
+function handleMenuKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || !moreMenuOpen.value) return
+  event.preventDefault()
+  closeMoreMenu(true)
 }
 </script>
 
@@ -782,23 +914,418 @@ function toggleRelease(releaseId: string) {
         <h2>程序更新</h2>
         <p>维护实例端可执行文件，并跟踪每台实例的更新结果。</p>
       </div>
-      <span class="page-count">{{ publishedCount }} 个已发布</span>
+      <div class="updates-header-actions">
+        <span class="page-count">{{ publishedCount }} 个已发布</span>
+        <button class="primary-button" type="button" :disabled="Boolean(operation)" @click="openCreateDrawer">
+          <Plus :size="16" />新建版本
+        </button>
+      </div>
     </header>
 
-    <p v-if="message" class="update-feedback" role="status" aria-live="polite">
-      <Check :size="15" />{{ message }}
-    </p>
+    <Transition name="notice">
+      <p v-if="message" class="update-feedback" role="status" aria-live="polite">
+        <Check :size="15" />{{ message }}
+      </p>
+    </Transition>
 
-    <section class="admin-content-card release-create-card" aria-labelledby="create-agent-release-title">
-      <div class="card-heading">
-        <div>
-          <h3 id="create-agent-release-title">创建更新草稿</h3>
-          <p>为一个版本添加多个系统和架构的可执行文件及同名 .sha256 校验文件。</p>
+    <section class="updates-workspace" aria-label="Agent 版本工作台">
+      <aside class="release-rail" aria-labelledby="agent-release-list-title">
+        <div class="release-rail-heading">
+          <div>
+            <span class="section-kicker">Release history</span>
+            <h3 id="agent-release-list-title">版本</h3>
+          </div>
+          <span>{{ releases.length }}</span>
         </div>
-      </div>
-      <form class="release-create-form" @submit.prevent="submitCreateRelease">
+
+        <div v-if="releases.length" class="release-rail-list">
+          <button
+            v-for="release in releases"
+            :key="release.id"
+            type="button"
+            :class="['release-rail-item', { selected: selectedReleaseId === release.id }]"
+            :aria-current="selectedReleaseId === release.id ? 'true' : undefined"
+            @click="selectRelease(release.id)"
+          >
+            <span class="release-rail-title">
+              <strong>Agent {{ release.version }}</strong>
+              <span :class="['release-status', release.status]">{{ releaseStatusText[release.status] }}</span>
+            </span>
+            <span class="release-rail-meta">
+              <span v-if="release.status === 'published'" :class="['rollout-status', release.rollout_state]">
+                {{ rolloutStatusText[release.rollout_state] }}
+              </span>
+              <time>{{ formatTime(release.rollout_updated_at || release.published_at || release.created_at) }}</time>
+            </span>
+            <span class="release-rail-stats" aria-label="实例更新统计">
+              <span class="success">成功 {{ attemptStats(release).upgradeSucceeded + attemptStats(release).rollbackSucceeded }}</span>
+              <span class="active">处理中 {{ attemptStats(release).active }}</span>
+              <span :class="{ danger: attemptStats(release).failed > 0 }">失败 {{ attemptStats(release).failed }}</span>
+            </span>
+          </button>
+        </div>
+
+        <div v-else class="page-empty update-empty">
+          <span><PackageCheck :size="24" /></span>
+          <strong>暂无更新版本</strong>
+          <p>创建草稿后即可上传更新包。</p>
+          <button class="primary-button" type="button" @click="openCreateDrawer">
+            <Plus :size="15" />新建版本
+          </button>
+        </div>
+      </aside>
+
+      <article v-if="selectedRelease" class="release-detail">
+        <header class="release-detail-header">
+          <div class="release-detail-identity">
+            <div class="release-detail-title">
+              <h3>Agent {{ selectedRelease.version }}</h3>
+              <span :class="['release-status', selectedRelease.status]">{{ releaseStatusText[selectedRelease.status] }}</span>
+              <span
+                v-if="selectedRelease.status === 'published'"
+                :class="['rollout-status', selectedRelease.rollout_state]"
+              >{{ rolloutStatusText[selectedRelease.rollout_state] }}</span>
+            </div>
+            <p :class="['release-notes', { empty: !selectedRelease.notes }]">
+              {{ selectedRelease.notes || '未填写发布说明' }}
+            </p>
+          </div>
+
+          <div class="release-detail-actions">
+            <button
+              v-if="draftArtifactCount(selectedRelease) > 0"
+              class="primary-button release-publish-button"
+              type="button"
+              :disabled="Boolean(operation) || !canPublishArtifacts(selectedRelease)"
+              @click="selectedRelease.status === 'draft' ? openRolloutSelector(selectedRelease, 'publish') : $emit('publishRelease', selectedRelease)"
+            >
+              <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'publishing'" class="spin" :size="15" />
+              <Send v-else :size="15" />{{ selectedRelease.status === 'published' ? '发布新增包' : '发布' }}
+            </button>
+            <button
+              v-else-if="isRolloutActive(selectedRelease)"
+              class="primary-button"
+              type="button"
+              :disabled="Boolean(operation)"
+              @click="$emit('pauseRollout', selectedRelease)"
+            >
+              <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'pausing'" class="spin" :size="15" />
+              <Pause v-else :size="15" />暂停发布
+            </button>
+            <button
+              v-else-if="isRolloutPaused(selectedRelease)"
+              class="primary-button"
+              type="button"
+              :disabled="Boolean(operation)"
+              @click="$emit('resumeRollout', selectedRelease)"
+            >
+              <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'resuming'" class="spin" :size="15" />
+              <Play v-else :size="15" />恢复发布
+            </button>
+
+            <div ref="moreMenuElement" class="release-more" @focusout="handleMoreMenuFocusout">
+              <button
+                ref="moreMenuButton"
+                class="icon-button"
+                type="button"
+                title="更多版本操作"
+                aria-label="更多版本操作"
+                aria-haspopup="menu"
+                :aria-expanded="moreMenuOpen"
+                @click="toggleMoreMenu"
+              >
+                <EllipsisVertical :size="17" />
+              </button>
+              <div v-if="moreMenuOpen" class="release-more-menu" role="menu" @keydown="handleMoreMenuKeydown">
+                <button
+                  v-if="selectedRelease.status === 'draft'"
+                  type="button"
+                  role="menuitem"
+                  :disabled="Boolean(operation)"
+                  @click="editRelease(selectedRelease)"
+                ><Pencil :size="15" />编辑草稿</button>
+                <button
+                  v-if="draftArtifactCount(selectedRelease) > 0 && isRolloutActive(selectedRelease)"
+                  type="button"
+                  role="menuitem"
+                  :disabled="Boolean(operation)"
+                  @click="moreMenuOpen = false; $emit('pauseRollout', selectedRelease)"
+                ><Pause :size="15" />暂停发布</button>
+                <button
+                  v-if="draftArtifactCount(selectedRelease) > 0 && isRolloutPaused(selectedRelease)"
+                  type="button"
+                  role="menuitem"
+                  :disabled="Boolean(operation)"
+                  @click="moreMenuOpen = false; $emit('resumeRollout', selectedRelease)"
+                ><Play :size="15" />恢复发布</button>
+                <button
+                  v-if="isCanaryRollout(selectedRelease)"
+                  type="button"
+                  role="menuitem"
+                  :disabled="Boolean(operation)"
+                  @click="moreMenuOpen = false; openRolloutSelector(selectedRelease, 'add')"
+                ><UserPlus :size="15" />添加灰度批次</button>
+                <button
+                  v-if="isCanaryRollout(selectedRelease)"
+                  type="button"
+                  role="menuitem"
+                  :disabled="Boolean(operation)"
+                  @click="moreMenuOpen = false; $emit('promoteRollout', selectedRelease)"
+                ><ArrowUpCircle :size="15" />晋级全量</button>
+                <button
+                  v-if="canRollbackRelease(selectedRelease)"
+                  class="danger"
+                  type="button"
+                  role="menuitem"
+                  :disabled="Boolean(operation)"
+                  @click="moreMenuOpen = false; $emit('rollbackRelease', selectedRelease)"
+                ><Undo2 :size="15" />批量回滚</button>
+                <button
+                  class="danger"
+                  type="button"
+                  role="menuitem"
+                  :title="deleteReleaseTitle(selectedRelease)"
+                  :aria-label="deleteReleaseLabel(selectedRelease)"
+                  :disabled="Boolean(operation) || !canDeleteRelease(selectedRelease)"
+                  @click="moreMenuOpen = false; $emit('deleteRelease', selectedRelease)"
+                >
+                  <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'deleting'" class="spin" :size="15" />
+                  <Trash2 v-else :size="15" />删除版本
+                </button>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <div class="release-tabs" role="tablist" aria-label="版本详情视图" @keydown="handleTabKeydown">
+          <button
+            id="release-tab-attempts"
+            type="button"
+            role="tab"
+            :aria-selected="activeTab === 'attempts'"
+            aria-controls="release-panel-attempts"
+            :tabindex="activeTab === 'attempts' ? 0 : -1"
+            :class="{ active: activeTab === 'attempts' }"
+            @click="activeTab = 'attempts'"
+          >实例更新 <span>{{ attemptsFor(selectedRelease).length }}</span></button>
+          <button
+            id="release-tab-overview"
+            type="button"
+            role="tab"
+            :aria-selected="activeTab === 'overview'"
+            aria-controls="release-panel-overview"
+            :tabindex="activeTab === 'overview' ? 0 : -1"
+            :class="{ active: activeTab === 'overview' }"
+            @click="activeTab = 'overview'"
+          >版本概览</button>
+          <button
+            id="release-tab-artifacts"
+            type="button"
+            role="tab"
+            :aria-selected="activeTab === 'artifacts'"
+            aria-controls="release-panel-artifacts"
+            :tabindex="activeTab === 'artifacts' ? 0 : -1"
+            :class="{ active: activeTab === 'artifacts' }"
+            @click="activeTab = 'artifacts'"
+          >更新包 <span>{{ selectedRelease.artifacts.length }}</span></button>
+        </div>
+
+        <section
+          v-if="activeTab === 'attempts'"
+          id="release-panel-attempts"
+          class="release-tab-panel release-attempts"
+          role="tabpanel"
+          aria-labelledby="release-tab-attempts"
+        >
+          <div v-if="attemptsFor(selectedRelease).length === 0" class="release-empty-row release-tab-empty">
+            <Clock3 :size="18" />尚无实例更新记录
+          </div>
+          <div v-else class="update-attempts-table">
+            <div class="update-attempts-head">
+              <span>实例</span><span>操作</span><span>版本</span><span>状态</span><span>说明</span><span>更新时间</span><span></span>
+            </div>
+            <div class="update-attempts-body">
+              <article v-for="attempt in attemptsFor(selectedRelease)" :key="attempt.id" class="update-attempt-row">
+                <div class="attempt-instance">
+                  <strong :title="attemptInstanceName(attempt)">{{ attemptInstanceName(attempt) }}</strong>
+                  <small :title="attempt.instance_id">{{ attempt.instance_id.slice(0, 12) }}</small>
+                </div>
+                <span :class="['attempt-operation', attempt.operation]">
+                  <ArrowUpCircle v-if="attempt.operation === 'upgrade'" :size="13" />
+                  <Undo2 v-else :size="13" />
+                  {{ attempt.operation === 'upgrade' ? '升级' : '回滚' }}
+                </span>
+                <span class="attempt-versions">{{ attempt.from_version }} -&gt; {{ attempt.target_version }}</span>
+                <span :class="['attempt-status', attempt.status]">{{ attemptStatusText[attempt.status] }}</span>
+                <span class="attempt-message" :title="attempt.message || '暂无补充说明'">{{ attempt.message || '—' }}</span>
+                <time>{{ formatTime(attempt.updated_at) }}</time>
+                <div class="attempt-actions">
+                  <button
+                    v-if="canRetryAttempt(selectedRelease, attempt)"
+                    class="icon-button"
+                    type="button"
+                    title="重试此任务"
+                    :aria-label="`重试实例 ${attempt.instance_id} 的${attempt.operation === 'upgrade' ? '升级' : '回滚'}任务`"
+                    :disabled="Boolean(operation)"
+                    @click="$emit('retryAttempt', attempt)"
+                  >
+                    <LoaderCircle v-if="isBusy(attempt.id) && operation === 'retrying'" class="spin" :size="15" />
+                    <RotateCcw v-else :size="15" />
+                  </button>
+                  <button
+                    v-else-if="canRollbackInstance(selectedRelease, attempt)"
+                    class="icon-button danger"
+                    type="button"
+                    title="回滚此实例"
+                    :aria-label="`将实例 ${attempt.instance_id} 回滚到 ${attempt.from_version}`"
+                    :disabled="Boolean(operation)"
+                    @click="$emit('rollbackInstance', selectedRelease, attempt)"
+                  >
+                    <LoaderCircle v-if="isBusy(attempt.id) && operation === 'rolling_back'" class="spin" :size="15" />
+                    <Undo2 v-else :size="15" />
+                  </button>
+                  <button
+                    v-else-if="canReupgradeInstance(selectedRelease, attempt)"
+                    class="icon-button"
+                    type="button"
+                    title="重新升级此实例"
+                    :aria-label="`将实例 ${attempt.instance_id} 重新升级到 ${selectedRelease.version}`"
+                    :disabled="Boolean(operation)"
+                    @click="$emit('reupgradeInstance', selectedRelease, attempt)"
+                  >
+                    <LoaderCircle v-if="isBusy(attempt.id) && operation === 'reupgrading'" class="spin" :size="15" />
+                    <RefreshCw v-else :size="15" />
+                  </button>
+                </div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section
+          v-else-if="activeTab === 'overview'"
+          id="release-panel-overview"
+          class="release-tab-panel release-overview"
+          role="tabpanel"
+          aria-labelledby="release-tab-overview"
+        >
+          <div class="overview-summary">
+            <div>
+              <span>发布策略</span>
+              <strong>{{ selectedRelease.status === 'draft' ? '尚未发布' : (isCanaryRollout(selectedRelease) ? '灰度发布' : '全量发布') }}</strong>
+              <small>{{ rolloutStatusText[selectedRelease.rollout_state] }}</small>
+            </div>
+            <div>
+              <span>平台覆盖</span>
+              <strong>{{ selectedRelease.coverage.covered_instances }} / {{ selectedRelease.coverage.eligible_instances }}</strong>
+              <small>{{ selectedRelease.coverage.missing_artifact_instances }} 个实例缺少更新包</small>
+            </div>
+            <div>
+              <span>回滚能力</span>
+              <strong>{{ selectedRelease.rollback_coverage.rollback_supported }} / {{ selectedRelease.rollback_coverage.succeeded_upgrades }}</strong>
+              <small>{{ selectedRelease.rollback_coverage.unavailable }} 个实例不可回滚</small>
+            </div>
+            <div>
+              <span>最近更新</span>
+              <strong>{{ formatTime(selectedRelease.rollout_updated_at || selectedRelease.published_at || selectedRelease.created_at) }}</strong>
+              <small>{{ selectedRelease.status === 'published' ? '发布状态更新时间' : '草稿创建时间' }}</small>
+            </div>
+          </div>
+
+          <div class="release-coverage" :aria-label="`Agent ${selectedRelease.version} 覆盖情况`">
+            <span><strong>{{ selectedRelease.coverage.selected_instances }}</strong> 显式目标</span>
+            <span><strong>{{ attemptStats(selectedRelease).upgradeSucceeded }}</strong> 升级成功</span>
+            <span><strong>{{ attemptStats(selectedRelease).rollbackSucceeded }}</strong> 回滚成功</span>
+            <span><strong>{{ attemptStats(selectedRelease).active }}</strong> 处理中</span>
+            <span :class="{ warning: attemptStats(selectedRelease).failed > 0 }"><strong>{{ attemptStats(selectedRelease).failed }}</strong> 失败</span>
+            <span v-if="selectedRelease.rollback_coverage.unavailable > 0" class="warning">
+              <ShieldAlert :size="14" />{{ selectedRelease.rollback_coverage.unavailable }} 不可回滚
+            </span>
+            <span :class="{ warning: selectedRelease.coverage.missing_artifact_instances > 0 }">
+              <CircleAlert :size="14" />{{ selectedRelease.coverage.missing_artifact_instances }} 缺少可执行文件
+            </span>
+            <span :class="{ warning: selectedRelease.coverage.unprivileged_instances > 0 }">
+              <ShieldAlert :size="14" />{{ selectedRelease.coverage.unprivileged_instances }} 权限不足
+            </span>
+          </div>
+
+          <div class="overview-notes">
+            <span>发布说明</span>
+            <p>{{ selectedRelease.notes || '未填写发布说明。' }}</p>
+            <div>
+              <time>创建于 {{ formatTime(selectedRelease.created_at) }}</time>
+              <time v-if="selectedRelease.published_at">发布于 {{ formatTime(selectedRelease.published_at) }}</time>
+            </div>
+          </div>
+        </section>
+
+        <section
+          v-else
+          id="release-panel-artifacts"
+          class="release-tab-panel release-artifacts"
+          role="tabpanel"
+          aria-labelledby="release-tab-artifacts"
+        >
+          <div class="release-section-heading">
+            <div>
+              <h4>更新包</h4>
+              <span>{{ selectedRelease.artifacts.length }} 个目标</span>
+            </div>
+            <button
+              class="text-button"
+              type="button"
+              :disabled="Boolean(operation) || !canPublishArtifacts(selectedRelease)"
+              @click="openUploadDrawer(selectedRelease)"
+            ><Plus :size="15" />添加更新包</button>
+          </div>
+
+          <div v-if="selectedRelease.artifacts.length === 0" class="release-empty-row release-tab-empty">
+            <FileArchive :size="18" />尚未添加更新包
+          </div>
+          <div v-else class="artifact-list">
+            <article v-for="artifact in selectedRelease.artifacts" :key="artifact.id" class="artifact-row">
+              <span class="artifact-icon"><FileArchive :size="17" /></span>
+              <div class="artifact-name">
+                <strong :title="artifact.file_name">{{ artifact.file_name }}</strong>
+                <span>{{ artifact.os }} / {{ artifact.native_arch }} / {{ artifact.package_type }}</span>
+              </div>
+              <span :class="['artifact-status', artifact.status]">
+                {{ artifact.status === 'published' ? '已发布' : '待发布' }}
+              </span>
+              <div class="artifact-integrity">
+                <span>{{ formatBytes(artifact.size_bytes) }}</span>
+                <code :title="artifact.sha256">{{ artifact.sha256.slice(0, 12) }}</code>
+              </div>
+              <button
+                v-if="artifact.status === 'draft'"
+                class="icon-button danger"
+                type="button"
+                title="移除更新包"
+                :aria-label="`移除 ${artifact.file_name}`"
+                :disabled="Boolean(operation)"
+                @click="$emit('deleteArtifact', selectedRelease.id, artifact.id)"
+              >
+                <LoaderCircle v-if="isBusy(artifact.id) && operation === 'deleting'" class="spin" :size="15" />
+                <Trash2 v-else :size="15" />
+              </button>
+            </article>
+          </div>
+        </section>
+      </article>
+    </section>
+    <WorkspaceDrawer
+      v-if="operationDrawer"
+      :key="operationDrawer"
+      :title="operationDrawerTitle"
+      :description="operationDrawerDescription"
+      :size="operationDrawer === 'upload' ? 'wide' : 'medium'"
+      :modal="true"
+      :busy="Boolean(operation)"
+      @close="closeOperationDrawer"
+    >
+      <form v-if="operationDrawer === 'create'" id="create-agent-release-form" class="drawer-form" @submit.prevent="submitCreateRelease">
         <label class="release-create-file-picker">
-          <span>更新文件 <i>用于识别版本</i></span>
+          <span>更新文件 <i>可选，用于识别版本</i></span>
           <span
             class="file-button"
             :class="{ dragging: isFileDragActive(createReleaseDropKey), disabled: operation }"
@@ -808,7 +1335,7 @@ function toggleRelease(releaseId: string) {
             @dragover="fileDragOver"
             @drop.prevent="dropCreateReleaseFiles"
           >
-            <Upload :size="17" />
+            <Upload :size="18" />
             <span>
               <strong>{{ isFileDragActive(createReleaseDropKey) ? '松开即可添加文件' : createReleaseFileSummary }}</strong>
               <small>可同时选择 .bin/.exe 及同名 .sha256</small>
@@ -822,15 +1349,14 @@ function toggleRelease(releaseId: string) {
               @change="chooseCreateReleaseFiles"
             />
           </span>
-          <small v-if="createReleaseFileError" class="artifact-file-error" role="alert">
-            {{ createReleaseFileError }}
-          </small>
+          <small v-if="createReleaseFileError" class="artifact-file-error" role="alert">{{ createReleaseFileError }}</small>
         </label>
         <label>
           <span>版本号</span>
           <input
             v-model.trim="form.version"
             required
+            autofocus
             placeholder="例如：1.4.0"
             autocomplete="off"
             :disabled="createReleaseVersionConflict"
@@ -841,512 +1367,180 @@ function toggleRelease(releaseId: string) {
         </label>
         <label>
           <span>发布说明 <i>可选</i></span>
-          <textarea v-model.trim="form.notes" placeholder="本次更新内容"></textarea>
+          <textarea v-model.trim="form.notes" rows="6" placeholder="本次更新内容"></textarea>
         </label>
-        <button
-          class="primary-button"
-          type="submit"
-          :disabled="Boolean(operation) || createReleaseVersionConflict || !form.version.trim()"
-        >
-          <LoaderCircle v-if="operation === 'creating'" class="spin" :size="16" />
-          <Plus v-else :size="16" />
-          {{ operation === 'creating' ? '正在创建' : '创建草稿' }}
-        </button>
       </form>
-    </section>
 
-    <section class="release-list" aria-labelledby="agent-release-list-title">
-      <div class="release-list-heading">
-        <div>
-          <span class="section-kicker">Release history</span>
-          <h3 id="agent-release-list-title">版本与更新状态</h3>
-        </div>
-        <span>{{ releases.length }} 个版本</span>
-      </div>
-
-      <div v-if="releases.length === 0" class="page-empty update-empty">
-        <span><PackageCheck :size="24" /></span>
-        <strong>暂无 Agent 更新版本</strong>
-        <p>创建草稿后即可上传面向不同实例的可执行文件。</p>
-      </div>
-
-      <article
-        v-for="release in releases"
-        :key="release.id"
-        class="update-release-card"
-        :class="{ collapsed: isReleaseCollapsed(release.id) }"
+      <form
+        v-else-if="operationDrawer === 'edit' && selectedRelease"
+        id="edit-agent-release-form"
+        class="drawer-form"
+        @submit.prevent="saveRelease(selectedRelease.id)"
       >
-        <header class="release-card-header">
-          <div class="release-identity">
-            <div class="release-badges">
-              <span :class="['release-status', release.status]">{{ releaseStatusText[release.status] }}</span>
-              <span
-                v-if="release.status === 'published'"
-                :class="['rollout-status', release.rollout_state]"
-              >{{ rolloutStatusText[release.rollout_state] }}</span>
-            </div>
-            <div v-if="editingReleaseId !== release.id">
-              <h3>Agent {{ release.version }}</h3>
-              <p v-if="release.notes" class="release-notes" :title="release.notes">{{ release.notes }}</p>
-              <p v-else class="release-notes empty">未填写发布说明</p>
-            </div>
-          </div>
+        <label>
+          <span>版本号</span>
+          <input v-model.trim="draftEdits[selectedRelease.id].version" required autofocus autocomplete="off" />
+        </label>
+        <label>
+          <span>发布说明 <i>可选</i></span>
+          <textarea v-model.trim="draftEdits[selectedRelease.id].notes" rows="8"></textarea>
+        </label>
+      </form>
 
-          <div v-if="editingReleaseId !== release.id" class="release-actions">
-            <time :title="formatTime(release.published_at || release.created_at)">
-              {{ release.status === 'published' ? `发布于 ${formatTime(release.published_at)}` : `创建于 ${formatTime(release.created_at)}` }}
-            </time>
-            <template v-if="release.status === 'draft'">
-              <button
-                class="icon-button"
-                type="button"
-                title="编辑草稿"
-                :aria-label="`编辑 Agent ${release.version} 草稿`"
-                :disabled="Boolean(operation)"
-                @click="editRelease(release)"
-              >
-                <Pencil :size="15" />
-              </button>
-            </template>
-            <span class="release-delete-control" :title="deleteReleaseTitle(release)">
-              <button
-                class="icon-button danger"
-                type="button"
-                :aria-label="deleteReleaseLabel(release)"
-                :disabled="Boolean(operation) || activeAttemptCount(release) > 0"
-                @click="$emit('deleteRelease', release)"
-              >
-                <LoaderCircle v-if="isBusy(release.id) && operation === 'deleting'" class="spin" :size="15" />
-                <Trash2 v-else :size="15" />
-              </button>
-            </span>
-            <button
-              v-if="draftArtifactCount(release) > 0"
-              class="primary-button release-publish-button"
-              type="button"
-              :title="release.status === 'published' ? '发布新增更新包' : '发布更新'"
-              :disabled="Boolean(operation) || !canPublishArtifacts(release)"
-              @click="release.status === 'draft' ? openRolloutSelector(release, 'publish') : $emit('publishRelease', release)"
-            >
-              <LoaderCircle v-if="isBusy(release.id) && operation === 'publishing'" class="spin" :size="15" />
-              <Send v-else :size="15" />{{ release.status === 'published' ? '发布新增包' : '发布' }}
-            </button>
-            <button
-              class="icon-button release-collapse-button"
-              :class="{ expanded: !isReleaseCollapsed(release.id) }"
-              type="button"
-              :title="isReleaseCollapsed(release.id) ? '展开版本详情' : '折叠版本详情'"
-              :aria-label="`${isReleaseCollapsed(release.id) ? '展开' : '折叠'} Agent ${release.version} 版本详情`"
-              :aria-expanded="!isReleaseCollapsed(release.id)"
-              :aria-controls="`release-body-${release.id}`"
-              @click="toggleRelease(release.id)"
-            >
-              <ChevronDown :size="16" />
-            </button>
-          </div>
-        </header>
-
-        <div
-          v-show="!isReleaseCollapsed(release.id)"
-          :id="`release-body-${release.id}`"
-          class="release-card-body"
+      <form
+        v-else-if="operationDrawer === 'upload' && selectedRelease"
+        id="upload-agent-artifact-form"
+        class="artifact-upload-form"
+        @submit.prevent="submitArtifacts(selectedRelease)"
+      >
+        <label
+          :class="['artifact-batch-picker', { dragging: batchDragActive[selectedRelease.id], disabled: operation }]"
+          @dragenter="batchDragEnter(selectedRelease.id, $event)"
+          @dragleave="batchDragLeave(selectedRelease.id)"
+          @dragover="fileDragOver"
+          @drop.prevent="dropBatchFiles(selectedRelease.id, $event)"
         >
-          <form
-            v-if="editingReleaseId === release.id"
-            class="release-edit-form"
-            @submit.prevent="saveRelease(release.id)"
-          >
-            <label>
-              <span>版本号</span>
-              <input v-model.trim="draftEdits[release.id].version" required autocomplete="off" />
-            </label>
-            <label>
-              <span>发布说明 <i>可选</i></span>
-              <textarea v-model.trim="draftEdits[release.id].notes"></textarea>
-            </label>
-            <div class="release-edit-actions">
-              <button class="text-button" type="button" :disabled="Boolean(operation)" @click="cancelEdit(release.id)">
-                <X :size="15" />取消
-              </button>
-              <button class="primary-button" type="submit" :disabled="Boolean(operation)">
-                <LoaderCircle v-if="isBusy(release.id) && operation === 'saving'" class="spin" :size="15" />
-                <Save v-else :size="15" />保存草稿
-              </button>
-            </div>
-          </form>
+          <Upload :size="18" />
+          <span>
+            <strong>{{ batchDragActive[selectedRelease.id] ? '松开即可添加多个文件' : '批量添加更新包' }}</strong>
+            <small>同时选择更新包及其同名 .sha256 文件</small>
+          </span>
+          <input
+            :key="batchInputKeys[selectedRelease.id]"
+            type="file"
+            accept=".bin,.exe,.sha256"
+            multiple
+            :disabled="Boolean(operation)"
+            @change="chooseBatchFiles(selectedRelease.id, $event)"
+          />
+        </label>
+        <small v-if="batchFileErrors[selectedRelease.id]" class="artifact-file-error" role="alert">
+          {{ batchFileErrors[selectedRelease.id] }}
+        </small>
 
-          <section v-if="release.status === 'published'" class="release-rollout-control">
-            <div class="release-rollout-summary">
-              <span :class="['rollout-state-icon', release.rollout_state]">
-                <Pause v-if="isRolloutPaused(release)" :size="16" />
-                <Undo2 v-else-if="['rollback_active', 'rolled_back', 'rollback_partial'].includes(release.rollout_state)" :size="16" />
-                <Send v-else :size="16" />
-              </span>
-              <div>
-                <strong>{{ rolloutStatusText[release.rollout_state] }}</strong>
-                <small>
-                  {{ isCanaryRollout(release) ? `${release.coverage.selected_instances} 个灰度目标` : '全量发布策略' }}
-                  <template v-if="release.rollout_updated_at"> · {{ formatTime(release.rollout_updated_at) }}</template>
-                </small>
-              </div>
-            </div>
-            <div class="release-rollout-actions">
+        <div class="artifact-upload-rows">
+          <div v-for="row in uploadRowsFor(selectedRelease.id)" :key="row.id" class="artifact-upload-row">
+            <div class="artifact-upload-target">
+              <label>
+                <span>目标系统</span>
+                <select v-model="row.os" @change="changeArtifactOs(row)">
+                  <option v-if="!row.os" value="" disabled>请选择系统</option>
+                  <option value="linux">Linux</option>
+                  <option value="windows">Windows</option>
+                  <option value="macos">macOS</option>
+                </select>
+              </label>
+              <label>
+                <span>原生架构</span>
+                <select v-model="row.native_arch" required @change="changeArtifactArchitecture(row)">
+                  <option v-if="!row.native_arch" value="" disabled>请选择架构</option>
+                  <option v-for="architecture in nativeArchitectures(row.os)" :key="architecture" :value="architecture">
+                    {{ architecture }}
+                  </option>
+                </select>
+              </label>
               <button
-                v-if="isCanaryRollout(release)"
-                class="text-button"
-                type="button"
-                title="添加灰度批次"
-                :disabled="Boolean(operation)"
-                @click="openRolloutSelector(release, 'add')"
-              >
-                <UserPlus :size="15" />添加批次
-              </button>
-              <button
-                v-if="isRolloutActive(release)"
-                class="text-button"
-                type="button"
-                title="暂停尚未下发的任务"
-                :disabled="Boolean(operation)"
-                @click="$emit('pauseRollout', release)"
-              >
-                <Pause :size="15" />暂停
-              </button>
-              <button
-                v-if="isRolloutPaused(release)"
-                class="text-button"
-                type="button"
-                title="恢复发布"
-                :disabled="Boolean(operation)"
-                @click="$emit('resumeRollout', release)"
-              >
-                <Play :size="15" />恢复
-              </button>
-              <button
-                v-if="isCanaryRollout(release)"
-                class="text-button"
-                type="button"
-                title="晋级为全量发布"
-                :disabled="Boolean(operation)"
-                @click="$emit('promoteRollout', release)"
-              >
-                <ArrowUpCircle :size="15" />晋级全量
-              </button>
-              <button
-                v-if="canRollbackRelease(release)"
-                class="text-button danger"
-                type="button"
-                title="批量回滚此版本"
-                :disabled="Boolean(operation)"
-                @click="$emit('rollbackRelease', release)"
-              >
-                <Undo2 :size="15" />批量回滚
-              </button>
-            </div>
-          </section>
-
-          <div class="release-coverage" :aria-label="`Agent ${release.version} 覆盖情况`">
-            <span><strong>{{ release.coverage.selected_instances }}</strong> 显式目标</span>
-            <span><strong>{{ release.coverage.covered_instances }}</strong> / {{ release.coverage.eligible_instances }} 平台覆盖</span>
-            <span><strong>{{ attemptStats(release).upgradeSucceeded }}</strong> 升级成功</span>
-            <span><strong>{{ attemptStats(release).rollbackSucceeded }}</strong> 回滚成功</span>
-            <span><strong>{{ attemptStats(release).active }}</strong> 处理中</span>
-            <span :class="{ warning: attemptStats(release).failed > 0 }">
-              <strong>{{ attemptStats(release).failed }}</strong> 失败
-            </span>
-            <span v-if="release.rollback_coverage.succeeded_upgrades > 0">
-              <strong>{{ release.rollback_coverage.rollback_supported }}</strong> / {{ release.rollback_coverage.succeeded_upgrades }} 支持回滚协议
-            </span>
-            <span
-              v-if="release.rollback_coverage.unavailable > 0"
-              class="warning"
-            >
-              <ShieldAlert :size="14" />{{ release.rollback_coverage.unavailable }} 不可回滚
-            </span>
-            <span :class="{ warning: release.coverage.missing_artifact_instances > 0 }">
-              <CircleAlert :size="14" />{{ release.coverage.missing_artifact_instances }} 缺少可执行文件
-            </span>
-            <span :class="{ warning: release.coverage.unprivileged_instances > 0 }">
-              <ShieldAlert :size="14" />{{ release.coverage.unprivileged_instances }} 权限不足
-            </span>
-          </div>
-
-          <section class="release-artifacts" :aria-labelledby="`artifacts-${release.id}`">
-          <div class="release-section-heading">
-            <div>
-              <h4 :id="`artifacts-${release.id}`">可执行文件</h4>
-              <span>{{ release.artifacts.length }} 个目标</span>
-            </div>
-          </div>
-
-          <div v-if="release.artifacts.length === 0" class="release-empty-row">
-            <FileArchive :size="17" />尚未添加可执行文件
-          </div>
-          <div v-else class="artifact-list">
-            <article v-for="artifact in release.artifacts" :key="artifact.id" class="artifact-row">
-              <span class="artifact-icon"><FileArchive :size="17" /></span>
-              <div class="artifact-name">
-                <strong :title="artifact.file_name">{{ artifact.file_name }}</strong>
-                <span>{{ artifact.os }} / {{ artifact.native_arch }} / {{ artifact.package_type }}</span>
-              </div>
-              <span
-                :class="['artifact-status', artifact.status]"
-                :title="artifact.status === 'published' ? `发布于 ${formatTime(artifact.published_at)}` : '再次确认发布后才会向实例推送'"
-              >
-                {{ artifact.status === 'published' ? '已发布' : '待发布' }}
-              </span>
-              <div class="artifact-integrity">
-                <span>{{ formatBytes(artifact.size_bytes) }}</span>
-                <code :title="artifact.sha256">{{ artifact.sha256.slice(0, 12) }}</code>
-              </div>
-              <button
-                v-if="artifact.status === 'draft'"
                 class="icon-button danger"
                 type="button"
-                title="移除可执行文件"
-                :aria-label="`移除 ${artifact.file_name}`"
+                title="移除上传目标"
+                :aria-label="`移除上传目标 ${row.file?.name || row.os}`"
                 :disabled="Boolean(operation)"
-                @click="$emit('deleteArtifact', release.id, artifact.id)"
-              >
-                <LoaderCircle v-if="isBusy(artifact.id) && operation === 'deleting'" class="spin" :size="15" />
-                <Trash2 v-else :size="15" />
-              </button>
-            </article>
-          </div>
+                @click="removeUploadRow(selectedRelease.id, row.id)"
+              ><Trash2 :size="15" /></button>
+            </div>
 
-          <form class="artifact-upload-form" @submit.prevent="submitArtifacts(release)">
-            <div class="artifact-upload-toolbar">
-              <label
-                :class="[
-                  'artifact-batch-picker',
-                  { dragging: batchDragActive[release.id], disabled: operation },
-                ]"
-                @dragenter="batchDragEnter(release.id, $event)"
-                @dragleave="batchDragLeave(release.id)"
-                @dragover="fileDragOver"
-                @drop.prevent="dropBatchFiles(release.id, $event)"
-              >
+            <label
+              :class="['artifact-file-picker', { dragging: isFileDragActive(uploadRowDropKey(row.id, 'executable')), selected: row.file, disabled: operation }]"
+              @dragenter="fileDragEnter(uploadRowDropKey(row.id, 'executable'), $event)"
+              @dragleave="fileDragLeave(uploadRowDropKey(row.id, 'executable'))"
+              @dragover="fileDragOver"
+              @drop.prevent="dropArtifactFile(row, $event)"
+            >
+              <span>可执行文件</span>
+              <span class="file-button" :title="row.file?.name">
                 <Upload :size="17" />
                 <span>
-                  <strong>{{ batchDragActive[release.id] ? '松开即可添加多个文件' : '批量添加更新包' }}</strong>
-                  <small>同时选择更新包及其同名 .sha256 文件</small>
+                  <strong>{{ row.file?.name || '选择单个文件' }}</strong>
+                  <small>{{ row.inference === 'needs_target' ? '请确认系统和架构' : row.inference === 'needs_architecture' ? '请确认架构' : `仅支持 ${artifactAccept(row)} 文件` }}</small>
                 </span>
                 <input
-                  :key="batchInputKeys[release.id]"
+                  :key="fileInputKeys[row.id] || 0"
                   type="file"
-                  accept=".bin,.exe,.sha256"
-                  multiple
+                  :accept="artifactAccept(row)"
                   :disabled="Boolean(operation)"
-                  @change="chooseBatchFiles(release.id, $event)"
+                  @change="chooseArtifactFile(row, $event)"
                 />
-              </label>
-              <button class="text-button" type="button" :disabled="Boolean(operation)" @click="addUploadRow(release.id)">
-                <Plus :size="15" />添加目标
-              </button>
-              <button
-                class="primary-button artifact-upload-button"
-                type="submit"
-                :disabled="Boolean(operation) || !uploadableRowsFor(release.id).length"
-              >
-                <LoaderCircle v-if="isBusy(release.id) && operation === 'uploading'" class="spin" :size="15" />
-                <Upload v-else :size="15" />上传 {{ uploadableRowsFor(release.id).length }} 个
-              </button>
-            </div>
-            <small v-if="batchFileErrors[release.id]" class="artifact-file-error" role="alert">
-              {{ batchFileErrors[release.id] }}
-            </small>
+              </span>
+            </label>
 
-            <div class="artifact-upload-rows">
-              <div v-for="row in uploadRowsFor(release.id)" :key="row.id" class="artifact-upload-row">
-                <label>
-                  <span>目标系统</span>
-                  <select v-model="row.os" @change="changeArtifactOs(row)">
-                    <option v-if="!row.os" value="" disabled>请选择系统</option>
-                    <option value="linux">Linux</option>
-                    <option value="windows">Windows</option>
-                    <option value="macos">macOS</option>
-                  </select>
-                </label>
-                <label>
-                  <span>分发格式</span>
-                  <input value="standalone" disabled />
-                </label>
-                <label>
-                  <span>原生架构</span>
-                  <select v-model="row.native_arch" required @change="changeArtifactArchitecture(row)">
-                    <option v-if="!row.native_arch" value="" disabled>请选择架构</option>
-                    <option
-                      v-for="architecture in nativeArchitectures(row.os)"
-                      :key="architecture"
-                      :value="architecture"
-                    >
-                      {{ architecture }}
-                    </option>
-                  </select>
-                </label>
-                <label
-                  :class="[
-                    'artifact-file-picker',
-                    {
-                      dragging: isFileDragActive(uploadRowDropKey(row.id, 'executable')),
-                      selected: row.file,
-                      disabled: operation,
-                    },
-                  ]"
-                  @dragenter="fileDragEnter(uploadRowDropKey(row.id, 'executable'), $event)"
-                  @dragleave="fileDragLeave(uploadRowDropKey(row.id, 'executable'))"
-                  @dragover="fileDragOver"
-                  @drop.prevent="dropArtifactFile(row, $event)"
-                >
-                  <span>可执行文件</span>
-                  <span class="file-button" :title="row.file?.name">
-                    <Upload :size="17" />
-                    <span>
-                      <strong>{{ row.file?.name || '选择单个文件' }}</strong>
-                      <small>{{ row.inference === 'needs_target' ? '请确认系统和架构后上传' : row.inference === 'needs_architecture' ? '请确认架构后上传' : `仅支持 ${artifactAccept(row)} 文件` }}</small>
-                    </span>
-                    <input
-                      :key="fileInputKeys[row.id] || 0"
-                      type="file"
-                      :accept="artifactAccept(row)"
-                      :disabled="Boolean(operation)"
-                      @change="chooseArtifactFile(row, $event)"
-                    />
-                  </span>
-                </label>
-                <label
-                  :class="[
-                    'artifact-checksum-picker',
-                    {
-                      dragging: isFileDragActive(uploadRowDropKey(row.id, 'checksum')),
-                      selected: row.checksum_file,
-                      disabled: operation,
-                    },
-                  ]"
-                  @dragenter="fileDragEnter(uploadRowDropKey(row.id, 'checksum'), $event)"
-                  @dragleave="fileDragLeave(uploadRowDropKey(row.id, 'checksum'))"
-                  @dragover="fileDragOver"
-                  @drop.prevent="dropChecksumFile(row, $event)"
-                >
-                  <span>SHA-256 文件</span>
-                  <span class="file-button" :title="row.checksum_file?.name">
-                    <FileArchive :size="17" />
-                    <span>
-                      <strong>{{ row.checksum_file?.name || '选择同名 .sha256' }}</strong>
-                      <small>{{ row.file ? `${row.file.name}.sha256` : '需与可执行文件同名' }}</small>
-                    </span>
-                    <input
-                      :key="checksumInputKeys[row.id] || 0"
-                      type="file"
-                      accept=".sha256"
-                      :disabled="Boolean(operation)"
-                      @change="chooseChecksumFile(row, $event)"
-                    />
-                  </span>
-                </label>
-                <div class="artifact-row-actions">
-                  <button
-                    v-if="row.file"
-                    class="icon-button"
-                    type="button"
-                    title="单独上传此目标"
-                    :aria-label="`上传 ${row.file.name}`"
-                    :disabled="Boolean(operation) || !row.os || !row.native_arch || !row.checksum_file"
-                    @click="submitArtifacts(release, row.id)"
-                  >
-                    <Upload :size="15" />
-                  </button>
-                  <button
-                    class="icon-button danger"
-                    type="button"
-                    title="移除上传目标"
-                    :aria-label="`移除上传目标 ${row.file?.name || row.os}`"
-                    :disabled="Boolean(operation)"
-                    @click="removeUploadRow(release.id, row.id)"
-                  >
-                    <Trash2 :size="15" />
-                  </button>
-                </div>
-                <small v-if="row.error" class="artifact-file-error" role="alert">{{ row.error }}</small>
-              </div>
-            </div>
-          </form>
-          </section>
-
-          <section class="release-attempts" :aria-labelledby="`attempts-${release.id}`">
-            <div class="release-section-heading">
-              <div>
-                <h4 :id="`attempts-${release.id}`">实例更新</h4>
-                <span>{{ attemptsFor(release).length }} 条记录</span>
-              </div>
-            </div>
-
-            <div v-if="attemptsFor(release).length === 0" class="release-empty-row">
-              <Clock3 :size="17" />尚无实例更新记录
-            </div>
-            <div v-else class="update-attempts-table">
-              <div class="update-attempts-head">
-                <span>实例</span><span>操作</span><span>版本</span><span>状态</span><span>说明</span><span>更新时间</span><span></span>
-              </div>
-              <article v-for="attempt in attemptsFor(release)" :key="attempt.id" class="update-attempt-row">
-                <div class="attempt-instance">
-                  <strong :title="attemptInstanceName(attempt)">{{ attemptInstanceName(attempt) }}</strong>
-                  <small :title="attempt.instance_id">{{ attempt.instance_id.slice(0, 12) }}</small>
-                </div>
-                <span :class="['attempt-operation', attempt.operation]">
-                  <ArrowUpCircle v-if="attempt.operation === 'upgrade'" :size="13" />
-                  <Undo2 v-else :size="13" />
-                  {{ attempt.operation === 'upgrade' ? '升级' : '回滚' }}
+            <label
+              :class="['artifact-checksum-picker', { dragging: isFileDragActive(uploadRowDropKey(row.id, 'checksum')), selected: row.checksum_file, disabled: operation }]"
+              @dragenter="fileDragEnter(uploadRowDropKey(row.id, 'checksum'), $event)"
+              @dragleave="fileDragLeave(uploadRowDropKey(row.id, 'checksum'))"
+              @dragover="fileDragOver"
+              @drop.prevent="dropChecksumFile(row, $event)"
+            >
+              <span>SHA-256 文件</span>
+              <span class="file-button" :title="row.checksum_file?.name">
+                <FileArchive :size="17" />
+                <span>
+                  <strong>{{ row.checksum_file?.name || '选择同名 .sha256' }}</strong>
+                  <small>{{ row.file ? `${row.file.name}.sha256` : '需与可执行文件同名' }}</small>
                 </span>
-                <span class="attempt-versions">{{ attempt.from_version }} -&gt; {{ attempt.target_version }}</span>
-                <span :class="['attempt-status', attempt.status]" :title="attemptStatusText[attempt.status]">
-                  {{ attemptStatusText[attempt.status] }}
-                </span>
-                <span class="attempt-message" :title="attempt.message || '暂无补充说明'">{{ attempt.message || '—' }}</span>
-                <time>{{ formatTime(attempt.updated_at) }}</time>
-                <div class="attempt-actions">
-                  <button
-                    v-if="canRetryAttempt(release, attempt)"
-                    class="icon-button"
-                    type="button"
-                    title="重试此任务"
-                    :aria-label="`重试实例 ${attempt.instance_id} 的${attempt.operation === 'upgrade' ? '升级' : '回滚'}任务`"
-                    :disabled="Boolean(operation)"
-                    @click="$emit('retryAttempt', attempt)"
-                  >
-                    <LoaderCircle v-if="isBusy(attempt.id) && operation === 'retrying'" class="spin" :size="15" />
-                    <RotateCcw v-else :size="15" />
-                  </button>
-                  <button
-                    v-else-if="canRollbackInstance(release, attempt)"
-                    class="icon-button danger"
-                    type="button"
-                    title="回滚此实例"
-                    :aria-label="`将实例 ${attempt.instance_id} 回滚到 ${attempt.from_version}`"
-                    :disabled="Boolean(operation)"
-                    @click="$emit('rollbackInstance', release, attempt)"
-                  >
-                    <LoaderCircle v-if="isBusy(attempt.id) && operation === 'rolling_back'" class="spin" :size="15" />
-                    <Undo2 v-else :size="15" />
-                  </button>
-                  <button
-                    v-else-if="canReupgradeInstance(release, attempt)"
-                    class="icon-button"
-                    type="button"
-                    title="重新升级此实例"
-                    :aria-label="`将实例 ${attempt.instance_id} 重新升级到 ${release.version}`"
-                    :disabled="Boolean(operation)"
-                    @click="$emit('reupgradeInstance', release, attempt)"
-                  >
-                    <LoaderCircle v-if="isBusy(attempt.id) && operation === 'reupgrading'" class="spin" :size="15" />
-                    <RefreshCw v-else :size="15" />
-                  </button>
-                </div>
-              </article>
-            </div>
-          </section>
+                <input
+                  :key="checksumInputKeys[row.id] || 0"
+                  type="file"
+                  accept=".sha256"
+                  :disabled="Boolean(operation)"
+                  @change="chooseChecksumFile(row, $event)"
+                />
+              </span>
+            </label>
+            <small v-if="row.error" class="artifact-file-error" role="alert">{{ row.error }}</small>
+          </div>
         </div>
-      </article>
-    </section>
+      </form>
+
+      <template #footer>
+        <template v-if="operationDrawer === 'create'">
+          <button class="text-button" type="button" :disabled="Boolean(operation)" @click="closeOperationDrawer">
+            <X :size="15" />取消
+          </button>
+          <button
+            class="primary-button"
+            type="submit"
+            form="create-agent-release-form"
+            :disabled="Boolean(operation) || createReleaseVersionConflict || !form.version.trim()"
+          >
+            <LoaderCircle v-if="operation === 'creating'" class="spin" :size="16" />
+            <Plus v-else :size="16" />{{ operation === 'creating' ? '正在创建' : '创建草稿' }}
+          </button>
+        </template>
+        <template v-else-if="operationDrawer === 'edit' && selectedRelease">
+          <button class="text-button" type="button" :disabled="Boolean(operation)" @click="cancelEdit(selectedRelease.id)">
+            <X :size="15" />取消
+          </button>
+          <button class="primary-button" type="submit" form="edit-agent-release-form" :disabled="Boolean(operation)">
+            <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'saving'" class="spin" :size="15" />
+            <Save v-else :size="15" />保存草稿
+          </button>
+        </template>
+        <template v-else-if="operationDrawer === 'upload' && selectedRelease">
+          <button class="text-button" type="button" :disabled="Boolean(operation)" @click="addUploadRow(selectedRelease.id)">
+            <Plus :size="15" />添加目标
+          </button>
+          <button
+            class="primary-button"
+            type="submit"
+            form="upload-agent-artifact-form"
+            :disabled="Boolean(operation) || !uploadableRowsFor(selectedRelease.id).length"
+          >
+            <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'uploading'" class="spin" :size="15" />
+            <Upload v-else :size="15" />上传 {{ uploadableRowsFor(selectedRelease.id).length }} 个
+          </button>
+        </template>
+      </template>
+    </WorkspaceDrawer>
   </section>
 
   <AgentRolloutSelectorModal

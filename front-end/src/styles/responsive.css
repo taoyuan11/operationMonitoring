@@ -32,7 +32,6 @@
   .admin-list-card { min-height: auto; flex: none; overflow: visible; }
   .admin-list-card > .approval-list { min-height: auto; flex: none; overflow: visible; scrollbar-gutter: auto; }
   .admin-list-card > .logs-table { min-height: auto; flex: none; overflow-x: auto; overflow-y: visible; scrollbar-gutter: auto; }
-  .admin-list-card > .audit-table { min-height: auto; flex: none; overflow-x: auto; overflow-y: visible; scrollbar-gutter: auto; }
   .topbar { grid-template-columns: 1fr auto; gap: 12px; min-height: 68px; padding: 10px 0; }
   .health-pill { display: none; }
   .top-actions { grid-column: 2; }
@@ -80,13 +79,6 @@
   .theme-mode-options { grid-template-columns: 1fr; }
   .theme-mode-option { min-height: 60px; }
   .appearance-save-row { align-items: flex-start; flex-direction: column; }
-  .audit-heading { align-items: flex-start; flex-direction: column; }
-  .audit-toolbar-actions { width: 100%; }
-  .audit-toolbar-actions .text-button { flex: 1; }
-  .audit-filters { grid-template-columns: 1fr 1fr; }
-  .audit-filter-wide { grid-column: 1 / -1; }
-  .audit-detail dl { grid-template-columns: 1fr 1fr; }
-  .audit-pagination { align-items: flex-start; flex-direction: column; }
   .terminal-screen { min-height: 320px; }
 }
 
@@ -99,7 +91,6 @@
   .admin-list-card { min-height: auto; flex: none; overflow: visible; }
   .admin-list-card > .approval-list { min-height: auto; flex: none; overflow: visible; scrollbar-gutter: auto; }
   .admin-list-card > .logs-table { min-height: auto; flex: none; overflow-x: auto; overflow-y: visible; scrollbar-gutter: auto; }
-  .admin-list-card > .audit-table { min-height: auto; flex: none; overflow-x: auto; overflow-y: visible; scrollbar-gutter: auto; }
 }
 
 @media (max-width: 520px) {
@@ -126,22 +117,6 @@
   .page-header h2 { font-size: 19px; }
   .page-header p { display: none; }
   .admin-content-card { padding: 15px; }
-  .audit-toolbar-actions { gap: 5px; }
-  .audit-filters { grid-template-columns: 1fr; }
-  .audit-filter-wide { grid-column: auto; }
-  .admin-list-card > .audit-table { overflow: visible; border: 0; }
-  .audit-table-head { display: none; }
-  .audit-row { grid-template-columns: minmax(0, 1fr) 34px; gap: 10px; min-width: 0; margin-bottom: 10px; padding: 13px; align-items: start; border: 1px solid var(--line); border-radius: 6px; }
-  .audit-row:last-child { margin-bottom: 0; border-bottom: 1px solid var(--line); }
-  .audit-primary { grid-column: 1; grid-row: 1; flex-direction: row; align-items: center; flex-wrap: wrap; }
-  .audit-row > .icon-button { grid-column: 2; grid-row: 1; }
-  .audit-action { grid-column: 1 / -1; grid-row: 2; }
-  .audit-context { grid-column: 1 / -1; grid-row: 3; }
-  .audit-request { grid-column: 1 / -1; grid-row: 4; }
-  .audit-action strong, .audit-action p, .audit-context strong { overflow: visible; text-overflow: clip; white-space: normal; }
-  .audit-detail { grid-column: 1 / -1; grid-row: 5; margin: 2px 0 0; }
-  .audit-detail dl { grid-template-columns: 1fr; }
-  .audit-pagination > div { width: 100%; justify-content: space-between; }
   .appearance-current { display: none; }
   .appearance-settings-body { gap: 16px; }
   .custom-color-picker { width: 100%; grid-template-columns: auto auto 28px 1fr; }

@@ -25,7 +25,7 @@ USER app
 
 EXPOSE 13500
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=5 \
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5m --retries=5 \
     CMD curl --fail --silent --show-error http://127.0.0.1:13500/api/health >/dev/null || exit 1
 
 ENTRYPOINT ["operation-monitoring-backend"]

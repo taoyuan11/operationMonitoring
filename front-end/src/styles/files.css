@@ -48,12 +48,8 @@
 .metric-history-current strong { color: var(--text); font-size: 15px; font-variant-numeric: tabular-nums; }
 .metric-history-current small { overflow: hidden; color: #69746f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .metric-chart-shell { position: relative; height: 132px; margin-top: 8px; }
-.metric-chart { display: block; width: 100%; height: 100%; overflow: visible; touch-action: pan-y; }
-.metric-chart.interactive { cursor: crosshair; }
-.metric-chart-grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
-.metric-chart-line { fill: none; stroke: var(--metric-color); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 0 4px color-mix(in srgb, var(--metric-color) 25%, transparent)); }
-.metric-chart-guide { stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 3 3; }
-.metric-chart-point { fill: var(--surface-inset); stroke: var(--metric-color); stroke-width: 2; }
+.metric-chart { display: block; width: 100%; height: 100%; touch-action: pan-y; }
+.metric-chart.interactive canvas { cursor: crosshair; }
 .metric-chart-state { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 6px; color: var(--muted); background: color-mix(in srgb, var(--surface-inset) 78%, transparent); font-size: 10px; }
 .metric-history-card > footer { display: flex; justify-content: space-between; gap: 8px; margin-top: 3px; color: #59645f; font-size: 8px; font-variant-numeric: tabular-nums; }
 

@@ -101,6 +101,10 @@ watch(
   () => props.instance.id,
   () => {
     activeTab.value = 'details'
+    historyMetrics.value = []
+    historyFrom.value = 0
+    historyTo.value = 0
+    historyError.value = ''
     dockerStatus.value = null
     void loadDeviceProfile()
     if (props.isAdmin) {
@@ -308,9 +312,6 @@ async function loadMetricHistory() {
   const range = selectedHistoryRange.value
   const to = Math.floor(Date.now() / 1000)
   const from = to - range.seconds
-  historyFrom.value = from
-  historyTo.value = to
-  historyMetrics.value = []
   historyError.value = ''
   historyLoading.value = true
 
@@ -327,6 +328,8 @@ async function loadMetricHistory() {
     )
     if (historyAbort !== controller || controller.signal.aborted) return
     historyMetrics.value = metrics
+    historyFrom.value = from
+    historyTo.value = to
   } catch (error) {
     if (historyAbort !== controller || controller.signal.aborted) return
     historyError.value = error instanceof Error ? error.message : '历史指标读取失败'

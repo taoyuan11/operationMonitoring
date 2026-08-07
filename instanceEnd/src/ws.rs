@@ -24,7 +24,7 @@ use crate::{
     outbound::AgentEventSender,
     profile::host_profile,
     remote_desktop::{CAPABILITY as DESKTOP_CAPABILITY, DesktopManager, DesktopOpenRequest},
-    terminal::TerminalManager,
+    terminal::{CAPABILITY as TERMINAL_SHELLS_CAPABILITY, TerminalManager, available_shells},
     update::{PrepareResult, UpdateManager, update_capability},
 };
 
@@ -472,8 +472,19 @@ async fn handle_agent_socket(
                                     &outbound_tx,
                                 );
                             }
-                            AgentOutbound::TerminalOpen { session_id, cols, rows } => {
-                                terminals.open(session_id, cols, rows);
+                            AgentOutbound::TerminalShellsRequest { request_id } => {
+                                outbound_tx.send(AgentInbound::TerminalShellsResponse {
+                                    request_id,
+                                    shells: available_shells(),
+                                })?;
+                            }
+                            AgentOutbound::TerminalOpen {
+                                session_id,
+                                shell,
+                                cols,
+                                rows,
+                            } => {
+                                terminals.open(session_id, shell, cols, rows);
                             }
                             AgentOutbound::TerminalInput { session_id, data } => {
                                 terminals.input(&session_id, &data);
@@ -845,7 +856,11 @@ fn websocket_request(
     identity: &Identity,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     let endpoint = ServerEndpoint::parse(server)?;
-    let mut capabilities = vec![FILE_MANAGER_CAPABILITY, ROLLBACK_CAPABILITY];
+    let mut capabilities = vec![
+        FILE_MANAGER_CAPABILITY,
+        ROLLBACK_CAPABILITY,
+        TERMINAL_SHELLS_CAPABILITY,
+    ];
     if cfg!(windows) {
         capabilities.push(DESKTOP_CAPABILITY);
     }
@@ -895,6 +910,7 @@ mod tests {
             "Bearer secret-1"
         );
         assert!(url.contains(ROLLBACK_CAPABILITY));
+        assert!(url.contains(TERMINAL_SHELLS_CAPABILITY));
         assert_eq!(url.contains(DESKTOP_CAPABILITY), cfg!(windows));
         assert_eq!(url.contains(DOCKER_CAPABILITY), cfg!(target_os = "linux"));
     }

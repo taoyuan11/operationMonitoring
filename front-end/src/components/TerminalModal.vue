@@ -1,181 +1,399 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { FitAddon } from '@xterm/addon-fit'
-import { Terminal } from '@xterm/xterm'
-import '@xterm/xterm/css/xterm.css'
-import { X } from 'lucide-vue-next'
-import type { Instance } from '../types/domain'
+import { computed, ref, watch } from 'vue'
+import {
+  LoaderCircle,
+  Plus,
+  RefreshCw,
+  Server,
+  TerminalSquare,
+  X,
+} from 'lucide-vue-next'
+import ConfirmModal from './ConfirmModal.vue'
+import TerminalSession from './TerminalSession.vue'
+import {
+  activeTerminalSessionCount,
+  listTerminalShells,
+  validCustomShellProgram,
+} from '../api/terminal'
+import type {
+  Instance,
+  TerminalSessionStatus,
+  TerminalShellInfo,
+} from '../types/domain'
 
 const props = defineProps<{
   instance: Instance
+  instances: Instance[]
 }>()
 
 const emit = defineEmits<{
   close: []
 }>()
 
-const terminalElement = ref<HTMLDivElement | null>(null)
-const status = ref('正在连接')
-let socket: WebSocket | null = null
-let terminal: Terminal | null = null
-let fitAddon: FitAddon | null = null
-let resizeObserver: ResizeObserver | null = null
-let closedByUser = false
+type ShellMode = 'auto' | 'detected' | 'custom'
 
-onMounted(() => {
-  terminal = new Terminal({
-    cursorBlink: true,
-    cursorStyle: 'block',
-    convertEol: true,
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-    fontSize: 14,
-    scrollback: 10_000,
-    theme: {
-      background: '#0d141c',
-      foreground: '#e6edf3',
-      cursor: '#6cb6ff',
-      selectionBackground: '#264f78',
-    },
-  })
-  fitAddon = new FitAddon()
-  terminal.loadAddon(fitAddon)
-  terminal.open(terminalElement.value!)
+type WorkspaceSession = {
+  id: string
+  instanceId: string
+  shellLabel: string
+  shellProgram: string | null
+  title: string
+  status: TerminalSessionStatus
+}
 
-  terminal.onData((data) => {
-    sendMessage({ type: 'input', data: encodeUtf8(data) })
-  })
-  terminal.onResize(({ cols, rows }) => {
-    sendMessage({ type: 'resize', cols, rows })
-  })
+const sessions = ref<WorkspaceSession[]>([])
+const activeSessionId = ref<string | null>(null)
+const creatorOpen = ref(true)
+const selectedInstanceId = ref(props.instance.id)
+const shellMode = ref<ShellMode>('auto')
+const detectedProgram = ref('')
+const customProgram = ref('')
+const shellOptions = ref<TerminalShellInfo[]>([])
+const shellsLoading = ref(false)
+const shellsError = ref('')
+const maxSessions = ref(8)
+const closeConfirmationOpen = ref(false)
+const returnSessionId = ref<string | null>(null)
+let sessionSequence = 0
+let shellRequestSequence = 0
 
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  socket = new WebSocket(
-    `${protocol}//${window.location.host}/api/admin/instances/${props.instance.id}/terminal/ws`,
-  )
-  socket.onopen = () => {
-    status.value = '正在启动交互式 Shell'
-    fitTerminal()
-    terminal?.focus()
-  }
-  socket.onmessage = (event) => {
-    if (typeof event.data !== 'string') return
-    try {
-      const message = JSON.parse(event.data) as TerminalServerMessage
-      switch (message.type) {
-        case 'opening':
-          status.value = '正在启动交互式 Shell'
-          break
-        case 'ready':
-          status.value = '已连接'
-          fitTerminal()
-          terminal?.focus()
-          break
-        case 'output':
-          terminal?.write(decodeBase64(message.data))
-          break
-        case 'closed':
-          status.value = '会话已结束'
-          terminal?.writeln(
-            `\r\n\x1b[33m[终端已关闭${message.exit_code == null ? '' : `，退出码 ${message.exit_code}`}${message.reason ? `：${message.reason}` : ''}]\x1b[0m`,
-          )
-          break
-        case 'error':
-          status.value = '连接失败'
-          terminal?.writeln(`\r\n\x1b[31m[${message.message}]\x1b[0m`)
-          break
-      }
-    } catch {
-      terminal?.writeln('\r\n\x1b[31m[收到无法解析的终端消息]\x1b[0m')
-    }
-  }
-  socket.onerror = () => {
-    status.value = '连接错误'
-    terminal?.writeln('\r\n\x1b[31m[终端连接发生错误]\x1b[0m')
-  }
-  socket.onclose = () => {
-    if (!closedByUser && status.value !== '会话已结束' && status.value !== '连接失败') {
-      status.value = '连接已断开'
-      terminal?.writeln('\r\n\x1b[33m[终端连接已断开]\x1b[0m')
-    }
-  }
-
-  resizeObserver = new ResizeObserver(fitTerminal)
-  resizeObserver.observe(terminalElement.value!)
-  window.addEventListener('resize', fitTerminal)
-  requestAnimationFrame(fitTerminal)
+const onlineInstances = computed(() => props.instances.filter((instance) => instance.online))
+const selectedInstance = computed(() =>
+  props.instances.find((instance) => instance.id === selectedInstanceId.value) || null,
+)
+const activeSession = computed(() =>
+  sessions.value.find((session) => session.id === activeSessionId.value) || null,
+)
+const supportsShellSelection = computed(() =>
+  selectedInstance.value?.capabilities?.includes('terminal_shells_v1') === true,
+)
+const selectedInstanceSessionCount = computed(() =>
+  activeTerminalSessionCount(sessions.value, selectedInstanceId.value),
+)
+const activeSessionCount = computed(() =>
+  sessions.value.filter((session) => isActiveStatus(session.status)).length,
+)
+const customProgramValid = computed(() =>
+  validCustomShellProgram(customProgram.value, selectedInstance.value?.os),
+)
+const createDisabled = computed(() => {
+  if (!selectedInstance.value?.online) return true
+  if (selectedInstanceSessionCount.value >= maxSessions.value) return true
+  if (shellMode.value === 'detected') return !detectedProgram.value
+  if (shellMode.value === 'custom') return !supportsShellSelection.value || !customProgramValid.value
+  return false
 })
 
-onBeforeUnmount(() => {
-  closedByUser = true
-  resizeObserver?.disconnect()
-  window.removeEventListener('resize', fitTerminal)
-  socket?.close()
-  terminal?.dispose()
-  socket = null
-  terminal = null
-  fitAddon = null
-})
+watch(
+  selectedInstanceId,
+  () => {
+    resetShellSelection()
+    void loadShellOptions()
+  },
+  { immediate: true },
+)
 
-function fitTerminal() {
-  if (!terminal || !fitAddon || !terminalElement.value) return
+function resetShellSelection() {
+  shellMode.value = 'auto'
+  detectedProgram.value = ''
+  customProgram.value = ''
+  shellOptions.value = []
+  shellsError.value = ''
+  maxSessions.value = 8
+}
+
+async function loadShellOptions() {
+  const request = ++shellRequestSequence
+  const instance = selectedInstance.value
+  if (!instance?.online || !supportsShellSelection.value) {
+    shellsLoading.value = false
+    return
+  }
+  shellsLoading.value = true
+  shellsError.value = ''
   try {
-    fitAddon.fit()
-  } catch {
-    // The modal may be in the middle of unmounting.
+    const response = await listTerminalShells(instance.id)
+    if (request !== shellRequestSequence || selectedInstanceId.value !== instance.id) return
+    shellOptions.value = response.shells
+    maxSessions.value = response.max_sessions
+    detectedProgram.value = response.shells[0]?.program || ''
+  } catch (error) {
+    if (request !== shellRequestSequence || selectedInstanceId.value !== instance.id) return
+    shellsError.value = error instanceof Error ? error.message : 'Shell 列表读取失败'
+  } finally {
+    if (request === shellRequestSequence) shellsLoading.value = false
   }
 }
 
-function sendMessage(message: TerminalClientMessage) {
-  if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(message))
+function createSession() {
+  const instance = selectedInstance.value
+  if (!instance || createDisabled.value) return
+  const shellProgram = selectedShellProgram()
+  const shellLabel = selectedShellLabel(shellProgram)
+  const baseTitle = `${instance.name || instance.hostname} · ${shellLabel}`
+  let title = baseTitle
+  let titleSequence = 2
+  while (sessions.value.some((session) => session.title === title)) {
+    title = `${baseTitle} #${titleSequence++}`
   }
+  const id = `terminal-${Date.now()}-${++sessionSequence}`
+  sessions.value.push({
+    id,
+    instanceId: instance.id,
+    shellLabel,
+    shellProgram,
+    title,
+    status: 'opening',
+  })
+  activeSessionId.value = id
+  returnSessionId.value = null
+  creatorOpen.value = false
 }
 
-function encodeUtf8(value: string): string {
-  const bytes = new TextEncoder().encode(value)
-  let binary = ''
-  for (let index = 0; index < bytes.length; index += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
-  }
-  return btoa(binary)
+function selectedShellProgram() {
+  if (shellMode.value === 'detected') return detectedProgram.value
+  if (shellMode.value === 'custom') return customProgram.value
+  return null
 }
 
-function decodeBase64(value: string): Uint8Array {
-  const binary = atob(value)
-  const bytes = new Uint8Array(binary.length)
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index)
-  }
-  return bytes
+function selectedShellLabel(program: string | null) {
+  if (!program) return '自动'
+  const detected = shellOptions.value.find((shell) => shell.program === program)
+  if (detected) return detected.label
+  const parts = program.split(/[\\/]/u).filter(Boolean)
+  return parts.at(-1) || program
 }
 
-type TerminalClientMessage =
-  | { type: 'input'; data: string }
-  | { type: 'resize'; cols: number; rows: number }
+function openCreator() {
+  const currentSession = activeSession.value
+  if (!creatorOpen.value) returnSessionId.value = currentSession?.id || null
+  const targetInstanceId = currentSession?.instanceId || selectedInstanceId.value
+  const instanceChanged = selectedInstanceId.value !== targetInstanceId
+  selectedInstanceId.value = targetInstanceId
+  if (!instanceChanged) {
+    resetShellSelection()
+    void loadShellOptions()
+  }
+  activeSessionId.value = null
+  creatorOpen.value = true
+}
 
-type TerminalServerMessage =
-  | { type: 'opening' }
-  | { type: 'ready' }
-  | { type: 'output'; data: string }
-  | { type: 'closed'; exit_code: number | null; reason: string | null }
-  | { type: 'error'; message: string }
+function cancelCreator() {
+  creatorOpen.value = false
+  activeSessionId.value = sessions.value.some((session) => session.id === returnSessionId.value)
+    ? returnSessionId.value
+    : sessions.value.at(-1)?.id || null
+  returnSessionId.value = null
+}
+
+function activateSession(sessionId: string) {
+  creatorOpen.value = false
+  activeSessionId.value = sessionId
+}
+
+function updateSessionStatus(sessionId: string, status: TerminalSessionStatus) {
+  const session = sessions.value.find((current) => current.id === sessionId)
+  if (session) session.status = status
+}
+
+function closeSession(sessionId: string) {
+  const index = sessions.value.findIndex((session) => session.id === sessionId)
+  if (index < 0) return
+  const wasActive = activeSessionId.value === sessionId
+  sessions.value.splice(index, 1)
+  if (!wasActive) return
+  const next = sessions.value[index] || sessions.value[index - 1]
+  activeSessionId.value = next?.id || null
+  creatorOpen.value = sessions.value.length === 0
+}
+
+function requestWorkspaceClose() {
+  if (activeSessionCount.value > 0) {
+    closeConfirmationOpen.value = true
+    return
+  }
+  emit('close')
+}
+
+function confirmWorkspaceClose() {
+  closeConfirmationOpen.value = false
+  emit('close')
+}
+
+function isActiveStatus(status: TerminalSessionStatus) {
+  return status === 'opening' || status === 'ready'
+}
+
+function statusText(status: TerminalSessionStatus) {
+  return {
+    opening: '正在连接',
+    ready: '已连接',
+    closed: '已结束',
+    error: '连接失败',
+    disconnected: '已断开',
+  }[status]
+}
 </script>
 
 <template>
-  <div class="modal-backdrop">
+  <div class="modal-backdrop terminal-workspace-backdrop">
     <section class="modal terminal-modal" role="dialog" aria-modal="true" aria-labelledby="terminal-title">
-      <div class="terminal-head">
-        <div>
-          <h2 id="terminal-title">{{ instance.name }} · Web 终端</h2>
-          <p>{{ status }} · UTF-8</p>
+      <header class="terminal-head">
+        <div class="terminal-workspace-title">
+          <span><TerminalSquare :size="18" /></span>
+          <div>
+            <h2 id="terminal-title">终端工作区</h2>
+            <p>{{ sessions.length }} 个会话 · {{ activeSessionCount }} 个活动</p>
+          </div>
         </div>
-        <button class="icon-button" type="button" title="关闭" @click="emit('close')">
-          <X :size="17" />
-        </button>
+        <div class="terminal-head-actions">
+          <button class="icon-button" type="button" title="新建终端" aria-label="新建终端" @click="openCreator">
+            <Plus :size="17" />
+          </button>
+          <button class="icon-button" type="button" title="关闭工作区" aria-label="关闭终端工作区" @click="requestWorkspaceClose">
+            <X :size="17" />
+          </button>
+        </div>
+      </header>
+
+      <div class="terminal-tabs" role="tablist" aria-label="终端会话">
+        <div
+          v-for="session in sessions"
+          :key="session.id"
+          :class="['terminal-tab', { active: session.id === activeSessionId && !creatorOpen }]"
+          role="tab"
+          tabindex="0"
+          :aria-selected="session.id === activeSessionId && !creatorOpen"
+          :title="session.title"
+          @click="activateSession(session.id)"
+          @keydown.enter="activateSession(session.id)"
+          @keydown.space.prevent="activateSession(session.id)"
+        >
+          <span :class="['terminal-tab-status', session.status]"></span>
+          <span class="terminal-tab-label">{{ session.title }}</span>
+          <span class="terminal-tab-state">{{ statusText(session.status) }}</span>
+          <button
+            class="terminal-tab-close"
+            type="button"
+            title="关闭会话"
+            :aria-label="`关闭 ${session.title}`"
+            @click.stop="closeSession(session.id)"
+            @keydown.enter.stop="closeSession(session.id)"
+            @keydown.space.prevent.stop="closeSession(session.id)"
+          ><X :size="13" /></button>
+        </div>
+        <button
+          :class="['terminal-new-tab', { active: creatorOpen }]"
+          type="button"
+          role="tab"
+          :aria-selected="creatorOpen"
+          title="新建终端"
+          @click="openCreator"
+        ><Plus :size="15" /></button>
       </div>
-      <div class="terminal-screen" aria-label="交互式终端">
-        <div ref="terminalElement" class="terminal-screen-content"></div>
+
+      <div v-if="creatorOpen" class="terminal-creator">
+        <div class="terminal-creator-heading">
+          <span><Server :size="18" /></span>
+          <div><h3>新建终端</h3><p>选择目标实例与 Shell</p></div>
+        </div>
+
+        <div class="terminal-creator-fields">
+          <label>
+            <span>实例</span>
+            <select v-model="selectedInstanceId">
+              <option v-for="item in onlineInstances" :key="item.id" :value="item.id">
+                {{ item.name || item.hostname }} · {{ item.os }}
+              </option>
+            </select>
+          </label>
+
+          <div class="terminal-shell-field">
+            <span class="terminal-field-label">Shell</span>
+            <div class="segmented terminal-shell-modes">
+              <button type="button" :class="{ active: shellMode === 'auto' }" @click="shellMode = 'auto'">自动</button>
+              <button
+                v-if="supportsShellSelection"
+                type="button"
+                :class="{ active: shellMode === 'detected' }"
+                @click="shellMode = 'detected'"
+              >已检测</button>
+              <button
+                v-if="supportsShellSelection"
+                type="button"
+                :class="{ active: shellMode === 'custom' }"
+                @click="shellMode = 'custom'"
+              >自定义</button>
+            </div>
+          </div>
+
+          <label v-if="shellMode === 'detected'" class="terminal-shell-input">
+            <span>可用 Shell</span>
+            <select v-model="detectedProgram" :disabled="shellsLoading || shellOptions.length === 0">
+              <option v-for="shell in shellOptions" :key="shell.program" :value="shell.program">
+                {{ shell.label }} · {{ shell.program }}
+              </option>
+            </select>
+          </label>
+
+          <label v-else-if="shellMode === 'custom'" class="terminal-shell-input">
+            <span>可执行文件</span>
+            <input
+              v-model="customProgram"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="fish 或 /opt/shells/fish"
+              :class="{ invalid: customProgram && !customProgramValid }"
+            />
+          </label>
+        </div>
+
+        <div v-if="!supportsShellSelection" class="terminal-creator-notice">
+          当前 Agent 版本仅支持自动 Shell，请更新 Agent 以使用检测和自定义选择。
+        </div>
+        <div v-else-if="shellsLoading" class="terminal-creator-notice">
+          <LoaderCircle class="spin" :size="14" />正在读取 Shell 列表
+        </div>
+        <div v-else-if="shellsError" class="terminal-creator-notice error" role="alert">
+          <span>{{ shellsError }}</span>
+          <button class="icon-button subtle" type="button" title="重试" aria-label="重新读取 Shell 列表" @click="loadShellOptions">
+            <RefreshCw :size="14" />
+          </button>
+        </div>
+        <div v-else-if="selectedInstanceSessionCount >= maxSessions" class="terminal-creator-notice error">
+          该实例已达到 {{ maxSessions }} 个活动终端的上限。
+        </div>
+
+        <div class="terminal-creator-actions">
+          <button v-if="sessions.length" class="text-button" type="button" @click="cancelCreator">取消</button>
+          <button class="primary-button" type="button" :disabled="createDisabled" @click="createSession">
+            <TerminalSquare :size="16" />创建终端
+          </button>
+        </div>
+      </div>
+
+      <div v-else class="terminal-session-stack">
+        <TerminalSession
+          v-for="session in sessions"
+          v-show="session.id === activeSessionId"
+          :key="session.id"
+          :instance-id="session.instanceId"
+          :shell-program="session.shellProgram"
+          :active="session.id === activeSessionId"
+          @status="updateSessionStatus(session.id, $event)"
+        />
       </div>
     </section>
+
+    <ConfirmModal
+      v-if="closeConfirmationOpen"
+      title="关闭终端工作区"
+      :message="`将结束 ${activeSessionCount} 个正在运行的终端会话。`"
+      confirm-label="结束全部会话"
+      tone="danger"
+      @close="closeConfirmationOpen = false"
+      @confirm="confirmWorkspaceClose"
+    />
   </div>
 </template>

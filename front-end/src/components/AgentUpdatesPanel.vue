@@ -660,7 +660,8 @@ function applyUploadResult(releaseId: string, result: AgentArtifactUploadResult)
   }
   const pendingRows = rows.filter((row) => row.file || row.checksum_file || row.error)
   artifactUploadRows[releaseId] = pendingRows.length ? pendingRows : [createUploadRow('linux', 'x86_64')]
-  if (pendingRows.length === 0 && result.failures.length === 0) operationDrawer.value = null
+  const hasBatchFailure = Boolean(batchFileErrors[releaseId])
+  if (pendingRows.length === 0 && result.failures.length === 0 && !hasBatchFailure) operationDrawer.value = null
 }
 
 function editRelease(release: AgentRelease) {

@@ -558,6 +558,7 @@ pub struct InstanceRecord {
     pub disabled: i64,
     pub first_seen: i64,
     pub last_seen: Option<i64>,
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Serialize, FromRow)]
@@ -602,7 +603,7 @@ pub struct MetricRecord {
     pub gpu_percent: Option<f64>,
     pub gpu_memory_used: Option<i64>,
     pub gpu_memory_total: Option<i64>,
-    pub uptime_seconds: i64,
+    pub uptime_seconds: Option<i64>,
     pub load_average: Option<f64>,
     pub latency_ms: Option<f64>,
 }
@@ -626,6 +627,7 @@ pub struct InstanceSummary {
     pub online: bool,
     pub first_seen: i64,
     pub last_seen: Option<i64>,
+    pub expires_at: Option<i64>,
     pub metrics: Option<MetricRecord>,
 }
 
@@ -647,6 +649,16 @@ pub struct UpdateInstanceRequest {
     pub province: Option<String>,
     pub city: Option<String>,
     pub remark: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_field")]
+    pub expires_at: Option<Option<i64>>,
+}
+
+fn deserialize_nullable_field<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(FromRow)]
@@ -1044,6 +1056,12 @@ pub enum FileResponse {
     },
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TerminalShellInfo {
+    pub label: String,
+    pub program: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentOutbound {
@@ -1054,8 +1072,13 @@ pub enum AgentOutbound {
     Ping {
         now: i64,
     },
+    TerminalShellsRequest {
+        request_id: String,
+    },
     TerminalOpen {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<String>,
         cols: u16,
         rows: u16,
     },
@@ -1199,6 +1222,10 @@ pub enum AgentInbound {
         job_id: String,
         output: String,
     },
+    TerminalShellsResponse {
+        request_id: String,
+        shells: Vec<TerminalShellInfo>,
+    },
     TerminalOpened {
         session_id: String,
     },
@@ -1269,6 +1296,19 @@ pub enum AgentInbound {
 
 fn default_docker_log_tail() -> u32 {
     200
+}
+
+#[derive(Deserialize, Default)]
+pub struct TerminalWsQuery {
+    #[serde(default)]
+    pub shell: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TerminalShellListResponse {
+    pub shells: Vec<TerminalShellInfo>,
+    pub supports_custom: bool,
+    pub max_sessions: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

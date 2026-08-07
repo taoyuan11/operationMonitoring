@@ -30,7 +30,7 @@ import type {
   SettingsResponse,
   ViewMode,
 } from '../types/domain'
-import { average } from '../utils/format'
+import { average, formatDateTimeInput, parseDateTimeInput } from '../utils/format'
 
 type TrafficSnapshot = {
   counters: Map<string, { rx: number; tx: number }>
@@ -184,6 +184,7 @@ export function useMonitoringConsole() {
     country_code: '',
     country: '',
     remark: '',
+    expires_at: '',
   })
 
   const terminalState = reactive<{
@@ -350,6 +351,7 @@ export function useMonitoringConsole() {
     editForm.country_code = ''
     editForm.country = ''
     editForm.remark = ''
+    editForm.expires_at = ''
     settingsForm.retention_days = 30
     settingsForm.audit_retention_days = 180
     settingsForm.alert_retention_days = 180
@@ -648,6 +650,7 @@ export function useMonitoringConsole() {
     editForm.country_code = country?.code || ''
     editForm.country = country?.name || ''
     editForm.remark = instance.remark
+    editForm.expires_at = formatDateTimeInput(instance.expires_at)
   }
 
   function closeEdit() {
@@ -661,7 +664,11 @@ export function useMonitoringConsole() {
       await api(`/api/admin/instances/${id}`, {
         method: 'PATCH',
         body: JSON.stringify({
-          ...editForm,
+          name: editForm.name,
+          country_code: editForm.country_code,
+          country: editForm.country,
+          remark: editForm.remark,
+          expires_at: parseDateTimeInput(editForm.expires_at),
           province_code: '',
           province: '',
           city: '',

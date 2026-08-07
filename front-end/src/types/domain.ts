@@ -10,7 +10,7 @@ export type Metric = {
   gpu_percent: number | null
   gpu_memory_used: number | null
   gpu_memory_total: number | null
-  uptime_seconds: number
+  uptime_seconds: number | null
   load_average: number | null
   latency_ms: number | null
 }
@@ -36,8 +36,22 @@ export type Instance = {
   online: boolean
   first_seen: number
   last_seen: number | null
+  expires_at: number | null
   metrics: Metric | null
 }
+
+export type TerminalShellInfo = {
+  label: string
+  program: string
+}
+
+export type TerminalShellListResponse = {
+  shells: TerminalShellInfo[]
+  supports_custom: boolean
+  max_sessions: number
+}
+
+export type TerminalSessionStatus = 'opening' | 'ready' | 'closed' | 'error' | 'disconnected'
 
 export type PublicDeviceGpuInfo = {
   name: string
@@ -421,6 +435,7 @@ export type AlertMetric =
   | 'memory_percent'
   | 'disk_percent'
   | 'latency_ms'
+  | 'instance_expiring'
 
 export type AlertSeverity = 'warning' | 'critical'
 export type AlertEventStatus = 'firing' | 'acknowledged' | 'resolved'

@@ -187,7 +187,8 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
             approved BIGINT NOT NULL DEFAULT 1,
             disabled BIGINT NOT NULL DEFAULT 0,
             first_seen BIGINT NOT NULL,
-            last_seen BIGINT
+            last_seen BIGINT,
+            expires_at BIGINT
         );
         "#,
     )
@@ -195,6 +196,7 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
     .await?;
 
     ensure_instance_location_columns(db).await?;
+    ensure_instance_expiration_column(db).await?;
     ensure_capability_columns(db, "instances").await?;
 
     sqlx::query(
@@ -753,6 +755,7 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
                 "disabled",
                 "first_seen",
                 "last_seen",
+                "expires_at",
             ][..],
         ),
         (
@@ -846,6 +849,13 @@ async fn ensure_instance_location_columns(db: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn ensure_instance_expiration_column(db: &PgPool) -> anyhow::Result<()> {
+    sqlx::query("ALTER TABLE instances ADD COLUMN IF NOT EXISTS expires_at BIGINT")
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 async fn ensure_metric_columns(db: &PgPool) -> anyhow::Result<()> {
     sqlx::query("ALTER TABLE metrics ADD COLUMN IF NOT EXISTS latency_ms DOUBLE PRECISION")
         .execute(db)
@@ -897,7 +907,7 @@ pub async fn register_or_touch_pending(
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version,
                package_type, native_arch, update_privileged, rollback_supported, rollback_version,
-               approved, disabled, first_seen, last_seen
+               approved, disabled, first_seen, last_seen, expires_at
         FROM instances
         WHERE id = $1
         FOR UPDATE
@@ -923,7 +933,7 @@ pub async fn register_or_touch_pending(
                 SELECT id, secret, name, region, country_code, country, province_code, province, city,
                        remark, hostname, os, arch, agent_version,
                        package_type, native_arch, update_privileged, rollback_supported, rollback_version,
-                       approved, disabled, first_seen, last_seen
+                       approved, disabled, first_seen, last_seen, expires_at
                 FROM instances
                 WHERE id = $1
                 FOR UPDATE
@@ -1371,7 +1381,7 @@ pub async fn get_instance_optional(db: &PgPool, id: &str) -> AppResult<Option<In
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version,
                package_type, native_arch, update_privileged, rollback_supported, rollback_version,
-               approved, disabled, first_seen, last_seen
+               approved, disabled, first_seen, last_seen, expires_at
         FROM instances
         WHERE id = $1
         "#,
@@ -1565,6 +1575,7 @@ pub fn instance_summary(
         online,
         first_seen: record.first_seen,
         last_seen: record.last_seen,
+        expires_at: record.expires_at,
         metrics,
     }
 }
@@ -1973,6 +1984,7 @@ mod tests {
         assert_eq!(record.province_code, "");
         assert_eq!(record.province, "");
         assert_eq!(record.city, "");
+        assert_eq!(record.expires_at, None);
 
         let approved_type: String = sqlx::query_scalar(
             r#"

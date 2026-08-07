@@ -109,6 +109,7 @@ export const ALERT_RULE_PRESETS: Array<{
   { metric: 'memory_percent', name: '内存使用率过高', threshold: 90, duration_seconds: 300 },
   { metric: 'disk_percent', name: '磁盘使用率过高', threshold: 90, duration_seconds: 300 },
   { metric: 'latency_ms', name: '节点延迟过高', threshold: 500, duration_seconds: 120 },
+  { metric: 'instance_expiring', name: '实例即将到期', threshold: 7, duration_seconds: 0 },
 ]
 
 function defaultEventQuery(): AlertEventQuery {
@@ -534,22 +535,28 @@ export function useAlertingConsole(options: AlertingOptions) {
       return false
     }
     const threshold = Number(ruleForm.threshold)
+    const isPercentageMetric = ['cpu_percent', 'memory_percent', 'disk_percent'].includes(ruleForm.metric)
     if (
       ruleForm.metric !== 'node_offline'
       && (!Number.isFinite(threshold)
         || threshold < 0
-        || (ruleForm.metric !== 'latency_ms' && threshold > 100))
+        || (isPercentageMetric && threshold > 100)
+        || (ruleForm.metric === 'instance_expiring' && !Number.isInteger(threshold)))
     ) {
-      errorMessage.value = ruleForm.metric === 'latency_ms'
-        ? '延迟阈值必须是非负数值'
-        : '百分比阈值必须在 0 到 100 之间'
+      errorMessage.value = ruleForm.metric === 'instance_expiring'
+        ? '到期提醒阈值必须是非负整数天'
+        : ruleForm.metric === 'latency_ms'
+          ? '延迟阈值必须是非负数值'
+          : '百分比阈值必须在 0 到 100 之间'
       return false
     }
     const payload: AlertRuleInput = {
       ...ruleForm,
       name: ruleForm.name.trim(),
       threshold: ruleForm.metric === 'node_offline' ? null : threshold,
-      duration_seconds: Math.max(0, Number(ruleForm.duration_seconds)),
+      duration_seconds: ruleForm.metric === 'instance_expiring'
+        ? 0
+        : Math.max(0, Number(ruleForm.duration_seconds)),
       target_instance_ids: ruleForm.scope === 'specific' ? [...ruleForm.target_instance_ids] : [],
       channel_ids: [...ruleForm.channel_ids],
     }

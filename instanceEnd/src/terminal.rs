@@ -1,7 +1,8 @@
 use std::{
-    collections::HashMap,
-    ffi::OsString,
+    collections::{HashMap, HashSet},
+    ffi::{OsStr, OsString},
     io::{self, Read, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{self, RecvTimeoutError},
@@ -31,12 +32,18 @@ use windows::{
 };
 
 use crate::{
-    activity::ActivityTracker, models::AgentInbound, outbound::AgentEventSender,
+    activity::ActivityTracker,
+    models::{AgentInbound, TerminalShellInfo},
+    outbound::AgentEventSender,
     pty_io::PtyInputWriter,
 };
 
+pub const CAPABILITY: &str = "terminal_shells_v1";
+
 const MAX_TERMINAL_SESSIONS: usize = 8;
 const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+const MAX_TERMINAL_SHELLS: usize = 64;
+const MAX_SHELL_PROGRAM_BYTES: usize = 1024;
 const TERMINAL_CONTROL_QUEUE_CAPACITY: usize = 128;
 const TERMINAL_WRITE_QUEUE_CAPACITY: usize = 16;
 const TERMINAL_PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -45,25 +52,22 @@ const TERMINAL_PIPE_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShellKind {
-    #[cfg(any(windows, test))]
     PowerShell,
-    #[cfg(any(windows, test))]
     Cmd,
-    #[cfg(any(not(windows), test))]
     Unix,
 }
 
 #[derive(Clone, Debug)]
 struct ShellCandidate {
-    name: &'static str,
+    name: String,
     program: OsString,
     kind: ShellKind,
 }
 
 impl ShellCandidate {
-    fn new(name: &'static str, program: impl Into<OsString>, kind: ShellKind) -> Self {
+    fn new(name: impl Into<String>, program: impl Into<OsString>, kind: ShellKind) -> Self {
         Self {
-            name,
+            name: name.into(),
             program: program.into(),
             kind,
         }
@@ -71,11 +75,8 @@ impl ShellCandidate {
 
     fn arguments(&self) -> &'static [&'static str] {
         match self.kind {
-            #[cfg(any(windows, test))]
             ShellKind::PowerShell => &["-NoLogo", "-NoExit"],
-            #[cfg(any(windows, test))]
             ShellKind::Cmd => &["/D", "/Q", "/K", "chcp 65001>nul"],
-            #[cfg(any(not(windows), test))]
             ShellKind::Unix => &["-i"],
         }
     }
@@ -89,6 +90,54 @@ impl ShellCandidate {
     fn description(&self) -> String {
         format!("{} ({})", self.name, self.program.to_string_lossy())
     }
+}
+
+fn shell_kind(program: &OsStr) -> ShellKind {
+    let stem = Path::new(program)
+        .file_stem()
+        .unwrap_or(program)
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "pwsh" | "powershell" => ShellKind::PowerShell,
+        "cmd" => ShellKind::Cmd,
+        _ => ShellKind::Unix,
+    }
+}
+
+fn selected_shell_candidate(program: &str) -> anyhow::Result<ShellCandidate> {
+    validate_shell_program(program)?;
+    let path = Path::new(program);
+    let label = path
+        .file_stem()
+        .or_else(|| path.file_name())
+        .and_then(OsStr::to_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(program)
+        .to_string();
+    Ok(ShellCandidate::new(
+        label,
+        program,
+        shell_kind(path.as_os_str()),
+    ))
+}
+
+pub fn validate_shell_program(program: &str) -> anyhow::Result<()> {
+    if program.is_empty()
+        || program.len() > MAX_SHELL_PROGRAM_BYTES
+        || program.chars().any(char::is_control)
+        || program.trim() != program
+    {
+        anyhow::bail!("shell executable is invalid");
+    }
+    let path = Path::new(program);
+    if !path.is_absolute() && path.components().count() != 1 {
+        anyhow::bail!("shell executable must be a file name or an absolute path");
+    }
+    if !path.is_absolute() && program.chars().any(char::is_whitespace) {
+        anyhow::bail!("shell executable name cannot contain whitespace");
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
@@ -144,6 +193,176 @@ fn platform_shell_candidates() -> Vec<ShellCandidate> {
     {
         linux_shell_candidates()
     }
+}
+
+pub fn available_shells() -> Vec<TerminalShellInfo> {
+    let mut candidates = platform_shell_candidates();
+
+    #[cfg(not(windows))]
+    {
+        if let Some(program) = std::env::var_os("SHELL").filter(|value| !value.is_empty()) {
+            candidates.insert(
+                0,
+                ShellCandidate::new("Login shell", &program, shell_kind(&program)),
+            );
+        }
+        if let Ok(configured) = std::fs::read_to_string("/etc/shells") {
+            candidates.extend(
+                configured
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(|program| {
+                        ShellCandidate::new(
+                            shell_label(Path::new(program)),
+                            program,
+                            shell_kind(OsStr::new(program)),
+                        )
+                    }),
+            );
+        }
+    }
+
+    candidates.extend(common_shell_names().iter().map(|program| {
+        ShellCandidate::new(
+            shell_label(Path::new(program)),
+            *program,
+            shell_kind(OsStr::new(program)),
+        )
+    }));
+
+    detected_shells(candidates)
+}
+
+fn detected_shells(candidates: Vec<ShellCandidate>) -> Vec<TerminalShellInfo> {
+    let mut seen = HashSet::new();
+    let mut shells = Vec::new();
+    for candidate in candidates {
+        let Some(program) = resolve_shell_program(&candidate.program) else {
+            continue;
+        };
+        let Some(program) = program.to_str() else {
+            continue;
+        };
+        let key = if cfg!(windows) {
+            program.to_ascii_lowercase()
+        } else {
+            program.to_string()
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        shells.push(TerminalShellInfo {
+            label: candidate.name,
+            program: program.to_string(),
+        });
+        if shells.len() == MAX_TERMINAL_SHELLS {
+            break;
+        }
+    }
+    shells
+}
+
+fn resolve_shell_program(program: &OsStr) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.is_absolute() {
+        return is_executable_file(path).then(|| path.to_path_buf());
+    }
+    if path.components().count() != 1 {
+        return None;
+    }
+    for directory in std::env::var_os("PATH")
+        .as_deref()
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+    {
+        for file_name in executable_names(program) {
+            let candidate = directory.join(file_name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn executable_names(program: &OsStr) -> Vec<OsString> {
+    #[cfg(windows)]
+    {
+        let path = Path::new(program);
+        if path.extension().is_some() {
+            return vec![program.to_os_string()];
+        }
+        let extensions = std::env::var_os("PATHEXT")
+            .and_then(|value| value.into_string().ok())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+        let mut names = vec![program.to_os_string()];
+        names.extend(
+            extensions
+                .split(';')
+                .filter(|value| !value.is_empty())
+                .map(|extension| {
+                    let mut name = program.to_os_string();
+                    name.push(extension.to_ascii_lowercase());
+                    name
+                }),
+        );
+        names
+    }
+    #[cfg(not(windows))]
+    {
+        vec![program.to_os_string()]
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn shell_label(program: &Path) -> String {
+    program
+        .file_stem()
+        .or_else(|| program.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| program.to_string_lossy().into_owned())
+}
+
+#[cfg(windows)]
+fn common_shell_names() -> &'static [&'static str] {
+    &[
+        "pwsh.exe",
+        "powershell.exe",
+        "cmd.exe",
+        "nu.exe",
+        "bash.exe",
+        "zsh.exe",
+        "fish.exe",
+        "xonsh.exe",
+        "elvish.exe",
+    ]
+}
+
+#[cfg(not(windows))]
+fn common_shell_names() -> &'static [&'static str] {
+    &[
+        "bash", "zsh", "fish", "nu", "ksh", "tcsh", "csh", "dash", "sh", "pwsh", "xonsh", "elvish",
+    ]
 }
 
 fn try_shell_candidates<T>(
@@ -206,7 +425,7 @@ impl TerminalManager {
         }
     }
 
-    pub fn open(&mut self, session_id: String, cols: u16, rows: u16) {
+    pub fn open(&mut self, session_id: String, shell: Option<String>, cols: u16, rows: u16) {
         if self.sessions.contains_key(&session_id) {
             let _ = self.outbound.send(AgentInbound::TerminalClosed {
                 session_id,
@@ -237,7 +456,14 @@ impl TerminalManager {
         let worker = thread::Builder::new().spawn(move || {
             let _activity_guard = activity_guard;
             let _session_slot = session_slot;
-            run_terminal(worker_session_id, cols, rows, control_rx, stream_outbound);
+            run_terminal(
+                worker_session_id,
+                shell,
+                cols,
+                rows,
+                control_rx,
+                stream_outbound,
+            );
         });
         match worker {
             Ok(_) => {
@@ -312,6 +538,7 @@ impl TerminalManager {
 
 fn run_terminal(
     session_id: String,
+    shell: Option<String>,
     cols: u16,
     rows: u16,
     control_rx: mpsc::Receiver<TerminalControl>,
@@ -319,6 +546,7 @@ fn run_terminal(
 ) {
     if let Err(error) = run_terminal_inner(
         &session_id,
+        shell.as_deref(),
         cols.clamp(2, 500),
         rows.clamp(1, 300),
         control_rx,
@@ -337,6 +565,7 @@ fn run_terminal(
 
 fn run_terminal_inner(
     session_id: &str,
+    shell: Option<&str>,
     cols: u16,
     rows: u16,
     control_rx: mpsc::Receiver<TerminalControl>,
@@ -347,7 +576,7 @@ fn run_terminal_inner(
         master,
         mut reader,
         writer,
-    } = open_terminal(cols, rows)?;
+    } = open_terminal(shell, cols, rows)?;
     let input_writer =
         match PtyInputWriter::spawn(writer, TERMINAL_WRITE_QUEUE_CAPACITY, "om-terminal-input") {
             Ok(writer) => writer,
@@ -537,11 +766,11 @@ impl TerminalMaster {
     }
 }
 
-fn open_terminal(cols: u16, rows: u16) -> anyhow::Result<RunningTerminal> {
+fn open_terminal(shell: Option<&str>, cols: u16, rows: u16) -> anyhow::Result<RunningTerminal> {
     #[cfg(windows)]
     {
         if conpty_available() {
-            match open_pty_terminal(cols, rows) {
+            match open_pty_terminal(shell, cols, rows) {
                 Ok(terminal) => return Ok(terminal),
                 Err(error) => crate::logging::error(format_args!(
                     "ConPTY terminal initialization failed; falling back to a pipe-backed terminal: {error:#}"
@@ -553,14 +782,20 @@ fn open_terminal(cols: u16, rows: u16) -> anyhow::Result<RunningTerminal> {
             ));
         }
 
-        return open_pipe_terminal().context("failed to start the legacy Windows terminal");
+        return open_pipe_terminal(shell).context("failed to start the legacy Windows terminal");
     }
 
     #[cfg(not(windows))]
-    open_pty_terminal(cols, rows)
+    open_pty_terminal(shell, cols, rows)
 }
 
-fn open_pty_terminal(cols: u16, rows: u16) -> anyhow::Result<RunningTerminal> {
+fn open_pty_terminal(shell: Option<&str>, cols: u16, rows: u16) -> anyhow::Result<RunningTerminal> {
+    if let Some(program) = shell {
+        let candidate = selected_shell_candidate(program)?;
+        return open_pty_terminal_with_shell(&candidate, cols, rows).with_context(|| {
+            format!("failed to start selected shell {}", candidate.description())
+        });
+    }
     let candidates = platform_shell_candidates();
     let transport = if cfg!(windows) { "ConPTY" } else { "PTY" };
     try_shell_candidates(&candidates, transport, |candidate| {
@@ -643,7 +878,13 @@ fn conpty_available() -> bool {
 }
 
 #[cfg(windows)]
-fn open_pipe_terminal() -> anyhow::Result<RunningTerminal> {
+fn open_pipe_terminal(shell: Option<&str>) -> anyhow::Result<RunningTerminal> {
+    if let Some(program) = shell {
+        let candidate = selected_shell_candidate(program)?;
+        return open_pipe_terminal_with_shell(&candidate).with_context(|| {
+            format!("failed to start selected shell {}", candidate.description())
+        });
+    }
     let candidates = platform_shell_candidates();
     try_shell_candidates(&candidates, "pipe-backed terminal", |candidate| {
         open_pipe_terminal_with_shell(candidate)
@@ -763,8 +1004,11 @@ impl Read for PipeReader {
 mod shell_selection_tests {
     use super::*;
 
-    fn candidate_names(candidates: &[ShellCandidate]) -> Vec<&'static str> {
-        candidates.iter().map(|candidate| candidate.name).collect()
+    fn candidate_names(candidates: &[ShellCandidate]) -> Vec<&str> {
+        candidates
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect()
     }
 
     #[test]
@@ -805,7 +1049,7 @@ mod shell_selection_tests {
         let candidates = linux_shell_candidates();
         let mut attempted = Vec::new();
         let selected = try_shell_candidates(&candidates, "test terminal", |candidate| {
-            attempted.push(candidate.name);
+            attempted.push(candidate.name.clone());
             if candidate.name == "ash" {
                 Ok(candidate.name.to_string())
             } else {
@@ -830,11 +1074,57 @@ mod shell_selection_tests {
         assert!(error.contains("none of the supported shells"));
         for candidate in candidates {
             assert!(
-                error.contains(candidate.name),
+                error.contains(&candidate.name),
                 "missing {} from {error}",
                 candidate.name
             );
         }
+    }
+
+    #[test]
+    fn selected_shells_accept_only_names_or_absolute_paths() {
+        let absolute = if cfg!(windows) {
+            r"C:\Program Files\Custom Shell\fish.exe"
+        } else {
+            "/opt/custom shells/fish"
+        };
+        assert!(validate_shell_program("fish").is_ok());
+        assert!(validate_shell_program(absolute).is_ok());
+        assert!(validate_shell_program("").is_err());
+        assert!(validate_shell_program("fish --login").is_err());
+        assert!(validate_shell_program("relative/fish").is_err());
+        assert!(validate_shell_program("fish\nwhoami").is_err());
+    }
+
+    #[test]
+    fn selected_shell_kind_controls_startup_arguments() {
+        assert_eq!(
+            selected_shell_candidate("pwsh.exe").unwrap().arguments(),
+            ["-NoLogo", "-NoExit"]
+        );
+        assert_eq!(
+            selected_shell_candidate("cmd.exe").unwrap().arguments(),
+            ["/D", "/Q", "/K", "chcp 65001>nul"]
+        );
+        assert_eq!(
+            selected_shell_candidate("fish").unwrap().arguments(),
+            ["-i"]
+        );
+    }
+
+    #[test]
+    fn detected_shells_keep_the_first_label_and_deduplicate_programs() {
+        let executable = std::env::current_exe().unwrap();
+        let candidates = vec![
+            ShellCandidate::new("Primary", &executable, ShellKind::Unix),
+            ShellCandidate::new("Duplicate", &executable, ShellKind::Unix),
+        ];
+
+        let shells = detected_shells(candidates);
+
+        assert_eq!(shells.len(), 1);
+        assert_eq!(shells[0].label, "Primary");
+        assert_eq!(shells[0].program, executable.to_string_lossy());
     }
 }
 
@@ -856,7 +1146,7 @@ mod tests {
         let mut manager =
             TerminalManager::new(outbound, stream_outbound, ActivityTracker::default());
         let session_id = "terminal-test".to_string();
-        manager.open(session_id.clone(), 80, 24);
+        manager.open(session_id.clone(), None, 80, 24);
 
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut opened = false;
@@ -890,6 +1180,69 @@ mod tests {
             "shell context did not change: {output}"
         );
         assert!(control_events.try_recv().is_err());
+    }
+
+    #[test]
+    fn concurrent_terminals_keep_working_directories_and_environments_isolated() {
+        let (outbound, _control_events, _failed) = AgentEventSender::channel(64);
+        let (stream_outbound, mut inbound, _stream_failed) = AgentEventSender::channel(128);
+        let mut manager =
+            TerminalManager::new(outbound, stream_outbound, ActivityTracker::default());
+        let first = "terminal-first".to_string();
+        let second = "terminal-second".to_string();
+        manager.open(first.clone(), None, 80, 24);
+        manager.open(second.clone(), None, 80, 24);
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut closed = HashSet::new();
+        let mut output = HashMap::<String, Vec<u8>>::new();
+        while Instant::now() < deadline && closed.len() < 2 {
+            match inbound.try_recv() {
+                Ok(AgentInbound::TerminalOpened { session_id }) if session_id == first => {
+                    manager.input(
+                        &first,
+                        &STANDARD.encode(
+                            b"cd /; export OM_TERMINAL_ISOLATION=first; printf '__OM_FIRST__%s:%s\\n' \"$PWD\" \"$OM_TERMINAL_ISOLATION\"; exit\n",
+                        ),
+                    );
+                }
+                Ok(AgentInbound::TerminalOpened { session_id }) if session_id == second => {
+                    manager.input(
+                        &second,
+                        &STANDARD.encode(
+                            b"cd /tmp; printf '__OM_SECOND__%s:%s\\n' \"$PWD\" \"${OM_TERMINAL_ISOLATION:-unset}\"; exit\n",
+                        ),
+                    );
+                }
+                Ok(AgentInbound::TerminalOutput { session_id, data }) => {
+                    output
+                        .entry(session_id)
+                        .or_default()
+                        .extend(STANDARD.decode(data).unwrap());
+                }
+                Ok(AgentInbound::TerminalClosed { session_id, .. }) => {
+                    closed.insert(session_id);
+                }
+                Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        manager.close_all();
+        let first_output = String::from_utf8_lossy(output.get(&first).map_or(&[], Vec::as_slice));
+        let second_output = String::from_utf8_lossy(output.get(&second).map_or(&[], Vec::as_slice));
+        assert!(closed.contains(&first), "first terminal did not close");
+        assert!(closed.contains(&second), "second terminal did not close");
+        assert!(
+            first_output.contains("__OM_FIRST__/:first"),
+            "first output was: {first_output}"
+        );
+        assert!(
+            second_output.contains("__OM_SECOND__/tmp:unset"),
+            "second output was: {second_output}"
+        );
     }
 
     #[test]
@@ -947,7 +1300,7 @@ mod tests {
         let (stream_outbound, mut inbound, _stream_failed) = AgentEventSender::channel(128);
         let mut manager = TerminalManager::new(outbound, stream_outbound, activity.clone());
         let session_id = "blocked-input".to_string();
-        manager.open(session_id.clone(), 80, 24);
+        manager.open(session_id.clone(), None, 80, 24);
 
         let opened_deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -1010,7 +1363,7 @@ mod tests {
             );
         }
 
-        manager.open("overflow".to_string(), 80, 24);
+        manager.open("overflow".to_string(), None, 80, 24);
 
         assert!(manager.sessions.is_empty());
         assert!(matches!(

@@ -634,6 +634,12 @@ pub enum FileResponse {
     },
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TerminalShellInfo {
+    pub label: String,
+    pub program: String,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentOutbound {
@@ -644,8 +650,13 @@ pub enum AgentOutbound {
     Ping {
         now: i64,
     },
+    TerminalShellsRequest {
+        request_id: String,
+    },
     TerminalOpen {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<String>,
         cols: u16,
         rows: u16,
     },
@@ -786,6 +797,10 @@ pub enum AgentInbound {
     CommandOutput {
         job_id: String,
         output: String,
+    },
+    TerminalShellsResponse {
+        request_id: String,
+        shells: Vec<TerminalShellInfo>,
     },
     TerminalOpened {
         session_id: String,

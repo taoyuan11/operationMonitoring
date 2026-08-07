@@ -406,7 +406,7 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
         CREATE TABLE IF NOT EXISTS alert_rules (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            metric TEXT NOT NULL CHECK(metric IN ('node_offline', 'cpu_percent', 'memory_percent', 'disk_percent', 'latency_ms')),
+            metric TEXT NOT NULL CHECK(metric IN ('node_offline', 'cpu_percent', 'memory_percent', 'disk_percent', 'latency_ms', 'instance_expiring')),
             threshold DOUBLE PRECISION,
             duration_seconds BIGINT NOT NULL CHECK(duration_seconds >= 0),
             severity TEXT NOT NULL CHECK(severity IN ('warning', 'critical')),
@@ -419,6 +419,14 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
             CHECK((metric = 'node_offline' AND threshold IS NULL) OR
                   (metric <> 'node_offline' AND threshold IS NOT NULL))
         );
+        ALTER TABLE alert_rules DROP CONSTRAINT IF EXISTS alert_rules_metric_check;
+        ALTER TABLE alert_rules DROP CONSTRAINT IF EXISTS alert_rules_check;
+        ALTER TABLE alert_rules DROP CONSTRAINT IF EXISTS alert_rules_threshold_check;
+        ALTER TABLE alert_rules ADD CONSTRAINT alert_rules_metric_check
+            CHECK(metric IN ('node_offline', 'cpu_percent', 'memory_percent', 'disk_percent', 'latency_ms', 'instance_expiring'));
+        ALTER TABLE alert_rules ADD CONSTRAINT alert_rules_threshold_check
+            CHECK((metric = 'node_offline' AND threshold IS NULL) OR
+                  (metric <> 'node_offline' AND threshold IS NOT NULL));
         CREATE TABLE IF NOT EXISTS alert_rule_targets (
             rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
             instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
@@ -619,7 +627,12 @@ fn validate_rule(payload: &RuleRequest) -> AppResult<RuleRequest> {
     normalized.name = trimmed(&payload.name, MAX_NAME_BYTES, "规则名称")?;
     if !matches!(
         normalized.metric.as_str(),
-        "node_offline" | "cpu_percent" | "memory_percent" | "disk_percent" | "latency_ms"
+        "node_offline"
+            | "cpu_percent"
+            | "memory_percent"
+            | "disk_percent"
+            | "latency_ms"
+            | "instance_expiring"
     ) {
         return Err(AppError::bad_request("不支持的告警指标"));
     }
@@ -635,6 +648,9 @@ fn validate_rule(payload: &RuleRequest) -> AppResult<RuleRequest> {
     if normalized.duration_seconds < 0 || normalized.duration_seconds > 365 * 24 * 3600 {
         return Err(AppError::bad_request("持续时间超出允许范围"));
     }
+    if normalized.metric == "instance_expiring" && normalized.duration_seconds != 0 {
+        return Err(AppError::bad_request("实例到期规则必须立即触发"));
+    }
     if normalized.metric == "node_offline" {
         if normalized.threshold.is_some() {
             return Err(AppError::bad_request("节点离线规则不能设置阈值"));
@@ -645,6 +661,9 @@ fn validate_rule(payload: &RuleRequest) -> AppResult<RuleRequest> {
         };
         if !threshold.is_finite() || threshold < 0.0 {
             return Err(AppError::bad_request("阈值必须是非负有限数值"));
+        }
+        if normalized.metric == "instance_expiring" && threshold.fract() != 0.0 {
+            return Err(AppError::bad_request("实例到期阈值必须是整数天"));
         }
         if matches!(
             normalized.metric.as_str(),
@@ -1088,7 +1107,19 @@ fn metric_value(metric: &str, observation: &MetricObservation) -> Option<(f64, i
 }
 
 fn node_offline_suppresses(metric: &str, has_active_offline_event: bool) -> bool {
-    has_active_offline_event && metric != "node_offline"
+    has_active_offline_event
+        && matches!(
+            metric,
+            "cpu_percent" | "memory_percent" | "disk_percent" | "latency_ms"
+        )
+}
+
+fn expiration_observation(expires_at: Option<i64>, now: i64, threshold_days: f64) -> (f64, bool) {
+    let Some(expires_at) = expires_at else {
+        return (0.0, false);
+    };
+    let remaining_days = expires_at.saturating_sub(now) as f64 / 86_400.0;
+    (remaining_days, remaining_days <= threshold_days)
 }
 
 fn connection_observation(online: bool) -> (f64, bool) {
@@ -1141,7 +1172,8 @@ async fn node_snapshot_tx(
         r#"
         SELECT jsonb_build_object(
             'id', id, 'name', name, 'hostname', hostname, 'region', region,
-            'os', os, 'arch', arch, 'agent_version', agent_version
+            'os', os, 'arch', arch, 'agent_version', agent_version,
+            'expires_at', expires_at
         ) FROM instances WHERE id = $1
         "#,
     )
@@ -1493,7 +1525,7 @@ pub async fn reset_metric_pending_states(
         sqlx::query(
             r#"
             DELETE FROM alert_evaluation_states s USING alert_rules r
-            WHERE s.rule_id=r.id AND r.metric <> 'node_offline'
+            WHERE s.rule_id=r.id AND r.metric NOT IN ('node_offline', 'instance_expiring')
               AND s.instance_id=$1 AND s.pending_since IS NOT NULL
               AND NOT EXISTS(
                   SELECT 1 FROM alert_events e
@@ -1509,7 +1541,7 @@ pub async fn reset_metric_pending_states(
         sqlx::query(
             r#"
             DELETE FROM alert_evaluation_states s USING alert_rules r
-            WHERE s.rule_id=r.id AND r.metric <> 'node_offline'
+            WHERE s.rule_id=r.id AND r.metric NOT IN ('node_offline', 'instance_expiring')
               AND s.pending_since IS NOT NULL
               AND NOT EXISTS(
                   SELECT 1 FROM alert_events e
@@ -1812,7 +1844,7 @@ pub async fn observe_metric(
         r#"
         SELECT DISTINCT r.* FROM alert_rules r
         LEFT JOIN alert_rule_targets t ON t.rule_id=r.id
-        WHERE r.enabled=TRUE AND r.metric <> 'node_offline'
+        WHERE r.enabled=TRUE AND r.metric NOT IN ('node_offline', 'instance_expiring')
           AND (r.scope='all' OR t.instance_id=$1)
         ORDER BY r.id
         "#,
@@ -1882,6 +1914,48 @@ async fn observe_offline_at(
     Ok(())
 }
 
+async fn observe_expiration_at(
+    state: &AppState,
+    instance_id: &str,
+    observed_at: i64,
+) -> AppResult<()> {
+    let expires_at = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT expires_at FROM instances WHERE id=$1 AND approved=1 AND disabled=0",
+    )
+    .bind(instance_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(expires_at) = expires_at else {
+        return Ok(());
+    };
+    let rules = sqlx::query_as::<_, RuleRow>(
+        r#"
+        SELECT DISTINCT r.* FROM alert_rules r
+        LEFT JOIN alert_rule_targets t ON t.rule_id=r.id
+        WHERE r.enabled=TRUE AND r.metric='instance_expiring'
+          AND (r.scope='all' OR t.instance_id=$1)
+        ORDER BY r.id
+        "#,
+    )
+    .bind(instance_id)
+    .fetch_all(&state.db)
+    .await?;
+    for rule in rules {
+        let (value, abnormal) =
+            expiration_observation(expires_at, observed_at, rule.threshold.unwrap_or_default());
+        process_rule_observation(
+            state,
+            &rule,
+            instance_id,
+            RuleObservation::Threshold { value, abnormal },
+            observed_at,
+            observed_at,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn observe_connection(
     state: &AppState,
     instance_id: &str,
@@ -1914,6 +1988,9 @@ pub async fn alert_evaluation_loop(state: AppState) {
             }
         };
         for instance_id in ids {
+            if let Err(error) = observe_expiration_at(&state, &instance_id, now).await {
+                warn!(?error, %instance_id, "failed to evaluate instance expiration alert");
+            }
             let online = state.agents.read().await.contains_key(&instance_id);
             if startup_grace_defers_offline(online, started_at, now) {
                 continue;
@@ -3907,6 +3984,48 @@ fn lifecycle_label(kind: &str) -> &str {
     }
 }
 
+fn metric_label(metric: &str) -> &str {
+    match metric {
+        "node_offline" => "节点离线",
+        "cpu_percent" => "CPU 使用率",
+        "memory_percent" => "内存使用率",
+        "disk_percent" => "磁盘使用率",
+        "latency_ms" => "网络延迟",
+        "instance_expiring" => "实例即将到期",
+        _ => metric,
+    }
+}
+
+fn format_expiration_days(value: f64) -> String {
+    if value < 0.0 {
+        format!("已到期 {:.1} 天", value.abs())
+    } else {
+        format!("剩余 {value:.1} 天")
+    }
+}
+
+fn notification_metric_values(payload: &Value, metric: &str) -> (String, String) {
+    if metric != "instance_expiring" {
+        return (
+            payload_string(payload, "event", "current_value").unwrap_or_else(|| "未知".into()),
+            payload_string(payload, "event", "threshold").unwrap_or_else(|| "不适用".into()),
+        );
+    }
+    let current = payload
+        .get("event")
+        .and_then(|event| event.get("current_value"))
+        .and_then(Value::as_f64)
+        .map(format_expiration_days)
+        .unwrap_or_else(|| "未知".to_string());
+    let threshold = payload
+        .get("event")
+        .and_then(|event| event.get("threshold"))
+        .and_then(Value::as_f64)
+        .map(|days| format!("剩余时间 <= {days:.0} 天"))
+        .unwrap_or_else(|| "不适用".to_string());
+    (current, threshold)
+}
+
 fn single_line(value: &str, max_bytes: usize) -> String {
     let normalized = value
         .chars()
@@ -3938,17 +4057,14 @@ fn notification_text(payload: &Value) -> String {
     let rule = payload_string(payload, "rule", "name").unwrap_or_else(|| "未知规则".to_string());
     let metric = payload_string(payload, "event", "metric").unwrap_or_else(|| "unknown".into());
     let severity = payload_string(payload, "event", "severity").unwrap_or_else(|| "unknown".into());
-    let current =
-        payload_string(payload, "event", "current_value").unwrap_or_else(|| "未知".into());
-    let threshold =
-        payload_string(payload, "event", "threshold").unwrap_or_else(|| "不适用".into());
+    let (current, threshold) = notification_metric_values(payload, &metric);
 
     let mut lines = vec![
         format!("operationMonitoring {label}"),
         format!("节点: {node}"),
         format!("规则: {rule}"),
         format!("级别: {severity}"),
-        format!("指标: {metric}"),
+        format!("指标: {}", metric_label(&metric)),
         format!("当前值: {current}"),
         format!("阈值: {threshold}"),
     ];
@@ -4692,7 +4808,7 @@ mod tests {
     async fn create_alert_prerequisites(db: &PgPool) {
         for statement in [
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            "CREATE TABLE instances (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', hostname TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '', agent_version TEXT NOT NULL DEFAULT '', approved BIGINT NOT NULL DEFAULT 1, disabled BIGINT NOT NULL DEFAULT 0)",
+            "CREATE TABLE instances (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', hostname TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '', agent_version TEXT NOT NULL DEFAULT '', approved BIGINT NOT NULL DEFAULT 1, disabled BIGINT NOT NULL DEFAULT 0, expires_at BIGINT)",
             "CREATE TABLE metrics (id BIGSERIAL PRIMARY KEY, instance_id TEXT NOT NULL, ts BIGINT NOT NULL, latency_ms DOUBLE PRECISION)",
         ] {
             sqlx::query(statement)
@@ -4949,6 +5065,25 @@ mod tests {
         invalid.metric = "cpu_percent".to_string();
         invalid.threshold = Some(f64::NAN);
         assert!(validate_rule(&invalid).is_err());
+
+        let expiration = RuleRequest {
+            name: "expiring".to_string(),
+            metric: "instance_expiring".to_string(),
+            threshold: Some(7.0),
+            duration_seconds: 0,
+            severity: "warning".to_string(),
+            scope: "all".to_string(),
+            target_instance_ids: vec![],
+            channel_ids: vec![],
+            enabled: true,
+        };
+        assert!(validate_rule(&expiration).is_ok());
+        let mut invalid_expiration = expiration.clone();
+        invalid_expiration.threshold = Some(1.5);
+        assert!(validate_rule(&invalid_expiration).is_err());
+        invalid_expiration.threshold = Some(7.0);
+        invalid_expiration.duration_seconds = 1;
+        assert!(validate_rule(&invalid_expiration).is_err());
     }
 
     #[test]
@@ -5108,7 +5243,7 @@ mod tests {
         assert!(telegram["text"].as_str().unwrap().contains("critical"));
 
         let discord = discord_body(&payload);
-        assert!(discord["content"].as_str().unwrap().contains("cpu_percent"));
+        assert!(discord["content"].as_str().unwrap().contains("CPU 使用率"));
         assert_eq!(discord["allowed_mentions"]["parse"], json!([]));
     }
 
@@ -5234,7 +5369,44 @@ mod tests {
         assert!(node_offline_suppresses("cpu_percent", true));
         assert!(node_offline_suppresses("latency_ms", true));
         assert!(!node_offline_suppresses("node_offline", true));
+        assert!(!node_offline_suppresses("instance_expiring", true));
         assert!(!node_offline_suppresses("cpu_percent", false));
+    }
+
+    #[test]
+    fn expiration_observation_uses_remaining_whole_day_threshold_direction() {
+        assert_eq!(expiration_observation(None, 100, 7.0), (0.0, false));
+        assert_eq!(
+            expiration_observation(Some(100 + 8 * 86_400), 100, 7.0),
+            (8.0, false)
+        );
+        assert_eq!(
+            expiration_observation(Some(100 + 7 * 86_400), 100, 7.0),
+            (7.0, true)
+        );
+        assert_eq!(
+            expiration_observation(Some(99), 100, 0.0),
+            (-1.0 / 86_400.0, true)
+        );
+    }
+
+    #[test]
+    fn expiration_notifications_use_readable_units() {
+        let text = notification_text(&json!({
+            "type": "alert.firing",
+            "event": {
+                "severity": "warning",
+                "metric": "instance_expiring",
+                "instance_id": "node-1",
+                "current_value": -2.0,
+                "threshold": 7
+            },
+            "rule": {"name": "Expiry reminder"},
+            "node": {"name": "API node", "expires_at": 1_700_000_000_i64}
+        }));
+        assert!(text.contains("指标: 实例即将到期"));
+        assert!(text.contains("当前值: 已到期 2.0 天"));
+        assert!(text.contains("阈值: 剩余时间 <= 7 天"));
     }
 
     #[test]
@@ -5309,6 +5481,104 @@ mod tests {
         ));
         assert!(!lifecycle_has_advanced("alert.resolved", Some("resolved")));
         assert!(!lifecycle_has_advanced("webhook.test", None));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn expiration_rule_fires_and_resolves_when_expiration_changes() {
+        let (db, bootstrap, schema) = isolated_test_pool("om_alerts_expiration").await;
+        create_alert_prerequisites(&db).await;
+        ensure_schema(&db).await.expect("create alert schema");
+        insert_test_instance(&db, "node-expiration", "Expiring Node").await;
+        sqlx::query(
+            r#"
+            INSERT INTO alert_rules(
+                id,name,metric,threshold,duration_seconds,severity,scope,
+                enabled,version,created_by,created_at,updated_at
+            ) VALUES(
+                'rule-expiration','Expiry reminder','instance_expiring',7,0,
+                'warning','all',TRUE,1,'test',100,100
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("insert expiration rule");
+        let state = test_state(db.clone());
+        let now = 1_700_000_000_i64;
+
+        sqlx::query("UPDATE instances SET expires_at=$1 WHERE id='node-expiration'")
+            .bind(now + 8 * 86_400)
+            .execute(&db)
+            .await
+            .expect("set distant expiration");
+        observe_expiration_at(&state, "node-expiration", now)
+            .await
+            .expect("evaluate distant expiration");
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alert_events")
+            .fetch_one(&db)
+            .await
+            .expect("count expiration events");
+        assert_eq!(events, 0);
+
+        let near_expiration = now + 7 * 86_400;
+        sqlx::query("UPDATE instances SET expires_at=$1 WHERE id='node-expiration'")
+            .bind(near_expiration)
+            .execute(&db)
+            .await
+            .expect("set near expiration");
+        observe_expiration_at(&state, "node-expiration", now + 1)
+            .await
+            .expect("evaluate near expiration");
+        let (status, snapshot) = sqlx::query_as::<_, (String, Value)>(
+            "SELECT status,node_snapshot FROM alert_events WHERE instance_id='node-expiration'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("load firing expiration event");
+        assert_eq!(status, "firing");
+        assert_eq!(snapshot["expires_at"], near_expiration);
+
+        sqlx::query("UPDATE instances SET expires_at=$1 WHERE id='node-expiration'")
+            .bind(now + 10 * 86_400)
+            .execute(&db)
+            .await
+            .expect("postpone expiration");
+        observe_expiration_at(&state, "node-expiration", now + 2)
+            .await
+            .expect("evaluate postponed expiration");
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM alert_events WHERE instance_id='node-expiration'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("load resolved expiration event");
+        assert_eq!(status, "resolved");
+
+        sqlx::query("UPDATE instances SET expires_at=$1 WHERE id='node-expiration'")
+            .bind(now - 1)
+            .execute(&db)
+            .await
+            .expect("expire instance");
+        observe_expiration_at(&state, "node-expiration", now + 3)
+            .await
+            .expect("evaluate expired instance");
+        sqlx::query("UPDATE instances SET expires_at=NULL WHERE id='node-expiration'")
+            .execute(&db)
+            .await
+            .expect("clear expiration");
+        observe_expiration_at(&state, "node-expiration", now + 4)
+            .await
+            .expect("evaluate cleared expiration");
+        let unresolved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM alert_events WHERE instance_id='node-expiration' AND status <> 'resolved'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count unresolved expiration events");
+        assert_eq!(unresolved, 0);
+
+        drop_test_schema(db, bootstrap, schema).await;
     }
 
     #[tokio::test]

@@ -39,7 +39,7 @@
 .instance-card:hover { background: var(--surface-card-hover); border-color: var(--line-strong); border-left-color: var(--success); }
 .instance-card.offline { border-left-color: var(--danger); }
 .instance-card.offline:hover { border-left-color: var(--danger); }
-.instance-list.rows .instance-card { display: grid; grid-template-columns: minmax(260px, .72fr) minmax(480px, 1.28fr); align-items: center; gap: 18px; }
+.instance-list.rows .instance-card { display: grid; grid-template-columns: minmax(220px, .7fr) minmax(240px, .75fr) minmax(420px, 1.3fr); align-items: center; gap: 18px; }
 .instance-list.rows .instance-remark, .instance-list.rows .quick-row { grid-column: 1 / -1; }
 
 .instance-main { display: flex; align-items: flex-start; justify-content: space-between; gap: 11px; min-width: 0; }
@@ -66,6 +66,14 @@
 .more-menu button.danger { color: var(--danger-text); }
 
 .instance-remark { margin: -4px 0 -2px; padding: 9px 10px; color: var(--muted); background: var(--panel-soft); border-left: 2px solid var(--line-strong); font-size: 12px; line-height: 1.5; }
+.lifecycle-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.lifecycle-item { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 10px 11px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; }
+.lifecycle-item > span { display: inline-flex; min-width: 0; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.lifecycle-item > span svg { flex: 0 0 auto; color: var(--accent-strong); }
+.lifecycle-item strong { overflow: hidden; color: var(--text-strong); font-size: 12px; font-weight: 650; text-align: right; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.lifecycle-item small { grid-column: 1 / -1; overflow: hidden; color: #77827d; font-size: 10px; text-align: right; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.lifecycle-item.expired { background: color-mix(in srgb, var(--danger) 8%, var(--panel-soft)); border-color: color-mix(in srgb, var(--danger) 34%, var(--line)); }
+.lifecycle-item.expired > span svg, .lifecycle-item.expired strong { color: var(--danger-text); }
 .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 13px; background: var(--surface-inset); border: 1px solid var(--line); border-radius: 6px; }
 .metric { display: flex; min-width: 0; flex-direction: column; gap: 7px; --metric-color: #49c89f; }
 .metric:nth-child(2) { --metric-color: #55b8cf; }

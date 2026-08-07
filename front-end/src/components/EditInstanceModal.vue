@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref } from 'vue'
-import { Check, ChevronDown, Globe2, MapPin, Pencil, Search, X } from 'lucide-vue-next'
+import { CalendarClock, Check, ChevronDown, Globe2, MapPin, Pencil, Search, X } from 'lucide-vue-next'
 import {
   COUNTRY_OPTIONS,
   getCountryFlagUrl,
@@ -14,6 +14,7 @@ const props = defineProps<{
     country_code: string
     country: string
     remark: string
+    expires_at: string
   }
 }>()
 
@@ -232,6 +233,13 @@ function submit() {
           </Transition>
         </div>
       </fieldset>
+      <label class="expiration-field">
+        <span><CalendarClock :size="13" />到期时间</span>
+        <div class="expiration-input-row">
+          <input v-model="form.expires_at" type="datetime-local" step="60" />
+          <button class="text-button" type="button" @click="form.expires_at = ''">长期有效</button>
+        </div>
+      </label>
       <label><span>节点备注</span><textarea v-model="form.remark" placeholder="补充说明"></textarea></label>
       <div class="modal-actions">
         <button class="text-button" type="button" @click="$emit('close')">取消</button>

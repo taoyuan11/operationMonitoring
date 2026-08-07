@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   Bot,
   BellRing,
+  CalendarClock,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -126,6 +127,7 @@ const metricOptions: Array<{ value: AlertMetric; label: string }> = [
   { value: 'memory_percent', label: '内存使用率' },
   { value: 'disk_percent', label: '磁盘使用率' },
   { value: 'latency_ms', label: '网络延迟' },
+  { value: 'instance_expiring', label: '实例即将到期' },
 ]
 
 const channelTypes: Array<{
@@ -229,6 +231,7 @@ function metricIcon(metric: AlertMetric) {
     memory_percent: MemoryStick,
     disk_percent: HardDrive,
     latency_ms: Activity,
+    instance_expiring: CalendarClock,
   }[metric]
 }
 
@@ -326,11 +329,15 @@ function formatDuration(seconds: number) {
 function formatMetricValue(metric: string, value: number | null) {
   if (metric === 'node_offline') return value && value > 0 ? '离线' : '在线'
   if (value === null || !Number.isFinite(value)) return '未知'
+  if (metric === 'instance_expiring') {
+    return value < 0 ? `已到期 ${Math.abs(value).toFixed(1)} 天` : `剩余 ${value.toFixed(1)} 天`
+  }
   return metric === 'latency_ms' ? `${value.toFixed(0)} ms` : `${value.toFixed(1)}%`
 }
 
 function formatThreshold(rule: Pick<AlertRule, 'metric' | 'threshold'>) {
   if (rule.metric === 'node_offline') return '连接状态'
+  if (rule.metric === 'instance_expiring') return `剩余时间 <= ${rule.threshold?.toFixed(0)} 天`
   return `>= ${formatMetricValue(rule.metric, rule.threshold)}`
 }
 
@@ -536,6 +543,7 @@ function jsonValue(value: unknown) {
             <div class="alert-event-state">
               <strong>{{ event.match_count }} 次匹配</strong>
               <small v-if="event.suppressed" class="suppression-label"><ShieldAlert :size="11" />{{ event.suppression_reason || '通知已抑制' }}</small>
+              <small v-else-if="event.metric === 'instance_expiring'">进入提醒周期后立即触发</small>
               <small v-else>{{ formatDuration(event.duration_seconds) }} 后触发</small>
             </div>
             <div class="alert-event-time">
@@ -555,7 +563,7 @@ function jsonValue(value: unknown) {
               <template v-else>
                 <dl class="alert-detail-grid">
                   <div><dt>事件 ID</dt><dd><code>{{ eventDetail.id }}</code></dd></div>
-                  <div><dt>阈值</dt><dd>{{ eventDetail.threshold === null ? '连接断开' : formatMetricValue(eventDetail.metric, eventDetail.threshold) }}</dd></div>
+                  <div><dt>阈值</dt><dd>{{ formatThreshold(eventDetail) }}</dd></div>
                   <div><dt>首次观察</dt><dd>{{ formatTime(eventDetail.first_observed_at) }}</dd></div>
                   <div><dt>确认人</dt><dd>{{ eventDetail.acknowledged_by || '尚未确认' }}</dd></div>
                   <div><dt>恢复原因</dt><dd>{{ eventDetail.resolution_reason || '尚未恢复' }}</dd></div>
@@ -610,7 +618,7 @@ function jsonValue(value: unknown) {
     <div v-else-if="activeTab === 'rules'" class="alert-tab-content alert-config-layout">
       <section class="alert-form-panel">
         <div class="alert-panel-heading">
-          <div><h3>{{ editingRuleId ? '编辑规则' : '创建规则' }}</h3><p>异常持续达到设定时间后生成事件。</p></div>
+          <div><h3>{{ editingRuleId ? '编辑规则' : '创建规则' }}</h3><p>{{ ruleForm.metric === 'instance_expiring' ? '进入设定的到期提醒周期后立即生成事件。' : '异常持续达到设定时间后生成事件。' }}</p></div>
           <button v-if="editingRuleId" class="icon-button" type="button" title="取消编辑" @click="resetRuleForm"><X :size="15" /></button>
         </div>
         <div class="alert-presets" aria-label="快速规则预设">
@@ -622,8 +630,8 @@ function jsonValue(value: unknown) {
           <label><span>规则名称</span><input v-model="ruleForm.name" required maxlength="120" placeholder="例如：核心节点 CPU 持续过高" /></label>
           <div class="alert-form-grid">
             <label><span>监控指标</span><select :value="ruleForm.metric" @change="changeRuleMetric"><option v-for="option in metricOptions" :key="option.value" :value="option.value">{{ option.label }}</option></select></label>
-            <label v-if="ruleForm.metric !== 'node_offline'"><span>阈值 {{ ruleForm.metric === 'latency_ms' ? '(ms)' : '(%)' }}</span><input v-model.number="ruleForm.threshold" required type="number" min="0" :max="ruleForm.metric === 'latency_ms' ? undefined : 100" step="0.1" /></label>
-            <label><span>持续时间（秒）</span><input v-model.number="ruleForm.duration_seconds" required type="number" min="0" max="31536000" /></label>
+            <label v-if="ruleForm.metric !== 'node_offline'"><span>阈值 {{ ruleForm.metric === 'latency_ms' ? '(ms)' : ruleForm.metric === 'instance_expiring' ? '(天)' : '(%)' }}</span><input v-model.number="ruleForm.threshold" required type="number" min="0" :max="['cpu_percent', 'memory_percent', 'disk_percent'].includes(ruleForm.metric) ? 100 : undefined" :step="ruleForm.metric === 'instance_expiring' ? 1 : 0.1" /></label>
+            <label v-if="ruleForm.metric !== 'instance_expiring'"><span>持续时间（秒）</span><input v-model.number="ruleForm.duration_seconds" required type="number" min="0" max="31536000" /></label>
           </div>
           <fieldset class="alert-choice-fieldset">
             <legend>严重级别</legend>
@@ -663,7 +671,7 @@ function jsonValue(value: unknown) {
         <div v-else class="alert-rule-list">
           <article v-for="rule in rules.items" :key="rule.id" :class="{ disabled: !rule.enabled, editing: editingRuleId === rule.id }">
             <span :class="['alert-severity-mark', rule.severity]"><component :is="metricIcon(rule.metric)" :size="16" /></span>
-            <div class="alert-rule-main"><strong>{{ rule.name }}</strong><small>{{ metricLabel(rule.metric) }} {{ formatThreshold(rule) }} · 持续 {{ formatDuration(rule.duration_seconds) }}</small><p>{{ rule.scope === 'all' ? '全部节点' : `${rule.target_instance_ids.length} 个指定节点` }} · {{ rule.channel_ids.length ? `${rule.channel_ids.length} 个通知渠道` : '仅控制台事件' }}</p></div>
+            <div class="alert-rule-main"><strong>{{ rule.name }}</strong><small>{{ metricLabel(rule.metric) }} {{ formatThreshold(rule) }}<template v-if="rule.metric !== 'instance_expiring'"> · 持续 {{ formatDuration(rule.duration_seconds) }}</template></small><p>{{ rule.scope === 'all' ? '全部节点' : `${rule.target_instance_ids.length} 个指定节点` }} · {{ rule.channel_ids.length ? `${rule.channel_ids.length} 个通知渠道` : '仅控制台事件' }}</p></div>
             <label class="switch-control" :title="rule.enabled ? '停用规则' : '启用规则'"><input type="checkbox" :checked="rule.enabled" :disabled="isBusy(`rule:${rule.id}:enabled`)" @change="toggleRule(rule, ($event.target as HTMLInputElement).checked)" /><span></span></label>
             <div class="row-actions">
               <button class="icon-button" type="button" title="编辑规则" @click="editRule(rule)"><Edit3 :size="14" /></button>

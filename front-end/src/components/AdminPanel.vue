@@ -8,7 +8,6 @@ import {
   Monitor,
   Moon,
   Palette,
-  Plus,
   Settings,
   Sun,
   Terminal,
@@ -17,8 +16,6 @@ import {
 } from 'lucide-vue-next'
 import type {
   AdminTab,
-  CommandJob,
-  CommandRecord,
   PendingInstance,
   ResolvedTheme,
   ThemeMode,
@@ -28,8 +25,6 @@ import { formatTime } from '../utils/format'
 const props = defineProps<{
   adminTab: AdminTab
   pendingInstances: PendingInstance[]
-  commands: CommandRecord[]
-  jobs: CommandJob[]
   settingsForm: {
     retention_days: number
     audit_retention_days: number
@@ -43,11 +38,6 @@ const props = defineProps<{
   backgroundFileName: string
   backgroundOperation: 'uploading' | 'removing' | null
   backgroundMessage: string
-  commandForm: {
-    name: string
-    command: string
-    confirm_text: string
-  }
 }>()
 
 const themeOptions = [
@@ -72,8 +62,6 @@ const previewTheme = computed(() =>
 const emit = defineEmits<{
   approve: [id: string]
   reject: [id: string]
-  createCommand: []
-  removeCommand: [command: CommandRecord]
   saveSettings: []
   saveAppearance: []
   appearanceChanged: []
@@ -127,61 +115,6 @@ const emit = defineEmits<{
             </article>
           </TransitionGroup>
         </Transition>
-      </div>
-    </template>
-
-    <template v-if="adminTab === 'commands'">
-      <header class="page-header">
-        <div class="page-heading-icon purple"><Terminal :size="22" /></div>
-        <div>
-          <span class="section-kicker">Remote actions</span>
-          <h2>快捷命令</h2>
-          <p>维护可在实例节点上安全执行的预设操作。</p>
-        </div>
-        <span class="page-count">{{ commands.length }} 个已启用</span>
-      </header>
-
-      <div class="admin-page-grid commands-layout">
-        <div class="admin-content-card">
-          <div class="card-heading"><div><h3>创建快捷命令</h3><p>添加后可直接在主页节点卡片中执行。</p></div></div>
-          <form class="stack-form page-form" @submit.prevent="$emit('createCommand')">
-            <label><span>显示名称</span><input v-model="commandForm.name" required placeholder="例如：重启 Nginx" /></label>
-            <label><span>执行命令</span><input v-model="commandForm.command" required placeholder="systemctl restart nginx" /></label>
-            <label><span>确认提示 <i>可选</i></span><input v-model="commandForm.confirm_text" placeholder="执行前显示的二次确认提示" /></label>
-            <button class="primary-button" type="submit"><Plus :size="16" />添加快捷命令</button>
-          </form>
-        </div>
-
-        <div class="admin-content-card">
-          <div class="card-heading"><div><h3>已启用命令</h3><p>当前允许执行的命令白名单。</p></div></div>
-          <Transition name="content" mode="out-in">
-            <div v-if="commands.length === 0" key="empty" class="compact-empty">暂无快捷命令</div>
-            <TransitionGroup v-else key="commands" name="row" tag="div" class="command-list">
-              <article v-for="command in commands" :key="command.id" class="command-row">
-                <span class="list-icon"><Terminal :size="16" /></span>
-                <div><strong>{{ command.name }}</strong><code>{{ command.command }}</code></div>
-                <button class="icon-button danger" type="button" title="停用" @click="$emit('removeCommand', command)">
-                  <Trash2 :size="15" />
-                </button>
-              </article>
-            </TransitionGroup>
-          </Transition>
-        </div>
-
-        <div class="admin-content-card recent-jobs-card">
-          <div class="card-heading"><div><h3>最近执行记录</h3><p>最近提交到节点的命令任务。</p></div></div>
-          <Transition name="content" mode="out-in">
-            <div v-if="jobs.length === 0" key="empty" class="compact-empty">暂无执行记录</div>
-            <TransitionGroup v-else key="jobs" name="row" tag="div" class="jobs-table">
-              <article v-for="job in jobs.slice(0, 10)" :key="job.id" class="job-table-row">
-                <span :class="['job-status', job.status]">{{ job.status }}</span>
-                <strong>{{ job.command }}</strong>
-                <small>节点 {{ job.instance_id.slice(0, 8) }}</small>
-                <time>{{ formatTime(job.created_at) }}</time>
-              </article>
-            </TransitionGroup>
-          </Transition>
-        </div>
       </div>
     </template>
 

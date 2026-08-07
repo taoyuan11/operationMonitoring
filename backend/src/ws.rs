@@ -4,10 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::{
+    extract::ws::{Message, WebSocket},
+    http::StatusCode,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -20,7 +23,7 @@ use crate::{
         handle_docker_exec_event, handle_docker_log_chunk, handle_docker_log_closed,
         handle_docker_response, update_current_docker_status,
     },
-    error::AppResult,
+    error::{AppError, AppResult},
     files::{close_connection_file_requests, handle_agent_file_binary, handle_agent_file_response},
     jobs::{
         MAX_COMMAND_OUTPUT_BYTES, append_command_job_output, complete_command_job,
@@ -28,10 +31,13 @@ use crate::{
     },
     models::{
         AgentInbound, AgentOutbound, MAX_AGENT_UPDATE_RETRY_COUNT, MetricPayload,
-        TerminalClientMessage, TerminalServerMessage,
+        TerminalClientMessage, TerminalServerMessage, TerminalShellInfo,
     },
     remote_desktop::{close_connection_desktops, desktop_agent_closed, desktop_agent_opened},
-    state::{AgentHandle, AgentOutboundSender, AppState, TerminalSessionHandle},
+    state::{
+        AgentHandle, AgentOutboundSender, AppState, PendingTerminalShellRequest,
+        TerminalSessionHandle, TerminalShellRequestFailure,
+    },
     updates::{
         confirm_update_version, offer_update_on_connect, record_connection_rollback_status,
         record_connection_update_status,
@@ -49,7 +55,12 @@ const MAX_STATUS_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_AGENT_ID_BYTES: usize = 128;
 const AGENT_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 128;
-const MAX_TERMINAL_SESSIONS_PER_INSTANCE: usize = 8;
+pub(crate) const MAX_TERMINAL_SESSIONS_PER_INSTANCE: usize = 8;
+pub(crate) const TERMINAL_SHELLS_CAPABILITY: &str = "terminal_shells_v1";
+const MAX_TERMINAL_SHELLS: usize = 64;
+const MAX_TERMINAL_SHELL_LABEL_BYTES: usize = 128;
+const MAX_TERMINAL_SHELL_PROGRAM_BYTES: usize = 1024;
+const TERMINAL_SHELLS_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_SESSION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
@@ -351,6 +362,19 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
                 return Err("command output chunk too large");
             }
         }
+        AgentInbound::TerminalShellsResponse { request_id, shells } => {
+            if !id(request_id)
+                || shells.len() > MAX_TERMINAL_SHELLS
+                || shells.iter().any(|shell| {
+                    shell.label.is_empty()
+                        || shell.label.len() > MAX_TERMINAL_SHELL_LABEL_BYTES
+                        || shell.label.chars().any(char::is_control)
+                        || !valid_terminal_shell_program(&shell.program)
+                })
+            {
+                return Err("terminal shell response is invalid");
+            }
+        }
         AgentInbound::TerminalOpened { session_id }
         | AgentInbound::DesktopOpened { session_id }
         | AgentInbound::DockerExecOpened { session_id } => {
@@ -461,6 +485,104 @@ fn serialized_len_exceeds<T: serde::Serialize>(value: &T, max_bytes: usize) -> b
         .unwrap_or(true)
 }
 
+pub(crate) fn valid_terminal_shell_program(program: &str) -> bool {
+    if program.is_empty()
+        || program.len() > MAX_TERMINAL_SHELL_PROGRAM_BYTES
+        || program.trim() != program
+        || program.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let has_separator = program.contains('/') || program.contains('\\');
+    has_separator || !program.chars().any(char::is_whitespace)
+}
+
+pub(crate) async fn request_terminal_shells(
+    state: &AppState,
+    instance_id: &str,
+) -> AppResult<Vec<TerminalShellInfo>> {
+    let agent = state
+        .agents
+        .read()
+        .await
+        .get(instance_id)
+        .cloned()
+        .ok_or_else(|| AppError::new(StatusCode::CONFLICT, "实例不在线"))?;
+    if !agent
+        .capabilities
+        .iter()
+        .any(|capability| capability == TERMINAL_SHELLS_CAPABILITY)
+    {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "当前 Agent 版本不支持 Shell 选择，请先更新 Agent",
+        ));
+    }
+
+    let request_id = Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel();
+    state.terminal_shell_requests.write().await.insert(
+        request_id.clone(),
+        PendingTerminalShellRequest {
+            instance_id: instance_id.to_string(),
+            agent_connection_id: agent.connection_id,
+            tx,
+        },
+    );
+    if agent
+        .tx
+        .send(AgentOutbound::TerminalShellsRequest {
+            request_id: request_id.clone(),
+        })
+        .is_err()
+    {
+        state
+            .terminal_shell_requests
+            .write()
+            .await
+            .remove(&request_id);
+        return Err(AppError::new(StatusCode::CONFLICT, "实例连接已断开"));
+    }
+
+    let result = tokio::time::timeout(TERMINAL_SHELLS_TIMEOUT, rx).await;
+    state
+        .terminal_shell_requests
+        .write()
+        .await
+        .remove(&request_id);
+    match result {
+        Ok(Ok(Ok(shells))) => Ok(shells),
+        Ok(Ok(Err(TerminalShellRequestFailure::Disconnected))) | Ok(Err(_)) => {
+            Err(AppError::new(StatusCode::CONFLICT, "实例连接已断开"))
+        }
+        Err(_) => Err(AppError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "等待 Agent Shell 列表响应超时",
+        )),
+    }
+}
+
+async fn handle_terminal_shells_response(
+    state: &AppState,
+    instance_id: &str,
+    connection_id: Uuid,
+    request_id: &str,
+    shells: Vec<TerminalShellInfo>,
+) {
+    let pending = {
+        let mut requests = state.terminal_shell_requests.write().await;
+        let matches = requests.get(request_id).is_some_and(|pending| {
+            pending.instance_id == instance_id && pending.agent_connection_id == connection_id
+        });
+        matches.then(|| requests.remove(request_id)).flatten()
+    };
+    if let Some(pending) = pending {
+        let _ = pending.tx.send(Ok(shells));
+    } else {
+        warn!(%instance_id, %connection_id, %request_id, "ignored unmatched terminal shell response");
+    }
+}
+
 async fn handle_agent_message(
     state: &AppState,
     instance_id: &str,
@@ -528,6 +650,10 @@ async fn handle_agent_message(
             {
                 warn!(%instance_id, %connection_id, %job_id, "ignored unmatched or terminal command output");
             }
+        }
+        AgentInbound::TerminalShellsResponse { request_id, shells } => {
+            handle_terminal_shells_response(state, instance_id, connection_id, &request_id, shells)
+                .await;
         }
         AgentInbound::TerminalOpened { session_id } => {
             send_terminal_event(
@@ -906,6 +1032,64 @@ mod tests {
     }
 
     #[test]
+    fn terminal_shell_programs_reject_commands_and_allow_paths_with_spaces() {
+        assert!(valid_terminal_shell_program("fish"));
+        assert!(valid_terminal_shell_program("/opt/custom shells/fish"));
+        assert!(valid_terminal_shell_program(
+            r"C:\Program Files\PowerShell\7\pwsh.exe"
+        ));
+        assert!(!valid_terminal_shell_program("fish --login"));
+        assert!(!valid_terminal_shell_program("fish\nwhoami"));
+        assert!(!valid_terminal_shell_program(""));
+    }
+
+    #[test]
+    fn terminal_open_protocol_keeps_auto_mode_backward_compatible() {
+        let legacy = serde_json::json!({
+            "type": "terminal_open",
+            "session_id": "terminal-1",
+            "cols": 80,
+            "rows": 24
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentOutbound>(legacy).unwrap(),
+            AgentOutbound::TerminalOpen { shell: None, .. }
+        ));
+
+        let automatic = serde_json::to_value(AgentOutbound::TerminalOpen {
+            session_id: "terminal-1".to_string(),
+            shell: None,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        assert!(automatic.get("shell").is_none());
+    }
+
+    #[test]
+    fn terminal_shell_responses_enforce_business_limits() {
+        let accepted = AgentInbound::TerminalShellsResponse {
+            request_id: "request-1".to_string(),
+            shells: vec![TerminalShellInfo {
+                label: "fish".to_string(),
+                program: "/usr/bin/fish".to_string(),
+            }],
+        };
+        assert!(validate_agent_inbound(&accepted).is_ok());
+
+        let oversized = AgentInbound::TerminalShellsResponse {
+            request_id: "request-1".to_string(),
+            shells: (0..=MAX_TERMINAL_SHELLS)
+                .map(|index| TerminalShellInfo {
+                    label: format!("shell-{index}"),
+                    program: format!("/usr/bin/shell-{index}"),
+                })
+                .collect(),
+        };
+        assert!(validate_agent_inbound(&oversized).is_err());
+    }
+
+    #[test]
     fn matching_pong_returns_millisecond_latency_and_clears_pending_heartbeat() {
         let sent_at = Instant::now();
         let mut pending = VecDeque::from([PendingHeartbeat { token: 42, sent_at }]);
@@ -1068,23 +1252,44 @@ fn send_terminal_agent_message(agent: &AgentHandle, message: AgentOutbound) -> b
 }
 
 async fn close_connection_terminals(state: &AppState, instance_id: &str, connection_id: Uuid) {
-    let mut sessions = state.terminal_sessions.write().await;
-    sessions.retain(|_, handle| {
-        let matches =
-            handle.instance_id == instance_id && handle.agent_connection_id == connection_id;
-        if matches {
-            let _ = handle.tx.try_send(TerminalServerMessage::Closed {
-                exit_code: None,
-                reason: Some("实例连接已断开".to_string()),
-            });
-        }
-        !matches
-    });
+    {
+        let mut sessions = state.terminal_sessions.write().await;
+        sessions.retain(|_, handle| {
+            let matches =
+                handle.instance_id == instance_id && handle.agent_connection_id == connection_id;
+            if matches {
+                let _ = handle.tx.try_send(TerminalServerMessage::Closed {
+                    exit_code: None,
+                    reason: Some("实例连接已断开".to_string()),
+                });
+            }
+            !matches
+        });
+    }
+    let disconnected = {
+        let mut requests = state.terminal_shell_requests.write().await;
+        let ids = requests
+            .iter()
+            .filter(|(_, pending)| {
+                pending.instance_id == instance_id && pending.agent_connection_id == connection_id
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| requests.remove(&id))
+            .collect::<Vec<_>>()
+    };
+    for pending in disconnected {
+        let _ = pending
+            .tx
+            .send(Err(TerminalShellRequestFailure::Disconnected));
+    }
 }
 
 pub async fn terminal_socket(
     state: AppState,
     instance_id: String,
+    shell: Option<String>,
     actor: String,
     user_id: String,
     audit_context: audit::AuditContext,
@@ -1103,6 +1308,21 @@ pub async fn terminal_socket(
         .await;
         return;
     };
+    if shell.is_some()
+        && !agent
+            .capabilities
+            .iter()
+            .any(|capability| capability == TERMINAL_SHELLS_CAPABILITY)
+    {
+        send_single_terminal_message(
+            socket,
+            TerminalServerMessage::Error {
+                message: "当前 Agent 版本不支持 Shell 选择，请先更新 Agent".to_string(),
+            },
+        )
+        .await;
+        return;
+    }
 
     if let Err(error) = audit::insert_event(
         &state.db,
@@ -1114,7 +1334,13 @@ pub async fn terminal_socket(
             action: "terminal_session".to_string(),
             target: instance_id.clone(),
             detail: "启动终端会话".to_string(),
-            metadata: json!({}),
+            metadata: match shell.as_deref() {
+                Some(program) => json!({
+                    "shell_mode": "selected",
+                    "shell_program": program,
+                }),
+                None => json!({ "shell_mode": "auto" }),
+            },
             instance_id: Some(instance_id.clone()),
             node_snapshot: audit::instance_snapshot(&state.db, &instance_id).await,
             context: audit_context,
@@ -1182,6 +1408,7 @@ pub async fn terminal_socket(
         &agent,
         AgentOutbound::TerminalOpen {
             session_id: session_id.clone(),
+            shell,
             cols: 80,
             rows: 24,
         },

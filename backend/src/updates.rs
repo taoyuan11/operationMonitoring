@@ -2673,7 +2673,7 @@ async fn locked_instance(
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version, package_type, native_arch,
                update_privileged, rollback_supported, rollback_version, approved, disabled,
-               first_seen, last_seen
+               first_seen, last_seen, expires_at
         FROM instances WHERE id = $1 FOR UPDATE
         "#,
     )
@@ -2889,7 +2889,7 @@ async fn queue_rollback_for_upgrade_in_transaction(
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version, package_type, native_arch,
                update_privileged, rollback_supported, rollback_version, approved, disabled,
-               first_seen, last_seen
+               first_seen, last_seen, expires_at
         FROM instances WHERE id = $1
         "#,
     )

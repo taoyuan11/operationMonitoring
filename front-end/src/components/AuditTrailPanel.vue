@@ -306,11 +306,27 @@ function exportAudit(format: AuditExportFormat) {
   emit('exportAudit', format)
 }
 
-async function toggleExportMenu() {
-  exportMenuOpen.value = !exportMenuOpen.value
-  if (!exportMenuOpen.value) return
+async function openExportMenu(itemIndex = 0) {
+  if (props.auditExporting) return
+  exportMenuOpen.value = true
   await nextTick()
-  exportMenuItems()[0]?.focus()
+  const items = exportMenuItems()
+  const targetIndex = itemIndex < 0 ? items.length - 1 : itemIndex
+  items[targetIndex]?.focus()
+}
+
+function toggleExportMenu() {
+  if (exportMenuOpen.value) {
+    closeExportMenu()
+    return
+  }
+  void openExportMenu()
+}
+
+function handleExportMenuButtonKeydown(event: KeyboardEvent) {
+  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+  event.preventDefault()
+  void openExportMenu(event.key === 'ArrowUp' ? -1 : 0)
 }
 
 function exportMenuItems() {
@@ -326,6 +342,11 @@ function closeExportMenu(restoreFocus = false) {
 }
 
 function handleExportMenuKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    closeExportMenu(true)
+    return
+  }
   const items = exportMenuItems()
   if (!items.length) return
   const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement)
@@ -430,6 +451,7 @@ function handleDocumentKeydown(event: KeyboardEvent) {
               aria-haspopup="menu"
               :aria-expanded="exportMenuOpen"
               @click="toggleExportMenu"
+              @keydown="handleExportMenuButtonKeydown"
             >
               <LoaderCircle v-if="auditExporting" class="spin" :size="15" />
               <Download v-else :size="15" />

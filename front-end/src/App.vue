@@ -5,6 +5,7 @@ import AdminPanel from './components/AdminPanel.vue'
 import AgentUpdatesPanel from './components/AgentUpdatesPanel.vue'
 import AlertCenterPanel from './components/AlertCenterPanel.vue'
 import AuditTrailPanel from './components/AuditTrailPanel.vue'
+import CommandCenterPanel from './components/CommandCenterPanel.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import InstanceBoard from './components/InstanceBoard.vue'
 import LoginModal from './components/LoginModal.vue'
@@ -439,6 +440,7 @@ function confirmAction() {
               <InstanceBoard
                 :instances="consoleState.instances.value"
                 :is-admin="consoleState.isAdmin.value"
+                :current-time="consoleState.currentTime.value"
                 :view-mode="consoleState.viewMode.value"
                 @update:view-mode="consoleState.viewMode.value = $event"
                 @open="openInstance"
@@ -521,24 +523,30 @@ function confirmAction() {
             @refresh-audit="consoleState.loadAudit"
             @export-audit="consoleState.exportAudit"
           />
+          <CommandCenterPanel
+            v-else-if="currentPage === 'commands'"
+            :key="`commands-${consoleState.adminResetKey.value}`"
+            :commands="consoleState.commands.value"
+            :jobs="consoleState.jobs.value"
+            :command-form="consoleState.commandForm"
+            :loading="consoleState.loading.value"
+            :error-message="consoleState.errorMessage.value"
+            @create-command="consoleState.createCommand"
+            @remove-command="requestRemoveCommand"
+          />
           <AdminPanel
             v-else
             :key="`admin-${consoleState.adminResetKey.value}`"
             :admin-tab="activeAdminTab"
             :pending-instances="consoleState.pendingInstances.value"
-            :commands="consoleState.commands.value"
-            :jobs="consoleState.jobs.value"
             :settings-form="consoleState.settingsForm"
             :resolved-theme="consoleState.resolvedTheme.value"
             :appearance-message="consoleState.appearanceMessage.value"
             :background-file-name="consoleState.backgroundFileName.value"
             :background-operation="consoleState.backgroundOperation.value"
             :background-message="consoleState.backgroundMessage.value"
-            :command-form="consoleState.commandForm"
             @approve="consoleState.approveInstance"
             @reject="consoleState.rejectInstance"
-            @create-command="consoleState.createCommand"
-            @remove-command="requestRemoveCommand"
             @save-settings="consoleState.saveSettings"
             @save-appearance="consoleState.saveAppearance"
             @appearance-changed="consoleState.appearanceMessage.value = ''"
@@ -593,6 +601,7 @@ function confirmAction() {
       <TerminalModal
         v-if="consoleState.terminalState.instance"
         :instance="consoleState.terminalState.instance"
+        :instances="consoleState.instances.value"
         @close="consoleState.closeTerminal"
       />
     </Transition>

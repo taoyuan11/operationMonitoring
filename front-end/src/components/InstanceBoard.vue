@@ -2,6 +2,8 @@
 import { computed, ref } from 'vue'
 import {
   ArrowDownWideNarrow,
+  CalendarClock,
+  Clock3,
   Cpu,
   Grid3X3,
   HardDrive,
@@ -19,7 +21,14 @@ import CountryFlag from './CountryFlag.vue'
 import OperatingSystemLogo from './OperatingSystemLogo.vue'
 import { getCountryOption } from '../data/countries'
 import type { Instance, ViewMode } from '../types/domain'
-import { formatBytes, formatPercent, metricPercent } from '../utils/format'
+import {
+  formatBytes,
+  formatDuration,
+  formatExpirationRelative,
+  formatPercent,
+  formatTime,
+  metricPercent,
+} from '../utils/format'
 
 type StatusFilter = 'all' | 'online' | 'offline'
 type SortMode = 'default' | 'cpu' | 'memory' | 'name'
@@ -27,6 +36,7 @@ type SortMode = 'default' | 'cpu' | 'memory' | 'name'
 const props = defineProps<{
   instances: Instance[]
   isAdmin: boolean
+  currentTime: Date
   viewMode: ViewMode
 }>()
 
@@ -105,6 +115,18 @@ function metricLevel(value: number | null | undefined) {
   if (value >= 85) return 'high'
   if (value >= 65) return 'elevated'
   return ''
+}
+
+function hasKnownRuntime(instance: Instance) {
+  return isKnownMetric(instance.metrics?.uptime_seconds)
+}
+
+function currentTimestamp() {
+  return Math.floor(props.currentTime.getTime() / 1000)
+}
+
+function isExpired(instance: Instance) {
+  return instance.expires_at !== null && instance.expires_at <= currentTimestamp()
 }
 
 function resetFilters() {
@@ -281,6 +303,19 @@ function openInstance(instance: Instance) {
                 </div>
               </div>
             </header>
+
+            <div class="lifecycle-grid">
+              <div class="lifecycle-item">
+                <span><Clock3 :size="14" />运行时长</span>
+                <strong>{{ formatDuration(instance.metrics?.uptime_seconds) }}</strong>
+                <small>{{ instance.online ? '当前主机' : hasKnownRuntime(instance) ? '最后上报' : '尚无数据' }}</small>
+              </div>
+              <div :class="['lifecycle-item', 'expiration', { expired: isExpired(instance) }]">
+                <span><CalendarClock :size="14" />到期时间</span>
+                <strong>{{ formatExpirationRelative(instance.expires_at, currentTimestamp()) }}</strong>
+                <small>{{ instance.expires_at ? formatTime(instance.expires_at) : '未设置到期时间' }}</small>
+              </div>
+            </div>
 
             <div class="metrics">
               <div :class="['metric', metricLevel(instance.metrics?.cpu_percent)]">

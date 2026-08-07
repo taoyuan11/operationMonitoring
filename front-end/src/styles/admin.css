@@ -19,7 +19,6 @@
 .page-count { display: inline-flex; min-height: 30px; align-items: center; padding: 0 10px; color: var(--muted-strong); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 5px; font-size: 12px; white-space: nowrap; }
 
 .admin-page-grid { display: grid; min-height: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; flex: 1; overflow-x: hidden; overflow-y: auto; padding-right: 6px; padding-bottom: 36px; overscroll-behavior: contain; scrollbar-gutter: stable; }
-.commands-layout { grid-template-columns: minmax(300px, .72fr) minmax(380px, 1.28fr); }
 .settings-layout { grid-template-columns: minmax(420px, 1.35fr) minmax(280px, .65fr); }
 .appearance-settings-card { grid-column: 1 / -1; }
 .admin-content-card { min-width: 0; padding: 20px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
@@ -46,14 +45,13 @@
 .auth-device-row strong { color: var(--text-strong); font-size: 11px; }
 .pending-enrollment-card .auth-device-list { margin: 0; padding: 0; }
 .wide-card { width: 100%; }
-.recent-jobs-card { grid-column: 1 / -1; }
 .card-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 17px; padding-bottom: 15px; border-bottom: 1px solid var(--line); }
 .card-heading h3 { color: var(--text); font-size: 15px; font-weight: 660; }
 .card-heading p { margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .page-form { padding: 2px 0 0; }
 .form-help { color: var(--muted); font-size: 12px; line-height: 1.5; }
 
-.approval-list, .command-list { display: flex; flex-direction: column; }
+.approval-list { display: flex; flex-direction: column; }
 .approval-row { display: grid; grid-template-columns: auto minmax(0, 1.4fr) minmax(150px, .7fr) auto; align-items: center; gap: 14px; min-width: 0; padding: 14px 4px; border-bottom: 1px solid var(--line); }
 .approval-row:first-child { padding-top: 2px; }
 .approval-row:last-child { padding-bottom: 2px; border-bottom: 0; }
@@ -63,22 +61,7 @@
 .approval-identity span, .approval-time span { color: #7e8984; font-size: 11px; }
 .approval-time strong { color: #b3bcb8; font-size: 12px; font-weight: 550; }
 
-.command-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; min-width: 0; padding: 13px 2px; border-bottom: 1px solid var(--line); }
-.command-row:first-child { padding-top: 2px; }
-.command-row:last-child { padding-bottom: 2px; border-bottom: 0; }
-.command-row > div { min-width: 0; }
-.command-row strong { display: block; color: var(--text-strong); font-size: 13px; }
-.command-row code { display: block; margin-top: 5px; overflow: hidden; color: var(--accent-strong); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-
-.jobs-table, .logs-table { overflow: hidden; border: 1px solid var(--line); border-radius: 6px; }
-.job-table-row { display: grid; grid-template-columns: 90px minmax(0, 1.6fr) minmax(140px, .6fr) minmax(170px, .7fr); align-items: center; gap: 14px; min-height: 50px; padding: 0 14px; border-bottom: 1px solid var(--line); }
-.job-table-row:last-child { border-bottom: 0; }
-.job-table-row strong { overflow: hidden; color: var(--text-strong); font-size: 12px; font-weight: 560; text-overflow: ellipsis; white-space: nowrap; }
-.job-table-row small, .job-table-row time { color: #7c8782; font-size: 11px; }
-.job-status { display: inline-flex; width: fit-content; min-height: 22px; align-items: center; padding: 0 7px; border-radius: 4px; font-size: 10px; font-weight: 750; text-transform: uppercase; }
-.job-status.completed { color: var(--success-text); background: rgba(73, 200, 159, 0.1); }
-.job-status.failed { color: var(--danger-text); background: rgba(236, 113, 130, 0.1); }
-.job-status.running, .job-status.queued { color: var(--cyan-text); background: rgba(85, 184, 207, 0.1); }
+.logs-table { overflow: hidden; border: 1px solid var(--line); border-radius: 6px; }
 
 .large-background-preview { display: flex; min-height: 260px; align-items: center; justify-content: center; overflow: hidden; color: var(--muted); background: var(--surface-inset); border: 1px solid var(--line); border-radius: 6px; }
 .large-background-preview img { width: 100%; height: 260px; object-fit: cover; }

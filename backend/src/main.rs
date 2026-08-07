@@ -46,9 +46,10 @@ use handlers::{
     admin_approve_instance, admin_commands, admin_create_command, admin_delete_background_image,
     admin_delete_instance, admin_device_profile, admin_disable_command, admin_disable_instance,
     admin_get_settings, admin_job, admin_jobs, admin_pending_instances, admin_put_appearance,
-    admin_put_settings, admin_reject_instance, admin_run_whitelist_command, admin_terminal_ws,
-    admin_update_instance, admin_upload_background_image, agent_register, agent_report, agent_ws,
-    health, public_appearance, public_device_profile, public_instances, public_metrics,
+    admin_put_settings, admin_reject_instance, admin_run_whitelist_command, admin_terminal_shells,
+    admin_terminal_ws, admin_update_instance, admin_upload_background_image, agent_register,
+    agent_report, agent_ws, health, public_appearance, public_device_profile, public_instances,
+    public_metrics,
 };
 use jobs::command_timeout_loop;
 use remote_desktop::{admin_desktop_ws, agent_desktop_ws};
@@ -222,6 +223,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/instances/{id}/terminal/ws",
             get(admin_terminal_ws),
+        )
+        .route(
+            "/api/admin/instances/{id}/terminal/shells",
+            get(admin_terminal_shells),
         )
         .route(
             "/api/admin/instances/{id}/desktop/ws",

@@ -7,7 +7,7 @@ use axum::{
     Json,
     extract::{ConnectInfo, Multipart, Path, Query, State, ws::WebSocketUpgrade},
     http::{HeaderMap, StatusCode, header},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use tokio::fs;
 use tracing::warn;
@@ -31,13 +31,17 @@ use crate::{
         CommandJobRecord, CommandRecord, CreateCommandRequest, DeviceProfile, HealthResponse,
         InstanceRecord, InstanceSummary, ListQuery, MetricRecord, MetricsQuery, PendingInstance,
         PublicDeviceProfile, PublicDeviceProfileResponse, SettingsRequest, SettingsResponse,
-        ThemeMode, UpdateInstanceRequest,
+        TerminalShellListResponse, TerminalWsQuery, ThemeMode, UpdateInstanceRequest,
     },
     request_security::{ensure_same_origin, request_scheme},
     state::AppState,
     updates::confirm_update_version,
     utils::{non_empty_or, now_ts},
-    ws::{MAX_AGENT_MESSAGE_BYTES, agent_socket, revoke_instance_connection, terminal_socket},
+    ws::{
+        MAX_AGENT_MESSAGE_BYTES, MAX_TERMINAL_SESSIONS_PER_INSTANCE, TERMINAL_SHELLS_CAPABILITY,
+        agent_socket, request_terminal_shells, revoke_instance_connection, terminal_socket,
+        valid_terminal_shell_program,
+    },
 };
 
 const BACKGROUND_SETTING_KEY: &str = "background_image_path";
@@ -81,7 +85,7 @@ pub async fn public_instances(
         SELECT id, secret, name, region, country_code, country, province_code, province, city,
                remark, hostname, os, arch, agent_version,
                package_type, native_arch, update_privileged, rollback_supported, rollback_version,
-               approved, disabled, first_seen, last_seen
+               approved, disabled, first_seen, last_seen, expires_at
         FROM instances
         WHERE approved = 1 AND disabled = 0
         ORDER BY LOWER(name) ASC, id ASC
@@ -306,7 +310,7 @@ fn offline_metric(latest: Option<&MetricRecord>, ts: i64) -> MetricRecord {
                 .and_then(|metric| metric.gpu_memory_total)
                 .unwrap_or(0),
         ),
-        uptime_seconds: 0,
+        uptime_seconds: latest.and_then(|metric| metric.uptime_seconds),
         load_average: Some(0.0),
         latency_ms: Some(0.0),
     }
@@ -325,7 +329,7 @@ fn zero_metric(ts: i64) -> MetricRecord {
         gpu_percent: Some(0.0),
         gpu_memory_used: Some(0),
         gpu_memory_total: Some(0),
-        uptime_seconds: 0,
+        uptime_seconds: Some(0),
         load_average: Some(0.0),
         latency_ms: Some(0.0),
     }
@@ -500,6 +504,7 @@ pub async fn admin_update_instance(
         payload.region.unwrap_or(current.region)
     };
     let remark = payload.remark.unwrap_or(current.remark);
+    let expires_at = updated_expiration(payload.expires_at, current.expires_at)?;
 
     if country.trim().is_empty() && (!province.trim().is_empty() || !city.trim().is_empty()) {
         return Err(AppError::new(
@@ -518,7 +523,7 @@ pub async fn admin_update_instance(
 
     sqlx::query(
         "UPDATE instances SET name = $1, region = $2, country_code = $3, country = $4, \
-         province_code = $5, province = $6, city = $7, remark = $8 WHERE id = $9",
+         province_code = $5, province = $6, city = $7, remark = $8, expires_at = $9 WHERE id = $10",
     )
     .bind(&name)
     .bind(&region)
@@ -528,6 +533,7 @@ pub async fn admin_update_instance(
     .bind(province.trim())
     .bind(city.trim())
     .bind(&remark)
+    .bind(expires_at)
     .bind(&id)
     .execute(&state.db)
     .await?;
@@ -572,6 +578,18 @@ pub async fn admin_update_instance(
         online,
         capabilities,
     )))
+}
+
+fn updated_expiration(
+    requested: Option<Option<i64>>,
+    current: Option<i64>,
+) -> AppResult<Option<i64>> {
+    match requested {
+        Some(Some(value)) if value > 0 => Ok(Some(value)),
+        Some(Some(_)) => Err(AppError::bad_request("到期时间必须是有效的正时间戳")),
+        Some(None) => Ok(None),
+        None => Ok(current),
+    }
 }
 
 pub async fn admin_disable_instance(
@@ -1391,11 +1409,38 @@ pub async fn admin_terminal_ws(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(instance_id): Path<String>,
+    Query(query): Query<TerminalWsQuery>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
     ensure_same_origin(&headers, request_scheme(&state, &headers, peer_addr.ip())?)?;
     let admin = require_admin(&state, &headers).await?;
     get_instance(&state.db, &instance_id).await?;
+    if query
+        .shell
+        .as_deref()
+        .is_some_and(|shell| !valid_terminal_shell_program(shell))
+    {
+        return Err(AppError::bad_request("Shell 可执行文件格式无效"));
+    }
+    if query.shell.is_some() {
+        let agent = state
+            .agents
+            .read()
+            .await
+            .get(&instance_id)
+            .cloned()
+            .ok_or_else(|| AppError::new(StatusCode::CONFLICT, "实例不在线"))?;
+        if !agent
+            .capabilities
+            .iter()
+            .any(|capability| capability == TERMINAL_SHELLS_CAPABILITY)
+        {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                "当前 Agent 版本不支持 Shell 选择，请先更新 Agent",
+            ));
+        }
+    }
     let audit_context = audit::AuditContext::from_headers(&headers);
     let user_id = admin.user_id.clone();
     let session_guard = admin.session_guard();
@@ -1406,6 +1451,7 @@ pub async fn admin_terminal_ws(
             terminal_socket(
                 state,
                 instance_id,
+                query.shell,
                 admin.username,
                 user_id,
                 audit_context,
@@ -1413,6 +1459,27 @@ pub async fn admin_terminal_ws(
                 socket,
             )
         }))
+}
+
+pub async fn admin_terminal_shells(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+) -> AppResult<Response> {
+    require_admin(&state, &headers).await?;
+    get_instance(&state.db, &instance_id).await?;
+    let shells = request_terminal_shells(&state, &instance_id).await?;
+    let mut response = Json(TerminalShellListResponse {
+        shells,
+        supports_custom: true,
+        max_sessions: MAX_TERMINAL_SESSIONS_PER_INSTANCE,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("valid cache-control header"),
+    );
+    Ok(response)
 }
 
 fn agent_websocket_secret<'a>(
@@ -1460,6 +1527,37 @@ mod tests {
         assert_eq!(parse_theme_mode(Some("unsupported")), ThemeMode::Auto);
         assert_eq!(stored_accent_color(None), DEFAULT_ACCENT_COLOR);
         assert_eq!(stored_accent_color(Some("invalid")), DEFAULT_ACCENT_COLOR);
+    }
+
+    #[test]
+    fn instance_expiration_patch_distinguishes_missing_null_and_value() {
+        let missing: UpdateInstanceRequest =
+            serde_json::from_value(serde_json::json!({})).expect("deserialize missing expiration");
+        let cleared: UpdateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "expires_at": null
+        }))
+        .expect("deserialize cleared expiration");
+        let set: UpdateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "expires_at": 1_800_000_000_i64
+        }))
+        .expect("deserialize expiration timestamp");
+
+        assert_eq!(missing.expires_at, None);
+        assert_eq!(cleared.expires_at, Some(None));
+        assert_eq!(set.expires_at, Some(Some(1_800_000_000)));
+        assert_eq!(
+            updated_expiration(missing.expires_at, Some(10)).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            updated_expiration(cleared.expires_at, Some(10)).unwrap(),
+            None
+        );
+        assert_eq!(
+            updated_expiration(set.expires_at, None).unwrap(),
+            Some(1_800_000_000)
+        );
+        assert!(updated_expiration(Some(Some(0)), None).is_err());
     }
 
     #[test]
@@ -1636,7 +1734,7 @@ mod tests {
             gpu_percent: Some(5.0),
             gpu_memory_used: Some(6),
             gpu_memory_total: Some(7),
-            uptime_seconds: 8,
+            uptime_seconds: Some(8),
             load_average: Some(9.0),
             latency_ms: Some(10.0),
         }];
@@ -1672,7 +1770,7 @@ mod tests {
             gpu_percent: Some(70.0),
             gpu_memory_used: Some(50),
             gpu_memory_total: Some(60),
-            uptime_seconds: 500,
+            uptime_seconds: Some(500),
             load_average: Some(4.0),
             latency_ms: Some(20.0),
         };
@@ -1683,7 +1781,18 @@ mod tests {
         assert_eq!(offline.disk_total, 200);
         assert_eq!(offline.network_rx, 0);
         assert_eq!(offline.gpu_memory_total, Some(60));
+        assert_eq!(offline.uptime_seconds, Some(500));
         assert_eq!(offline.latency_ms, Some(0.0));
+    }
+
+    #[test]
+    fn offline_metric_marks_never_reported_uptime_unknown() {
+        let offline = offline_metric(None, 600);
+
+        assert_eq!(offline.uptime_seconds, None);
+        assert_eq!(offline.cpu_percent, 0.0);
+        assert_eq!(offline.memory_used, 0);
+        assert_eq!(offline.disk_used, 0);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::{
     config::Cli,
     models::{
         AgentOutbound, DockerError, DockerResponse, DockerStatus, FileResponse,
-        TerminalServerMessage,
+        TerminalServerMessage, TerminalShellInfo,
     },
     update_signature::UpdateSigner,
 };
@@ -38,6 +38,7 @@ pub struct AppState {
     pub auth_account_attempts: Arc<RwLock<HashMap<String, AuthAttempt>>>,
     pub agents: Arc<RwLock<HashMap<String, AgentHandle>>>,
     pub terminal_sessions: Arc<RwLock<HashMap<String, TerminalSessionHandle>>>,
+    pub terminal_shell_requests: Arc<RwLock<HashMap<String, PendingTerminalShellRequest>>>,
     pub file_requests: Arc<RwLock<HashMap<String, PendingFileRequest>>>,
     pub active_file_transfers: Arc<RwLock<HashMap<String, String>>>,
     pub desktop_sessions: Arc<RwLock<HashMap<String, DesktopSessionHandle>>>,
@@ -73,6 +74,7 @@ impl AppState {
             auth_account_attempts: Arc::new(RwLock::new(HashMap::new())),
             agents: Arc::new(RwLock::new(HashMap::new())),
             terminal_sessions: Arc::new(RwLock::new(HashMap::new())),
+            terminal_shell_requests: Arc::new(RwLock::new(HashMap::new())),
             file_requests: Arc::new(RwLock::new(HashMap::new())),
             active_file_transfers: Arc::new(RwLock::new(HashMap::new())),
             desktop_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -149,6 +151,17 @@ pub struct TerminalSessionHandle {
     pub instance_id: String,
     pub agent_connection_id: Uuid,
     pub tx: mpsc::Sender<TerminalServerMessage>,
+}
+
+#[derive(Debug)]
+pub enum TerminalShellRequestFailure {
+    Disconnected,
+}
+
+pub struct PendingTerminalShellRequest {
+    pub instance_id: String,
+    pub agent_connection_id: Uuid,
+    pub tx: oneshot::Sender<Result<Vec<TerminalShellInfo>, TerminalShellRequestFailure>>,
 }
 
 #[derive(Debug)]

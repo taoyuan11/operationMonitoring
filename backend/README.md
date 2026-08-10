@@ -1,6 +1,6 @@
 # Operation Monitoring Backend
 
-Rust、Axum 与 SQLx 实现的 Operation Monitoring API 服务。后端负责实例注册与监控数据、管理员认证、命令任务、文件传输、Agent 更新以及 WebSocket 会话，业务数据存储在 PostgreSQL 中。
+Rust、Axum 与 SQLx 实现的 Operation Monitoring API 服务。后端负责实例注册与监控数据、生命周期和到期提醒、管理员认证、告警通知、命令任务、文件传输、Docker 管理、远程桌面中继、Agent 更新以及 WebSocket 会话，业务数据存储在 PostgreSQL 中。
 
 ## 默认部署方式
 
@@ -45,6 +45,10 @@ cargo fmt --check
 cargo test
 cargo check
 ```
+
+后端启动时会幂等创建或升级表与索引。实例的可选 `expires_at` 字段是 Unix 秒时间戳；它只
+用于控制台展示和 `instance_expiring` 告警评估，不会自动禁用或删除实例。到期规则要求
+非负整数天阈值和 `duration_seconds=0`，由后台告警循环周期评估。
 
 需要执行依赖 PostgreSQL 的 ignored 测试时，使用专用空数据库并统一通过
 `OM_TEST_DATABASE_URL` 指定连接地址：

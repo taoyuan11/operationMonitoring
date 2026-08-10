@@ -1,6 +1,6 @@
 # Operation Monitoring Frontend
 
-Vue 3、TypeScript 与 Vite 实现的 Operation Monitoring 管理控制台。生产镜像使用 Nginx 提供静态文件，并将 `/api`、`/uploads` 和 WebSocket 请求转发到后端服务。
+Vue 3、TypeScript 与 Vite 实现的 Operation Monitoring 控制台。公开视图展示实例状态和生命周期，管理员视图提供接入审核、快捷命令、程序更新、告警、用户、审计和设置页面，以及终端、文件、Docker 和 Windows 远程桌面操作。生产镜像使用 Nginx 提供静态文件，并将 `/api`、`/uploads` 和 WebSocket 请求转发到后端服务。
 
 ## 默认部署方式
 
@@ -27,8 +27,15 @@ pnpm dev
 
 开发和预览服务器仅监听 `127.0.0.1`；开发模式默认访问 `http://127.0.0.1:5173`。跨主机调试应使用受控反向代理，不要将 Vite 开发服务器直接暴露到公网。
 
-生产构建与类型检查：
+实例编辑弹窗支持设置或清除到期时间；实例卡片会显示绝对时间、剩余时间或已到期时长。
+快捷命令使用独立的 `#/commands` 管理页面，命令执行入口仍位于实例操作面板。
+
+提交前运行 Node 回归测试、TypeScript 类型检查和生产构建：
 
 ```bash
+pnpm test
 pnpm build
 ```
+
+`pnpm test` 执行 `tests/*.test.mjs`，当前覆盖告警筛选与通知渠道请求、实例到期格式化、
+Agent 产物匹配和终端消息处理。涉及布局或交互的改动还应在窄屏和宽屏视口手动检查。

@@ -1,6 +1,6 @@
 # Operation Monitoring
 
-一个自托管的远程资源监控系统 MVP，用于小规模服务器、电脑实例的资源上报、审批管理、快捷命令、Web 终端和远程文件管理。
+一个自托管的远程资源监控与运维系统，用于小规模服务器和电脑实例的资源上报、生命周期管理、接入审批、告警通知、快捷命令、Web 终端和远程文件管理。
 
 ## 文档
 
@@ -25,29 +25,39 @@ operationMonitoring/
 
 ```text
 front-end/src/
-  api/            HTTP 请求封装
-  components/     页面组件：顶部栏、实例看板、管理面板、弹窗
+  api/            HTTP、文件传输与 WebSocket 请求封装
+  components/     实例、命令、告警、审计、更新及远程操作组件
   composables/    控制台状态与业务动作
+  data/           国家和地区等静态数据
   styles/         基础、布局、控件、看板、管理面板、弹窗、响应式样式
   types/          前端领域类型
   utils/          格式化与指标计算工具
+front-end/tests/  Node test runner 回归测试
 ```
 
-`App.vue` 只负责装配页面，接口调用、状态管理和 UI 组件已经拆分，后续加历史图表、告警、设置页时可以直接在对应目录扩展。
+`App.vue` 负责页面路由和顶层装配。实例概览、接入审核、快捷命令、程序更新、告警中心、用户管理、统一审计和系统设置是独立管理视图；接口调用、状态管理和 UI 组件分别放在对应目录中。
 
 ## 后端分层
 
 ```text
 backend/src/
-  auth.rs         TOTP、密钥加密和管理员 session 校验
   admin_auth.rs   管理员初始化、登录、用户与认证设备 API
+  alerts.rs       告警规则、事件、维护窗口和通知投递
+  audit.rs        管理操作审计查询与导出
+  auth.rs         TOTP、密钥加密和管理员 session 校验
   config.rs       启动参数和环境变量
   db.rs           PostgreSQL 连接、建表、查询辅助、清理任务
+  docker.rs       远端 Docker 管理 API
   error.rs        统一错误响应
+  files.rs        远端文件管理与流式传输
   handlers/       HTTP API handler
   jobs.rs         命令任务创建、下发、完成
   models.rs       请求、响应、数据库行模型
+  remote_desktop.rs  Windows 远程桌面会话中继
+  request_security.rs  代理来源、协议与 Origin 校验
   state.rs        全局共享状态
+  update_signature.rs Agent 更新签名密钥
+  updates.rs      Agent 发布、灰度、更新和回滚
   utils.rs        通用工具
   ws.rs           Agent WebSocket 和 Web 终端
 ```
@@ -56,16 +66,26 @@ backend/src/
 
 ```text
 instanceEnd/src/
+  activity.rs     活动会话计数与更新协调
   command.rs      系统命令执行与超时截断
   config.rs       Agent 启动参数
+  device_profile.rs  主机硬件和网络资料采集
+  docker.rs       本机 Docker 探测与操作
+  file_manager.rs  文件浏览与流式传输
   http.rs         审批前注册请求
   identity.rs     本地实例身份生成和读取
+  install.rs      跨平台系统服务安装与卸载
   lifecycle.rs    实例进程启动、停止与状态管理
+  logging.rs      Agent 与 updater 日志滚动
   metrics.rs      CPU、内存、磁盘、网络采集
   models.rs       Agent 与后端通信模型
+  outbound.rs     Agent 出站请求并发控制
   profile.rs      主机基础信息
+  pty_io.rs       PTY 原始字节读写
+  remote_desktop/ Windows 桌面捕获和输入控制
   terminal.rs     跨平台 PTY/ConPTY 交互式 Shell
   time.rs         时间戳工具
+  update.rs       standalone 自更新与回滚
   ws.rs           Agent WebSocket、指标上报、命令与终端复用通道
 ```
 
@@ -131,6 +151,19 @@ cargo build --release
 ```
 
 `start` 会在后台启动实例端并立即释放命令行，标准输出和错误输出会写入命令返回的日志路径。Windows 使用同目录下的 `om-agent.exe`，后台子进程不会创建控制台窗口。
+
+## 控制台与实例生命周期
+
+控制台首页公开展示已批准且未禁用的实例及最新指标。管理员登录后可进入独立的接入审核、
+快捷命令、程序更新、告警中心、用户管理、统一审计和系统设置页面。快捷命令页用于维护命令
+白名单和查看最近任务，实际执行入口位于实例的操作面板；任意命令仍以 Agent 服务账号权限
+在目标主机上运行。
+
+管理员可在实例编辑弹窗中设置到期时间，或选择“长期有效”清除到期时间。实例卡片会向访客和
+管理员展示绝对到期时间及剩余时间；到期仅作为生命周期标记和告警依据，不会自动禁用、断开或
+删除实例。需要提醒时，在告警中心创建“实例即将到期”规则，并设置非负整数天阈值。后端会
+周期检查全部或指定实例，剩余天数小于等于阈值时立即创建事件；清除到期时间或将日期延后到
+阈值之外后，活动事件会自动恢复。
 
 ## 实例 Docker 管理
 
@@ -533,10 +566,11 @@ cd instanceEnd && cargo fmt --check && cargo test && cargo check
 
 ## 告警与事件闭环
 
-管理员登录后可从“告警中心”创建节点离线、CPU、内存、聚合磁盘占用率和通信延迟
-规则。规则可作用于全部节点或指定节点，并使用 `warning`、`critical` 两个严重级别。
-阈值持续时间按后端接收样本的时间计算；无效或缺失指标不会触发告警，也不会被当作
-恢复。节点在线状态仍以授权 Agent WebSocket 为准，旧 `/api/agent/report` 只参与资源
+管理员登录后可从“告警中心”创建节点离线、CPU、内存、聚合磁盘占用率、通信延迟和
+实例即将到期规则。规则可作用于全部节点或指定节点，并使用 `warning`、`critical` 两个
+严重级别。资源和离线规则的持续时间按后端接收观察的时间计算；实例到期规则使用非负整数天
+作为阈值，进入提醒周期后立即触发，不使用持续时间。无效或缺失指标不会触发资源告警，也不会
+被当作恢复。节点在线状态仍以授权 Agent WebSocket 为准，旧 `/api/agent/report` 只参与资源
 阈值判断，不会使节点进入在线状态。
 
 同一规则和节点在恢复前只保留一个事件。事件从“告警中”进入“已确认”，条件恢复后
@@ -609,7 +643,6 @@ fencing 令牌的租约认领，同一事件和渠道的首报、确认、恢复
 
 ## 后续增强
 
-- 增加历史趋势图和指标明细页。
 - 增加周期维护窗口、节点分组以及短信、电话等通知渠道。
-- 增加登录失败限制、密码哈希和更细粒度权限。
+- 增加角色划分和更细粒度的管理员权限。
 - 增加 CI 中的多平台 standalone 可执行文件构建、签名和发布流水线。

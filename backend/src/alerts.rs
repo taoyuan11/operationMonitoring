@@ -40,6 +40,8 @@ const DEFAULT_PAGE_SIZE: i64 = 50;
 const MAX_PAGE_SIZE: i64 = 200;
 const MAX_NAME_BYTES: usize = 120;
 const MAX_REASON_BYTES: usize = 2_000;
+const MAX_RULE_TARGET_INSTANCE_IDS: usize = 1_000;
+const MAX_RULE_CHANNEL_IDS: usize = 100;
 const MAX_HEADER_COUNT: usize = 32;
 const MAX_HEADER_NAME_BYTES: usize = 128;
 const MAX_HEADER_VALUE_BYTES: usize = 4_096;
@@ -52,6 +54,7 @@ const MAX_NOTIFICATION_TEXT_BYTES: usize = 16 * 1024;
 const MAX_WECOM_TEXT_BYTES: usize = 1_900;
 const MAX_TELEGRAM_CHAT_ID_BYTES: usize = 256;
 const STARTUP_RECONNECT_GRACE_SECONDS: i64 = 60;
+const OFFLINE_RECOVERY_STABILITY_SECONDS: i64 = 60;
 const DELIVERY_LEASE_SECONDS: i64 = 180;
 const DELIVERY_WORKER_COUNT: usize = 4;
 const DELIVERY_RETRY_DELAYS: [i64; 4] = [60, 5 * 60, 15 * 60, 60 * 60];
@@ -443,6 +446,7 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
             headers_ciphertext TEXT NOT NULL,
             config_ciphertext TEXT,
             enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            delivery_cooldown_until BIGINT,
             created_at BIGINT NOT NULL,
             updated_at BIGINT NOT NULL,
             deleted_at BIGINT
@@ -451,6 +455,8 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
             ADD COLUMN IF NOT EXISTS channel_type TEXT NOT NULL DEFAULT 'generic_webhook';
         ALTER TABLE alert_webhook_channels
             ADD COLUMN IF NOT EXISTS config_ciphertext TEXT;
+        ALTER TABLE alert_webhook_channels
+            ADD COLUMN IF NOT EXISTS delivery_cooldown_until BIGINT;
         UPDATE alert_webhook_channels
             SET channel_type='generic_webhook' WHERE channel_type IS NULL;
         ALTER TABLE alert_webhook_channels
@@ -474,12 +480,15 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
             instance_id TEXT NOT NULL,
             rule_version BIGINT NOT NULL,
             pending_since BIGINT,
+            recovery_since BIGINT,
             last_observed_at BIGINT,
             last_value DOUBLE PRECISION,
             last_sample_at BIGINT,
             match_count BIGINT NOT NULL DEFAULT 0,
             PRIMARY KEY(rule_id, instance_id)
         );
+        ALTER TABLE alert_evaluation_states
+            ADD COLUMN IF NOT EXISTS recovery_since BIGINT;
         CREATE TABLE IF NOT EXISTS alert_events (
             id TEXT PRIMARY KEY,
             rule_id TEXT NOT NULL,
@@ -575,6 +584,31 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_alert_deliveries_lifecycle_order
             ON alert_deliveries(event_id, channel_id, status, created_at, id);
         ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS lease_token TEXT;
+        WITH ranked_deliveries AS (
+            SELECT id,ROW_NUMBER() OVER(
+                PARTITION BY event_id,channel_id,kind
+                ORDER BY
+                    CASE status
+                        WHEN 'succeeded' THEN 1
+                        WHEN 'processing' THEN 2
+                        WHEN 'pending' THEN 3
+                        WHEN 'failed' THEN 4
+                        ELSE 5
+                    END,
+                    created_at,id
+            ) AS duplicate_rank
+            FROM alert_deliveries
+            WHERE event_id IS NOT NULL AND status <> 'suppressed'
+        )
+        UPDATE alert_deliveries d SET
+            status='suppressed',suppression_reason='duplicate_delivery_migrated',
+            next_attempt_at=NULL,lease_until=NULL,lease_token=NULL,
+            completed_at=COALESCE(d.completed_at,d.updated_at)
+        FROM ranked_deliveries ranked
+        WHERE d.id=ranked.id AND ranked.duplicate_rank > 1;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_deliveries_deliverable_lifecycle
+            ON alert_deliveries(event_id, channel_id, kind)
+            WHERE event_id IS NOT NULL AND status <> 'suppressed';
         CREATE TABLE IF NOT EXISTS alert_delivery_attempts (
             id TEXT PRIMARY KEY,
             delivery_id TEXT NOT NULL REFERENCES alert_deliveries(id) ON DELETE CASCADE,
@@ -623,6 +657,16 @@ fn trimmed(value: &str, max_bytes: usize, label: &str) -> AppResult<String> {
 }
 
 fn validate_rule(payload: &RuleRequest) -> AppResult<RuleRequest> {
+    if payload.target_instance_ids.len() > MAX_RULE_TARGET_INSTANCE_IDS {
+        return Err(AppError::bad_request(format!(
+            "目标节点数量不能超过 {MAX_RULE_TARGET_INSTANCE_IDS} 个"
+        )));
+    }
+    if payload.channel_ids.len() > MAX_RULE_CHANNEL_IDS {
+        return Err(AppError::bad_request(format!(
+            "通知渠道数量不能超过 {MAX_RULE_CHANNEL_IDS} 个"
+        )));
+    }
     let mut normalized = payload.clone();
     normalized.name = trimmed(&payload.name, MAX_NAME_BYTES, "规则名称")?;
     if !matches!(
@@ -687,31 +731,43 @@ async fn validate_rule_links(
     tx: &mut Transaction<'_, Postgres>,
     payload: &RuleRequest,
 ) -> AppResult<()> {
-    for instance_id in &payload.target_instance_ids {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM instances WHERE id = $1 AND approved = 1)",
-        )
-        .bind(instance_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        if !exists {
-            return Err(AppError::bad_request(format!(
-                "节点 {instance_id} 不存在或未批准"
-            )));
-        }
+    let missing_instance_id = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT requested.id
+        FROM UNNEST($1::TEXT[]) WITH ORDINALITY AS requested(id, position)
+        LEFT JOIN instances i ON i.id=requested.id AND i.approved=1
+        WHERE i.id IS NULL
+        ORDER BY requested.position
+        LIMIT 1
+        "#,
+    )
+    .bind(&payload.target_instance_ids)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(instance_id) = missing_instance_id {
+        return Err(AppError::bad_request(format!(
+            "节点 {instance_id} 不存在或未批准"
+        )));
     }
-    for channel_id in &payload.channel_ids {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM alert_webhook_channels WHERE id = $1 AND deleted_at IS NULL)",
-        )
-        .bind(channel_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        if !exists {
-            return Err(AppError::bad_request(format!(
-                "通知渠道 {channel_id} 不存在"
-            )));
-        }
+
+    let missing_channel_id = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT requested.id
+        FROM UNNEST($1::TEXT[]) WITH ORDINALITY AS requested(id, position)
+        LEFT JOIN alert_webhook_channels c
+            ON c.id=requested.id AND c.deleted_at IS NULL
+        WHERE c.id IS NULL
+        ORDER BY requested.position
+        LIMIT 1
+        "#,
+    )
+    .bind(&payload.channel_ids)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(channel_id) = missing_channel_id {
+        return Err(AppError::bad_request(format!(
+            "通知渠道 {channel_id} 不存在"
+        )));
     }
     Ok(())
 }
@@ -726,25 +782,33 @@ async fn replace_rule_links(
         .execute(&mut **tx)
         .await?;
     if payload.scope == "specific" {
-        for instance_id in &payload.target_instance_ids {
-            sqlx::query("INSERT INTO alert_rule_targets(rule_id, instance_id) VALUES($1, $2)")
-                .bind(rule_id)
-                .bind(instance_id)
-                .execute(&mut **tx)
-                .await?;
-        }
+        sqlx::query(
+            r#"
+            INSERT INTO alert_rule_targets(rule_id, instance_id)
+            SELECT $1, requested.instance_id
+            FROM UNNEST($2::TEXT[]) AS requested(instance_id)
+            "#,
+        )
+        .bind(rule_id)
+        .bind(&payload.target_instance_ids)
+        .execute(&mut **tx)
+        .await?;
     }
     sqlx::query("DELETE FROM alert_rule_channels WHERE rule_id = $1")
         .bind(rule_id)
         .execute(&mut **tx)
         .await?;
-    for channel_id in &payload.channel_ids {
-        sqlx::query("INSERT INTO alert_rule_channels(rule_id, channel_id) VALUES($1, $2)")
-            .bind(rule_id)
-            .bind(channel_id)
-            .execute(&mut **tx)
-            .await?;
-    }
+    sqlx::query(
+        r#"
+        INSERT INTO alert_rule_channels(rule_id, channel_id)
+        SELECT $1, requested.channel_id
+        FROM UNNEST($2::TEXT[]) AS requested(channel_id)
+        "#,
+    )
+    .bind(rule_id)
+    .bind(&payload.channel_ids)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -1066,6 +1130,7 @@ pub async fn remove_instance_maintenance_target(
 #[derive(Clone, Debug, FromRow)]
 struct EvaluationRow {
     pending_since: Option<i64>,
+    recovery_since: Option<i64>,
     last_observed_at: Option<i64>,
     last_value: Option<f64>,
     last_sample_at: Option<i64>,
@@ -1128,6 +1193,22 @@ fn connection_observation(online: bool) -> (f64, bool) {
 
 fn startup_grace_defers_offline(online: bool, started_at: i64, now: i64) -> bool {
     !online && now.saturating_sub(started_at) < STARTUP_RECONNECT_GRACE_SECONDS
+}
+
+fn recovery_confirmation(
+    metric: &str,
+    has_active_event: bool,
+    recovery_since: Option<i64>,
+    observed_at: i64,
+) -> (Option<i64>, bool) {
+    if metric != "node_offline" || !has_active_event {
+        return (None, true);
+    }
+    let recovery_since = recovery_since.unwrap_or(observed_at);
+    (
+        Some(recovery_since),
+        observed_at.saturating_sub(recovery_since) >= OFFLINE_RECOVERY_STABILITY_SECONDS,
+    )
 }
 
 fn observation_is_stale(
@@ -1309,6 +1390,9 @@ async fn insert_delivery_tx(
             id,event_id,channel_id,kind,status,payload,channel_snapshot,
             suppression_reason,next_attempt_at,created_at,updated_at,completed_at
         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11)
+        ON CONFLICT(event_id,channel_id,kind)
+            WHERE event_id IS NOT NULL AND status <> 'suppressed'
+            DO NOTHING
         "#,
     )
     .bind(id)
@@ -1354,40 +1438,21 @@ async fn enqueue_event_lifecycle_tx(
     .fetch_all(&mut **tx)
     .await?;
     for (channel_id, channel_name, channel_type) in channels {
-        if kind == "alert.firing" {
-            let already_deliverable: bool = sqlx::query_scalar(
+        if kind == "alert.firing" && suppression.is_some() {
+            let already_recorded: bool = sqlx::query_scalar(
                 r#"
-                SELECT EXISTS(
-                    SELECT 1 FROM alert_deliveries
-                    WHERE event_id=$1 AND channel_id=$2 AND kind='alert.firing'
-                      AND status <> 'suppressed'
-                )
-                "#,
+                    SELECT EXISTS(
+                        SELECT 1 FROM alert_deliveries
+                        WHERE event_id=$1 AND channel_id=$2 AND kind='alert.firing'
+                    )
+                    "#,
             )
             .bind(&event.id)
             .bind(&channel_id)
             .fetch_one(&mut **tx)
             .await?;
-            if already_deliverable {
+            if already_recorded {
                 continue;
-            }
-            if suppression.is_some() {
-                let already_suppressed: bool = sqlx::query_scalar(
-                    r#"
-                    SELECT EXISTS(
-                        SELECT 1 FROM alert_deliveries
-                        WHERE event_id=$1 AND channel_id=$2 AND kind='alert.firing'
-                          AND status='suppressed'
-                    )
-                    "#,
-                )
-                .bind(&event.id)
-                .bind(&channel_id)
-                .fetch_one(&mut **tx)
-                .await?;
-                if already_suppressed {
-                    continue;
-                }
             }
         }
         insert_delivery_tx(
@@ -1594,12 +1659,12 @@ async fn process_rule_observation(
     sqlx::query(
         r#"
         INSERT INTO alert_evaluation_states(
-            rule_id,instance_id,rule_version,pending_since,last_observed_at,
-            last_value,last_sample_at,match_count
-        ) VALUES($1,$2,$3,NULL,NULL,NULL,NULL,0)
+            rule_id,instance_id,rule_version,pending_since,recovery_since,
+            last_observed_at,last_value,last_sample_at,match_count
+        ) VALUES($1,$2,$3,NULL,NULL,NULL,NULL,NULL,0)
         ON CONFLICT(rule_id,instance_id) DO UPDATE SET
-            rule_version=EXCLUDED.rule_version,pending_since=NULL,last_observed_at=NULL,
-            last_value=NULL,last_sample_at=NULL,match_count=0
+            rule_version=EXCLUDED.rule_version,pending_since=NULL,recovery_since=NULL,
+            last_observed_at=NULL,last_value=NULL,last_sample_at=NULL,match_count=0
         WHERE alert_evaluation_states.rule_version <> EXCLUDED.rule_version
         "#,
     )
@@ -1610,7 +1675,7 @@ async fn process_rule_observation(
     .await?;
     let evaluation = sqlx::query_as::<_, EvaluationRow>(
         r#"
-        SELECT pending_since,last_observed_at,last_value,last_sample_at,match_count
+        SELECT pending_since,recovery_since,last_observed_at,last_value,last_sample_at,match_count
         FROM alert_evaluation_states
         WHERE rule_id=$1 AND instance_id=$2 FOR UPDATE
         "#,
@@ -1649,13 +1714,24 @@ async fn process_rule_observation(
     .await?;
 
     if !abnormal {
+        let (recovery_since, recovery_confirmed) = recovery_confirmation(
+            &rule.metric,
+            active.is_some(),
+            evaluation.recovery_since,
+            observed_at,
+        );
         sqlx::query(
             r#"
-            UPDATE alert_evaluation_states SET pending_since=NULL,last_observed_at=$1,
-                last_value=$2,last_sample_at=$3,match_count=0
-            WHERE rule_id=$4 AND instance_id=$5
+            UPDATE alert_evaluation_states SET pending_since=NULL,recovery_since=$1,
+                last_observed_at=$2,last_value=$3,last_sample_at=$4,match_count=0
+            WHERE rule_id=$5 AND instance_id=$6
             "#,
         )
+        .bind(if recovery_confirmed {
+            None
+        } else {
+            recovery_since
+        })
         .bind(observed_at)
         .bind(value)
         .bind(sample_at)
@@ -1663,7 +1739,7 @@ async fn process_rule_observation(
         .bind(instance_id)
         .execute(&mut *tx)
         .await?;
-        if let Some(event) = active {
+        if recovery_confirmed && let Some(event) = active {
             resolve_event_tx(
                 &mut tx,
                 event,
@@ -1711,8 +1787,8 @@ async fn process_rule_observation(
         .await?;
         sqlx::query(
             r#"
-            UPDATE alert_evaluation_states SET last_observed_at=$1,last_value=$2,
-                last_sample_at=$3,match_count=$4
+            UPDATE alert_evaluation_states SET recovery_since=NULL,last_observed_at=$1,
+                last_value=$2,last_sample_at=$3,match_count=$4
             WHERE rule_id=$5 AND instance_id=$6
             "#,
         )
@@ -1738,8 +1814,8 @@ async fn process_rule_observation(
     );
     sqlx::query(
         r#"
-        UPDATE alert_evaluation_states SET pending_since=$1,last_observed_at=$2,
-            last_value=$3,last_sample_at=$4,match_count=$5
+        UPDATE alert_evaluation_states SET pending_since=$1,recovery_since=NULL,
+            last_observed_at=$2,last_value=$3,last_sample_at=$4,match_count=$5
         WHERE rule_id=$6 AND instance_id=$7
         "#,
     )
@@ -3744,10 +3820,19 @@ async fn claim_delivery(db: &PgPool, now: i64) -> AppResult<Option<DeliveryRow>>
         r#"
         WITH candidate AS (
             SELECT queued.id FROM alert_deliveries queued
+            JOIN alert_webhook_channels c ON c.id=queued.channel_id
             WHERE (
                 (queued.status='pending' AND COALESCE(queued.next_attempt_at,0) <= $1)
                 OR (queued.status='processing' AND COALESCE(queued.lease_until,0) <= $1)
             )
+              AND COALESCE(c.delivery_cooldown_until,0) <= $1
+              AND NOT EXISTS (
+                SELECT 1 FROM alert_deliveries in_flight
+                WHERE in_flight.channel_id=queued.channel_id
+                  AND in_flight.status='processing'
+                  AND COALESCE(in_flight.lease_until,0) > $1
+                  AND in_flight.id <> queued.id
+              )
               AND NOT EXISTS (
                 SELECT 1 FROM alert_deliveries earlier
                 WHERE queued.event_id IS NOT NULL
@@ -3774,9 +3859,9 @@ async fn claim_delivery(db: &PgPool, now: i64) -> AppResult<Option<DeliveryRow>>
                     END,
                     queued.id
                   )
-              )
+            )
             ORDER BY COALESCE(queued.next_attempt_at,queued.created_at),queued.created_at,queued.id
-            FOR UPDATE SKIP LOCKED
+            FOR UPDATE OF queued,c SKIP LOCKED
             LIMIT 1
         )
         UPDATE alert_deliveries d SET status='processing',lease_until=$2,
@@ -4428,10 +4513,13 @@ fn smtp_delivery_error_code(error: &lettre::transport::smtp::Error) -> String {
         "smtp_timeout".to_string()
     } else if error.is_tls() {
         "smtp_tls_failed".to_string()
+    } else if error.is_transient() {
+        error
+            .status()
+            .map(|status| format!("smtp_transient_{status}"))
+            .unwrap_or_else(|| "smtp_transient".to_string())
     } else if let Some(status) = error.status() {
         format!("smtp_status_{status}")
-    } else if error.is_transient() {
-        "smtp_transient".to_string()
     } else if error.is_permanent() {
         "smtp_permanent".to_string()
     } else {
@@ -4520,16 +4608,16 @@ async fn finish_delivery_attempt(
     .bind(now)
     .execute(&mut *tx)
     .await?;
-    let channel_state = sqlx::query_as::<_, (bool, Option<i64>)>(
-        "SELECT enabled,deleted_at FROM alert_webhook_channels WHERE id=$1 FOR SHARE",
+    let channel_state = sqlx::query_as::<_, (bool, Option<i64>, String)>(
+        "SELECT enabled,deleted_at,channel_type FROM alert_webhook_channels WHERE id=$1 FOR SHARE",
     )
     .bind(&delivery.channel_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let inactive_channel_error = match channel_state {
-        Some((_, Some(_))) | None => Some("channel_deleted"),
-        Some((false, None)) => Some("channel_disabled"),
-        Some((true, None)) => None,
+    let inactive_channel_error = match channel_state.as_ref() {
+        Some((_, Some(_), _)) | None => Some("channel_deleted"),
+        Some((false, None, _)) => Some("channel_disabled"),
+        Some((true, None, _)) => None,
     };
     let event_resolved = if !outcome.succeeded && delivery.kind == "alert.firing" {
         if let Some(event_id) = delivery.event_id.as_deref() {
@@ -4546,6 +4634,44 @@ async fn finish_delivery_attempt(
     } else {
         false
     };
+    let channel_cooldown_delay = channel_state
+        .as_ref()
+        .and_then(|(_, deleted_at, channel_type)| {
+            deleted_at.is_none().then(|| {
+                transient_channel_cooldown_delay(
+                    channel_type,
+                    &outcome.error,
+                    delivery.cycle_attempts,
+                )
+            })
+        })
+        .flatten();
+    if let Some(delay) = channel_cooldown_delay {
+        let resume_at = now.saturating_add(delay);
+        sqlx::query(
+            r#"
+            UPDATE alert_webhook_channels SET
+                delivery_cooldown_until=GREATEST(COALESCE(delivery_cooldown_until,$1),$1)
+            WHERE id=$2
+            "#,
+        )
+        .bind(resume_at)
+        .bind(&delivery.channel_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE alert_deliveries SET
+                next_attempt_at=GREATEST(COALESCE(next_attempt_at,$1),$1),updated_at=$2
+            WHERE channel_id=$3 AND status='pending'
+            "#,
+        )
+        .bind(resume_at)
+        .bind(now)
+        .bind(&delivery.channel_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     if outcome.succeeded {
         sqlx::query(
             r#"
@@ -4628,6 +4754,18 @@ fn retry_delay_after(cycle_attempts: i64) -> Option<i64> {
         return None;
     }
     Some(DELIVERY_RETRY_DELAYS[(cycle_attempts - 1) as usize])
+}
+
+fn transient_channel_cooldown_delay(
+    channel_type: &str,
+    error: &str,
+    cycle_attempts: i64,
+) -> Option<i64> {
+    let transient_smtp_error = error == "smtp_timeout" || error.starts_with("smtp_transient");
+    if channel_type != "email" || !transient_smtp_error {
+        return None;
+    }
+    retry_delay_after(cycle_attempts).or_else(|| DELIVERY_RETRY_DELAYS.last().copied())
 }
 
 async fn notification_delivery_worker(state: AppState, client: Client) {
@@ -5087,6 +5225,49 @@ mod tests {
     }
 
     #[test]
+    fn limits_rule_link_arrays_before_deduplication() {
+        let base = RuleRequest {
+            name: "offline".to_string(),
+            metric: "node_offline".to_string(),
+            threshold: None,
+            duration_seconds: 60,
+            severity: "critical".to_string(),
+            scope: "specific".to_string(),
+            target_instance_ids: vec!["node-1".to_string()],
+            channel_ids: vec![],
+            enabled: true,
+        };
+
+        let mut at_target_limit = base.clone();
+        at_target_limit.target_instance_ids =
+            vec!["node-1".to_string(); MAX_RULE_TARGET_INSTANCE_IDS];
+        let normalized = validate_rule(&at_target_limit).expect("accept target ID limit");
+        assert_eq!(normalized.target_instance_ids, vec!["node-1".to_string()]);
+
+        let mut too_many_targets = base.clone();
+        too_many_targets.target_instance_ids =
+            vec!["node-1".to_string(); MAX_RULE_TARGET_INSTANCE_IDS + 1];
+        let error = validate_rule(&too_many_targets).expect_err("reject excessive target IDs");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            error
+                .message
+                .contains(&MAX_RULE_TARGET_INSTANCE_IDS.to_string())
+        );
+
+        let mut at_channel_limit = base.clone();
+        at_channel_limit.channel_ids = vec!["channel-1".to_string(); MAX_RULE_CHANNEL_IDS];
+        let normalized = validate_rule(&at_channel_limit).expect("accept channel ID limit");
+        assert_eq!(normalized.channel_ids, vec!["channel-1".to_string()]);
+
+        let mut too_many_channels = base;
+        too_many_channels.channel_ids = vec!["channel-1".to_string(); MAX_RULE_CHANNEL_IDS + 1];
+        let error = validate_rule(&too_many_channels).expect_err("reject excessive channel IDs");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains(&MAX_RULE_CHANNEL_IDS.to_string()));
+    }
+
+    #[test]
     fn maintenance_interval_is_half_open() {
         fn active(starts_at: i64, ends_at: i64, now: i64) -> bool {
             starts_at <= now && ends_at > now
@@ -5452,6 +5633,30 @@ mod tests {
     }
 
     #[test]
+    fn offline_recovery_requires_a_stable_online_window() {
+        assert_eq!(
+            recovery_confirmation("node_offline", true, None, 100),
+            (Some(100), false),
+        );
+        assert_eq!(
+            recovery_confirmation("node_offline", true, Some(100), 159),
+            (Some(100), false),
+        );
+        assert_eq!(
+            recovery_confirmation("node_offline", true, Some(100), 160),
+            (Some(100), true),
+        );
+        assert_eq!(
+            recovery_confirmation("cpu_percent", true, None, 100),
+            (None, true),
+        );
+        assert_eq!(
+            recovery_confirmation("node_offline", false, None, 100),
+            (None, true),
+        );
+    }
+
+    #[test]
     fn recovery_observation_replaces_last_abnormal_value_and_time() {
         assert_eq!(
             resolution_values(Some(95.0), 100, Some((42.0, 120))),
@@ -5468,6 +5673,26 @@ mod tests {
         assert_eq!(retry_delay_after(4), Some(60 * 60));
         assert_eq!(retry_delay_after(5), None);
         assert_eq!(retry_delay_after(0), None);
+    }
+
+    #[test]
+    fn transient_smtp_failures_cool_down_only_the_failing_channel() {
+        assert_eq!(
+            transient_channel_cooldown_delay("email", "smtp_transient_4.7.0", 1),
+            Some(60),
+        );
+        assert_eq!(
+            transient_channel_cooldown_delay("email", "smtp_timeout", 5),
+            Some(60 * 60),
+        );
+        assert_eq!(
+            transient_channel_cooldown_delay("email", "smtp_status_5.7.1", 1),
+            None,
+        );
+        assert_eq!(
+            transient_channel_cooldown_delay("generic_webhook", "smtp_transient", 1),
+            None,
+        );
     }
 
     #[test]
@@ -6292,6 +6517,277 @@ mod tests {
         release_delivery_claim(&db, &recovery, observed_at + 4)
             .await
             .expect("release recovery test delivery");
+
+        drop_test_schema(db, bootstrap, schema).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn offline_flaps_share_one_event_until_online_state_is_stable() {
+        let (db, bootstrap, schema) = isolated_test_pool("om_alerts_offline_flap").await;
+        create_alert_prerequisites(&db).await;
+        ensure_schema(&db).await.expect("create alert schema");
+        let state = test_state(db.clone());
+        insert_test_instance(&db, "node-flap", "Flapping Node").await;
+        set_test_channel(
+            &state,
+            "channel-flap",
+            "http://127.0.0.1/unused",
+            None,
+            &BTreeMap::new(),
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO alert_rules(
+                id,name,metric,threshold,duration_seconds,severity,scope,
+                enabled,version,created_by,created_at,updated_at
+            ) VALUES(
+                'rule-flap','Node offline','node_offline',NULL,0,'critical','all',
+                TRUE,1,'test',100,100
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("insert offline rule");
+        sqlx::query(
+            "INSERT INTO alert_rule_channels(rule_id,channel_id) VALUES('rule-flap','channel-flap')",
+        )
+        .execute(&db)
+        .await
+        .expect("link offline channel");
+        let rule = sqlx::query_as::<_, RuleRow>("SELECT * FROM alert_rules WHERE id='rule-flap'")
+            .fetch_one(&db)
+            .await
+            .expect("load offline rule");
+        let observed_at = now_ts();
+
+        process_rule_observation(
+            &state,
+            &rule,
+            "node-flap",
+            RuleObservation::Threshold {
+                value: 1.0,
+                abnormal: true,
+            },
+            observed_at,
+            observed_at,
+        )
+        .await
+        .expect("fire initial offline event");
+        process_rule_observation(
+            &state,
+            &rule,
+            "node-flap",
+            RuleObservation::Threshold {
+                value: 0.0,
+                abnormal: false,
+            },
+            observed_at + 1,
+            observed_at + 1,
+        )
+        .await
+        .expect("begin online recovery window");
+        process_rule_observation(
+            &state,
+            &rule,
+            "node-flap",
+            RuleObservation::Threshold {
+                value: 1.0,
+                abnormal: true,
+            },
+            observed_at + 2,
+            observed_at + 2,
+        )
+        .await
+        .expect("merge flap into active event");
+
+        let active_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM alert_events WHERE rule_id='rule-flap' AND status <> 'resolved'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count active flap events");
+        let firing_deliveries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM alert_deliveries WHERE channel_id='channel-flap' AND kind='alert.firing' AND status <> 'suppressed'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count deduplicated flap deliveries");
+        let recovery_since: Option<i64> = sqlx::query_scalar(
+            "SELECT recovery_since FROM alert_evaluation_states WHERE rule_id='rule-flap' AND instance_id='node-flap'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("load reset recovery window");
+        assert_eq!(active_events, 1);
+        assert_eq!(firing_deliveries, 1);
+        assert_eq!(recovery_since, None);
+
+        for offset in [3, 62] {
+            process_rule_observation(
+                &state,
+                &rule,
+                "node-flap",
+                RuleObservation::Threshold {
+                    value: 0.0,
+                    abnormal: false,
+                },
+                observed_at + offset,
+                observed_at + offset,
+            )
+            .await
+            .expect("observe online recovery window");
+        }
+        let still_active: bool = sqlx::query_scalar(
+            "SELECT status <> 'resolved' FROM alert_events WHERE rule_id='rule-flap'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("check unconfirmed recovery");
+        assert!(still_active);
+
+        process_rule_observation(
+            &state,
+            &rule,
+            "node-flap",
+            RuleObservation::Threshold {
+                value: 0.0,
+                abnormal: false,
+            },
+            observed_at + 63,
+            observed_at + 63,
+        )
+        .await
+        .expect("confirm stable recovery");
+        let resolved: bool = sqlx::query_scalar(
+            "SELECT status='resolved' FROM alert_events WHERE rule_id='rule-flap'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("check stable recovery");
+        assert!(resolved);
+
+        drop_test_schema(db, bootstrap, schema).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn smtp_transient_failure_defers_its_channel_without_blocking_other_channels() {
+        let (db, bootstrap, schema) = isolated_test_pool("om_alerts_smtp_cooldown").await;
+        create_alert_prerequisites(&db).await;
+        ensure_schema(&db).await.expect("create alert schema");
+        let state = test_state(db.clone());
+        for channel_id in ["channel-email", "channel-other"] {
+            set_test_channel(
+                &state,
+                channel_id,
+                "http://127.0.0.1/unused",
+                None,
+                &BTreeMap::new(),
+            )
+            .await;
+        }
+        sqlx::query(
+            "UPDATE alert_webhook_channels SET channel_type='email' WHERE id='channel-email'",
+        )
+        .execute(&db)
+        .await
+        .expect("mark test channel as email");
+        let observed_at = now_ts();
+        sqlx::query(
+            r#"
+            INSERT INTO alert_deliveries(
+                id,event_id,channel_id,kind,status,payload,channel_snapshot,
+                next_attempt_at,created_at,updated_at
+            ) VALUES
+                ('a-email-first',NULL,'channel-email','webhook.test','pending','{}','{}',$1,$1,$1),
+                ('b-email-second',NULL,'channel-email','webhook.test','pending','{}','{}',$1,$1,$1),
+                ('c-other',NULL,'channel-other','webhook.test','pending','{}','{}',$1,$1,$1)
+            "#,
+        )
+        .bind(observed_at)
+        .execute(&db)
+        .await
+        .expect("insert channel isolation deliveries");
+
+        let email = claim_delivery(&db, observed_at)
+            .await
+            .expect("claim first email")
+            .expect("first email is ready");
+        assert_eq!(email.id, "a-email-first");
+        let other = claim_delivery(&db, observed_at)
+            .await
+            .expect("claim other channel")
+            .expect("other channel remains available");
+        assert_eq!(other.id, "c-other");
+        let other = start_delivery_attempt(&db, &other, observed_at)
+            .await
+            .expect("start other channel attempt")
+            .expect("other channel lease is active");
+        finish_delivery_attempt(
+            &db,
+            &other,
+            WebhookAttemptOutcome {
+                succeeded: true,
+                http_status: Some(204),
+                duration_ms: 1,
+                error: String::new(),
+                response_excerpt: String::new(),
+            },
+        )
+        .await
+        .expect("finish other channel delivery");
+
+        let email = start_delivery_attempt(&db, &email, observed_at)
+            .await
+            .expect("start email attempt")
+            .expect("email lease is active");
+        let before_failure = now_ts();
+        finish_delivery_attempt(
+            &db,
+            &email,
+            WebhookAttemptOutcome {
+                succeeded: false,
+                http_status: None,
+                duration_ms: 1,
+                error: "smtp_transient_4.7.0".to_string(),
+                response_excerpt: String::new(),
+            },
+        )
+        .await
+        .expect("record transient SMTP failure");
+
+        let queued = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT status,attempts_count,next_attempt_at FROM alert_deliveries WHERE id='b-email-second'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("load deferred email delivery");
+        assert_eq!(queued.0, "pending");
+        assert_eq!(queued.1, 0);
+        assert!(queued.2 >= before_failure + 60);
+        sqlx::query(
+            r#"
+            INSERT INTO alert_deliveries(
+                id,event_id,channel_id,kind,status,payload,channel_snapshot,
+                next_attempt_at,created_at,updated_at
+            ) VALUES(
+                'd-email-new',NULL,'channel-email','webhook.test','pending','{}','{}',$1,$1,$1
+            )
+            "#,
+        )
+        .bind(before_failure + 1)
+        .execute(&db)
+        .await
+        .expect("insert email delivery during cooldown");
+        assert!(
+            claim_delivery(&db, before_failure + 1)
+                .await
+                .expect("check SMTP cooldown")
+                .is_none()
+        );
 
         drop_test_schema(db, bootstrap, schema).await;
     }

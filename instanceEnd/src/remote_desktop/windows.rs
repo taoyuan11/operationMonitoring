@@ -26,9 +26,7 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 use windows::{
     Win32::{
-        Foundation::{
-            CloseHandle, FreeLibrary, GENERIC_WRITE, HANDLE, HMODULE, HWND, LocalFree, STILL_ACTIVE,
-        },
+        Foundation::{CloseHandle, GENERIC_WRITE, HANDLE, HMODULE, HWND, LocalFree, STILL_ACTIVE},
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0},
             Direct3D11::{
@@ -63,7 +61,6 @@ use windows::{
         },
         System::{
             Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
-            LibraryLoader::{GetProcAddress, LoadLibraryW},
             Pipes::GetNamedPipeClientProcessId,
             RemoteDesktop::{
                 ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
@@ -92,16 +89,20 @@ use windows::{
             MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
             VIRTUAL_KEY,
         },
-        UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
+        UI::WindowsAndMessaging::{
+            GetSystemMetrics, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+            MB_SYSTEMMODAL, MB_TOPMOST, MB_YESNO, MessageBoxW, SM_CXSCREEN, SM_CYSCREEN,
+        },
     },
     core::{ComInterface, PCWSTR, PWSTR},
 };
 
 use super::{
-    AdaptiveSettings, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl, DesktopOpenRequest,
-    DesktopOptions, FrameHeader, INPUT_RELEASE_ACK_TIMEOUT, MAX_CONTROL_BYTES, MAX_FRAME_BYTES,
-    MAX_JPEG_QUALITY, MIN_JPEG_QUALITY, absolute_pointer_coordinate, dom_code_to_vk,
-    dom_code_uses_extended_key, error_reason, scaled_dimensions, wait_for_input_release_ack,
+    AdaptiveSettings, ControlRateLimiter, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl,
+    DesktopOpenRequest, DesktopOptions, FrameHeader, INPUT_RELEASE_ACK_TIMEOUT, MAX_CONTROL_BYTES,
+    MAX_FRAME_BYTES, MAX_JPEG_QUALITY, MIN_JPEG_QUALITY, absolute_pointer_coordinate,
+    dom_code_to_vk, dom_code_uses_extended_key, error_reason, scaled_dimensions,
+    wait_for_input_release_ack,
 };
 use crate::{config::AgentConfig, models::AgentInbound, outbound::AgentEventSender};
 
@@ -116,6 +117,8 @@ const PIPE_MAX_PACKET: usize = MAX_FRAME_BYTES + 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const DESKTOP_BINDING_LOST: &str = "input_desktop_binding_lost";
+const DESKTOP_HANDLE_CLEANUP_FAILED: &str = "desktop_handle_cleanup_failed";
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 // WINSTA_ALL_ACCESS from winuser.h; windows 0.52 does not expose the aggregate constant.
 const WINSTA_ALL_ACCESS_MASK: u32 = 0x0000_037f;
@@ -310,6 +313,8 @@ async fn relay(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_browser_message = tokio::time::Instant::now();
+    let mut control_rate = ControlRateLimiter::new(Instant::now());
+    let mut input_ready = false;
 
     let result: Result<String> = async {
         let reason = loop {
@@ -335,6 +340,7 @@ async fn relay(
             }
             status = status_rx.recv() => {
                 let Some(status) = status else { break "helper_disconnected".to_string() };
+                update_remote_input_gate(&status, &mut input_ready);
                 tokio::time::timeout(
                     SOCKET_SEND_TIMEOUT,
                     ws_write.send(Message::Text(status.into())),
@@ -348,8 +354,14 @@ async fn relay(
                 match incoming? {
                     Message::Text(text) => {
                         if text.len() > MAX_CONTROL_BYTES { bail!("desktop control message too large") }
-                        serde_json::from_str::<DesktopControl>(&text)
+                        let _control = serde_json::from_str::<DesktopControl>(&text)
                             .context("invalid desktop control message")?;
+                        if !control_rate.allow(Instant::now()) {
+                            bail!("control_rate_limited: desktop control rate exceeded")
+                        }
+                        if !input_ready {
+                            continue;
+                        }
                         tokio::time::timeout(
                             PIPE_WRITE_TIMEOUT,
                             write_packet(&mut pipe_write, PIPE_CONTROL, text.as_bytes()),
@@ -423,6 +435,22 @@ async fn relay(
     result
 }
 
+fn update_remote_input_gate(status: &str, input_ready: &mut bool) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(status) else {
+        return;
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("ready") => *input_ready = true,
+        Some("consent_required" | "paused" | "closed" | "error") => *input_ready = false,
+        Some("desktop_state")
+            if value.get("desktop").and_then(serde_json::Value::as_str) != Some("default") =>
+        {
+            *input_ready = false;
+        }
+        _ => {}
+    }
+}
+
 async fn pipe_reader<R: AsyncRead + Unpin>(
     mut reader: R,
     frame_tx: watch::Sender<Option<Vec<u8>>>,
@@ -469,6 +497,17 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
         .await
         .map_err(|_| anyhow!("desktop helper pipe connection timeout"))??;
     let (read, mut write) = tokio::io::split(pipe);
+    let consent_required = serde_json::json!({"type":"consent_required"}).to_string();
+    write_packet(&mut write, PIPE_CONTROL, consent_required.as_bytes()).await?;
+    let consent_granted = tokio::task::spawn_blocking(request_local_control_consent)
+        .await
+        .context("local consent prompt task failed")?;
+    if !consent_granted {
+        write_fatal_packet(&mut write, "local_consent_denied").await?;
+        bail!("local_consent_denied")
+    }
+    let mut local_stop = spawn_local_session_indicator()?;
+
     // `read_packet` is not cancellation-safe: if another `select!` branch wins after the length
     // or kind byte has been consumed, dropping the future leaves the next read in the middle of a
     // packet. Browser feedback arrives while the timer and capture branches are also active, so
@@ -488,12 +527,8 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
         .name("om-desktop-capture".to_string())
         .spawn(move || capture_loop(capture_options, capture_settings, capture_tx))?;
 
-    let mut input = InputState {
-        keys: HashSet::new(),
-        buttons: HashSet::new(),
-        allow_secure_attention: options.system_helper,
-    };
-    let mut input_desktop_available = options.system_helper || default_input_desktop();
+    let mut input = InputState::default();
+    let mut input_desktop_available = default_input_desktop();
     let mut pending_release = false;
     let mut stopping = false;
     let mut last_input_error_log = None;
@@ -504,14 +539,21 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     write_packet(&mut write, PIPE_CONTROL, ready.as_bytes()).await?;
     loop {
         tokio::select! {
+            local_stop = local_stop.recv() => {
+                if local_stop.is_some() {
+                    let _ = release_on_input_desktop(&mut input);
+                    write_fatal_packet(&mut write, "local_consent_revoked").await?;
+                    bail!("local_consent_revoked")
+                }
+            }
             _ = desktop_check.tick() => {
-                let available = options.system_helper || default_input_desktop();
+                let available = default_input_desktop();
                 if input_desktop_available && !available {
-                    pending_release = !release_on_input_desktop(&mut input);
+                    pending_release = !release_on_input_desktop(&mut input)?;
                 }
                 input_desktop_available = available;
                 if available && pending_release {
-                    pending_release = !release_on_input_desktop(&mut input);
+                    pending_release = !release_on_input_desktop(&mut input)?;
                 }
                 if stopping && !pending_release {
                     write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
@@ -534,7 +576,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                         fatal.extend_from_slice(reason.as_bytes());
                         write_packet(&mut write, PIPE_INTERNAL, &fatal).await?;
                         stopping = true;
-                        pending_release = !release_on_input_desktop(&mut input);
+                        pending_release = !release_on_input_desktop(&mut input)?;
                         if !pending_release {
                             write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
                             break;
@@ -548,7 +590,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                     .context("desktop service pipe reader stopped unexpectedly")??;
                 if kind == PIPE_INTERNAL && value == INTERNAL_STOP {
                     stopping = true;
-                    pending_release = !release_on_input_desktop(&mut input);
+                    pending_release = !release_on_input_desktop(&mut input)?;
                     if !pending_release {
                         write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
                         break;
@@ -571,16 +613,16 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                         );
                     }
                     DesktopControl::ReleaseAll => {
-                        pending_release = !release_on_input_desktop(&mut input);
+                        pending_release = !release_on_input_desktop(&mut input)?;
                     }
                     control if !stopping => {
-                        let available = options.system_helper || default_input_desktop();
+                        let available = default_input_desktop();
                         if input_desktop_available && !available {
-                            pending_release = !release_on_input_desktop(&mut input);
+                            pending_release = !release_on_input_desktop(&mut input)?;
                         }
                         input_desktop_available = available;
                         if available && pending_release {
-                            pending_release = !release_on_input_desktop(&mut input);
+                            pending_release = !release_on_input_desktop(&mut input)?;
                         }
                         if available && !pending_release {
                             let secure_attention = matches!(&control, DesktopControl::SecureAttention);
@@ -590,6 +632,12 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                                     | DesktopControl::PointerButton { down: false, .. }
                             );
                             if let Err(error) = apply_on_input_desktop(&mut input, control) {
+                                if error.to_string().contains(DESKTOP_BINDING_LOST)
+                                    || error.to_string().contains(DESKTOP_HANDLE_CLEANUP_FAILED)
+                                {
+                                    write_fatal_packet(&mut write, DESKTOP_BINDING_LOST).await?;
+                                    return Err(error);
+                                }
                                 log_input_injection_error(
                                     &error,
                                     &mut last_input_error_log,
@@ -615,7 +663,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
             }
         }
     }
-    let _ = release_on_input_desktop(&mut input);
+    let _ = release_on_input_desktop(&mut input)?;
     Ok(())
 }
 
@@ -658,7 +706,15 @@ fn capture_loop(
     tx: mpsc::Sender<HelperEvent>,
 ) {
     let mut capture: Option<DxgiCapture> = None;
-    let mut attached_desktop: Option<(HDESK, String)> = None;
+    let mut attached_desktop = match ThreadDesktopBinding::new() {
+        Ok(binding) => binding,
+        Err(error) => {
+            let _ = tx.blocking_send(HelperEvent::Fatal(format!(
+                "failed to inspect capture thread desktop: {error:#}"
+            )));
+            return;
+        }
+    };
     let mut sequence = 0_u64;
     let mut foreground_secure_paused = false;
     let mut next_capture = Instant::now();
@@ -684,18 +740,22 @@ fn capture_loop(
                 name
             }
             Err(error) => {
+                if error.to_string().contains(DESKTOP_HANDLE_CLEANUP_FAILED) {
+                    let _ = tx.blocking_send(HelperEvent::Fatal(format!("{error:#}")));
+                    return;
+                }
                 crate::logging::error(format_args!("failed to attach input desktop: {error:#}"));
                 capture = None;
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
         };
-        if !options.system_helper && !desktop_name.eq_ignore_ascii_case("Default") {
+        if !desktop_name.eq_ignore_ascii_case("Default") {
             if !foreground_secure_paused {
                 let _ = tx.blocking_send(HelperEvent::Status(
                     serde_json::json!({
                         "type":"paused",
-                        "reason":"secure_desktop_requires_service"
+                        "reason":"secure_desktop"
                     })
                     .to_string(),
                 ));
@@ -772,18 +832,75 @@ fn desktop_kind(name: &str) -> &'static str {
     }
 }
 
-fn attach_input_desktop(current: &mut Option<(HDESK, String)>) -> Result<(String, bool)> {
+struct OwnedDesktop(Option<HDESK>);
+
+impl OwnedDesktop {
+    fn new(desktop: HDESK) -> Self {
+        Self(Some(desktop))
+    }
+
+    fn handle(&self) -> HDESK {
+        self.0.expect("owned desktop handle is present")
+    }
+
+    fn close(mut self) -> Result<()> {
+        let desktop = self.0.take().expect("owned desktop handle is present");
+        unsafe { CloseDesktop(desktop) }
+            .with_context(|| format!("{DESKTOP_HANDLE_CLEANUP_FAILED}: failed to close desktop"))
+    }
+}
+
+impl Drop for OwnedDesktop {
+    fn drop(&mut self) {
+        if let Some(desktop) = self.0.take() {
+            unsafe {
+                let _ = CloseDesktop(desktop);
+            }
+        }
+    }
+}
+
+struct ThreadDesktopBinding {
+    original: HDESK,
+    current: Option<(OwnedDesktop, String)>,
+}
+
+impl ThreadDesktopBinding {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            original: unsafe { GetThreadDesktop(GetCurrentThreadId())? },
+            current: None,
+        })
+    }
+}
+
+impl Drop for ThreadDesktopBinding {
+    fn drop(&mut self) {
+        if self.current.is_some() && unsafe { SetThreadDesktop(self.original) }.is_ok() {
+            self.current.take();
+        }
+    }
+}
+
+fn attach_input_desktop(current: &mut ThreadDesktopBinding) -> Result<(String, bool)> {
     unsafe {
-        let desktop = OpenInputDesktop(Default::default(), false, DESKTOP_READOBJECTS)
-            .context("input desktop is unavailable")?;
-        let name = desktop_name(desktop)?;
-        if current.as_ref().is_some_and(|(_, value)| value == &name) {
-            let _ = CloseDesktop(desktop);
+        let desktop = OwnedDesktop::new(
+            OpenInputDesktop(Default::default(), false, DESKTOP_READOBJECTS)
+                .context("input desktop is unavailable")?,
+        );
+        let name = desktop_name(desktop.handle())?;
+        if current
+            .current
+            .as_ref()
+            .is_some_and(|(_, value)| value == &name)
+        {
+            desktop.close()?;
             return Ok((name, false));
         }
-        SetThreadDesktop(desktop).context("failed to bind capture thread to input desktop")?;
-        if let Some((previous, _)) = current.replace((desktop, name.clone())) {
-            let _ = CloseDesktop(previous);
+        SetThreadDesktop(desktop.handle())
+            .context("failed to bind capture thread to input desktop")?;
+        if let Some((previous, _)) = current.current.replace((desktop, name.clone())) {
+            previous.close()?;
         }
         Ok((name, true))
     }
@@ -831,6 +948,45 @@ fn bind_interactive_window_station() -> Result<()> {
     }
 }
 
+fn request_local_control_consent() -> bool {
+    let title = wide("Operation Monitoring 远程桌面");
+    let message = wide("管理员请求查看并控制此 Windows 桌面。\r\n\r\n是否允许本次远程桌面会话？");
+    unsafe {
+        MessageBoxW(
+            HWND(0),
+            PCWSTR(message.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO
+                | MB_ICONWARNING
+                | MB_DEFBUTTON2
+                | MB_SETFOREGROUND
+                | MB_TOPMOST
+                | MB_SYSTEMMODAL,
+        ) == IDYES
+    }
+}
+
+fn spawn_local_session_indicator() -> Result<mpsc::Receiver<()>> {
+    let (stop_tx, stop_rx) = mpsc::channel(1);
+    std::thread::Builder::new()
+        .name("om-desktop-indicator".to_string())
+        .spawn(move || {
+            let title = wide("Operation Monitoring 远程桌面正在进行");
+            let message =
+                wide("此计算机正在被远程查看和控制。\r\n\r\n单击“确定”可立即终止远程桌面会话。");
+            unsafe {
+                let _ = MessageBoxW(
+                    HWND(0),
+                    PCWSTR(message.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST | MB_SYSTEMMODAL,
+                );
+            }
+            let _ = stop_tx.blocking_send(());
+        })?;
+    Ok(stop_rx)
+}
+
 fn log_helper_security_context(options: &DesktopOptions) -> Result<()> {
     unsafe {
         let mut token = HANDLE::default();
@@ -855,25 +1011,40 @@ fn log_helper_security_context(options: &DesktopOptions) -> Result<()> {
 fn apply_on_input_desktop(input: &mut InputState, control: DesktopControl) -> Result<()> {
     unsafe {
         let original = GetThreadDesktop(GetCurrentThreadId())?;
-        let desktop = OpenInputDesktop(Default::default(), false, INPUT_DESKTOP_ACCESS)
-            .context("input desktop is unavailable for input injection")?;
-        let result = (|| -> Result<()> {
-            let name = desktop_name(desktop)?;
-            SetThreadDesktop(desktop).context("failed to bind input thread to input desktop")?;
-            let applied = input
-                .apply(control)
-                .with_context(|| format!("input desktop {name}"));
-            let restored = SetThreadDesktop(original)
-                .context("failed to restore input thread desktop after injection");
-            applied.and(restored)
-        })();
-        let _ = CloseDesktop(desktop);
-        result
+        let desktop = OwnedDesktop::new(
+            OpenInputDesktop(Default::default(), false, INPUT_DESKTOP_ACCESS)
+                .context("input desktop is unavailable for input injection")?,
+        );
+        let name = desktop_name(desktop.handle())?;
+        if !name.eq_ignore_ascii_case("Default") {
+            bail!("secure_desktop: input injection is restricted to the default desktop")
+        }
+        SetThreadDesktop(desktop.handle())
+            .context("failed to bind input thread to input desktop")?;
+        let applied = input
+            .apply(control)
+            .with_context(|| format!("input desktop {name}"));
+        if let Err(error) = SetThreadDesktop(original) {
+            return Err(error).with_context(|| {
+                format!("{DESKTOP_BINDING_LOST}: failed to restore input thread desktop")
+            });
+        }
+        desktop.close()?;
+        applied
     }
 }
 
-fn release_on_input_desktop(input: &mut InputState) -> bool {
-    apply_on_input_desktop(input, DesktopControl::ReleaseAll).is_ok()
+fn release_on_input_desktop(input: &mut InputState) -> Result<bool> {
+    match apply_on_input_desktop(input, DesktopControl::ReleaseAll) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error.to_string().contains(DESKTOP_BINDING_LOST)
+                || error.to_string().contains(DESKTOP_HANDLE_CLEANUP_FAILED) =>
+        {
+            Err(error)
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 struct DxgiCapture {
@@ -1155,7 +1326,6 @@ fn capture_gdi_jpeg(
 struct InputState {
     keys: HashSet<(u16, bool)>,
     buttons: HashSet<u8>,
-    allow_secure_attention: bool,
 }
 
 impl InputState {
@@ -1201,10 +1371,7 @@ impl InputState {
                 Ok(())
             }
             DesktopControl::SecureAttention => {
-                if !self.allow_secure_attention {
-                    bail!("secure_attention_unavailable")
-                }
-                send_secure_attention()
+                bail!("secure_attention_unavailable")
             }
             DesktopControl::Feedback { .. } => Ok(()),
         }
@@ -1225,26 +1392,11 @@ impl InputState {
     }
 }
 
-fn send_secure_attention() -> Result<()> {
-    unsafe {
-        let library_name = wide("sas.dll");
-        let library = LoadLibraryW(PCWSTR(library_name.as_ptr()))
-            .context("secure_attention_unavailable: failed to load sas.dll")?;
-        let address = GetProcAddress(library, windows::core::s!("SendSAS"));
-        let Some(address) = address else {
-            let _ = FreeLibrary(library);
-            bail!("secure_attention_unavailable: SendSAS is unavailable")
-        };
-        let send_sas: unsafe extern "system" fn(i32) = std::mem::transmute(address);
-        send_sas(0);
-        let _ = FreeLibrary(library);
-        Ok(())
-    }
-}
-
 impl Drop for InputState {
     fn drop(&mut self) {
-        let _ = self.release_all();
+        if !self.keys.is_empty() || !self.buttons.is_empty() {
+            let _ = apply_on_input_desktop(self, DesktopControl::ReleaseAll);
+        }
     }
 }
 
@@ -1705,54 +1857,57 @@ fn spawn_helper_in_active_session(
 ) -> Result<HelperProcess> {
     unsafe {
         let primary_token = duplicate_session_system_token(session_id)?;
-        crate::logging::info(format_args!(
-            "launching remote desktop helper with target session LocalSystem token: session_id={session_id}"
-        ));
+        let result = (|| -> Result<HelperProcess> {
+            crate::logging::info(format_args!(
+                "launching remote desktop helper with target session LocalSystem token: session_id={session_id}"
+            ));
 
-        let executable = std::env::current_exe()?;
-        let mut command = Command::new(&executable);
-        append_helper_args(&mut command, options);
-        config.append_cli_args(&mut command);
-        let mut command_line = wide(&format!(
-            "\"{}\" {}",
-            executable.display(),
-            command
-                .get_args()
-                .map(|v| quote_arg(v))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
-        let application = wide(executable.as_os_str());
-        let desktop = wide("winsta0\\default");
-        let mut environment: *mut c_void = null_mut();
-        CreateEnvironmentBlock(&mut environment, primary_token, false)?;
-        let startup = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            lpDesktop: PWSTR(desktop.as_ptr() as *mut _),
-            ..zeroed()
-        };
-        let mut process: PROCESS_INFORMATION = zeroed();
-        let created = CreateProcessAsUserW(
-            primary_token,
-            PCWSTR(application.as_ptr()),
-            PWSTR(command_line.as_mut_ptr()),
-            None,
-            None,
-            false,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            Some(environment),
-            PCWSTR(null()),
-            &startup,
-            &mut process,
-        );
-        let _ = DestroyEnvironmentBlock(environment);
+            let executable = std::env::current_exe()?;
+            let mut command = Command::new(&executable);
+            append_helper_args(&mut command, options);
+            config.append_cli_args(&mut command);
+            let mut command_line = wide(&format!(
+                "\"{}\" {}",
+                executable.display(),
+                command
+                    .get_args()
+                    .map(|v| quote_arg(v))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+            let application = wide(executable.as_os_str());
+            let desktop = wide("winsta0\\default");
+            let mut environment: *mut c_void = null_mut();
+            CreateEnvironmentBlock(&mut environment, primary_token, false)?;
+            let startup = STARTUPINFOW {
+                cb: size_of::<STARTUPINFOW>() as u32,
+                lpDesktop: PWSTR(desktop.as_ptr() as *mut _),
+                ..zeroed()
+            };
+            let mut process: PROCESS_INFORMATION = zeroed();
+            let created = CreateProcessAsUserW(
+                primary_token,
+                PCWSTR(application.as_ptr()),
+                PWSTR(command_line.as_mut_ptr()),
+                None,
+                None,
+                false,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                Some(environment),
+                PCWSTR(null()),
+                &startup,
+                &mut process,
+            );
+            let _ = DestroyEnvironmentBlock(environment);
+            created?;
+            let _ = CloseHandle(process.hThread);
+            Ok(HelperProcess::Handle {
+                handle: process.hProcess,
+                pid: process.dwProcessId,
+            })
+        })();
         let _ = CloseHandle(primary_token);
-        created?;
-        let _ = CloseHandle(process.hThread);
-        Ok(HelperProcess::Handle {
-            handle: process.hProcess,
-            pid: process.dwProcessId,
-        })
+        result
     }
 }
 
@@ -1791,6 +1946,13 @@ async fn write_packet<W: AsyncWrite + Unpin>(writer: &mut W, kind: u8, value: &[
     writer.write_all(value).await?;
     writer.flush().await?;
     Ok(())
+}
+
+async fn write_fatal_packet<W: AsyncWrite + Unpin>(writer: &mut W, reason: &str) -> Result<()> {
+    let mut fatal = Vec::with_capacity(INTERNAL_FATAL_PREFIX.len() + reason.len());
+    fatal.extend_from_slice(INTERNAL_FATAL_PREFIX);
+    fatal.extend_from_slice(reason.as_bytes());
+    write_packet(writer, PIPE_INTERNAL, &fatal).await
 }
 
 async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(u8, Vec<u8>)> {
@@ -1880,6 +2042,27 @@ mod tests {
     #[test]
     fn interactive_window_station_access_matches_win32_all_access() {
         assert_eq!(WINSTA_ALL_ACCESS_MASK, 0x037f);
+    }
+
+    #[test]
+    fn helper_statuses_gate_remote_input_until_consent_and_default_desktop() {
+        let mut ready = false;
+        update_remote_input_gate(r#"{"type":"consent_required"}"#, &mut ready);
+        assert!(!ready);
+        update_remote_input_gate(r#"{"type":"ready"}"#, &mut ready);
+        assert!(ready);
+        update_remote_input_gate(r#"{"type":"desktop_state","desktop":"secure"}"#, &mut ready);
+        assert!(!ready);
+        update_remote_input_gate(r#"{"type":"ready"}"#, &mut ready);
+        update_remote_input_gate(r#"{"type":"paused","reason":"secure_desktop"}"#, &mut ready);
+        assert!(!ready);
+    }
+
+    #[test]
+    fn secure_attention_is_always_rejected() {
+        let mut input = InputState::default();
+        let error = input.apply(DesktopControl::SecureAttention).unwrap_err();
+        assert!(error.to_string().contains("secure_attention_unavailable"));
     }
 
     #[test]

@@ -7,7 +7,6 @@ import {
   Maximize2,
   Monitor,
   RefreshCw,
-  ShieldAlert,
   Shrink,
   X,
 } from 'lucide-vue-next'
@@ -43,6 +42,7 @@ type DesktopFrame = {
 
 type DesktopServerMessage =
   | { type: 'opening' }
+  | { type: 'consent_required' }
   | { type: 'ready' }
   | { type: 'display'; width: number; height: number }
   | { type: 'desktop_state'; desktop: 'default' | 'secure' | 'other' }
@@ -63,7 +63,6 @@ type DesktopClientMessage =
     modifiers: KeyModifier[]
   }
   | { type: 'release_all' }
-  | { type: 'secure_attention' }
   | {
     type: 'feedback'
     sequence: number
@@ -136,7 +135,7 @@ const statusLabel = computed(() => {
 })
 const showStatusOverlay = computed(() => connectionState.value !== 'ready')
 const showInputHint = computed(() => isNarrowViewport.value || hasCoarsePointer.value)
-const canControl = computed(() => connectionState.value === 'ready' && !hasCoarsePointer.value)
+const canControl = computed(() => connectionState.value === 'ready' && desktopKind.value === 'default' && !hasCoarsePointer.value)
 
 onMounted(() => {
   viewportMediaQuery = window.matchMedia('(max-width: 760px)')
@@ -278,6 +277,10 @@ function handleServerMessage(payload: string) {
       connectionState.value = 'connecting'
       statusDetail.value = '正在启动 Windows 桌面捕获'
       break
+    case 'consent_required':
+      connectionState.value = 'connecting'
+      statusDetail.value = '等待远程计算机上的用户允许本次查看和控制'
+      break
     case 'ready':
       connectionState.value = 'ready'
       statusDetail.value = '键盘和鼠标操作将发送到远程实例'
@@ -296,11 +299,11 @@ function handleServerMessage(payload: string) {
       break
     case 'desktop_state':
       desktopKind.value = message.desktop
-      connectionState.value = 'ready'
+      connectionState.value = message.desktop === 'default' ? 'ready' : 'paused'
       statusDetail.value = message.desktop === 'secure'
-        ? '正在操作 Windows 登录或 UAC 安全桌面'
+        ? 'Windows 正在显示登录或 UAC 安全桌面，远程查看和控制已暂停'
         : message.desktop === 'other'
-          ? '正在操作 Windows 系统桌面'
+          ? 'Windows 已切换到非默认桌面，远程查看和控制已暂停'
           : '键盘和鼠标操作将发送到远程实例'
       break
     case 'notice':
@@ -577,16 +580,6 @@ function releaseAllInputs() {
   releaseLocalInputState()
 }
 
-function sendSecureAttention() {
-  if (!canControl.value) return
-  if (!window.confirm('确定向远程 Windows 发送 Ctrl+Alt+Del 吗？')) return
-  releaseAllInputs()
-  if (sendMessage({ type: 'secure_attention' })) {
-    markInputActivity()
-    statusDetail.value = '已请求 Windows 显示安全选项'
-  }
-}
-
 function releaseLocalInputState() {
   pressedMouseButtons.clear()
   pendingPointer = null
@@ -702,6 +695,9 @@ function desktopReason(reason: string) {
     browser_closed: '浏览器已关闭远程桌面连接',
     desktop_busy: '该实例已有管理员正在操作远程桌面',
     agent_draining: 'Agent 正在准备更新，暂不接受新的远程桌面会话',
+    local_consent_denied: '远程计算机上的用户拒绝了本次远程桌面请求',
+    local_consent_revoked: '远程计算机上的用户已终止本次远程桌面会话',
+    control_rate_limited: '控制消息速率过高，远程桌面会话已终止',
     unsupported_platform: '该实例平台不支持远程桌面',
     helper_disconnected: 'Windows 桌面捕获进程已断开',
     helper_error: 'Windows 桌面捕获进程发生错误，请查看 Agent 日志',
@@ -795,15 +791,6 @@ function isDesktopQuality(value: string | null): value is DesktopQuality {
               <Maximize2 :size="15" />1:1
             </button>
           </div>
-          <button
-            class="desktop-tool-button desktop-secure-button"
-            type="button"
-            title="向远程 Windows 发送 Ctrl+Alt+Del"
-            :disabled="!canControl"
-            @click="sendSecureAttention"
-          >
-            <ShieldAlert :size="15" /><span>Ctrl+Alt+Del</span>
-          </button>
           <button class="desktop-tool-button" type="button" title="重新连接" @click="connect">
             <RefreshCw :size="15" /><span>重连</span>
           </button>

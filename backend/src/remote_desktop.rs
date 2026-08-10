@@ -44,6 +44,34 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const CONTROL_RATE_PER_SECOND: f64 = 120.0;
+const CONTROL_RATE_BURST: f64 = 240.0;
+
+struct ControlRateLimiter {
+    tokens: f64,
+    updated_at: Instant,
+}
+
+impl ControlRateLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: CONTROL_RATE_BURST,
+            updated_at: now,
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.updated_at);
+        self.updated_at = now;
+        self.tokens =
+            (self.tokens + elapsed.as_secs_f64() * CONTROL_RATE_PER_SECOND).min(CONTROL_RATE_BURST);
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -302,7 +330,9 @@ async fn desktop_browser_socket(
     let started = Instant::now();
     let mut last_activity = started;
     let mut last_inbound = started;
+    let mut control_rate = ControlRateLimiter::new(started);
     let mut joined = false;
+    let mut control_ready = false;
     let mut helper_timeout = Box::pin(tokio::time::sleep(HELPER_JOIN_TIMEOUT));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -328,6 +358,14 @@ async fn desktop_browser_socket(
                         last_inbound = Instant::now();
                         match validate_browser_message(&text) {
                             Ok(is_activity) => {
+                                if !control_rate.allow(Instant::now()) {
+                                    let _ = send_text(&mut sender, &server_error("control_rate_limited", "远程桌面控制消息速率过高")).await;
+                                    reason = "control_rate_limited".to_string();
+                                    break;
+                                }
+                                if !control_ready {
+                                    continue;
+                                }
                                 if is_activity { last_activity = Instant::now(); }
                                 let reliable = is_reliable_browser_message(&text);
                                 let delivered = if reliable {
@@ -365,7 +403,15 @@ async fn desktop_browser_socket(
             message = browser_rx.recv() => {
                 let Some(message) = message else { break; };
                 let kind = message_type(&message);
-                if kind.as_deref() == Some("ready") { joined = true; }
+                if matches!(kind.as_deref(), Some("ready" | "consent_required")) { joined = true; }
+                match kind.as_deref() {
+                    Some("ready") => control_ready = true,
+                    Some("consent_required" | "paused" | "closed" | "error") => control_ready = false,
+                    Some("desktop_state") if message_desktop(&message).as_deref() != Some("default") => {
+                        control_ready = false;
+                    }
+                    _ => {}
+                }
                 let close_reason = (kind.as_deref() == Some("closed"))
                     .then(|| message_reason(&message).unwrap_or_else(|| "agent_closed".to_string()));
                 if !send_text(&mut sender, &message).await { break; }
@@ -742,7 +788,11 @@ fn validate_browser_message(text: &str) -> Result<bool, (&'static str, &'static 
             }
             Ok(true)
         }
-        "release_all" | "secure_attention" => Ok(true),
+        "release_all" => Ok(true),
+        "secure_attention" => Err((
+            "secure_attention_unavailable",
+            "不允许通过远程桌面发送 Ctrl+Alt+Del",
+        )),
         "feedback" => {
             if value.get("sequence").and_then(Value::as_u64).is_none() {
                 return Err(("invalid_message", "桌面反馈消息无效"));
@@ -774,7 +824,14 @@ fn validate_agent_message(text: &str) -> Result<(), (&'static str, &'static str)
         .ok_or(("invalid_message", "远程桌面状态消息缺少类型"))?;
     if matches!(
         kind,
-        "ready" | "display" | "desktop_state" | "notice" | "paused" | "closed" | "error"
+        "consent_required"
+            | "ready"
+            | "display"
+            | "desktop_state"
+            | "notice"
+            | "paused"
+            | "closed"
+            | "error"
     ) {
         Ok(())
     } else {
@@ -838,6 +895,14 @@ fn message_reason(text: &str) -> Option<String> {
         .get("reason")?
         .as_str()
         .map(sanitize_reason)
+}
+
+fn message_desktop(text: &str) -> Option<String> {
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .get("desktop")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn sanitize_reason(reason: &str) -> String {
@@ -986,10 +1051,34 @@ mod tests {
         );
         assert_eq!(
             validate_browser_message(r#"{"type":"secure_attention"}"#),
-            Ok(true)
+            Err((
+                "secure_attention_unavailable",
+                "不允许通过远程桌面发送 Ctrl+Alt+Del"
+            ))
         );
         assert!(validate_browser_message(r#"{"type":"pointer_move","x":2,"y":0}"#).is_err());
         assert!(validate_browser_message(r#"{"type":"unknown"}"#).is_err());
+    }
+
+    #[test]
+    fn validates_local_consent_status_message() {
+        assert!(validate_agent_message(r#"{"type":"consent_required"}"#).is_ok());
+    }
+
+    #[test]
+    fn desktop_control_rate_limiter_allows_a_bounded_burst_and_refills() {
+        let started = Instant::now();
+        let mut limiter = ControlRateLimiter::new(started);
+        for _ in 0..CONTROL_RATE_BURST as usize {
+            assert!(limiter.allow(started));
+        }
+        assert!(!limiter.allow(started));
+
+        let refilled = started + Duration::from_secs(1);
+        for _ in 0..CONTROL_RATE_PER_SECOND as usize {
+            assert!(limiter.allow(refilled));
+        }
+        assert!(!limiter.allow(refilled));
     }
 
     #[test]

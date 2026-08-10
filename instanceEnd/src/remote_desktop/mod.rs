@@ -1,6 +1,9 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -23,10 +26,38 @@ pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CONTROL_BYTES: usize = 16 * 1024;
 pub const MIN_JPEG_QUALITY: u8 = 25;
 pub const MAX_JPEG_QUALITY: u8 = 75;
+pub(super) const CONTROL_RATE_PER_SECOND: f64 = 120.0;
+pub(super) const CONTROL_RATE_BURST: f64 = 240.0;
 pub(super) const DATA_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const INPUT_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_ABORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(super) struct ControlRateLimiter {
+    tokens: f64,
+    updated_at: Instant,
+}
+
+impl ControlRateLimiter {
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            tokens: CONTROL_RATE_BURST,
+            updated_at: now,
+        }
+    }
+
+    pub(super) fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.updated_at);
+        self.updated_at = now;
+        self.tokens =
+            (self.tokens + elapsed.as_secs_f64() * CONTROL_RATE_PER_SECOND).min(CONTROL_RATE_BURST);
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
 
 pub(super) async fn wait_for_input_release_ack(
     ack_rx: &mut mpsc::Receiver<()>,
@@ -245,11 +276,14 @@ pub fn run_helper(options: DesktopOptions) -> Result<()> {
 
 pub(super) fn error_reason(error: &anyhow::Error) -> String {
     let value = error.to_string();
-    const KNOWN: [&str; 8] = [
+    const KNOWN: [&str; 11] = [
         "no_active_session",
         "multiple_active_sessions",
         "desktop_locked",
         "secure_desktop",
+        "local_consent_denied",
+        "local_consent_revoked",
+        "control_rate_limited",
         "unsupported_platform",
         "agent_draining",
         "data_channel_timeout",
@@ -701,6 +735,22 @@ mod tests {
     }
 
     #[test]
+    fn desktop_control_rate_limiter_allows_a_bounded_burst_and_refills() {
+        let started = Instant::now();
+        let mut limiter = ControlRateLimiter::new(started);
+        for _ in 0..CONTROL_RATE_BURST as usize {
+            assert!(limiter.allow(started));
+        }
+        assert!(!limiter.allow(started));
+
+        let refilled = started + Duration::from_secs(1);
+        for _ in 0..CONTROL_RATE_PER_SECOND as usize {
+            assert!(limiter.allow(refilled));
+        }
+        assert!(!limiter.allow(refilled));
+    }
+
+    #[test]
     fn classifies_remote_desktop_transport_errors() {
         assert_eq!(
             error_reason(&anyhow::anyhow!("desktop helper fatal: broken pipe")),
@@ -713,6 +763,16 @@ mod tests {
         assert_eq!(
             error_reason(&anyhow::anyhow!("frame_too_large")),
             "frame_too_large"
+        );
+        assert_eq!(
+            error_reason(&anyhow::anyhow!(
+                "desktop helper fatal: local_consent_denied"
+            )),
+            "local_consent_denied"
+        );
+        assert_eq!(
+            error_reason(&anyhow::anyhow!("control_rate_limited")),
+            "control_rate_limited"
         );
     }
 

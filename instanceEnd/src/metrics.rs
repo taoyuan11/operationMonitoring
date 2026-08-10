@@ -1,4 +1,10 @@
-use std::{ffi::OsString, process::Command};
+use std::{
+    ffi::OsString,
+    io,
+    process::Command,
+    sync::mpsc::{self, SyncSender, TrySendError},
+    time::Duration,
+};
 
 #[cfg(any(not(target_os = "linux"), test))]
 use std::collections::HashSet;
@@ -35,13 +41,39 @@ use windows::{
     core::{PCWSTR, w},
 };
 
-use crate::{models::MetricPayload, time::now_ts};
+use crate::{device_profile::run_bounded_command, models::MetricPayload, time::now_ts};
+
+const METRICS_WORKER_QUEUE_CAPACITY: usize = 1;
+
+pub(crate) const METRICS_SAMPLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct MetricsCollector {
     system: System,
     disks: Disks,
     networks: Networks,
     gpu: GpuCollector,
+}
+
+pub(crate) struct MetricsSampler {
+    request_tx: SyncSender<()>,
+    result_rx: tokio::sync::mpsc::Receiver<MetricPayload>,
+    timeout: Duration,
+    deadline: Option<tokio::time::Instant>,
+    in_flight: bool,
+    timed_out: bool,
+    worker_stopped: bool,
+}
+
+pub(crate) enum MetricsSampleEvent {
+    Ready(MetricPayload),
+    TimedOut,
+    Discarded,
+    WorkerStopped,
+}
+
+enum MetricsWorkerWait {
+    Result(Option<MetricPayload>),
+    TimedOut,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -130,6 +162,108 @@ impl MetricsCollector {
             gpu_memory_total: gpu.memory_total,
             uptime_seconds: System::uptime() as i64,
             load_average: Some(load_average.one),
+        }
+    }
+}
+
+impl MetricsSampler {
+    pub(crate) fn new(timeout: Duration) -> io::Result<Self> {
+        Self::spawn(timeout, || {
+            let mut collector = MetricsCollector::new();
+            move || collector.sample()
+        })
+    }
+
+    fn spawn<F, S>(timeout: Duration, initialize: F) -> io::Result<Self>
+    where
+        F: FnOnce() -> S + Send + 'static,
+        S: FnMut() -> MetricPayload + Send + 'static,
+    {
+        let (request_tx, request_rx) = mpsc::sync_channel(METRICS_WORKER_QUEUE_CAPACITY);
+        let (result_tx, result_rx) = tokio::sync::mpsc::channel(METRICS_WORKER_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("om-metrics".to_string())
+            .spawn(move || {
+                let mut sample = initialize();
+                while request_rx.recv().is_ok() {
+                    if result_tx.blocking_send(sample()).is_err() {
+                        break;
+                    }
+                }
+            })?;
+
+        Ok(Self {
+            request_tx,
+            result_rx,
+            timeout,
+            deadline: None,
+            in_flight: false,
+            timed_out: false,
+            worker_stopped: false,
+        })
+    }
+
+    pub(crate) fn request_sample(&mut self) {
+        if self.in_flight || self.worker_stopped {
+            return;
+        }
+        match self.request_tx.try_send(()) {
+            Ok(()) => {
+                self.in_flight = true;
+                self.timed_out = false;
+                self.deadline = Some(tokio::time::Instant::now() + self.timeout);
+            }
+            Err(TrySendError::Full(())) => {
+                crate::logging::error(format_args!(
+                    "metrics worker queue was unexpectedly full; skipping sample"
+                ));
+            }
+            Err(TrySendError::Disconnected(())) => {
+                self.worker_stopped = true;
+                crate::logging::error(format_args!(
+                    "metrics worker stopped; metric reporting is unavailable"
+                ));
+            }
+        }
+    }
+
+    pub(crate) fn sample_in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    pub(crate) async fn next_event(&mut self) -> MetricsSampleEvent {
+        debug_assert!(self.in_flight);
+        let event = if let Some(deadline) = self.deadline {
+            tokio::select! {
+                result = self.result_rx.recv() => MetricsWorkerWait::Result(result),
+                _ = tokio::time::sleep_until(deadline) => MetricsWorkerWait::TimedOut,
+            }
+        } else {
+            MetricsWorkerWait::Result(self.result_rx.recv().await)
+        };
+
+        match event {
+            MetricsWorkerWait::TimedOut => {
+                self.deadline = None;
+                self.timed_out = true;
+                MetricsSampleEvent::TimedOut
+            }
+            MetricsWorkerWait::Result(Some(metrics)) => {
+                self.deadline = None;
+                self.in_flight = false;
+                if std::mem::take(&mut self.timed_out) {
+                    MetricsSampleEvent::Discarded
+                } else {
+                    MetricsSampleEvent::Ready(metrics)
+                }
+            }
+            MetricsWorkerWait::Result(None) => {
+                self.deadline = None;
+                self.in_flight = false;
+                self.timed_out = false;
+                self.worker_stopped = true;
+                MetricsSampleEvent::WorkerStopped
+            }
         }
     }
 }
@@ -402,10 +536,7 @@ fn collect_nvidia_samples() -> Vec<GpuSample> {
     let commands = vec![PathBuf::from("nvidia-smi")];
 
     let Some(output) = commands.into_iter().find_map(|command| {
-        Command::new(command)
-            .args(args)
-            .output()
-            .ok()
+        run_bounded_command(Command::new(command).args(args))
             .filter(|output| output.status.success())
     }) else {
         return Vec::new();
@@ -825,11 +956,16 @@ fn read_trimmed(path: impl AsRef<std::path::Path>) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn collect_macos_apple_gpu_sample(system_memory_total: i64) -> Option<GpuSample> {
-    let output = Command::new("/usr/sbin/ioreg")
-        .args(["-r", "-d", "1", "-w", "0", "-c", "AGXAccelerator"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
+    let output = run_bounded_command(Command::new("/usr/sbin/ioreg").args([
+        "-r",
+        "-d",
+        "1",
+        "-w",
+        "0",
+        "-c",
+        "AGXAccelerator",
+    ]))
+    .filter(|output| output.status.success())?;
 
     parse_macos_ioreg(
         &String::from_utf8_lossy(&output.stdout),
@@ -864,8 +1000,18 @@ fn parse_ioreg_integer(output: &str, key: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiskSample, GpuSample, aggregate_gpu_samples, aggregate_linux_disk_metrics,
-        aggregate_standard_disk_metrics, parse_macos_ioreg, parse_nvidia_smi,
+        DiskSample, GpuSample, MetricsSampleEvent, MetricsSampler, aggregate_gpu_samples,
+        aggregate_linux_disk_metrics, aggregate_standard_disk_metrics, parse_macos_ioreg,
+        parse_nvidia_smi,
+    };
+    use crate::models::MetricPayload;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
     };
 
     #[cfg(target_os = "windows")]
@@ -889,6 +1035,69 @@ mod tests {
             free,
             device_id,
         }
+    }
+
+    fn metric_payload(ts: i64) -> MetricPayload {
+        MetricPayload {
+            ts,
+            cpu_percent: 0.0,
+            memory_used: 0,
+            memory_total: 0,
+            disk_used: 0,
+            disk_total: 0,
+            network_rx: 0,
+            network_tx: 0,
+            gpu_percent: None,
+            gpu_memory_used: None,
+            gpu_memory_total: None,
+            uptime_seconds: 0,
+            load_average: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_sample_does_not_block_runtime_or_queue_another_sample() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = calls.clone();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut sampler = MetricsSampler::spawn(Duration::from_millis(10), move || {
+            move || {
+                let call = worker_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 1 {
+                    release_rx.recv().unwrap();
+                }
+                metric_payload(call as i64)
+            }
+        })
+        .unwrap();
+
+        sampler.request_sample();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), sampler.next_event())
+                .await
+                .unwrap(),
+            MetricsSampleEvent::TimedOut
+        ));
+
+        sampler.request_sample();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), sampler.next_event())
+                .await
+                .unwrap(),
+            MetricsSampleEvent::Discarded
+        ));
+
+        sampler.request_sample();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), sampler.next_event())
+                .await
+                .unwrap(),
+            MetricsSampleEvent::Ready(metrics) if metrics.ts == 2
+        ));
     }
 
     #[test]

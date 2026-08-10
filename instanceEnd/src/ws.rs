@@ -19,7 +19,7 @@ use crate::{
     docker::{CAPABILITY as DOCKER_CAPABILITY, DockerManager},
     file_manager::{CAPABILITY as FILE_MANAGER_CAPABILITY, FileManager},
     http::register_once,
-    metrics::MetricsCollector,
+    metrics::{METRICS_SAMPLE_TIMEOUT, MetricsSampleEvent, MetricsSampler},
     models::{AgentInbound, AgentOutbound, Identity, RollbackOffer, UpdateOffer, UpdateStatus},
     outbound::AgentEventSender,
     profile::host_profile,
@@ -91,6 +91,8 @@ pub async fn agent_ws_loop(
         }
     };
     let command_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_COMMANDS));
+    let mut metrics_sampler =
+        MetricsSampler::new(METRICS_SAMPLE_TIMEOUT).context("failed to start metrics sampler")?;
     loop {
         let registration = tokio::select! {
             biased;
@@ -163,6 +165,7 @@ pub async fn agent_ws_loop(
                     activity.clone(),
                     command_slots.clone(),
                     update_manager.clone(),
+                    &mut metrics_sampler,
                     &mut shutdown,
                 )
                 .await
@@ -215,6 +218,7 @@ async fn handle_agent_socket(
     activity: ActivityTracker,
     command_slots: Arc<Semaphore>,
     update_manager: Option<UpdateManager>,
+    metrics_sampler: &mut MetricsSampler,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<SocketOutcome> {
     let (mut write, mut read) = stream.split();
@@ -237,7 +241,6 @@ async fn handle_agent_socket(
     );
     let mut draining_updates = activity.subscribe_draining();
     docker.start_probe();
-    let mut collector = MetricsCollector::new();
     let mut report_interval =
         tokio::time::interval(Duration::from_secs(config.report_interval.max(1)));
     report_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -262,6 +265,7 @@ async fn handle_agent_socket(
     }
     let result: Result<SocketOutcome> = async {
         let outcome = loop {
+            let metric_sample_in_flight = metrics_sampler.sample_in_flight();
             tokio::select! {
             _ = shutdown_requested(shutdown) => {
                 break SocketOutcome::Shutdown;
@@ -290,22 +294,38 @@ async fn handle_agent_socket(
                 }
             }
             _ = report_interval.tick() => {
-                let profile = host_profile();
-                outbound_tx.send(AgentInbound::Metrics {
-                    hostname: profile.hostname,
-                    os: profile.os,
-                    arch: profile.arch,
-                    agent_version: profile.agent_version,
-                    package_type: capability.package_type.clone(),
-                    native_arch: capability.native_arch.clone(),
-                    update_privileged: Some(capability.update_privileged),
-                    rollback_supported: Some(true),
-                    rollback_version: update_manager
-                        .as_ref()
-                        .and_then(UpdateManager::rollback_version),
-                    docker_status: docker.status(),
-                    metrics: collector.sample(),
-                })?;
+                metrics_sampler.request_sample();
+            }
+            event = metrics_sampler.next_event(), if metric_sample_in_flight => {
+                match event {
+                    MetricsSampleEvent::Ready(metrics) => {
+                        let profile = host_profile();
+                        outbound_tx.send(AgentInbound::Metrics {
+                            hostname: profile.hostname,
+                            os: profile.os,
+                            arch: profile.arch,
+                            agent_version: profile.agent_version,
+                            package_type: capability.package_type.clone(),
+                            native_arch: capability.native_arch.clone(),
+                            update_privileged: Some(capability.update_privileged),
+                            rollback_supported: Some(true),
+                            rollback_version: update_manager
+                                .as_ref()
+                                .and_then(UpdateManager::rollback_version),
+                            docker_status: docker.status(),
+                            metrics,
+                        })?;
+                    }
+                    MetricsSampleEvent::TimedOut => crate::logging::error(format_args!(
+                        "metric collection timed out; websocket processing will continue"
+                    )),
+                    MetricsSampleEvent::Discarded => crate::logging::error(format_args!(
+                        "discarded metric sample that completed after its deadline"
+                    )),
+                    MetricsSampleEvent::WorkerStopped => crate::logging::error(format_args!(
+                        "metrics worker stopped; metric reporting is unavailable"
+                    )),
+                }
             }
             _ = docker_probe_interval.tick() => {
                 docker.start_probe();

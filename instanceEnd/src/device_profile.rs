@@ -546,7 +546,7 @@ fn to_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
-fn run_bounded_command(command: &mut Command) -> Option<Output> {
+pub(crate) fn run_bounded_command(command: &mut Command) -> Option<Output> {
     run_bounded_command_with_timeout(command, Duration::from_secs(5))
 }
 

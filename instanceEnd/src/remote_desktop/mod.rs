@@ -1,14 +1,18 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot},
     task::JoinHandle,
 };
 
@@ -19,19 +23,162 @@ use crate::{
 
 #[cfg(windows)]
 mod windows;
+#[cfg(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod windows_audio;
+#[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[path = "windows_audio_unsupported.rs"]
+mod windows_audio;
 
 pub const CAPABILITY: &str = "remote_desktop_v1";
+pub const AUDIO_CAPABILITY: &str = "remote_desktop_audio_v1";
+pub const AUDIO_SUPPORTED: bool = cfg!(all(
+    windows,
+    any(target_arch = "x86_64", target_arch = "aarch64")
+));
 pub const FRAME_HEADER_LEN: usize = 32;
+pub const AUDIO_FRAME_HEADER_LEN: usize = 32;
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_AUDIO_OPUS_PAYLOAD_BYTES: usize = 1_275;
+pub const MAX_AUDIO_FRAME_BYTES: usize = AUDIO_FRAME_HEADER_LEN + MAX_AUDIO_OPUS_PAYLOAD_BYTES;
 pub const MAX_CONTROL_BYTES: usize = 16 * 1024;
 pub const MIN_JPEG_QUALITY: u8 = 25;
 pub const MAX_JPEG_QUALITY: u8 = 75;
+pub const AUDIO_CODEC_NAME: &str = "opus";
+pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
+pub const AUDIO_CHANNELS: u8 = 2;
+pub const AUDIO_SAMPLES_PER_FRAME: u32 = 960;
+pub const AUDIO_FLAG_DISCONTINUITY: u8 = 0x01;
+const AUDIO_KNOWN_FLAGS: u8 = AUDIO_FLAG_DISCONTINUITY;
+pub(super) const AUDIO_CHANNEL_CAPACITY: usize = 8;
 pub(super) const CONTROL_RATE_PER_SECOND: f64 = 120.0;
 pub(super) const CONTROL_RATE_BURST: f64 = 240.0;
 pub(super) const DATA_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const INPUT_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_ABORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct DropOldestInner<T> {
+    capacity: usize,
+    queue: Mutex<VecDeque<T>>,
+    notify: Notify,
+    senders: AtomicUsize,
+    receiver_alive: AtomicBool,
+}
+
+pub(super) struct DropOldestSender<T> {
+    inner: Arc<DropOldestInner<T>>,
+}
+
+pub(super) struct DropOldestReceiver<T> {
+    inner: Arc<DropOldestInner<T>>,
+}
+
+pub(super) fn drop_oldest_channel<T>(
+    capacity: usize,
+) -> (DropOldestSender<T>, DropOldestReceiver<T>) {
+    assert!(
+        capacity > 0,
+        "drop-oldest channel capacity must be positive"
+    );
+    let inner = Arc::new(DropOldestInner {
+        capacity,
+        queue: Mutex::new(VecDeque::with_capacity(capacity)),
+        notify: Notify::new(),
+        senders: AtomicUsize::new(1),
+        receiver_alive: AtomicBool::new(true),
+    });
+    (
+        DropOldestSender {
+            inner: inner.clone(),
+        },
+        DropOldestReceiver { inner },
+    )
+}
+
+impl<T> DropOldestSender<T> {
+    /// Enqueues the newest value and reports whether an older value was discarded.
+    pub(super) fn send(&self, value: T) -> std::result::Result<bool, T> {
+        if !self.inner.receiver_alive.load(Ordering::Acquire) {
+            return Err(value);
+        }
+        let mut queue = self
+            .inner
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.inner.receiver_alive.load(Ordering::Acquire) {
+            return Err(value);
+        }
+        let dropped = if queue.len() == self.inner.capacity {
+            queue.pop_front();
+            true
+        } else {
+            false
+        };
+        queue.push_back(value);
+        drop(queue);
+        self.inner.notify.notify_one();
+        Ok(dropped)
+    }
+
+    pub(super) fn clear(&self) {
+        self.inner
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+impl<T> Clone for DropOldestSender<T> {
+    fn clone(&self) -> Self {
+        self.inner.senders.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> Drop for DropOldestSender<T> {
+    fn drop(&mut self) {
+        if self.inner.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.notify.notify_one();
+        }
+    }
+}
+
+impl<T> DropOldestReceiver<T> {
+    pub(super) async fn recv(&self) -> Option<T> {
+        loop {
+            let notified = self.inner.notify.notified();
+            {
+                let mut queue = self
+                    .inner
+                    .queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(value) = queue.pop_front() {
+                    return Some(value);
+                }
+                if self.inner.senders.load(Ordering::Acquire) == 0 {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl<T> Drop for DropOldestReceiver<T> {
+    fn drop(&mut self) {
+        self.inner.receiver_alive.store(false, Ordering::Release);
+        self.inner
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
 
 pub(super) struct ControlRateLimiter {
     tokens: f64,
@@ -77,6 +224,7 @@ pub struct DesktopOptions {
     pub min_fps: u8,
     pub max_fps: u8,
     pub jpeg_quality: u8,
+    pub audio_codec: Option<String>,
     pub system_helper: bool,
 }
 
@@ -89,6 +237,7 @@ pub struct DesktopOpenRequest {
     pub min_fps: u8,
     pub max_fps: u8,
     pub jpeg_quality: u8,
+    pub audio_codec: Option<String>,
 }
 
 pub struct DesktopManager {
@@ -338,6 +487,51 @@ impl FrameHeader {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioFrameHeader {
+    pub flags: u8,
+    pub sequence: u64,
+    pub timestamp_us: u64,
+    pub sample_rate: u32,
+    pub samples_per_channel: u32,
+}
+
+impl AudioFrameHeader {
+    pub fn encode(self) -> [u8; AUDIO_FRAME_HEADER_LEN] {
+        let mut output = [0_u8; AUDIO_FRAME_HEADER_LEN];
+        output[0..4].copy_from_slice(b"OMRA");
+        output[4] = 1;
+        output[5] = 1;
+        output[6] = AUDIO_CHANNELS;
+        output[7] = self.flags;
+        output[8..16].copy_from_slice(&self.sequence.to_be_bytes());
+        output[16..24].copy_from_slice(&self.timestamp_us.to_be_bytes());
+        output[24..28].copy_from_slice(&self.sample_rate.to_be_bytes());
+        output[28..32].copy_from_slice(&self.samples_per_channel.to_be_bytes());
+        output
+    }
+
+    pub fn decode(value: &[u8]) -> Result<Self> {
+        if value.len() < AUDIO_FRAME_HEADER_LEN || &value[0..4] != b"OMRA" {
+            bail!("invalid remote desktop audio frame header")
+        }
+        if value[4] != 1
+            || value[5] != 1
+            || value[6] != AUDIO_CHANNELS
+            || value[7] & !AUDIO_KNOWN_FLAGS != 0
+        {
+            bail!("unsupported remote desktop audio frame version or codec")
+        }
+        Ok(Self {
+            flags: value[7],
+            sequence: u64::from_be_bytes(value[8..16].try_into()?),
+            timestamp_us: u64::from_be_bytes(value[16..24].try_into()?),
+            sample_rate: u32::from_be_bytes(value[24..28].try_into()?),
+            samples_per_channel: u32::from_be_bytes(value[28..32].try_into()?),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DesktopControl {
@@ -371,6 +565,11 @@ pub enum DesktopControl {
         sequence: u64,
         fps: f64,
         decode_ms: f64,
+    },
+    AudioControl {
+        enabled: bool,
+        #[serde(default)]
+        generation: Option<u64>,
     },
 }
 
@@ -652,6 +851,60 @@ mod tests {
     }
 
     #[test]
+    fn omra_header_is_fixed_big_endian_and_round_trips() {
+        let header = AudioFrameHeader {
+            flags: AUDIO_FLAG_DISCONTINUITY,
+            sequence: 0x0102_0304_0506_0708,
+            timestamp_us: 1_725_000_000_123_456,
+            sample_rate: AUDIO_SAMPLE_RATE,
+            samples_per_channel: AUDIO_SAMPLES_PER_FRAME,
+        };
+        let encoded = header.encode();
+        assert_eq!(encoded.len(), AUDIO_FRAME_HEADER_LEN);
+        assert_eq!(&encoded[..8], b"OMRA\x01\x01\x02\x01");
+        assert_eq!(AudioFrameHeader::decode(&encoded).unwrap(), header);
+    }
+
+    #[test]
+    fn omra_header_rejects_unknown_version_codec_channels_and_flags() {
+        for index in [4, 5, 6] {
+            let mut encoded = AudioFrameHeader {
+                flags: 0,
+                sequence: 1,
+                timestamp_us: 2,
+                sample_rate: AUDIO_SAMPLE_RATE,
+                samples_per_channel: AUDIO_SAMPLES_PER_FRAME,
+            }
+            .encode();
+            encoded[index] = 99;
+            assert!(AudioFrameHeader::decode(&encoded).is_err());
+        }
+
+        let mut encoded = AudioFrameHeader {
+            flags: 0,
+            sequence: 1,
+            timestamp_us: 2,
+            sample_rate: AUDIO_SAMPLE_RATE,
+            samples_per_channel: AUDIO_SAMPLES_PER_FRAME,
+        }
+        .encode();
+        encoded[7] = 0x02;
+        assert!(AudioFrameHeader::decode(&encoded).is_err());
+    }
+
+    #[tokio::test]
+    async fn audio_channel_discards_the_oldest_value_when_full() {
+        let (tx, rx) = drop_oldest_channel(2);
+        assert_eq!(tx.send(1), Ok(false));
+        assert_eq!(tx.send(2), Ok(false));
+        assert_eq!(tx.send(3), Ok(true));
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(rx.recv().await, Some(3));
+        drop(tx);
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[test]
     fn rejects_unknown_frame_version_codec_and_flags() {
         for index in [4, 5, 6, 7] {
             let mut encoded = FrameHeader {
@@ -731,6 +984,24 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<DesktopControl>(r#"{"type":"secure_attention"}"#).unwrap(),
             DesktopControl::SecureAttention
+        );
+        assert_eq!(
+            serde_json::from_str::<DesktopControl>(r#"{"type":"audio_control","enabled":true}"#)
+                .unwrap(),
+            DesktopControl::AudioControl {
+                enabled: true,
+                generation: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<DesktopControl>(
+                r#"{"type":"audio_control","enabled":true,"generation":7}"#
+            )
+            .unwrap(),
+            DesktopControl::AudioControl {
+                enabled: true,
+                generation: Some(7),
+            }
         );
     }
 

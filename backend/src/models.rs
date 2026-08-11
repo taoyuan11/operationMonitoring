@@ -1097,6 +1097,8 @@ pub enum AgentOutbound {
     DesktopOpen {
         session_id: String,
         stream_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio_codec: Option<String>,
         max_width: u32,
         max_height: u32,
         min_fps: u8,

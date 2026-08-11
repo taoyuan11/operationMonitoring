@@ -79,6 +79,7 @@ fn run() -> Result<()> {
             min_fps,
             max_fps,
             jpeg_quality,
+            audio_codec,
             system_helper,
         } => {
             init_agent_logging(&cli.agent)?;
@@ -92,6 +93,7 @@ fn run() -> Result<()> {
                 min_fps,
                 max_fps,
                 jpeg_quality,
+                audio_codec,
                 system_helper,
             })
         }

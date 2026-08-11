@@ -23,7 +23,10 @@ use crate::{
     models::{AgentInbound, AgentOutbound, Identity, RollbackOffer, UpdateOffer, UpdateStatus},
     outbound::AgentEventSender,
     profile::host_profile,
-    remote_desktop::{CAPABILITY as DESKTOP_CAPABILITY, DesktopManager, DesktopOpenRequest},
+    remote_desktop::{
+        AUDIO_CAPABILITY as DESKTOP_AUDIO_CAPABILITY, AUDIO_SUPPORTED as DESKTOP_AUDIO_SUPPORTED,
+        CAPABILITY as DESKTOP_CAPABILITY, DesktopManager, DesktopOpenRequest,
+    },
     terminal::{CAPABILITY as TERMINAL_SHELLS_CAPABILITY, TerminalManager, available_shells},
     update::{PrepareResult, UpdateManager, update_capability},
 };
@@ -679,6 +682,7 @@ async fn handle_agent_socket(
                                 min_fps,
                                 max_fps,
                                 jpeg_quality,
+                                audio_codec,
                             } => desktops.open(DesktopOpenRequest {
                                 session_id,
                                 stream_token,
@@ -687,6 +691,7 @@ async fn handle_agent_socket(
                                 min_fps,
                                 max_fps,
                                 jpeg_quality,
+                                audio_codec,
                             }),
                             AgentOutbound::DesktopClose { session_id, reason } => {
                                 desktops.close(&session_id, &reason);
@@ -884,6 +889,9 @@ fn websocket_request(
     if cfg!(windows) {
         capabilities.push(DESKTOP_CAPABILITY);
     }
+    if DESKTOP_AUDIO_SUPPORTED {
+        capabilities.push(DESKTOP_AUDIO_CAPABILITY);
+    }
     if crate::docker::supported() {
         capabilities.push(DOCKER_CAPABILITY);
     }
@@ -932,6 +940,10 @@ mod tests {
         assert!(url.contains(ROLLBACK_CAPABILITY));
         assert!(url.contains(TERMINAL_SHELLS_CAPABILITY));
         assert_eq!(url.contains(DESKTOP_CAPABILITY), cfg!(windows));
+        assert_eq!(
+            url.contains(DESKTOP_AUDIO_CAPABILITY),
+            DESKTOP_AUDIO_SUPPORTED
+        );
         assert_eq!(url.contains(DOCKER_CAPABILITY), cfg!(target_os = "linux"));
     }
 

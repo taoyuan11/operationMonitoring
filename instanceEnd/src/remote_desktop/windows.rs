@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     ffi::{OsStr, c_void},
     mem::{size_of, zeroed},
     os::windows::{ffi::OsStrExt, io::AsRawHandle, process::CommandExt},
@@ -98,11 +98,13 @@ use windows::{
 };
 
 use super::{
-    AdaptiveSettings, ControlRateLimiter, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl,
-    DesktopOpenRequest, DesktopOptions, FrameHeader, INPUT_RELEASE_ACK_TIMEOUT, MAX_CONTROL_BYTES,
-    MAX_FRAME_BYTES, MAX_JPEG_QUALITY, MIN_JPEG_QUALITY, absolute_pointer_coordinate,
-    dom_code_to_vk, dom_code_uses_extended_key, error_reason, scaled_dimensions,
-    wait_for_input_release_ack,
+    AUDIO_CHANNEL_CAPACITY, AUDIO_CHANNELS, AUDIO_CODEC_NAME, AUDIO_FRAME_HEADER_LEN,
+    AUDIO_SAMPLE_RATE, AUDIO_SAMPLES_PER_FRAME, AdaptiveSettings, AudioFrameHeader,
+    ControlRateLimiter, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl, DesktopOpenRequest,
+    DesktopOptions, FrameHeader, INPUT_RELEASE_ACK_TIMEOUT, MAX_AUDIO_FRAME_BYTES,
+    MAX_CONTROL_BYTES, MAX_FRAME_BYTES, MAX_JPEG_QUALITY, MIN_JPEG_QUALITY,
+    absolute_pointer_coordinate, dom_code_to_vk, dom_code_uses_extended_key, drop_oldest_channel,
+    error_reason, scaled_dimensions, wait_for_input_release_ack, windows_audio,
 };
 use crate::{config::AgentConfig, models::AgentInbound, outbound::AgentEventSender};
 
@@ -110,9 +112,11 @@ const CREATE_NO_WINDOW_FLAG: u32 = 0x08000000;
 const PIPE_FRAME: u8 = 1;
 const PIPE_CONTROL: u8 = 2;
 const PIPE_INTERNAL: u8 = 3;
+const PIPE_AUDIO: u8 = 4;
 const INTERNAL_STOP: &[u8] = b"stop";
 const INTERNAL_STOPPED: &[u8] = b"stopped";
 const INTERNAL_FATAL_PREFIX: &[u8] = b"fatal:";
+const INTERNAL_AUDIO_CONTROL_ACK_PREFIX: &[u8] = b"audio_control_ack:";
 const PIPE_MAX_PACKET: usize = MAX_FRAME_BYTES + 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -120,6 +124,126 @@ const INPUT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const DESKTOP_BINDING_LOST: &str = "input_desktop_binding_lost";
 const DESKTOP_HANDLE_CLEANUP_FAILED: &str = "desktop_handle_cleanup_failed";
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioControlAck {
+    enabled: bool,
+    changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingAudioControl {
+    order: u64,
+    enabled: bool,
+    generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioRelayPhase {
+    Disabled,
+    AwaitingControlAck,
+    AwaitingDiscontinuity,
+    Playing,
+}
+
+struct AudioRelayGate {
+    next_order: u64,
+    latest: Option<PendingAudioControl>,
+    pending: VecDeque<PendingAudioControl>,
+    phase: AudioRelayPhase,
+}
+
+impl AudioRelayGate {
+    fn new() -> Self {
+        Self {
+            next_order: 0,
+            latest: None,
+            pending: VecDeque::new(),
+            phase: AudioRelayPhase::Disabled,
+        }
+    }
+
+    fn register_control(&mut self, generation: Option<u64>, enabled: bool) -> Result<()> {
+        let previously_enabled = self.latest.is_some_and(|control| control.enabled);
+        if let (Some(previous), Some(generation)) = (
+            self.latest.and_then(|control| control.generation),
+            generation,
+        ) && generation <= previous
+        {
+            bail!("desktop audio control generation is not increasing")
+        }
+        self.next_order = self
+            .next_order
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("desktop audio control order overflow"))?;
+        let control = PendingAudioControl {
+            order: self.next_order,
+            enabled,
+            generation,
+        };
+        self.latest = Some(control);
+        self.pending.push_back(control);
+        self.phase = if !enabled {
+            AudioRelayPhase::Disabled
+        } else if !previously_enabled {
+            AudioRelayPhase::AwaitingControlAck
+        } else {
+            self.phase
+        };
+        Ok(())
+    }
+
+    /// Returns the generation that must be acknowledged to the backend before audio resumes.
+    fn acknowledge(&mut self, ack: AudioControlAck) -> Result<Option<u64>> {
+        let Some(expected) = self.pending.front().copied() else {
+            bail!("unexpected desktop audio control acknowledgement")
+        };
+        if expected.enabled != ack.enabled || expected.generation != ack.generation {
+            bail!("out-of-order desktop audio control acknowledgement")
+        }
+        self.pending.pop_front();
+        if self.latest != Some(expected) {
+            return Ok(None);
+        }
+        if !ack.enabled {
+            self.phase = AudioRelayPhase::Disabled;
+            return Ok(None);
+        }
+        if ack.changed {
+            self.phase = AudioRelayPhase::AwaitingDiscontinuity;
+            return Ok(ack.generation);
+        }
+        Ok(None)
+    }
+
+    fn observe_status(&mut self, status: &str) {
+        if !matches!(
+            self.phase,
+            AudioRelayPhase::Playing | AudioRelayPhase::AwaitingDiscontinuity
+        ) || !audio_state_clears_queue(status)
+        {
+            return;
+        }
+        self.phase = AudioRelayPhase::AwaitingDiscontinuity;
+    }
+
+    fn accepts_audio(&mut self, frame: &[u8]) -> bool {
+        match self.phase {
+            AudioRelayPhase::Playing => true,
+            AudioRelayPhase::AwaitingDiscontinuity
+                if AudioFrameHeader::decode(frame)
+                    .is_ok_and(|header| header.flags & super::AUDIO_FLAG_DISCONTINUITY != 0) =>
+            {
+                self.phase = AudioRelayPhase::Playing;
+                true
+            }
+            _ => false,
+        }
+    }
+}
 // WINSTA_ALL_ACCESS from winuser.h; windows 0.52 does not expose the aggregate constant.
 const WINSTA_ALL_ACCESS_MASK: u32 = 0x0000_037f;
 // SetThreadDesktop constrains subsequent USER calls to the rights on this handle. Generic write
@@ -177,6 +301,11 @@ async fn establish_session(
     let pipe = create_private_pipe(&pipe_name, &user_sid)?;
 
     let min_fps = request.min_fps.clamp(1, 12);
+    let audio_codec = request
+        .audio_codec
+        .as_deref()
+        .filter(|codec| windows_audio::negotiated(Some(codec)))
+        .map(|_| AUDIO_CODEC_NAME.to_string());
     let options = DesktopOptions {
         pipe: pipe_name,
         max_width: request.max_width.clamp(320, 1920),
@@ -186,6 +315,7 @@ async fn establish_session(
         jpeg_quality: request
             .jpeg_quality
             .clamp(MIN_JPEG_QUALITY, MAX_JPEG_QUALITY),
+        audio_codec,
         system_helper: matches!(target, HelperTarget::ServiceSession { .. }),
     };
     let mut child = spawn_helper(&options, target, config)?;
@@ -304,17 +434,27 @@ async fn relay(
     let (mut ws_write, mut ws_read) = socket.split();
     let (pipe_read, mut pipe_write) = tokio::io::split(pipe);
     let (frame_tx, mut frame_rx) = watch::channel::<Option<Vec<u8>>>(None);
+    let (audio_tx, audio_rx) = drop_oldest_channel(AUDIO_CHANNEL_CAPACITY);
     let (status_tx, mut status_rx) = mpsc::channel::<String>(32);
-    let (ack_tx, mut ack_rx) = mpsc::channel::<()>(1);
+    let (release_ack_tx, mut release_ack_rx) = mpsc::channel::<()>(1);
+    let (audio_ack_tx, mut audio_ack_rx) = mpsc::channel::<AudioControlAck>(32);
     let (fatal_tx, mut fatal_rx) = mpsc::channel::<String>(1);
     let reader = tokio::spawn(pipe_reader(
-        pipe_read, frame_tx, status_tx, ack_tx, fatal_tx,
+        pipe_read,
+        frame_tx,
+        audio_tx,
+        status_tx,
+        release_ack_tx,
+        audio_ack_tx,
+        fatal_tx,
     ));
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_browser_message = tokio::time::Instant::now();
     let mut control_rate = ControlRateLimiter::new(Instant::now());
     let mut input_ready = false;
+    let mut audio_open = true;
+    let mut audio_relay = AudioRelayGate::new();
 
     let result: Result<String> = async {
         let reason = loop {
@@ -327,40 +467,26 @@ async fn relay(
             reason = &mut close => {
                 break reason.unwrap_or_else(|_| "agent_disconnected".to_string());
             }
-            changed = frame_rx.changed() => {
-                if changed.is_err() { break "helper_disconnected".to_string() }
-                let Some(frame) = frame_rx.borrow_and_update().clone() else { continue };
-                validate_frame(&frame)?;
-                tokio::time::timeout(
-                    SOCKET_SEND_TIMEOUT,
-                    ws_write.send(Message::Binary(frame.into())),
-                )
-                .await
-                .context("desktop data websocket frame send timed out")??;
-            }
-            status = status_rx.recv() => {
-                let Some(status) = status else { break "helper_disconnected".to_string() };
-                update_remote_input_gate(&status, &mut input_ready);
-                tokio::time::timeout(
-                    SOCKET_SEND_TIMEOUT,
-                    ws_write.send(Message::Text(status.into())),
-                )
-                .await
-                .context("desktop data websocket status send timed out")??;
-            }
             incoming = ws_read.next() => {
                 let Some(incoming) = incoming else { break "browser_disconnected".to_string() };
                 last_browser_message = tokio::time::Instant::now();
                 match incoming? {
                     Message::Text(text) => {
                         if text.len() > MAX_CONTROL_BYTES { bail!("desktop control message too large") }
-                        let _control = serde_json::from_str::<DesktopControl>(&text)
+                        let control = serde_json::from_str::<DesktopControl>(&text)
                             .context("invalid desktop control message")?;
                         if !control_rate.allow(Instant::now()) {
                             bail!("control_rate_limited: desktop control rate exceeded")
                         }
-                        if !input_ready {
+                        if !control_is_allowed(input_ready, &control) {
                             continue;
+                        }
+                        if let DesktopControl::AudioControl {
+                            enabled,
+                            generation,
+                        } = control
+                        {
+                            audio_relay.register_control(generation, enabled)?;
                         }
                         tokio::time::timeout(
                             PIPE_WRITE_TIMEOUT,
@@ -383,6 +509,56 @@ async fn relay(
                     _ => {}
                 }
             }
+            ack = audio_ack_rx.recv() => {
+                let Some(ack) = ack else { break "helper_disconnected".to_string() };
+                if let Some(generation) = audio_relay.acknowledge(ack)? {
+                    let status = audio_control_ack_status(generation);
+                    tokio::time::timeout(
+                        SOCKET_SEND_TIMEOUT,
+                        ws_write.send(Message::Text(status.into())),
+                    )
+                    .await
+                    .context("desktop data websocket audio acknowledgement send timed out")??;
+                }
+            }
+            status = status_rx.recv() => {
+                let Some(status) = status else { break "helper_disconnected".to_string() };
+                update_remote_input_gate(&status, &mut input_ready);
+                audio_relay.observe_status(&status);
+                tokio::time::timeout(
+                    SOCKET_SEND_TIMEOUT,
+                    ws_write.send(Message::Text(status.into())),
+                )
+                .await
+                .context("desktop data websocket status send timed out")??;
+            }
+            audio = audio_rx.recv(), if audio_open => {
+                let Some(audio) = audio else {
+                    audio_open = false;
+                    continue;
+                };
+                validate_audio_frame(&audio)?;
+                if !audio_relay.accepts_audio(&audio) {
+                    continue;
+                }
+                tokio::time::timeout(
+                    SOCKET_SEND_TIMEOUT,
+                    ws_write.send(Message::Binary(audio.into())),
+                )
+                .await
+                .context("desktop data websocket audio send timed out")??;
+            }
+            changed = frame_rx.changed() => {
+                if changed.is_err() { break "helper_disconnected".to_string() }
+                let Some(frame) = frame_rx.borrow_and_update().clone() else { continue };
+                validate_frame(&frame)?;
+                tokio::time::timeout(
+                    SOCKET_SEND_TIMEOUT,
+                    ws_write.send(Message::Binary(frame.into())),
+                )
+                .await
+                .context("desktop data websocket frame send timed out")??;
+            }
             _ = heartbeat.tick() => {
                 if last_browser_message.elapsed() >= Duration::from_secs(30) {
                     break "browser_heartbeat_timeout".to_string();
@@ -404,6 +580,28 @@ async fn relay(
         Ok(reason) => reason.clone(),
         Err(error) => error_reason(error),
     };
+
+    // Keep the reader alive while the helper drains input state. This prevents a queued JPEG
+    // packet from filling the pipe and blocking the helper before it can receive the stop packet.
+    let stop_sent = match tokio::time::timeout(
+        PIPE_WRITE_TIMEOUT,
+        write_packet(&mut pipe_write, PIPE_INTERNAL, INTERNAL_STOP),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            crate::logging::error(format_args!(
+                "failed to send the desktop helper stop packet: {error:#}"
+            ));
+            false
+        }
+        Err(_) => {
+            crate::logging::error(format_args!("desktop helper stop packet write timed out"));
+            false
+        }
+    };
+
     let closed = serde_json::json!({"type":"closed", "reason":close_reason}).to_string();
     let _ = tokio::time::timeout(
         SOCKET_SEND_TIMEOUT,
@@ -411,28 +609,19 @@ async fn relay(
     )
     .await;
 
-    // Keep the reader alive while the helper drains input state. This prevents a queued JPEG
-    // packet from filling the pipe and blocking the helper before it can receive the stop packet.
-    match tokio::time::timeout(
-        PIPE_WRITE_TIMEOUT,
-        write_packet(&mut pipe_write, PIPE_INTERNAL, INTERNAL_STOP),
-    )
-    .await
+    if stop_sent
+        && !wait_for_input_release_ack(&mut release_ack_rx, INPUT_RELEASE_ACK_TIMEOUT).await
     {
-        Ok(Ok(())) => {
-            if !wait_for_input_release_ack(&mut ack_rx, INPUT_RELEASE_ACK_TIMEOUT).await {
-                crate::logging::error(format_args!(
-                    "desktop helper did not acknowledge input release before the cleanup deadline"
-                ));
-            }
-        }
-        Ok(Err(error)) => crate::logging::error(format_args!(
-            "failed to send the desktop helper stop packet: {error:#}"
-        )),
-        Err(_) => crate::logging::error(format_args!("desktop helper stop packet write timed out")),
+        crate::logging::error(format_args!(
+            "desktop helper did not acknowledge input release before the cleanup deadline"
+        ));
     }
     reader.abort();
     result
+}
+
+fn control_is_allowed(input_ready: bool, control: &DesktopControl) -> bool {
+    input_ready || matches!(control, DesktopControl::AudioControl { .. })
 }
 
 fn update_remote_input_gate(status: &str, input_ready: &mut bool) {
@@ -454,8 +643,10 @@ fn update_remote_input_gate(status: &str, input_ready: &mut bool) {
 async fn pipe_reader<R: AsyncRead + Unpin>(
     mut reader: R,
     frame_tx: watch::Sender<Option<Vec<u8>>>,
+    audio_tx: super::DropOldestSender<Vec<u8>>,
     status_tx: mpsc::Sender<String>,
-    ack_tx: mpsc::Sender<()>,
+    release_ack_tx: mpsc::Sender<()>,
+    audio_ack_tx: mpsc::Sender<AudioControlAck>,
     fatal_tx: mpsc::Sender<String>,
 ) -> Result<()> {
     let result: Result<()> = async {
@@ -467,17 +658,38 @@ async fn pipe_reader<R: AsyncRead + Unpin>(
                 PIPE_FRAME => {
                     frame_tx.send_replace(Some(value));
                 }
+                PIPE_AUDIO => {
+                    if let Err(error) = validate_audio_frame(&value) {
+                        crate::logging::error(format_args!(
+                            "discarded invalid desktop helper audio frame: {error:#}"
+                        ));
+                    } else {
+                        let _ = audio_tx.send(value);
+                    }
+                }
                 PIPE_CONTROL => {
                     let text = String::from_utf8(value).context("helper sent non-UTF8 control")?;
+                    if audio_state_clears_queue(&text) {
+                        audio_tx.clear();
+                    }
                     status_tx.send(text).await?;
                 }
                 PIPE_INTERNAL if value == INTERNAL_STOPPED => {
-                    let _ = ack_tx.try_send(());
+                    let _ = release_ack_tx.try_send(());
                 }
                 PIPE_INTERNAL if value.starts_with(INTERNAL_FATAL_PREFIX) => {
                     let reason = String::from_utf8(value[INTERNAL_FATAL_PREFIX.len()..].to_vec())
                         .context("helper sent non-UTF8 fatal reason")?;
                     let _ = fatal_tx.try_send(reason);
+                }
+                PIPE_INTERNAL => {
+                    let Some(ack) = parse_audio_control_ack(&value)? else {
+                        bail!("unknown desktop helper internal packet")
+                    };
+                    if ack.changed {
+                        audio_tx.clear();
+                    }
+                    audio_ack_tx.send(ack).await?;
                 }
                 _ => bail!("unknown desktop helper packet type"),
             }
@@ -490,23 +702,60 @@ async fn pipe_reader<R: AsyncRead + Unpin>(
     result
 }
 
+fn audio_state_clears_queue(status: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(status) else {
+        return false;
+    };
+    value.get("type").and_then(serde_json::Value::as_str) == Some("audio_state")
+        && value.get("state").and_then(serde_json::Value::as_str) != Some("playing")
+}
+
+fn encode_audio_control_ack(ack: AudioControlAck) -> Result<Vec<u8>> {
+    let encoded = serde_json::to_vec(&ack)?;
+    let mut packet = Vec::with_capacity(INTERNAL_AUDIO_CONTROL_ACK_PREFIX.len() + encoded.len());
+    packet.extend_from_slice(INTERNAL_AUDIO_CONTROL_ACK_PREFIX);
+    packet.extend_from_slice(&encoded);
+    Ok(packet)
+}
+
+fn parse_audio_control_ack(value: &[u8]) -> Result<Option<AudioControlAck>> {
+    let Some(encoded) = value.strip_prefix(INTERNAL_AUDIO_CONTROL_ACK_PREFIX) else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_slice(encoded).context(
+        "invalid desktop audio control acknowledgement",
+    )?))
+}
+
+fn audio_control_ack_status(generation: u64) -> String {
+    serde_json::json!({
+        "type":"audio_state",
+        "state":"starting",
+        "reason":"control_ack",
+        "generation":generation,
+    })
+    .to_string()
+}
+
 pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     bind_interactive_window_station()?;
     log_helper_security_context(&options)?;
+    let audio_negotiated = windows_audio::negotiated(options.audio_codec.as_deref());
     let pipe = tokio::time::timeout(DATA_CHANNEL_JOIN_TIMEOUT, connect_pipe(&options.pipe))
         .await
         .map_err(|_| anyhow!("desktop helper pipe connection timeout"))??;
     let (read, mut write) = tokio::io::split(pipe);
     let consent_required = serde_json::json!({"type":"consent_required"}).to_string();
     write_packet(&mut write, PIPE_CONTROL, consent_required.as_bytes()).await?;
-    let consent_granted = tokio::task::spawn_blocking(request_local_control_consent)
-        .await
-        .context("local consent prompt task failed")?;
+    let consent_granted =
+        tokio::task::spawn_blocking(move || request_local_control_consent(audio_negotiated))
+            .await
+            .context("local consent prompt task failed")?;
     if !consent_granted {
         write_fatal_packet(&mut write, "local_consent_denied").await?;
         bail!("local_consent_denied")
     }
-    let mut local_stop = spawn_local_session_indicator()?;
+    let mut local_stop = spawn_local_session_indicator(audio_negotiated)?;
 
     // `read_packet` is not cancellation-safe: if another `select!` branch wins after the length
     // or kind byte has been consumed, dropping the future leaves the next read in the middle of a
@@ -529,6 +778,44 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
 
     let mut input = InputState::default();
     let mut input_desktop_available = default_input_desktop();
+    let (audio_frame_tx, audio_frame_rx) = drop_oldest_channel(AUDIO_CHANNEL_CAPACITY);
+    let (audio_status_tx, mut audio_status_rx) = mpsc::channel::<String>(8);
+    let mut audio_frames_open = audio_negotiated;
+    let mut audio_status_open = audio_negotiated;
+    let audio_runtime = if audio_negotiated {
+        let failure_tx = audio_status_tx.clone();
+        let started = current_session_id().and_then(|session_id| {
+            windows_audio::spawn(
+                options.system_helper,
+                session_id,
+                input_desktop_available,
+                audio_frame_tx,
+                audio_status_tx,
+            )
+        });
+        match started {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                crate::logging::error(format_args!(
+                    "remote desktop audio thread failed to start: {error:#}"
+                ));
+                let unavailable = serde_json::json!({
+                    "type":"audio_state",
+                    "state":"unavailable",
+                    "reason":"capture_failed"
+                })
+                .to_string();
+                let _ = failure_tx.try_send(unavailable);
+                None
+            }
+        }
+    } else {
+        drop(audio_frame_tx);
+        drop(audio_status_tx);
+        audio_frames_open = false;
+        audio_status_open = false;
+        None
+    };
     let mut pending_release = false;
     let mut stopping = false;
     let mut last_input_error_log = None;
@@ -539,50 +826,15 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     write_packet(&mut write, PIPE_CONTROL, ready.as_bytes()).await?;
     loop {
         tokio::select! {
+            biased;
             local_stop = local_stop.recv() => {
                 if local_stop.is_some() {
+                    if let Some(audio) = &audio_runtime {
+                        audio.stop();
+                    }
                     let _ = release_on_input_desktop(&mut input);
                     write_fatal_packet(&mut write, "local_consent_revoked").await?;
                     bail!("local_consent_revoked")
-                }
-            }
-            _ = desktop_check.tick() => {
-                let available = default_input_desktop();
-                if input_desktop_available && !available {
-                    pending_release = !release_on_input_desktop(&mut input)?;
-                }
-                input_desktop_available = available;
-                if available && pending_release {
-                    pending_release = !release_on_input_desktop(&mut input)?;
-                }
-                if stopping && !pending_release {
-                    write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
-                    break;
-                }
-            }
-            event = capture_rx.recv() => {
-                let Some(event) = event else {
-                    let reason = "desktop capture thread stopped unexpectedly";
-                    let mut fatal = INTERNAL_FATAL_PREFIX.to_vec();
-                    fatal.extend_from_slice(reason.as_bytes());
-                    write_packet(&mut write, PIPE_INTERNAL, &fatal).await?;
-                    bail!(reason)
-                };
-                match event {
-                    HelperEvent::Frame(frame) if !stopping => write_packet(&mut write, PIPE_FRAME, &frame).await?,
-                    HelperEvent::Status(status) if !stopping => write_packet(&mut write, PIPE_CONTROL, status.as_bytes()).await?,
-                    HelperEvent::Fatal(reason) => {
-                        let mut fatal = INTERNAL_FATAL_PREFIX.to_vec();
-                        fatal.extend_from_slice(reason.as_bytes());
-                        write_packet(&mut write, PIPE_INTERNAL, &fatal).await?;
-                        stopping = true;
-                        pending_release = !release_on_input_desktop(&mut input)?;
-                        if !pending_release {
-                            write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
-                            break;
-                        }
-                    }
-                    _ => {}
                 }
             }
             packet = packet_rx.recv() => {
@@ -590,6 +842,9 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                     .context("desktop service pipe reader stopped unexpectedly")??;
                 if kind == PIPE_INTERNAL && value == INTERNAL_STOP {
                     stopping = true;
+                    if let Some(audio) = &audio_runtime {
+                        audio.stop();
+                    }
                     pending_release = !release_on_input_desktop(&mut input)?;
                     if !pending_release {
                         write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
@@ -600,6 +855,20 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                 if kind != PIPE_CONTROL { bail!("unexpected service packet type") }
                 let control: DesktopControl = serde_json::from_slice(&value)?;
                 match control {
+                    DesktopControl::AudioControl {
+                        enabled,
+                        generation,
+                    } if !stopping => {
+                        let changed = audio_runtime
+                            .as_ref()
+                            .is_some_and(|audio| audio.set_enabled(enabled));
+                        let ack = encode_audio_control_ack(AudioControlAck {
+                            enabled,
+                            changed,
+                            generation,
+                        })?;
+                        write_packet(&mut write, PIPE_INTERNAL, &ack).await?;
+                    }
                     DesktopControl::Feedback { sequence, fps, decode_ms } if !stopping => {
                         let mut settings = settings
                             .lock()
@@ -621,6 +890,9 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                             pending_release = !release_on_input_desktop(&mut input)?;
                         }
                         input_desktop_available = available;
+                        if let Some(audio) = &audio_runtime {
+                            audio.set_default_desktop(available);
+                        }
                         if available && pending_release {
                             pending_release = !release_on_input_desktop(&mut input)?;
                         }
@@ -661,7 +933,70 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                     _ => {}
                 }
             }
+            _ = desktop_check.tick() => {
+                let available = default_input_desktop();
+                if input_desktop_available && !available {
+                    pending_release = !release_on_input_desktop(&mut input)?;
+                }
+                input_desktop_available = available;
+                if let Some(audio) = &audio_runtime {
+                    audio.set_default_desktop(available);
+                }
+                if available && pending_release {
+                    pending_release = !release_on_input_desktop(&mut input)?;
+                }
+                if stopping && !pending_release {
+                    write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
+                    break;
+                }
+            }
+            audio = audio_frame_rx.recv(), if audio_frames_open && !stopping => {
+                match audio {
+                    Some(audio) if audio_runtime.as_ref().is_some_and(|runtime| runtime.accepts(&audio)) => {
+                        write_packet(&mut write, PIPE_AUDIO, &audio.bytes).await?
+                    }
+                    Some(_) => {}
+                    None => audio_frames_open = false,
+                }
+            }
+            status = audio_status_rx.recv(), if audio_status_open && !stopping => {
+                match status {
+                    Some(status) => write_packet(&mut write, PIPE_CONTROL, status.as_bytes()).await?,
+                    None => audio_status_open = false,
+                }
+            }
+            event = capture_rx.recv() => {
+                let Some(event) = event else {
+                    let reason = "desktop capture thread stopped unexpectedly";
+                    let mut fatal = INTERNAL_FATAL_PREFIX.to_vec();
+                    fatal.extend_from_slice(reason.as_bytes());
+                    write_packet(&mut write, PIPE_INTERNAL, &fatal).await?;
+                    bail!(reason)
+                };
+                match event {
+                    HelperEvent::Frame(frame) if !stopping => write_packet(&mut write, PIPE_FRAME, &frame).await?,
+                    HelperEvent::Status(status) if !stopping => write_packet(&mut write, PIPE_CONTROL, status.as_bytes()).await?,
+                    HelperEvent::Fatal(reason) => {
+                        if let Some(audio) = &audio_runtime {
+                            audio.stop();
+                        }
+                        let mut fatal = INTERNAL_FATAL_PREFIX.to_vec();
+                        fatal.extend_from_slice(reason.as_bytes());
+                        write_packet(&mut write, PIPE_INTERNAL, &fatal).await?;
+                        stopping = true;
+                        pending_release = !release_on_input_desktop(&mut input)?;
+                        if !pending_release {
+                            write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
+    }
+    if let Some(audio) = &audio_runtime {
+        audio.stop();
     }
     let _ = release_on_input_desktop(&mut input)?;
     Ok(())
@@ -948,9 +1283,15 @@ fn bind_interactive_window_station() -> Result<()> {
     }
 }
 
-fn request_local_control_consent() -> bool {
+fn request_local_control_consent(audio_negotiated: bool) -> bool {
     let title = wide("Operation Monitoring 远程桌面");
-    let message = wide("管理员请求查看并控制此 Windows 桌面。\r\n\r\n是否允许本次远程桌面会话？");
+    let message = if audio_negotiated {
+        wide(
+            "管理员请求查看并控制此 Windows 桌面，并可能收听系统声音。\r\n\r\n是否允许本次远程桌面会话？",
+        )
+    } else {
+        wide("管理员请求查看并控制此 Windows 桌面。\r\n\r\n是否允许本次远程桌面会话？")
+    };
     unsafe {
         MessageBoxW(
             HWND(0),
@@ -966,14 +1307,19 @@ fn request_local_control_consent() -> bool {
     }
 }
 
-fn spawn_local_session_indicator() -> Result<mpsc::Receiver<()>> {
+fn spawn_local_session_indicator(audio_negotiated: bool) -> Result<mpsc::Receiver<()>> {
     let (stop_tx, stop_rx) = mpsc::channel(1);
     std::thread::Builder::new()
         .name("om-desktop-indicator".to_string())
         .spawn(move || {
             let title = wide("Operation Monitoring 远程桌面正在进行");
-            let message =
-                wide("此计算机正在被远程查看和控制。\r\n\r\n单击“确定”可立即终止远程桌面会话。");
+            let message = if audio_negotiated {
+                wide(
+                    "此计算机正在被远程查看和控制，并可能被收听系统声音。\r\n\r\n单击“确定”可立即终止远程桌面会话。",
+                )
+            } else {
+                wide("此计算机正在被远程查看和控制。\r\n\r\n单击“确定”可立即终止远程桌面会话。")
+            };
             unsafe {
                 let _ = MessageBoxW(
                     HWND(0),
@@ -1373,7 +1719,7 @@ impl InputState {
             DesktopControl::SecureAttention => {
                 bail!("secure_attention_unavailable")
             }
-            DesktopControl::Feedback { .. } => Ok(()),
+            DesktopControl::Feedback { .. } | DesktopControl::AudioControl { .. } => Ok(()),
         }
     }
 
@@ -1673,6 +2019,9 @@ fn append_helper_args(command: &mut Command, options: &DesktopOptions) {
         .arg(options.max_fps.to_string())
         .arg("--jpeg-quality")
         .arg(options.jpeg_quality.to_string());
+    if let Some(codec) = &options.audio_codec {
+        command.arg("--audio-codec").arg(codec);
+    }
     if options.system_helper {
         command.arg("--system-helper");
     }
@@ -1937,6 +2286,20 @@ fn validate_frame(frame: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn validate_audio_frame(frame: &[u8]) -> Result<()> {
+    if frame.len() <= AUDIO_FRAME_HEADER_LEN || frame.len() > MAX_AUDIO_FRAME_BYTES {
+        bail!("invalid remote desktop audio frame size")
+    }
+    let header = AudioFrameHeader::decode(frame)?;
+    if header.sample_rate != AUDIO_SAMPLE_RATE
+        || header.samples_per_channel != AUDIO_SAMPLES_PER_FRAME
+        || AUDIO_CHANNELS != 2
+    {
+        bail!("invalid remote desktop audio format")
+    }
+    Ok(())
+}
+
 async fn write_packet<W: AsyncWrite + Unpin>(writer: &mut W, kind: u8, value: &[u8]) -> Result<()> {
     if value.len() > PIPE_MAX_PACKET {
         bail!("desktop helper packet too large")
@@ -1995,6 +2358,24 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn test_audio_frame_with_flags(payload_len: usize, flags: u8) -> Vec<u8> {
+        let mut frame = AudioFrameHeader {
+            flags,
+            sequence: 1,
+            timestamp_us: 0,
+            sample_rate: AUDIO_SAMPLE_RATE,
+            samples_per_channel: AUDIO_SAMPLES_PER_FRAME,
+        }
+        .encode()
+        .to_vec();
+        frame.resize(AUDIO_FRAME_HEADER_LEN + payload_len, 0x55);
+        frame
+    }
+
+    fn test_audio_frame(payload_len: usize) -> Vec<u8> {
+        test_audio_frame_with_flags(payload_len, 0)
+    }
+
     #[tokio::test]
     async fn helper_pipe_reader_preserves_fragmented_packet_boundaries() {
         let (mut writer, reader) = tokio::io::duplex(64);
@@ -2021,6 +2402,276 @@ mod tests {
         drop(writer);
         assert!(packet_rx.recv().await.unwrap().is_err());
         reader.await.unwrap();
+    }
+
+    #[test]
+    fn audio_frame_validation_enforces_format_and_opus_payload_bounds() {
+        assert!(validate_audio_frame(&test_audio_frame(1)).is_ok());
+        assert!(validate_audio_frame(&test_audio_frame(1_275)).is_ok());
+        assert!(validate_audio_frame(&test_audio_frame(0)).is_err());
+        assert!(validate_audio_frame(&test_audio_frame(1_276)).is_err());
+
+        let mut wrong_rate = test_audio_frame(1);
+        wrong_rate[24..28].copy_from_slice(&44_100_u32.to_be_bytes());
+        assert!(validate_audio_frame(&wrong_rate).is_err());
+    }
+
+    #[tokio::test]
+    async fn pipe_reader_routes_audio_packets_without_blocking_video_statuses() {
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let (frame_tx, _frame_rx) = watch::channel(None);
+        let (audio_tx, audio_rx) = drop_oldest_channel(AUDIO_CHANNEL_CAPACITY);
+        let (status_tx, mut status_rx) = mpsc::channel(1);
+        let (release_ack_tx, _release_ack_rx) = mpsc::channel(1);
+        let (audio_ack_tx, _audio_ack_rx) = mpsc::channel(1);
+        let (fatal_tx, mut fatal_rx) = mpsc::channel(1);
+        let task = tokio::spawn(pipe_reader(
+            reader,
+            frame_tx,
+            audio_tx,
+            status_tx,
+            release_ack_tx,
+            audio_ack_tx,
+            fatal_tx,
+        ));
+
+        write_packet(&mut writer, PIPE_AUDIO, b"invalid")
+            .await
+            .unwrap();
+        let audio = test_audio_frame(1);
+        write_packet(&mut writer, PIPE_AUDIO, &audio).await.unwrap();
+        write_packet(
+            &mut writer,
+            PIPE_CONTROL,
+            br#"{"type":"audio_state","state":"playing"}"#,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(audio_rx.recv().await, Some(audio));
+        assert_eq!(
+            status_rx.recv().await.as_deref(),
+            Some(r#"{"type":"audio_state","state":"playing"}"#)
+        );
+        drop(writer);
+        assert!(fatal_rx.recv().await.is_some());
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[test]
+    fn audio_control_ack_round_trips_and_rejects_malformed_payloads() {
+        let ack = AudioControlAck {
+            enabled: true,
+            changed: true,
+            generation: Some(42),
+        };
+        let encoded = encode_audio_control_ack(ack).unwrap();
+        assert_eq!(parse_audio_control_ack(&encoded).unwrap(), Some(ack));
+        assert_eq!(parse_audio_control_ack(INTERNAL_STOPPED).unwrap(), None);
+
+        let mut unknown = INTERNAL_AUDIO_CONTROL_ACK_PREFIX.to_vec();
+        unknown
+            .extend_from_slice(br#"{"enabled":true,"changed":true,"generation":42,"error":"raw"}"#);
+        assert!(parse_audio_control_ack(&unknown).is_err());
+        assert!(parse_audio_control_ack(INTERNAL_AUDIO_CONTROL_ACK_PREFIX).is_err());
+    }
+
+    #[test]
+    fn audio_relay_requires_ordered_latest_changed_ack_and_discontinuity() {
+        let mut relay = AudioRelayGate::new();
+        relay.register_control(Some(1), true).unwrap();
+        relay.register_control(Some(2), false).unwrap();
+
+        assert!(
+            relay
+                .acknowledge(AudioControlAck {
+                    enabled: false,
+                    changed: true,
+                    generation: Some(2),
+                })
+                .is_err()
+        );
+        assert_eq!(relay.pending.len(), 2);
+        assert_eq!(
+            relay
+                .acknowledge(AudioControlAck {
+                    enabled: true,
+                    changed: true,
+                    generation: Some(1),
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(relay.phase, AudioRelayPhase::Disabled);
+        assert_eq!(
+            relay
+                .acknowledge(AudioControlAck {
+                    enabled: false,
+                    changed: true,
+                    generation: Some(2),
+                })
+                .unwrap(),
+            None
+        );
+
+        relay.register_control(Some(3), true).unwrap();
+        assert_eq!(
+            relay
+                .acknowledge(AudioControlAck {
+                    enabled: true,
+                    changed: true,
+                    generation: Some(3),
+                })
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(relay.phase, AudioRelayPhase::AwaitingDiscontinuity);
+        assert!(!relay.accepts_audio(&test_audio_frame(1)));
+        assert!(relay.accepts_audio(&test_audio_frame_with_flags(
+            1,
+            super::super::AUDIO_FLAG_DISCONTINUITY,
+        )));
+        assert_eq!(relay.phase, AudioRelayPhase::Playing);
+    }
+
+    #[test]
+    fn duplicate_enabled_ack_does_not_interrupt_playing_audio() {
+        let mut relay = AudioRelayGate::new();
+        relay.register_control(Some(1), true).unwrap();
+        assert_eq!(
+            relay
+                .acknowledge(AudioControlAck {
+                    enabled: true,
+                    changed: true,
+                    generation: Some(1),
+                })
+                .unwrap(),
+            Some(1)
+        );
+        assert!(relay.accepts_audio(&test_audio_frame_with_flags(
+            1,
+            super::super::AUDIO_FLAG_DISCONTINUITY,
+        )));
+
+        relay.register_control(Some(2), true).unwrap();
+        assert_eq!(relay.phase, AudioRelayPhase::Playing);
+        assert_eq!(
+            relay
+                .acknowledge(AudioControlAck {
+                    enabled: true,
+                    changed: false,
+                    generation: Some(2),
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(relay.phase, AudioRelayPhase::Playing);
+        assert!(relay.accepts_audio(&test_audio_frame(1)));
+    }
+
+    #[test]
+    fn duplicate_enabled_ack_preserves_discontinuity_wait() {
+        let mut relay = AudioRelayGate::new();
+        relay.register_control(Some(1), true).unwrap();
+        assert_eq!(
+            relay
+                .acknowledge(AudioControlAck {
+                    enabled: true,
+                    changed: true,
+                    generation: Some(1),
+                })
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(relay.phase, AudioRelayPhase::AwaitingDiscontinuity);
+
+        relay.register_control(Some(2), true).unwrap();
+        assert_eq!(relay.phase, AudioRelayPhase::AwaitingDiscontinuity);
+        assert_eq!(
+            relay
+                .acknowledge(AudioControlAck {
+                    enabled: true,
+                    changed: false,
+                    generation: Some(2),
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(relay.phase, AudioRelayPhase::AwaitingDiscontinuity);
+        assert!(relay.accepts_audio(&test_audio_frame_with_flags(
+            1,
+            super::super::AUDIO_FLAG_DISCONTINUITY,
+        )));
+    }
+
+    #[tokio::test]
+    async fn changed_audio_ack_clears_queued_frames_at_the_pipe_boundary() {
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let (frame_tx, _frame_rx) = watch::channel(None);
+        let (audio_tx, audio_rx) = drop_oldest_channel(AUDIO_CHANNEL_CAPACITY);
+        let (status_tx, _status_rx) = mpsc::channel(1);
+        let (release_ack_tx, _release_ack_rx) = mpsc::channel(1);
+        let (audio_ack_tx, mut audio_ack_rx) = mpsc::channel(1);
+        let (fatal_tx, _fatal_rx) = mpsc::channel(1);
+        let task = tokio::spawn(pipe_reader(
+            reader,
+            frame_tx,
+            audio_tx,
+            status_tx,
+            release_ack_tx,
+            audio_ack_tx,
+            fatal_tx,
+        ));
+
+        let old = test_audio_frame(1);
+        write_packet(&mut writer, PIPE_AUDIO, &old).await.unwrap();
+        let ack = AudioControlAck {
+            enabled: true,
+            changed: true,
+            generation: Some(9),
+        };
+        write_packet(
+            &mut writer,
+            PIPE_INTERNAL,
+            &encode_audio_control_ack(ack).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(audio_ack_rx.recv().await, Some(ack));
+
+        let mut current = test_audio_frame_with_flags(1, super::super::AUDIO_FLAG_DISCONTINUITY);
+        current[15] = 2;
+        write_packet(&mut writer, PIPE_AUDIO, &current)
+            .await
+            .unwrap();
+        assert_eq!(audio_rx.recv().await, Some(current));
+
+        task.abort();
+    }
+
+    #[test]
+    fn backend_audio_ack_status_is_generation_scoped() {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&audio_control_ack_status(17)).unwrap(),
+            serde_json::json!({
+                "type":"audio_state",
+                "state":"starting",
+                "reason":"control_ack",
+                "generation":17,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn non_playing_audio_state_discards_queued_audio() {
+        let (audio_tx, audio_rx) = drop_oldest_channel(2);
+        audio_tx.send(vec![1]).unwrap();
+        assert!(audio_state_clears_queue(
+            r#"{"type":"audio_state","state":"paused","reason":"secure_desktop"}"#
+        ));
+        audio_tx.clear();
+        audio_tx.send(vec![2]).unwrap();
+        assert_eq!(audio_rx.recv().await, Some(vec![2]));
     }
 
     #[test]
@@ -2059,10 +2710,63 @@ mod tests {
     }
 
     #[test]
+    fn audio_control_bypasses_the_remote_input_gate() {
+        assert!(control_is_allowed(
+            false,
+            &DesktopControl::AudioControl {
+                enabled: false,
+                generation: Some(1),
+            }
+        ));
+        assert!(!control_is_allowed(
+            false,
+            &DesktopControl::PointerMove { x: 0.5, y: 0.5 }
+        ));
+    }
+
+    #[test]
+    fn helper_arguments_include_negotiated_audio_codec() {
+        let mut command = Command::new("om-agent");
+        append_helper_args(
+            &mut command,
+            &DesktopOptions {
+                pipe: r"\\.\pipe\desktop".to_string(),
+                max_width: 1280,
+                max_height: 720,
+                min_fps: 6,
+                max_fps: 8,
+                jpeg_quality: 50,
+                audio_codec: Some("opus".to_string()),
+                system_helper: true,
+            },
+        );
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--audio-codec", "opus"])
+        );
+        assert!(args.iter().any(|value| value == "--system-helper"));
+    }
+
+    #[test]
     fn secure_attention_is_always_rejected() {
         let mut input = InputState::default();
         let error = input.apply(DesktopControl::SecureAttention).unwrap_err();
         assert!(error.to_string().contains("secure_attention_unavailable"));
+    }
+
+    #[test]
+    fn audio_control_is_never_injected_as_input() {
+        let mut input = InputState::default();
+        input
+            .apply(DesktopControl::AudioControl {
+                enabled: true,
+                generation: Some(1),
+            })
+            .unwrap();
     }
 
     #[test]

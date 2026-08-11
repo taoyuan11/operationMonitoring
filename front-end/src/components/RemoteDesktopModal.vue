@@ -8,12 +8,24 @@ import {
   Monitor,
   RefreshCw,
   Shrink,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-vue-next'
+import {
+  DESKTOP_AUDIO_CAPABILITY,
+  desktopStateAllowsAudio,
+  desktopWebSocketUrl,
+  parseDesktopMediaFrame,
+  type DesktopQuality,
+  type DesktopVideoFrame,
+} from '../api/desktop'
+import {
+  type DesktopAudioServerState,
+  useRemoteDesktopAudio,
+} from '../composables/useRemoteDesktopAudio'
 import type { Instance } from '../types/domain'
 
-const FRAME_HEADER_BYTES = 32
-const MAX_FRAME_BYTES = 2 * 1024 * 1024
 const POINTER_INTERVAL_MS = 1000 / 30
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000
 const SESSION_TIMEOUT_MS = 2 * 60 * 60 * 1000
@@ -21,7 +33,6 @@ const DESKTOP_QUALITY_STORAGE_KEY = 'operation-monitoring.desktop-quality'
 
 type ConnectionState = 'connecting' | 'ready' | 'paused' | 'closed' | 'error' | 'disconnected'
 type ViewMode = 'fit' | 'actual'
-type DesktopQuality = 'low' | 'balanced' | 'high' | 'original'
 type PointerButton = 0 | 1 | 2
 type KeyModifier = 'alt' | 'ctrl' | 'shift' | 'meta'
 
@@ -32,21 +43,18 @@ const desktopQualityOptions: Array<{ value: DesktopQuality; label: string }> = [
   { value: 'original', label: '原画 1080p' },
 ]
 
-type DesktopFrame = {
+type DesktopFrame = DesktopVideoFrame & {
   generation: number
-  sequence: number
-  width: number
-  height: number
-  jpeg: ArrayBuffer
 }
 
 type DesktopServerMessage =
-  | { type: 'opening' }
+  | { type: 'opening'; audio_codec?: string }
   | { type: 'consent_required' }
   | { type: 'ready' }
   | { type: 'display'; width: number; height: number }
   | { type: 'desktop_state'; desktop: 'default' | 'secure' | 'other' }
   | { type: 'notice'; code: string; message: string }
+  | { type: 'audio_state'; state: DesktopAudioServerState; reason?: string }
   | { type: 'paused'; reason: string }
   | { type: 'closed'; reason: string }
   | { type: 'error'; code: string; message: string }
@@ -63,6 +71,7 @@ type DesktopClientMessage =
     modifiers: KeyModifier[]
   }
   | { type: 'release_all' }
+  | { type: 'audio_control'; enabled: boolean }
   | {
     type: 'feedback'
     sequence: number
@@ -114,8 +123,31 @@ let lastPointer: { x: number; y: number } | null = null
 let lastPointerSentAt = 0
 let sessionStartedAt = 0
 let lastInputAt = 0
+let componentActive = true
+let audioSupportReady = false
+let connectQueued = false
 const pressedMouseButtons = new Set<PointerButton>()
 let renderedRect = { x: 0, y: 0, width: 0, height: 0 }
+
+const {
+  canToggle: canToggleAudio,
+  enabled: audioEnabled,
+  negotiated: audioNegotiated,
+  requestedCodec: requestedAudioCodec,
+  title: audioTitle,
+  dispose: disposeRemoteAudio,
+  handleConnectionPaused: pauseRemoteAudio,
+  handleConnectionReady: readyRemoteAudio,
+  handleFrame: handleAudioFrame,
+  handleOpening: openRemoteAudio,
+  handleServerState: handleAudioState,
+  prepare: prepareRemoteAudio,
+  resetConnection: resetRemoteAudio,
+  toggle: toggleRemoteAudio,
+} = useRemoteDesktopAudio({
+  agentSupported: props.instance.capabilities?.includes(DESKTOP_AUDIO_CAPABILITY) === true,
+  sendControl: (enabled) => sendMessage({ type: 'audio_control', enabled }),
+})
 
 const instanceName = computed(() => props.instance.name || props.instance.hostname || '未命名节点')
 const resolutionLabel = computed(() =>
@@ -154,10 +186,16 @@ onMounted(() => {
 
   feedbackTimer = window.setInterval(sendFeedback, 2000)
   warningTimer = window.setInterval(updateSessionWarning, 1000)
-  connect()
+  connectQueued = true
+  void prepareRemoteAudio().then(
+    finishAudioPreparation,
+    finishAudioPreparation,
+  )
 })
 
 onBeforeUnmount(() => {
+  componentActive = false
+  disposeRemoteAudio()
   releaseAllInputs()
   socketGeneration += 1
   socket?.close(1000, 'client_closed')
@@ -178,6 +216,13 @@ onBeforeUnmount(() => {
 })
 
 function connect() {
+  if (!componentActive) return
+  if (!audioSupportReady) {
+    connectQueued = true
+    statusDetail.value = '正在检查浏览器音频支持'
+    return
+  }
+  connectQueued = false
   if (reconnectTimer !== null) {
     window.clearTimeout(reconnectTimer)
     reconnectTimer = null
@@ -189,6 +234,7 @@ function connect() {
     sendMessage({ type: 'release_all' }, previousSocket)
     previousSocket.close(1000, 'reconnecting')
     releaseLocalInputState()
+    resetRemoteAudio(true)
     connectionState.value = 'connecting'
     statusDetail.value = '正在关闭旧会话'
     reconnectTimer = window.setTimeout(() => {
@@ -201,8 +247,15 @@ function connect() {
   openConnection()
 }
 
+function finishAudioPreparation() {
+  audioSupportReady = true
+  if (componentActive && connectQueued) connect()
+}
+
 function openConnection() {
+  if (!componentActive) return
   const generation = ++socketGeneration
+  resetRemoteAudio(true)
   connectionState.value = 'connecting'
   statusDetail.value = '正在建立安全连接'
   sessionWarning.value = ''
@@ -213,16 +266,14 @@ function openConnection() {
   renderTimes = []
   decodeTimes = []
   renderedFps.value = 0
+  desktopKind.value = 'default'
   pressedMouseButtons.clear()
   currentBitmap?.close()
   currentBitmap = null
   clearCanvas()
 
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const id = encodeURIComponent(props.instance.id)
-  const quality = encodeURIComponent(desktopQuality.value)
   const nextSocket = new WebSocket(
-    `${protocol}//${window.location.host}/api/admin/instances/${id}/desktop/ws?quality=${quality}`,
+    desktopWebSocketUrl(props.instance.id, desktopQuality.value, requestedAudioCodec.value),
   )
   nextSocket.binaryType = 'arraybuffer'
   socket = nextSocket
@@ -238,12 +289,12 @@ function openConnection() {
       return
     }
     if (event.data instanceof ArrayBuffer) {
-      handleFrame(event.data)
+      handleMediaFrame(event.data)
       return
     }
     if (event.data instanceof Blob) {
       void event.data.arrayBuffer().then((buffer) => {
-        if (generation === socketGeneration) handleFrame(buffer)
+        if (generation === socketGeneration) handleMediaFrame(buffer)
       })
     }
   }
@@ -251,11 +302,13 @@ function openConnection() {
     if (generation !== socketGeneration) return
     connectionState.value = 'error'
     statusDetail.value = '远程桌面连接发生错误'
+    pauseRemoteAudio()
   }
   nextSocket.onclose = () => {
     if (generation !== socketGeneration) return
     socket = null
     releaseLocalInputState()
+    pauseRemoteAudio()
     if (!['closed', 'error'].includes(connectionState.value)) {
       connectionState.value = 'disconnected'
       statusDetail.value = '数据连接已断开，可尝试重新连接'
@@ -274,14 +327,18 @@ function handleServerMessage(payload: string) {
 
   switch (message.type) {
     case 'opening':
+      openRemoteAudio(message.audio_codec)
       connectionState.value = 'connecting'
       statusDetail.value = '正在启动 Windows 桌面捕获'
       break
     case 'consent_required':
+      pauseRemoteAudio()
       connectionState.value = 'connecting'
       statusDetail.value = '等待远程计算机上的用户允许本次查看和控制'
       break
     case 'ready':
+      desktopKind.value = 'default'
+      readyRemoteAudio()
       connectionState.value = 'ready'
       statusDetail.value = '键盘和鼠标操作将发送到远程实例'
       if (!sessionStartedAt) {
@@ -299,6 +356,8 @@ function handleServerMessage(payload: string) {
       break
     case 'desktop_state':
       desktopKind.value = message.desktop
+      if (desktopStateAllowsAudio(message.desktop)) readyRemoteAudio()
+      else pauseRemoteAudio()
       connectionState.value = message.desktop === 'default' ? 'ready' : 'paused'
       statusDetail.value = message.desktop === 'secure'
         ? 'Windows 正在显示登录或 UAC 安全桌面，远程查看和控制已暂停'
@@ -309,17 +368,23 @@ function handleServerMessage(payload: string) {
     case 'notice':
       statusDetail.value = message.message || desktopError(message.code, '')
       break
+    case 'audio_state':
+      handleAudioState(message.state, message.reason)
+      break
     case 'paused':
+      pauseRemoteAudio()
       connectionState.value = 'paused'
       statusDetail.value = desktopReason(message.reason)
       releaseAllInputs()
       break
     case 'closed':
+      pauseRemoteAudio()
       connectionState.value = 'closed'
       statusDetail.value = desktopReason(message.reason) || '远程桌面会话已结束'
       releaseLocalInputState()
       break
     case 'error':
+      pauseRemoteAudio()
       connectionState.value = 'error'
       statusDetail.value = desktopError(message.code, message.message)
       releaseLocalInputState()
@@ -329,41 +394,26 @@ function handleServerMessage(payload: string) {
   }
 }
 
-function handleFrame(buffer: ArrayBuffer) {
-  if (buffer.byteLength <= FRAME_HEADER_BYTES || buffer.byteLength > MAX_FRAME_BYTES) {
-    failProtocol('收到大小异常的桌面画面')
-    return
+function handleMediaFrame(buffer: ArrayBuffer) {
+  try {
+    const frame = parseDesktopMediaFrame(buffer, audioNegotiated.value)
+    if (frame.kind === 'audio') {
+      handleAudioFrame(frame)
+      return
+    }
+    queueVideoFrame(frame)
+  } catch (error) {
+    failProtocol(error instanceof Error ? error.message : '收到无法解析的远程桌面媒体帧')
   }
+}
 
-  const bytes = new Uint8Array(buffer, 0, 4)
-  if (bytes[0] !== 0x4f || bytes[1] !== 0x4d || bytes[2] !== 0x52 || bytes[3] !== 0x44) {
-    failProtocol('收到无效的桌面画面标识')
-    return
-  }
-
-  const view = new DataView(buffer)
-  if (view.getUint8(4) !== 1 || view.getUint8(5) !== 1 || view.getUint16(6, false) !== 0) {
-    failProtocol('当前浏览器不支持此桌面画面版本或编码')
-    return
-  }
-
-  const width = view.getUint32(24, false)
-  const height = view.getUint32(28, false)
-  if (!width || !height || width > 1920 || height > 1080) {
-    failProtocol('收到无效的桌面画面尺寸')
-    return
-  }
-
-  const sequence = Number(view.getBigUint64(8, false))
+function queueVideoFrame(frame: DesktopVideoFrame) {
   pendingFrame = {
+    ...frame,
     generation: socketGeneration,
-    sequence,
-    width,
-    height,
-    jpeg: buffer.slice(FRAME_HEADER_BYTES),
   }
-  displayWidth.value = width
-  displayHeight.value = height
+  displayWidth.value = frame.width
+  displayHeight.value = frame.height
   if (!decodingFrame) void decodeNextFrame()
 }
 
@@ -658,10 +708,14 @@ function updateSessionWarning() {
 }
 
 function failProtocol(message: string) {
+  const target = socket
+  pauseRemoteAudio()
   connectionState.value = 'error'
   statusDetail.value = message
   releaseAllInputs()
-  socket?.close(1002, 'invalid_desktop_message')
+  socketGeneration += 1
+  socket = null
+  target?.close(1002, 'invalid_desktop_message')
 }
 
 function desktopError(code: string, fallback: string) {
@@ -791,6 +845,19 @@ function isDesktopQuality(value: string | null): value is DesktopQuality {
               <Maximize2 :size="15" />1:1
             </button>
           </div>
+          <button
+            :class="['desktop-tool-button', { active: audioEnabled }]"
+            type="button"
+            :title="audioTitle"
+            :aria-label="audioTitle"
+            :aria-pressed="audioEnabled"
+            :disabled="!canToggleAudio"
+            @click="toggleRemoteAudio"
+          >
+            <Volume2 v-if="audioEnabled" :size="15" />
+            <VolumeX v-else :size="15" />
+            <span>{{ audioEnabled ? '静音' : '声音' }}</span>
+          </button>
           <button class="desktop-tool-button" type="button" title="重新连接" @click="connect">
             <RefreshCw :size="15" /><span>重连</span>
           </button>

@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -29,15 +29,23 @@ use crate::{
     error::{AppError, AppResult},
     models::{AgentOutbound, DesktopAgentWsQuery},
     request_security::{ensure_same_origin, request_scheme},
-    state::{AppState, DesktopSessionHandle},
+    state::{AppState, DesktopAudioPacket, DesktopSessionHandle},
     utils::now_ts,
 };
 
 const DESKTOP_CAPABILITY: &str = "remote_desktop_v1";
+const DESKTOP_AUDIO_CAPABILITY: &str = "remote_desktop_audio_v1";
+const AUDIO_CODEC_OPUS: &str = "opus";
 const TOKEN_TTL_SECONDS: i64 = 30;
 const CONTROL_MESSAGE_MAX_BYTES: usize = 16 * 1024;
 const FRAME_MAX_BYTES: usize = 2 * 1024 * 1024;
 const FRAME_HEADER_BYTES: usize = 32;
+const AUDIO_RELAY_CAPACITY: usize = 8;
+const OPUS_MAX_PACKET_BYTES: usize = 1275;
+const OPUS_CHANNELS: u8 = 2;
+const OPUS_SAMPLE_RATE: u32 = 48_000;
+const OPUS_SAMPLES_PER_CHANNEL: u32 = 960;
+const AUDIO_DISCONTINUITY_FLAG: u8 = 0x01;
 const HELPER_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -83,10 +91,26 @@ enum DesktopQuality {
     Original,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum DesktopAudioCodec {
+    Opus,
+}
+
+impl DesktopAudioCodec {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Opus => AUDIO_CODEC_OPUS,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DesktopBrowserWsQuery {
     #[serde(default)]
     quality: DesktopQuality,
+    #[serde(default)]
+    audio: Option<DesktopAudioCodec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +207,7 @@ pub async fn admin_desktop_ws(
                 audit_context,
                 session_guard,
                 query.quality,
+                query.audio,
                 socket,
             )
         }))
@@ -210,6 +235,7 @@ async fn desktop_browser_socket(
     audit_context: audit::AuditContext,
     session_guard: AdminSessionGuard,
     quality: DesktopQuality,
+    requested_audio_codec: Option<DesktopAudioCodec>,
     socket: WebSocket,
 ) {
     let Some(agent) = state.agents.read().await.get(&instance_id).cloned() else {
@@ -228,11 +254,13 @@ async fn desktop_browser_socket(
         .await;
         return;
     }
+    let audio_codec = negotiate_audio_codec(requested_audio_codec, &agent.capabilities);
 
     let session_id = Uuid::new_v4().to_string();
     let (stream_token, token_hash) = new_stream_token();
     let (browser_tx, mut browser_rx) = mpsc::channel::<String>(32);
     let (frame_tx, mut frame_rx) = watch::channel::<Option<Arc<Vec<u8>>>>(None);
+    let (audio_tx, mut audio_rx) = broadcast::channel::<DesktopAudioPacket>(AUDIO_RELAY_CAPACITY);
     let (agent_input_tx, agent_input_rx) = mpsc::channel::<String>(64);
     let (close_tx, mut close_rx) = watch::channel::<Option<String>>(None);
 
@@ -260,6 +288,8 @@ async fn desktop_browser_socket(
                 token_claimed: false,
                 browser_tx,
                 frame_tx,
+                audio_tx,
+                audio_codec: audio_codec.map(|codec| codec.as_str().to_string()),
                 agent_input_rx: Arc::new(tokio::sync::Mutex::new(Some(agent_input_rx))),
                 close_tx,
             },
@@ -276,7 +306,12 @@ async fn desktop_browser_socket(
             action: "desktop_session".to_string(),
             target: instance_id.clone(),
             detail: "启动远程桌面会话".to_string(),
-            metadata: json!({ "quality": format!("{quality:?}").to_ascii_lowercase() }),
+            metadata: json!({
+                "quality": format!("{quality:?}").to_ascii_lowercase(),
+                "audio_requested": requested_audio_codec.is_some(),
+                "audio_enabled": audio_codec.is_some(),
+                "audio_codec": audio_codec.map(DesktopAudioCodec::as_str),
+            }),
             instance_id: Some(instance_id.clone()),
             node_snapshot: audit::instance_snapshot(&state.db, &instance_id).await,
             context: audit_context,
@@ -307,6 +342,7 @@ async fn desktop_browser_socket(
         .send(AgentOutbound::DesktopOpen {
             session_id: session_id.clone(),
             stream_token,
+            audio_codec: audio_codec.map(|codec| codec.as_str().to_string()),
             max_width: stream_settings.max_width,
             max_height: stream_settings.max_height,
             min_fps: stream_settings.min_fps,
@@ -321,7 +357,7 @@ async fn desktop_browser_socket(
     }
 
     let (mut sender, mut receiver) = socket.split();
-    if !send_text(&mut sender, &json!({"type": "opening"}).to_string()).await {
+    if !send_text(&mut sender, &opening_message(audio_codec)).await {
         end_desktop_session(&state, &session_id, "browser_disconnected").await;
         return;
     }
@@ -333,55 +369,103 @@ async fn desktop_browser_socket(
     let mut control_rate = ControlRateLimiter::new(started);
     let mut joined = false;
     let mut control_ready = false;
+    let mut browser_audio = BrowserAudioRelayGate::new();
     let mut helper_timeout = Box::pin(tokio::time::sleep(HELPER_JOIN_TIMEOUT));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let authorization = session_guard.wait_until_invalid(state.clone());
-    tokio::pin!(authorization);
+    let authorization_state = state.clone();
+    let authorization_session_id = session_id.clone();
+    let (authorization_cancel_tx, authorization_cancel_rx) = oneshot::channel();
+    let mut authorization = tokio::spawn(async move {
+        tokio::select! {
+            _ = session_guard.wait_until_invalid(authorization_state.clone()) => {
+                end_desktop_session(
+                    &authorization_state,
+                    &authorization_session_id,
+                    "authorization_revoked",
+                )
+                .await;
+                true
+            }
+            _ = authorization_cancel_rx => false,
+        }
+    });
     let mut reason = "browser_disconnected".to_string();
+    let mut deferred_browser_message = None;
 
     loop {
         tokio::select! {
-            _ = &mut authorization => {
-                let _ = send_text(
-                    &mut sender,
-                    &json!({"type":"closed", "reason":"authorization_revoked"}).to_string(),
-                )
-                .await;
+            biased;
+            authorization_result = &mut authorization => {
+                if !matches!(authorization_result, Ok(true)) {
+                    break;
+                }
                 reason = "authorization_revoked".to_string();
+                deferred_browser_message = Some(
+                    json!({"type":"closed", "reason":"authorization_revoked"}).to_string(),
+                );
                 break;
+            }
+            changed = close_rx.changed() => {
+                if changed.is_err() { break; }
+                let close_reason = { close_rx.borrow_and_update().clone() };
+                if let Some(close_reason) = close_reason {
+                    deferred_browser_message =
+                        Some(json!({"type":"closed", "reason":&close_reason}).to_string());
+                    reason = close_reason;
+                    break;
+                }
             }
             incoming = receiver.next() => {
                 let Some(incoming) = incoming else { break; };
                 match incoming {
                     Ok(Message::Text(text)) => {
                         last_inbound = Instant::now();
-                        match validate_browser_message(&text) {
+                        match validate_browser_message(&text, audio_codec.is_some()) {
                             Ok(is_activity) => {
                                 if !control_rate.allow(Instant::now()) {
-                                    let _ = send_text(&mut sender, &server_error("control_rate_limited", "远程桌面控制消息速率过高")).await;
+                                    deferred_browser_message = Some(server_error(
+                                        "control_rate_limited",
+                                        "远程桌面控制消息速率过高",
+                                    ));
                                     reason = "control_rate_limited".to_string();
                                     break;
                                 }
-                                if !control_ready {
+                                if !control_ready && !bypasses_desktop_control_gate(&text) {
                                     continue;
                                 }
+                                let forwarded = if let Some(enabled) = audio_control_enabled(&text) {
+                                    clear_pending_audio(&mut audio_rx);
+                                    browser_audio.set_control(enabled).map(|generation| {
+                                        json!({
+                                            "type":"audio_control",
+                                            "enabled":enabled,
+                                            "generation":generation,
+                                        })
+                                        .to_string()
+                                    })
+                                } else {
+                                    Some(text.to_string())
+                                };
                                 if is_activity { last_activity = Instant::now(); }
                                 let reliable = is_reliable_browser_message(&text);
-                                let delivered = if reliable {
-                                    tokio::time::timeout(Duration::from_secs(1), agent_input_tx.send(text.to_string())).await
-                                        .is_ok_and(|result| result.is_ok())
-                                } else {
-                                    agent_input_tx.try_send(text.to_string()).is_ok()
+                                let delivered = match forwarded {
+                                    None => true,
+                                    Some(forwarded) if reliable => {
+                                        tokio::time::timeout(Duration::from_secs(1), agent_input_tx.send(forwarded)).await
+                                            .is_ok_and(|result| result.is_ok())
+                                    }
+                                    Some(forwarded) => agent_input_tx.try_send(forwarded).is_ok(),
                                 };
                                 if reliable && !delivered {
-                                    let _ = send_text(&mut sender, &server_error("input_queue_overflow", "远程输入队列拥塞")).await;
+                                    deferred_browser_message =
+                                        Some(server_error("input_queue_overflow", "远程输入队列拥塞"));
                                     reason = "input_queue_overflow".to_string();
                                     break;
                                 }
                             }
                             Err((code, message)) => {
-                                let _ = send_text(&mut sender, &server_error(code, message)).await;
+                                deferred_browser_message = Some(server_error(code, message));
                                 reason = "invalid_control_message".to_string();
                                 break;
                             }
@@ -394,7 +478,8 @@ async fn desktop_browser_socket(
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
                     Ok(Message::Binary(_)) => {
-                        let _ = send_text(&mut sender, &server_error("invalid_message", "浏览器不得发送二进制数据")).await;
+                        deferred_browser_message =
+                            Some(server_error("invalid_message", "浏览器不得发送二进制数据"));
                         reason = "invalid_control_message".to_string();
                         break;
                     }
@@ -403,7 +488,13 @@ async fn desktop_browser_socket(
             message = browser_rx.recv() => {
                 let Some(message) = message else { break; };
                 let kind = message_type(&message);
+                if browser_audio.observe_state(&message) {
+                    clear_pending_audio(&mut audio_rx);
+                }
                 if matches!(kind.as_deref(), Some("ready" | "consent_required")) { joined = true; }
+                if stops_audio_stream(&message) {
+                    clear_pending_audio(&mut audio_rx);
+                }
                 match kind.as_deref() {
                     Some("ready") => control_ready = true,
                     Some("consent_required" | "paused" | "closed" | "error") => control_ready = false,
@@ -414,10 +505,31 @@ async fn desktop_browser_socket(
                 }
                 let close_reason = (kind.as_deref() == Some("closed"))
                     .then(|| message_reason(&message).unwrap_or_else(|| "agent_closed".to_string()));
-                if !send_text(&mut sender, &message).await { break; }
                 if let Some(close_reason) = close_reason {
+                    deferred_browser_message = Some(message);
                     reason = close_reason;
                     break;
+                }
+                if !send_text(&mut sender, &message).await { break; }
+            }
+            audio = audio_rx.recv(), if audio_codec.is_some() => {
+                match audio {
+                    Ok(packet) => {
+                        if !browser_audio.accepts(&packet) {
+                            continue;
+                        }
+                        if !send_socket_message(
+                            &mut sender,
+                            Message::Binary(packet.frame.as_ref().clone().into()),
+                        )
+                        .await
+                        {
+                            reason = "browser_send_timeout".to_string();
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             changed = frame_rx.changed() => {
@@ -435,17 +547,8 @@ async fn desktop_browser_socket(
                     }
                 }
             }
-            changed = close_rx.changed() => {
-                if changed.is_err() { break; }
-                let close_reason = { close_rx.borrow_and_update().clone() };
-                if let Some(close_reason) = close_reason {
-                    let _ = send_text(&mut sender, &json!({"type":"closed", "reason":&close_reason}).to_string()).await;
-                    reason = close_reason;
-                    break;
-                }
-            }
             _ = &mut helper_timeout, if !joined => {
-                let _ = send_text(&mut sender, &server_error("helper_timeout", "远程桌面启动超时")).await;
+                deferred_browser_message = Some(server_error("helper_timeout", "远程桌面启动超时"));
                 reason = "helper_timeout".to_string();
                 break;
             }
@@ -456,12 +559,14 @@ async fn desktop_browser_socket(
                     break;
                 }
                 if now.duration_since(last_activity) >= IDLE_TIMEOUT {
-                    let _ = send_text(&mut sender, &json!({"type":"closed", "reason":"idle_timeout"}).to_string()).await;
+                    deferred_browser_message =
+                        Some(json!({"type":"closed", "reason":"idle_timeout"}).to_string());
                     reason = "idle_timeout".to_string();
                     break;
                 }
                 if now.duration_since(started) >= SESSION_TIMEOUT {
-                    let _ = send_text(&mut sender, &json!({"type":"closed", "reason":"session_timeout"}).to_string()).await;
+                    deferred_browser_message =
+                        Some(json!({"type":"closed", "reason":"session_timeout"}).to_string());
                     reason = "session_timeout".to_string();
                     break;
                 }
@@ -473,7 +578,11 @@ async fn desktop_browser_socket(
         }
     }
 
+    let _ = authorization_cancel_tx.send(());
     end_desktop_session(&state, &session_id, &reason).await;
+    if let Some(message) = deferred_browser_message {
+        let _ = send_text(&mut sender, &message).await;
+    }
     info!(%session_id, %instance_id, %reason, "desktop browser websocket disconnected");
 }
 
@@ -500,6 +609,8 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_inbound = Instant::now();
     let mut reason = "agent_data_disconnected".to_string();
+    let audio_negotiated = handle.audio_codec.as_deref() == Some(AUDIO_CODEC_OPUS);
+    let mut audio_relay = AudioRelayGate::new();
     info!(%session_id, instance_id = %handle.instance_id, "desktop agent data websocket connected");
 
     loop {
@@ -509,13 +620,14 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
                 match incoming {
                     Ok(Message::Text(text)) => {
                         last_inbound = Instant::now();
-                        match validate_agent_message(&text) {
-                            Ok(()) => {
-                                let close_reason = (message_type(&text).as_deref() == Some("closed"))
-                                    .then(|| message_reason(&text).unwrap_or_else(|| "agent_closed".to_string()));
+                        match validate_agent_message(&text, handle.audio_codec.is_some()) {
+                            Ok(message) => {
+                                audio_relay.observe_state(&message);
+                                let close_reason = (message_type(&message).as_deref() == Some("closed"))
+                                    .then(|| message_reason(&message).unwrap_or_else(|| "agent_closed".to_string()));
                                 let delivered = tokio::time::timeout(
                                     Duration::from_secs(1),
-                                    handle.browser_tx.send(text.to_string()),
+                                    handle.browser_tx.send(message),
                                 )
                                 .await
                                 .is_ok_and(|result| result.is_ok());
@@ -537,12 +649,23 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
                     }
                     Ok(Message::Binary(frame)) => {
                         last_inbound = Instant::now();
-                        if let Err((code, message)) = validate_frame(&frame) {
-                            try_send_browser_error(&handle.browser_tx, code, message);
-                            reason = "invalid_frame".to_string();
-                            break;
+                        match classify_agent_binary_frame(&frame, audio_negotiated) {
+                            Ok(AgentBinaryFrameDisposition::Video) => {
+                                handle.frame_tx.send_replace(Some(Arc::new(frame.to_vec())));
+                            }
+                            Ok(AgentBinaryFrameDisposition::Audio) if audio_relay.accepts_audio(&frame) => {
+                                let _ = handle.audio_tx.send(DesktopAudioPacket {
+                                    generation: audio_relay.generation,
+                                    frame: Arc::new(frame.to_vec()),
+                                });
+                            }
+                            Ok(AgentBinaryFrameDisposition::Audio) => {}
+                            Err((code, message)) => {
+                                try_send_browser_error(&handle.browser_tx, code, message);
+                                reason = "invalid_frame".to_string();
+                                break;
+                            }
                         }
-                        handle.frame_tx.send_replace(Some(Arc::new(frame.to_vec())));
                     }
                     Ok(Message::Pong(_)) => last_inbound = Instant::now(),
                     Ok(Message::Ping(data)) => {
@@ -554,6 +677,12 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
             }
             input = input_rx.recv() => {
                 let Some(input) = input else { break; };
+                if let (Some(enabled), Some(generation)) = (
+                    audio_control_enabled(&input),
+                    audio_control_generation(&input),
+                ) {
+                    audio_relay.set_control(generation, enabled);
+                }
                 if !send_socket_message(&mut sender, Message::Text(input.into())).await {
                     reason = "agent_send_timeout".to_string();
                     break;
@@ -718,7 +847,187 @@ fn new_stream_token() -> (String, [u8; 32]) {
     (token, hash)
 }
 
-fn validate_frame(frame: &[u8]) -> Result<(), (&'static str, &'static str)> {
+fn negotiate_audio_codec(
+    requested: Option<DesktopAudioCodec>,
+    capabilities: &[String],
+) -> Option<DesktopAudioCodec> {
+    requested.filter(|_| {
+        capabilities
+            .iter()
+            .any(|value| value == DESKTOP_AUDIO_CAPABILITY)
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopBinaryFrameKind {
+    Video,
+    Audio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentBinaryFrameDisposition {
+    Video,
+    Audio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrowserAudioRelayGate {
+    generation: u64,
+    enabled: bool,
+    acknowledged: bool,
+}
+
+impl BrowserAudioRelayGate {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            enabled: false,
+            acknowledged: false,
+        }
+    }
+
+    fn set_control(&mut self, enabled: bool) -> Option<u64> {
+        if self.enabled == enabled {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.enabled = enabled;
+        self.acknowledged = false;
+        Some(self.generation)
+    }
+
+    /// Returns true when the current enable command has just been acknowledged.
+    fn observe_state(&mut self, message: &str) -> bool {
+        if !self.enabled || self.acknowledged {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(message) else {
+            return false;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("audio_state")
+            && value.get("state").and_then(Value::as_str) == Some("starting")
+            && value.get("reason").and_then(Value::as_str) == Some("control_ack")
+            && value.get("generation").and_then(Value::as_u64) == Some(self.generation)
+        {
+            self.acknowledged = true;
+            return true;
+        }
+        false
+    }
+
+    fn accepts(&self, packet: &DesktopAudioPacket) -> bool {
+        self.enabled && self.acknowledged && packet.generation == self.generation
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioRelayPhase {
+    Disabled,
+    AwaitingControlAck,
+    AwaitingDiscontinuity,
+    Playing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AudioRelayGate {
+    generation: u64,
+    enabled: bool,
+    phase: AudioRelayPhase,
+}
+
+impl AudioRelayGate {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            enabled: false,
+            phase: AudioRelayPhase::Disabled,
+        }
+    }
+
+    fn set_control(&mut self, generation: u64, enabled: bool) {
+        self.generation = generation;
+        self.enabled = enabled;
+        self.phase = if enabled {
+            AudioRelayPhase::AwaitingControlAck
+        } else {
+            AudioRelayPhase::Disabled
+        };
+    }
+
+    fn observe_state(&mut self, message: &str) {
+        if !self.enabled {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(message) else {
+            return;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("audio_state") {
+            return;
+        }
+        let state = value.get("state").and_then(Value::as_str);
+        let reason = value.get("reason").and_then(Value::as_str);
+        if reason == Some("control_ack") {
+            if state == Some("starting")
+                && value.get("generation").and_then(Value::as_u64) == Some(self.generation)
+            {
+                self.phase = AudioRelayPhase::AwaitingDiscontinuity;
+            }
+            return;
+        }
+        if self.phase != AudioRelayPhase::AwaitingControlAck && !matches!(state, Some("playing")) {
+            self.phase = AudioRelayPhase::AwaitingDiscontinuity;
+        }
+    }
+
+    fn accepts_audio(&mut self, frame: &[u8]) -> bool {
+        match self.phase {
+            AudioRelayPhase::Playing => true,
+            AudioRelayPhase::AwaitingDiscontinuity
+                if frame
+                    .get(7)
+                    .is_some_and(|flags| flags & AUDIO_DISCONTINUITY_FLAG != 0) =>
+            {
+                self.phase = AudioRelayPhase::Playing;
+                true
+            }
+            AudioRelayPhase::Disabled
+            | AudioRelayPhase::AwaitingControlAck
+            | AudioRelayPhase::AwaitingDiscontinuity => false,
+        }
+    }
+}
+
+fn validate_binary_frame(
+    frame: &[u8],
+) -> Result<DesktopBinaryFrameKind, (&'static str, &'static str)> {
+    match frame.get(..4) {
+        Some(b"OMRD") => {
+            validate_video_frame(frame)?;
+            Ok(DesktopBinaryFrameKind::Video)
+        }
+        Some(b"OMRA") => {
+            validate_audio_frame(frame)?;
+            Ok(DesktopBinaryFrameKind::Audio)
+        }
+        _ => Err(("unsupported_frame", "远程桌面媒体帧类型不受支持")),
+    }
+}
+
+fn classify_agent_binary_frame(
+    frame: &[u8],
+    audio_negotiated: bool,
+) -> Result<AgentBinaryFrameDisposition, (&'static str, &'static str)> {
+    let is_audio = frame.get(..4) == Some(b"OMRA");
+    if is_audio && !audio_negotiated {
+        return Err(("unexpected_audio", "当前远程桌面会话未启用音频"));
+    }
+    match validate_binary_frame(frame)? {
+        DesktopBinaryFrameKind::Video => Ok(AgentBinaryFrameDisposition::Video),
+        DesktopBinaryFrameKind::Audio => Ok(AgentBinaryFrameDisposition::Audio),
+    }
+}
+
+fn validate_video_frame(frame: &[u8]) -> Result<(), (&'static str, &'static str)> {
     if frame.len() < FRAME_HEADER_BYTES || frame.len() > FRAME_MAX_BYTES {
         return Err(("invalid_frame", "桌面图像帧大小无效"));
     }
@@ -740,7 +1049,136 @@ fn validate_frame(frame: &[u8]) -> Result<(), (&'static str, &'static str)> {
     Ok(())
 }
 
-fn validate_browser_message(text: &str) -> Result<bool, (&'static str, &'static str)> {
+fn validate_audio_frame(frame: &[u8]) -> Result<(), (&'static str, &'static str)> {
+    if frame.len() <= FRAME_HEADER_BYTES || frame.len() > FRAME_HEADER_BYTES + OPUS_MAX_PACKET_BYTES
+    {
+        return Err(("invalid_audio_frame", "桌面音频帧大小无效"));
+    }
+    if frame[4] != 1 || frame[5] != 1 {
+        return Err(("unsupported_audio_frame", "桌面音频帧版本或编码不受支持"));
+    }
+    if frame[6] != OPUS_CHANNELS || frame[7] & !AUDIO_DISCONTINUITY_FLAG != 0 {
+        return Err(("invalid_audio_frame", "桌面音频帧声道或标志无效"));
+    }
+    let sample_rate =
+        u32::from_be_bytes(frame[24..28].try_into().expect("fixed audio sample rate"));
+    let samples_per_channel =
+        u32::from_be_bytes(frame[28..32].try_into().expect("fixed audio sample count"));
+    if sample_rate != OPUS_SAMPLE_RATE || samples_per_channel != OPUS_SAMPLES_PER_CHANNEL {
+        return Err(("invalid_audio_frame", "桌面音频帧采样参数无效"));
+    }
+    if !valid_opus_packet(&frame[FRAME_HEADER_BYTES..]) {
+        return Err(("invalid_audio_frame", "桌面音频 Opus 包结构无效"));
+    }
+    Ok(())
+}
+
+fn valid_opus_packet(packet: &[u8]) -> bool {
+    let Some(&toc) = packet.first() else {
+        return false;
+    };
+    let frame_samples = opus_frame_samples_48k(toc);
+    match toc & 0x03 {
+        0 => frame_samples == OPUS_SAMPLES_PER_CHANNEL as usize,
+        1 => {
+            frame_samples * 2 == OPUS_SAMPLES_PER_CHANNEL as usize
+                && (packet.len() - 1).is_multiple_of(2)
+        }
+        2 => {
+            if frame_samples * 2 != OPUS_SAMPLES_PER_CHANNEL as usize {
+                return false;
+            }
+            let mut cursor = 1;
+            let Some(first_len) = opus_frame_length(packet, &mut cursor) else {
+                return false;
+            };
+            let remaining = packet.len() - cursor;
+            first_len <= remaining && remaining - first_len <= OPUS_MAX_PACKET_BYTES
+        }
+        3 => valid_opus_code_three_packet(packet, toc),
+        _ => unreachable!(),
+    }
+}
+
+fn valid_opus_code_three_packet(packet: &[u8], toc: u8) -> bool {
+    let Some(&frame_control) = packet.get(1) else {
+        return false;
+    };
+    let frame_count = usize::from(frame_control & 0x3f);
+    if frame_count == 0
+        || frame_count > 48
+        || frame_count * opus_frame_samples_48k(toc) != OPUS_SAMPLES_PER_CHANNEL as usize
+    {
+        return false;
+    }
+
+    let variable_bitrate = frame_control & 0x80 != 0;
+    let mut cursor = 2;
+    let mut padding = 0_usize;
+    if frame_control & 0x40 != 0 {
+        loop {
+            let Some(&value) = packet.get(cursor) else {
+                return false;
+            };
+            cursor += 1;
+            padding += if value == 255 {
+                254
+            } else {
+                usize::from(value)
+            };
+            if value != 255 {
+                break;
+            }
+        }
+    }
+    let Some(data_end) = packet.len().checked_sub(padding) else {
+        return false;
+    };
+    if cursor > data_end {
+        return false;
+    }
+
+    if !variable_bitrate {
+        let frame_bytes = data_end - cursor;
+        return frame_bytes.is_multiple_of(frame_count)
+            && frame_bytes / frame_count <= OPUS_MAX_PACKET_BYTES;
+    }
+
+    let mut described_bytes = 0_usize;
+    for _ in 1..frame_count {
+        let Some(frame_len) = opus_frame_length(&packet[..data_end], &mut cursor) else {
+            return false;
+        };
+        described_bytes += frame_len;
+    }
+    let remaining = data_end - cursor;
+    described_bytes <= remaining && remaining - described_bytes <= OPUS_MAX_PACKET_BYTES
+}
+
+fn opus_frame_length(packet: &[u8], cursor: &mut usize) -> Option<usize> {
+    let first = usize::from(*packet.get(*cursor)?);
+    *cursor += 1;
+    if first < 252 {
+        return Some(first);
+    }
+    let second = usize::from(*packet.get(*cursor)?);
+    *cursor += 1;
+    Some(first + 4 * second)
+}
+
+fn opus_frame_samples_48k(toc: u8) -> usize {
+    let config = usize::from(toc >> 3);
+    match config {
+        0..=11 => [480, 960, 1_920, 2_880][config % 4],
+        12..=15 => [480, 960][config % 2],
+        _ => [120, 240, 480, 960][config % 4],
+    }
+}
+
+fn validate_browser_message(
+    text: &str,
+    audio_enabled: bool,
+) -> Result<bool, (&'static str, &'static str)> {
     if text.len() > CONTROL_MESSAGE_MAX_BYTES {
         return Err(("message_too_large", "远程桌面控制消息过大"));
     }
@@ -789,6 +1227,17 @@ fn validate_browser_message(text: &str) -> Result<bool, (&'static str, &'static 
             Ok(true)
         }
         "release_all" => Ok(true),
+        "audio_control" => {
+            if !audio_enabled {
+                return Err(("audio_unavailable", "当前远程桌面会话未启用音频"));
+            }
+            if !has_only_fields(&value, &["type", "enabled"])
+                || value.get("enabled").and_then(Value::as_bool).is_none()
+            {
+                return Err(("invalid_message", "远程桌面音频控制消息无效"));
+            }
+            Ok(false)
+        }
         "secure_attention" => Err((
             "secure_attention_unavailable",
             "不允许通过远程桌面发送 Ctrl+Alt+Del",
@@ -812,7 +1261,51 @@ fn is_reliable_browser_message(text: &str) -> bool {
     )
 }
 
-fn validate_agent_message(text: &str) -> Result<(), (&'static str, &'static str)> {
+fn bypasses_desktop_control_gate(text: &str) -> bool {
+    message_type(text).as_deref() == Some("audio_control")
+}
+
+fn audio_control_enabled(text: &str) -> Option<bool> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    (value.get("type").and_then(Value::as_str) == Some("audio_control"))
+        .then(|| value.get("enabled").and_then(Value::as_bool))
+        .flatten()
+}
+
+fn audio_control_generation(text: &str) -> Option<u64> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    (value.get("type").and_then(Value::as_str) == Some("audio_control"))
+        .then(|| value.get("generation").and_then(Value::as_u64))
+        .flatten()
+}
+
+fn stops_audio_stream(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    match value.get("type").and_then(Value::as_str) {
+        Some("audio_state") => value.get("state").and_then(Value::as_str) != Some("playing"),
+        Some("desktop_state") => value.get("desktop").and_then(Value::as_str) != Some("default"),
+        Some("consent_required" | "paused" | "closed" | "error") => true,
+        _ => false,
+    }
+}
+
+fn clear_pending_audio<T: Clone>(receiver: &mut broadcast::Receiver<T>) {
+    loop {
+        match receiver.try_recv() {
+            Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                break;
+            }
+        }
+    }
+}
+
+fn validate_agent_message(
+    text: &str,
+    audio_enabled: bool,
+) -> Result<String, (&'static str, &'static str)> {
     if text.len() > CONTROL_MESSAGE_MAX_BYTES {
         return Err(("message_too_large", "远程桌面状态消息过大"));
     }
@@ -822,6 +1315,38 @@ fn validate_agent_message(text: &str) -> Result<(), (&'static str, &'static str)
         .get("type")
         .and_then(Value::as_str)
         .ok_or(("invalid_message", "远程桌面状态消息缺少类型"))?;
+    if kind == "audio_state" {
+        if !audio_enabled {
+            return Err(("unexpected_audio", "当前远程桌面会话未启用音频"));
+        }
+        let state = value.get("state").and_then(Value::as_str);
+        let reason = value.get("reason").and_then(Value::as_str);
+        let generation = value.get("generation").and_then(Value::as_u64);
+        let valid_generation = match (state, reason, generation) {
+            (Some("starting"), Some("control_ack"), Some(_)) => true,
+            (_, Some("control_ack"), _) | (_, _, Some(_)) => false,
+            _ => true,
+        };
+        if !has_only_fields(&value, &["type", "state", "reason", "generation"])
+            || !matches!(
+                state,
+                Some("off" | "starting" | "playing" | "paused" | "unavailable")
+            )
+            || !valid_optional_status_code(value.get("reason"))
+            || !valid_generation
+        {
+            return Err(("invalid_message", "远程桌面音频状态消息无效"));
+        }
+        return Ok(match (reason, generation) {
+            (Some(reason), Some(generation)) => {
+                json!({"type":"audio_state", "state":state, "reason":reason, "generation":generation})
+            }
+            (Some(reason), None) => json!({"type":"audio_state", "state":state, "reason":reason}),
+            (None, None) => json!({"type":"audio_state", "state":state}),
+            (None, Some(_)) => unreachable!("generation validation requires a reason"),
+        }
+        .to_string());
+    }
     if matches!(
         kind,
         "consent_required"
@@ -833,10 +1358,35 @@ fn validate_agent_message(text: &str) -> Result<(), (&'static str, &'static str)
             | "closed"
             | "error"
     ) {
-        Ok(())
+        Ok(text.to_string())
     } else {
         Err(("unknown_message", "未知的远程桌面状态消息"))
     }
+}
+
+fn has_only_fields(value: &Value, allowed: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+}
+
+fn valid_optional_status_code(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    matches!(
+        value.as_str(),
+        Some(
+            "secure_desktop"
+                | "no_output_device"
+                | "audio_service_unavailable"
+                | "device_invalidated"
+                | "user_token_unavailable"
+                | "capture_failed"
+                | "encoder_failed"
+                | "control_ack"
+        )
+    )
 }
 
 fn normalized_coordinate(value: &Value, field: &str) -> Result<(), (&'static str, &'static str)> {
@@ -918,6 +1468,13 @@ fn server_error(code: &str, message: &str) -> String {
     json!({"type":"error", "code":code, "message":message}).to_string()
 }
 
+fn opening_message(audio_codec: Option<DesktopAudioCodec>) -> String {
+    match audio_codec {
+        Some(codec) => json!({"type":"opening", "audio_codec":codec.as_str()}).to_string(),
+        None => json!({"type":"opening"}).to_string(),
+    }
+}
+
 fn try_send_browser_error(sender: &mpsc::Sender<String>, code: &str, message: &str) {
     let _ = sender.try_send(server_error(code, message));
 }
@@ -966,18 +1523,130 @@ mod tests {
         frame
     }
 
+    fn valid_audio_frame() -> Vec<u8> {
+        let mut frame = vec![0; FRAME_HEADER_BYTES];
+        frame[0..4].copy_from_slice(b"OMRA");
+        frame[4] = 1;
+        frame[5] = 1;
+        frame[6] = OPUS_CHANNELS;
+        frame[8..16].copy_from_slice(&7_u64.to_be_bytes());
+        frame[16..24].copy_from_slice(&20_000_u64.to_be_bytes());
+        frame[24..28].copy_from_slice(&OPUS_SAMPLE_RATE.to_be_bytes());
+        frame[28..32].copy_from_slice(&OPUS_SAMPLES_PER_CHANNEL.to_be_bytes());
+        frame.push(0xf8);
+        frame
+    }
+
     #[test]
     fn validates_omrd_jpeg_frame() {
-        assert!(validate_frame(&valid_frame()).is_ok());
+        assert_eq!(
+            validate_binary_frame(&valid_frame()),
+            Ok(DesktopBinaryFrameKind::Video)
+        );
         let mut invalid = valid_frame();
         invalid[4] = 2;
-        assert!(validate_frame(&invalid).is_err());
+        assert!(validate_binary_frame(&invalid).is_err());
+    }
+
+    #[test]
+    fn validates_strict_omra_opus_frame() {
+        assert_eq!(
+            validate_binary_frame(&valid_audio_frame()),
+            Ok(DesktopBinaryFrameKind::Audio)
+        );
+
+        let mut discontinuity = valid_audio_frame();
+        discontinuity[7] = AUDIO_DISCONTINUITY_FLAG;
+        assert_eq!(
+            validate_binary_frame(&discontinuity),
+            Ok(DesktopBinaryFrameKind::Audio)
+        );
+
+        for (index, value) in [(4, 2), (5, 2), (6, 1), (7, 2)] {
+            let mut invalid = valid_audio_frame();
+            invalid[index] = value;
+            assert!(validate_binary_frame(&invalid).is_err());
+        }
+
+        let mut invalid_rate = valid_audio_frame();
+        invalid_rate[24..28].copy_from_slice(&44_100_u32.to_be_bytes());
+        assert!(validate_binary_frame(&invalid_rate).is_err());
+
+        let mut invalid_samples = valid_audio_frame();
+        invalid_samples[28..32].copy_from_slice(&480_u32.to_be_bytes());
+        assert!(validate_binary_frame(&invalid_samples).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_omra_payload_sizes_and_unknown_media() {
+        let mut empty = valid_audio_frame();
+        empty.truncate(FRAME_HEADER_BYTES);
+        assert!(validate_binary_frame(&empty).is_err());
+
+        let mut oversized = valid_audio_frame();
+        oversized.resize(FRAME_HEADER_BYTES + OPUS_MAX_PACKET_BYTES + 1, 0);
+        assert!(validate_binary_frame(&oversized).is_err());
+        assert!(validate_binary_frame(b"NOPE").is_err());
+
+        let mut missing_vbr_length = valid_audio_frame();
+        missing_vbr_length.truncate(FRAME_HEADER_BYTES);
+        missing_vbr_length.push(0x02);
+        assert!(validate_binary_frame(&missing_vbr_length).is_err());
+
+        let mut odd_cbr = valid_audio_frame();
+        odd_cbr.truncate(FRAME_HEADER_BYTES);
+        odd_cbr.extend_from_slice(&[0x01, 0xaa]);
+        assert!(validate_binary_frame(&odd_cbr).is_err());
+
+        let mut excessive_duration = valid_audio_frame();
+        excessive_duration.truncate(FRAME_HEADER_BYTES);
+        excessive_duration.extend_from_slice(&[0x1b, 0x03]);
+        assert!(validate_binary_frame(&excessive_duration).is_err());
+
+        let mut truncated_padding = valid_audio_frame();
+        truncated_padding.truncate(FRAME_HEADER_BYTES);
+        truncated_padding.extend_from_slice(&[0xfb, 0x41, 0xff]);
+        assert!(validate_binary_frame(&truncated_padding).is_err());
+    }
+
+    #[test]
+    fn malformed_negotiated_audio_is_a_protocol_error() {
+        let mut malformed_audio = valid_audio_frame();
+        malformed_audio[4] = 2;
+        assert!(classify_agent_binary_frame(&malformed_audio, true).is_err());
+        assert_eq!(
+            classify_agent_binary_frame(&valid_frame(), true),
+            Ok(AgentBinaryFrameDisposition::Video)
+        );
+
+        assert_eq!(
+            classify_agent_binary_frame(&valid_audio_frame(), false),
+            Err(("unexpected_audio", "当前远程桌面会话未启用音频"))
+        );
+        let mut malformed_video = valid_frame();
+        malformed_video[4] = 2;
+        assert!(classify_agent_binary_frame(&malformed_video, true).is_err());
+    }
+
+    #[test]
+    fn accepts_rfc_6716_opus_packet_framing_modes() {
+        for packet in [
+            vec![0xf8, 0xaa],
+            vec![0xf1, 0xaa, 0xbb],
+            vec![0xf2, 0x01, 0xaa, 0xbb],
+            vec![0xeb, 0x84, 0x01, 0x01, 0x01, 0xaa, 0xbb, 0xcc, 0xdd],
+            vec![0xf3, 0x42, 0x01, 0xaa, 0xbb, 0x00],
+        ] {
+            assert!(valid_opus_packet(&packet), "rejected packet {packet:02x?}");
+        }
+        assert!(!valid_opus_packet(&[0xf9, 0xaa, 0xbb]));
     }
 
     #[test]
     fn desktop_quality_defaults_to_balanced() {
         let query: DesktopBrowserWsQuery = serde_json::from_value(json!({})).unwrap();
         assert_eq!(query.quality, DesktopQuality::Balanced);
+        assert_eq!(query.audio, None);
         assert_eq!(
             query.quality.stream_settings(),
             DesktopStreamSettings {
@@ -1038,31 +1707,347 @@ mod tests {
     }
 
     #[test]
+    fn negotiates_opus_only_for_capable_agents() {
+        let query: DesktopBrowserWsQuery = serde_json::from_value(json!({"audio":"opus"})).unwrap();
+        assert_eq!(query.audio, Some(DesktopAudioCodec::Opus));
+        assert!(serde_json::from_value::<DesktopBrowserWsQuery>(json!({"audio":"pcm"})).is_err());
+
+        assert_eq!(negotiate_audio_codec(query.audio, &[]), None);
+        assert_eq!(
+            negotiate_audio_codec(query.audio, &[DESKTOP_AUDIO_CAPABILITY.to_string()],),
+            Some(DesktopAudioCodec::Opus)
+        );
+    }
+
+    #[test]
+    fn audio_codec_is_optional_in_opening_and_agent_open_messages() {
+        let legacy_opening: Value = serde_json::from_str(&opening_message(None)).unwrap();
+        assert!(legacy_opening.get("audio_codec").is_none());
+        assert_eq!(
+            serde_json::from_str::<Value>(&opening_message(Some(DesktopAudioCodec::Opus))).unwrap()
+                ["audio_codec"],
+            AUDIO_CODEC_OPUS
+        );
+
+        let legacy = json!({
+            "type": "desktop_open",
+            "session_id": "desktop-1",
+            "stream_token": "token",
+            "max_width": 1280,
+            "max_height": 720,
+            "min_fps": 6,
+            "max_fps": 8,
+            "jpeg_quality": 50
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentOutbound>(legacy).unwrap(),
+            AgentOutbound::DesktopOpen {
+                audio_codec: None,
+                ..
+            }
+        ));
+
+        let no_audio = serde_json::to_value(AgentOutbound::DesktopOpen {
+            session_id: "desktop-1".to_string(),
+            stream_token: "token".to_string(),
+            audio_codec: None,
+            max_width: 1280,
+            max_height: 720,
+            min_fps: 6,
+            max_fps: 8,
+            jpeg_quality: 50,
+        })
+        .unwrap();
+        assert!(no_audio.get("audio_codec").is_none());
+
+        let encoded = serde_json::to_value(AgentOutbound::DesktopOpen {
+            session_id: "desktop-1".to_string(),
+            stream_token: "token".to_string(),
+            audio_codec: Some(AUDIO_CODEC_OPUS.to_string()),
+            max_width: 1280,
+            max_height: 720,
+            min_fps: 6,
+            max_fps: 8,
+            jpeg_quality: 50,
+        })
+        .unwrap();
+        assert_eq!(encoded["audio_codec"], AUDIO_CODEC_OPUS);
+    }
+
+    #[test]
     fn validates_browser_control_message_types() {
         assert_eq!(
-            validate_browser_message(r#"{"type":"pointer_move","x":0.5,"y":1.0}"#),
+            validate_browser_message(r#"{"type":"pointer_move","x":0.5,"y":1.0}"#, false),
             Ok(true)
         );
         assert_eq!(
             validate_browser_message(
-                r#"{"type":"feedback","sequence":7,"fps":10.0,"decode_ms":4.2}"#
+                r#"{"type":"feedback","sequence":7,"fps":10.0,"decode_ms":4.2}"#,
+                false,
             ),
             Ok(false)
         );
         assert_eq!(
-            validate_browser_message(r#"{"type":"secure_attention"}"#),
+            validate_browser_message(r#"{"type":"audio_control","enabled":false}"#, true),
+            Ok(false)
+        );
+        assert!(bypasses_desktop_control_gate(
+            r#"{"type":"audio_control","enabled":false}"#
+        ));
+        assert!(!bypasses_desktop_control_gate(
+            r#"{"type":"pointer_move","x":0.5,"y":1.0}"#
+        ));
+        assert!(is_reliable_browser_message(
+            r#"{"type":"audio_control","enabled":false}"#
+        ));
+        assert!(
+            validate_browser_message(r#"{"type":"audio_control","enabled":false}"#, false).is_err()
+        );
+        assert!(
+            validate_browser_message(r#"{"type":"audio_control","enabled":"no"}"#, true).is_err()
+        );
+        assert!(
+            validate_browser_message(
+                r#"{"type":"audio_control","enabled":true,"extra":"raw"}"#,
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            validate_browser_message(r#"{"type":"secure_attention"}"#, false),
             Err((
                 "secure_attention_unavailable",
                 "不允许通过远程桌面发送 Ctrl+Alt+Del"
             ))
         );
-        assert!(validate_browser_message(r#"{"type":"pointer_move","x":2,"y":0}"#).is_err());
-        assert!(validate_browser_message(r#"{"type":"unknown"}"#).is_err());
+        assert!(validate_browser_message(r#"{"type":"pointer_move","x":2,"y":0}"#, false).is_err());
+        assert!(validate_browser_message(r#"{"type":"unknown"}"#, false).is_err());
     }
 
     #[test]
     fn validates_local_consent_status_message() {
-        assert!(validate_agent_message(r#"{"type":"consent_required"}"#).is_ok());
+        assert!(validate_agent_message(r#"{"type":"consent_required"}"#, false).is_ok());
+    }
+
+    #[test]
+    fn validates_audio_state_and_safe_reason_codes() {
+        for state in ["off", "starting", "playing", "paused", "unavailable"] {
+            let message = json!({
+                "type": "audio_state",
+                "state": state,
+                "reason": "device_invalidated",
+            })
+            .to_string();
+            assert!(validate_agent_message(&message, true).is_ok());
+        }
+        assert!(
+            validate_agent_message(r#"{"type":"audio_state","state":"playing"}"#, true).is_ok()
+        );
+        assert!(
+            validate_agent_message(r#"{"type":"audio_state","state":"playing"}"#, false).is_err()
+        );
+        let control_ack = validate_agent_message(
+            r#"{"type":"audio_state","state":"starting","reason":"control_ack","generation":7}"#,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&control_ack).unwrap(),
+            json!({
+                "type": "audio_state",
+                "state": "starting",
+                "reason": "control_ack",
+                "generation": 7,
+            })
+        );
+        assert!(
+            validate_agent_message(
+                r#"{"type":"audio_state","state":"starting","reason":"control_ack"}"#,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_agent_message(
+                r#"{"type":"audio_state","state":"playing","reason":"control_ack","generation":7}"#,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_agent_message(
+                r#"{"type":"audio_state","state":"playing","generation":7}"#,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_agent_message(
+                r#"{"type":"audio_state","state":"unknown","reason":"ok"}"#,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_agent_message(
+                r#"{"type":"audio_state","state":"unavailable","reason":"unsafe reason"}"#,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_agent_message(
+                r#"{"type":"audio_state","state":"unavailable","reason":"other_failure"}"#,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_agent_message(
+                r#"{"type":"audio_state","state":"unavailable","reason":"capture_failed","error":"raw WASAPI failure"}"#,
+                true,
+            )
+            .is_err()
+        );
+        let sanitized = validate_agent_message(
+            r#"{"type":"audio_state","state":"unavailable","reason":"raw WASAPI failure","reason":"capture_failed"}"#,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&sanitized).unwrap(),
+            json!({
+                "type": "audio_state",
+                "state": "unavailable",
+                "reason": "capture_failed"
+            })
+        );
+        assert!(!sanitized.contains("raw WASAPI failure"));
+    }
+
+    #[tokio::test]
+    async fn audio_relay_overwrites_the_oldest_packet_at_capacity() {
+        let (sender, mut receiver) = broadcast::channel::<Arc<Vec<u8>>>(AUDIO_RELAY_CAPACITY);
+        for sequence in 0..=AUDIO_RELAY_CAPACITY {
+            sender.send(Arc::new(vec![sequence as u8])).unwrap();
+        }
+
+        assert!(matches!(
+            receiver.recv().await,
+            Err(broadcast::error::RecvError::Lagged(1))
+        ));
+        assert_eq!(receiver.recv().await.unwrap().as_slice(), &[1]);
+    }
+
+    #[test]
+    fn audio_relay_waits_for_the_current_control_ack_and_discontinuity() {
+        let mut gate = AudioRelayGate::new();
+        let continuous = valid_audio_frame();
+        let mut discontinuous = valid_audio_frame();
+        discontinuous[7] = AUDIO_DISCONTINUITY_FLAG;
+
+        gate.set_control(1, true);
+        gate.observe_state(
+            r#"{"type":"audio_state","state":"starting","reason":"control_ack","generation":0}"#,
+        );
+        assert!(!gate.accepts_audio(&discontinuous));
+
+        gate.observe_state(
+            r#"{"type":"audio_state","state":"starting","reason":"control_ack","generation":1}"#,
+        );
+        assert!(!gate.accepts_audio(&continuous));
+        assert!(gate.accepts_audio(&discontinuous));
+        assert!(gate.accepts_audio(&continuous));
+
+        gate.set_control(2, false);
+        assert!(!gate.accepts_audio(&discontinuous));
+        gate.set_control(3, true);
+        gate.observe_state(
+            r#"{"type":"audio_state","state":"starting","reason":"control_ack","generation":2}"#,
+        );
+        assert!(!gate.accepts_audio(&discontinuous));
+        gate.observe_state(
+            r#"{"type":"audio_state","state":"starting","reason":"control_ack","generation":3}"#,
+        );
+        assert!(gate.accepts_audio(&discontinuous));
+
+        gate.observe_state(r#"{"type":"audio_state","state":"unavailable"}"#);
+        assert!(!gate.accepts_audio(&continuous));
+        assert!(gate.accepts_audio(&discontinuous));
+    }
+
+    #[test]
+    fn browser_audio_relay_merges_duplicate_controls_and_rejects_old_generations() {
+        let mut gate = BrowserAudioRelayGate::new();
+        let packet = |generation| DesktopAudioPacket {
+            generation,
+            frame: Arc::new(valid_audio_frame()),
+        };
+
+        assert_eq!(gate.set_control(false), None);
+        assert_eq!(gate.set_control(true), Some(1));
+        assert!(!gate.accepts(&packet(0)));
+        assert!(!gate.observe_state(
+            r#"{"type":"audio_state","state":"starting","reason":"control_ack","generation":0}"#,
+        ));
+        assert!(gate.observe_state(
+            r#"{"type":"audio_state","state":"starting","reason":"control_ack","generation":1}"#,
+        ));
+        assert!(gate.accepts(&packet(1)));
+        assert_eq!(gate.set_control(true), None);
+        assert!(gate.accepts(&packet(1)));
+
+        assert_eq!(gate.set_control(false), Some(2));
+        assert!(!gate.accepts(&packet(1)));
+        assert_eq!(gate.set_control(true), Some(3));
+        assert!(!gate.observe_state(
+            r#"{"type":"audio_state","state":"starting","reason":"control_ack","generation":1}"#,
+        ));
+        assert!(!gate.accepts(&packet(1)));
+        assert!(gate.observe_state(
+            r#"{"type":"audio_state","state":"starting","reason":"control_ack","generation":3}"#,
+        ));
+        assert!(!gate.accepts(&packet(1)));
+        assert!(gate.accepts(&packet(3)));
+    }
+
+    #[test]
+    fn audio_stop_events_discard_pending_relay_packets() {
+        let (sender, mut receiver) = broadcast::channel::<Arc<Vec<u8>>>(AUDIO_RELAY_CAPACITY);
+        sender.send(Arc::new(vec![1])).unwrap();
+        sender.send(Arc::new(vec![2])).unwrap();
+
+        assert_eq!(
+            audio_control_enabled(r#"{"type":"audio_control","enabled":false}"#),
+            Some(false)
+        );
+        assert_eq!(
+            audio_control_enabled(r#"{"type":"audio_control","enabled":true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            audio_control_generation(r#"{"type":"audio_control","enabled":true,"generation":9}"#),
+            Some(9)
+        );
+        assert_eq!(
+            audio_control_enabled(r#"{"type":"pointer_move","enabled":true}"#),
+            None
+        );
+        assert!(stops_audio_stream(
+            r#"{"type":"audio_state","state":"paused","reason":"secure_desktop"}"#
+        ));
+        assert!(stops_audio_stream(
+            r#"{"type":"desktop_state","desktop":"other"}"#
+        ));
+        assert!(!stops_audio_stream(
+            r#"{"type":"audio_state","state":"playing"}"#
+        ));
+
+        clear_pending_audio(&mut receiver);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

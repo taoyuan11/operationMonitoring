@@ -112,7 +112,7 @@
 .desktop-view-toggle button + button { border-left: 1px solid #303936; }
 .desktop-view-toggle button:hover, .desktop-tool-button:hover, .desktop-close-button:hover { color: #edf4f1; background: #222b28; }
 .desktop-tool-button:disabled { cursor: not-allowed; opacity: .45; }
-.desktop-view-toggle button.active { color: #a0ead2; background: rgba(73, 200, 159, .1); }
+.desktop-view-toggle button.active, .desktop-tool-button.active { color: #a0ead2; background: rgba(73, 200, 159, .1); }
 .desktop-close-button { width: 34px; padding: 0; color: #c1cac6; }
 
 .remote-desktop-viewport {

@@ -127,6 +127,8 @@ pub enum AgentCommand {
         max_fps: u8,
         #[arg(long, default_value_t = 70)]
         jpeg_quality: u8,
+        #[arg(long)]
+        audio_codec: Option<String>,
         #[arg(long, hide = true)]
         system_helper: bool,
     },

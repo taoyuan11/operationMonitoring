@@ -759,6 +759,8 @@ pub enum AgentOutbound {
         min_fps: u8,
         max_fps: u8,
         jpeg_quality: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio_codec: Option<String>,
     },
     DesktopClose {
         session_id: String,
@@ -1277,8 +1279,31 @@ mod tests {
         });
         assert!(matches!(
             serde_json::from_value::<AgentOutbound>(open).unwrap(),
-            AgentOutbound::DesktopOpen { session_id, jpeg_quality: 70, .. }
-                if session_id == "desktop-1"
+            AgentOutbound::DesktopOpen {
+                session_id,
+                jpeg_quality: 70,
+                audio_codec: None,
+                ..
+            } if session_id == "desktop-1"
+        ));
+
+        let with_audio = json!({
+            "type": "desktop_open",
+            "session_id": "desktop-2",
+            "stream_token": "one-time-token",
+            "max_width": 1280,
+            "max_height": 720,
+            "min_fps": 6,
+            "max_fps": 8,
+            "jpeg_quality": 50,
+            "audio_codec": "opus"
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentOutbound>(with_audio).unwrap(),
+            AgentOutbound::DesktopOpen {
+                audio_codec: Some(codec),
+                ..
+            } if codec == "opus"
         ));
 
         assert_eq!(

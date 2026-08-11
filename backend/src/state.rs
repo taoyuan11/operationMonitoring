@@ -6,7 +6,9 @@ use std::{
 
 use ipnet::IpNet;
 use sqlx::PgPool;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{
+    Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, mpsc, oneshot, watch,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -187,8 +189,16 @@ pub struct DesktopSessionHandle {
     pub token_claimed: bool,
     pub browser_tx: mpsc::Sender<String>,
     pub frame_tx: watch::Sender<Option<Arc<Vec<u8>>>>,
+    pub audio_tx: broadcast::Sender<DesktopAudioPacket>,
+    pub audio_codec: Option<String>,
     pub agent_input_rx: Arc<Mutex<Option<mpsc::Receiver<String>>>>,
     pub close_tx: watch::Sender<Option<String>>,
+}
+
+#[derive(Clone)]
+pub struct DesktopAudioPacket {
+    pub generation: u64,
+    pub frame: Arc<Vec<u8>>,
 }
 
 #[derive(Debug)]

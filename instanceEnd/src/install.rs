@@ -1128,7 +1128,7 @@ start_service() {
 }
 "#;
 #[cfg(target_os = "macos")]
-const MACOS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>com.operation-monitoring.agent</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>set -a; . '/Library/Application Support/OperationMonitoring/agent.env'; exec /usr/local/bin/om-agent service-run</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>/Library/Logs/OperationMonitoring/agent.log</string><key>StandardErrorPath</key><string>/Library/Logs/OperationMonitoring/agent.log</string></dict></plist>"#;
+const MACOS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>com.operation-monitoring.agent</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>set -a; . '/Library/Application Support/OperationMonitoring/agent.env'; exec /usr/local/bin/om-agent service-run</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>"#;
 
 #[cfg(test)]
 mod tests {
@@ -1324,6 +1324,13 @@ mod macos_tests {
     fn launch_daemon_uses_the_short_executable_name() {
         assert!(MACOS.contains("exec /usr/local/bin/om-agent service-run"));
         assert!(!MACOS.contains("exec /usr/local/bin/operation-monitoring-agent service-run"));
+    }
+
+    #[test]
+    fn launch_daemon_does_not_write_the_agent_managed_log() {
+        assert!(!MACOS.contains("StandardOutPath"));
+        assert!(!MACOS.contains("StandardErrorPath"));
+        assert!(!MACOS.contains("/Library/Logs/OperationMonitoring/agent.log"));
     }
 
     #[test]

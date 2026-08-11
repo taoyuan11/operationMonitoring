@@ -746,7 +746,7 @@ fn dispatch_command_job(
         return;
     };
 
-    crate::logging::info(format_args!("running command job {job_id}: {command}"));
+    crate::logging::info(format_args!("running command job {job_id}"));
     let command_outbound = outbound.clone();
     let output_outbound = outbound.clone();
     let output_job_id = job_id.clone();

@@ -158,9 +158,20 @@ fn open_log_file(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options
+    let file = options
         .open(path)
-        .with_context(|| format!("failed to open log file {}", path.display()))
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
+    #[cfg(unix)]
+    set_private_permissions(&file, path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn set_private_permissions(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure log file {}", path.display()))
 }
 
 fn history_path(path: &Path, index: usize) -> PathBuf {
@@ -202,9 +213,22 @@ fn remove_excess_history(path: &Path, history: usize) -> Result<()> {
         };
         if index > history {
             remove_if_exists(&entry.path())?;
+        } else {
+            #[cfg(unix)]
+            secure_existing_history(&entry.path())?;
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn secure_existing_history(path: &Path) -> Result<()> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Ok(());
+    }
+    let file = File::open(path)
+        .with_context(|| format!("failed to open log history {}", path.display()))?;
+    set_private_permissions(&file, path)
 }
 
 #[cfg(test)]
@@ -253,6 +277,32 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "22222\n");
         assert!(!history_path(&path, 1).exists());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restricts_existing_log_and_history_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_log();
+        let history = history_path(&path, 1);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "current\n").unwrap();
+        fs::write(&history, "history\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&history, fs::Permissions::from_mode(0o644)).unwrap();
+
+        drop(RollingLog::open(&path, 1024, 1).unwrap());
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&history).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

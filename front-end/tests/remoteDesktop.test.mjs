@@ -12,13 +12,18 @@ const compiledSource = ts.transpileModule(source, {
 }).outputText
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiledSource).toString('base64')}`
 const {
+  canSendDesktopSecureAttention,
   DESKTOP_AUDIO_DISCONTINUITY_FLAG,
+  DesktopControlProtocolError,
   DESKTOP_MEDIA_HEADER_BYTES,
   DESKTOP_OPUS_MAX_PACKET_BYTES,
   DesktopMediaProtocolError,
+  desktopMessageControllable,
   desktopStateAllowsAudio,
   desktopWebSocketPath,
   parseDesktopMediaFrame,
+  parseDesktopServerMessage,
+  resolveDesktopInteractionState,
   shouldReanchorAudio,
 } = await import(moduleUrl)
 
@@ -304,6 +309,116 @@ test('restores audio readiness only on the default Windows desktop', () => {
   assert.equal(desktopStateAllowsAudio('default'), true)
   assert.equal(desktopStateAllowsAudio('secure'), false)
   assert.equal(desktopStateAllowsAudio('other'), false)
+})
+
+test('strictly parses the extended desktop policy and device status messages', () => {
+  assert.deepEqual(parseDesktopServerMessage(JSON.stringify({
+    type: 'session_policy',
+    access_mode: 'unattended',
+    local_consent_required: false,
+    secure_desktop_control: true,
+    secure_attention_allowed: true,
+  })), {
+    type: 'session_policy',
+    access_mode: 'unattended',
+    local_consent_required: false,
+    secure_desktop_control: true,
+    secure_attention_allowed: true,
+  })
+  assert.deepEqual(parseDesktopServerMessage(JSON.stringify({
+    type: 'display_state',
+    state: 'preparing',
+    source: 'virtual',
+    code: 'virtual_display_preparing',
+  })), {
+    type: 'display_state',
+    state: 'preparing',
+    source: 'virtual',
+    code: 'virtual_display_preparing',
+  })
+  assert.deepEqual(parseDesktopServerMessage(JSON.stringify({
+    type: 'desktop_state',
+    desktop: 'secure',
+    context: 'winlogon',
+    controllable: true,
+  })), {
+    type: 'desktop_state',
+    desktop: 'secure',
+    context: 'winlogon',
+    controllable: true,
+  })
+})
+
+test('rejects inconsistent unattended policy and partial desktop context messages', () => {
+  for (const message of [
+    {
+      type: 'session_policy',
+      access_mode: 'unattended',
+      local_consent_required: true,
+      secure_desktop_control: true,
+      secure_attention_allowed: true,
+    },
+    {
+      type: 'session_policy',
+      access_mode: 'local_consent',
+      local_consent_required: true,
+      secure_desktop_control: false,
+      secure_attention_allowed: true,
+    },
+    { type: 'display_state', state: 'ready', source: 'virtual', code: 'Bad Code' },
+    { type: 'desktop_state', desktop: 'secure', context: 'winlogon' },
+  ]) {
+    assert.throws(
+      () => parseDesktopServerMessage(JSON.stringify(message)),
+      (error) => error instanceof DesktopControlProtocolError,
+    )
+  }
+})
+
+test('keeps legacy desktop state default-only and gates readiness on ready plus first frame', () => {
+  const legacyDefault = parseDesktopServerMessage('{"type":"desktop_state","desktop":"default"}')
+  const legacySecure = parseDesktopServerMessage('{"type":"desktop_state","desktop":"secure"}')
+  assert.equal(desktopMessageControllable(legacyDefault), true)
+  assert.equal(desktopMessageControllable(legacySecure), false)
+
+  const base = {
+    displayState: 'ready',
+    serverReady: false,
+    firstFrameRendered: false,
+    desktopControllable: true,
+  }
+  assert.equal(resolveDesktopInteractionState(base), 'waiting_ready')
+  assert.equal(resolveDesktopInteractionState({ ...base, serverReady: true }), 'waiting_frame')
+  assert.equal(resolveDesktopInteractionState({
+    ...base,
+    serverReady: true,
+    firstFrameRendered: true,
+  }), 'ready')
+  assert.equal(resolveDesktopInteractionState({
+    ...base,
+    serverReady: true,
+    firstFrameRendered: true,
+    desktopControllable: false,
+  }), 'paused')
+  assert.equal(resolveDesktopInteractionState({ ...base, displayState: 'preparing' }), 'preparing')
+  assert.equal(resolveDesktopInteractionState({ ...base, displayState: 'unavailable' }), 'unavailable')
+})
+
+test('allows Ctrl+Alt+Del only for a ready controllable unattended session', () => {
+  const allowed = {
+    accessMode: 'unattended',
+    secureDesktopControl: true,
+    secureAttentionAllowed: true,
+    desktopControllable: true,
+    serverReady: true,
+    firstFrameRendered: true,
+  }
+  assert.equal(canSendDesktopSecureAttention(allowed), true)
+  for (const key of Object.keys(allowed)) {
+    if (key === 'accessMode') continue
+    assert.equal(canSendDesktopSecureAttention({ ...allowed, [key]: false }), false)
+  }
+  assert.equal(canSendDesktopSecureAttention({ ...allowed, accessMode: 'local_consent' }), false)
 })
 
 test('reanchors audio only at the bounded latency and continuity limits', () => {

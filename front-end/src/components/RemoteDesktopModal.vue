@@ -4,6 +4,8 @@ import {
   Expand,
   Fullscreen,
   Gauge,
+  Keyboard,
+  LoaderCircle,
   Maximize2,
   Monitor,
   RefreshCw,
@@ -14,16 +16,22 @@ import {
 } from 'lucide-vue-next'
 import {
   DESKTOP_AUDIO_CAPABILITY,
+  canSendDesktopSecureAttention,
+  desktopMessageControllable,
   desktopStateAllowsAudio,
   desktopWebSocketUrl,
   parseDesktopMediaFrame,
+  parseDesktopServerMessage,
+  resolveDesktopInteractionState,
+  type DesktopContext,
+  type DesktopDisplaySource,
+  type DesktopDisplayState,
+  type DesktopKind,
   type DesktopQuality,
+  type DesktopServerMessage,
   type DesktopVideoFrame,
 } from '../api/desktop'
-import {
-  type DesktopAudioServerState,
-  useRemoteDesktopAudio,
-} from '../composables/useRemoteDesktopAudio'
+import { useRemoteDesktopAudio } from '../composables/useRemoteDesktopAudio'
 import type { Instance } from '../types/domain'
 
 const POINTER_INTERVAL_MS = 1000 / 30
@@ -45,19 +53,8 @@ const desktopQualityOptions: Array<{ value: DesktopQuality; label: string }> = [
 
 type DesktopFrame = DesktopVideoFrame & {
   generation: number
+  displayGeneration: number
 }
-
-type DesktopServerMessage =
-  | { type: 'opening'; audio_codec?: string }
-  | { type: 'consent_required' }
-  | { type: 'ready' }
-  | { type: 'display'; width: number; height: number }
-  | { type: 'desktop_state'; desktop: 'default' | 'secure' | 'other' }
-  | { type: 'notice'; code: string; message: string }
-  | { type: 'audio_state'; state: DesktopAudioServerState; reason?: string }
-  | { type: 'paused'; reason: string }
-  | { type: 'closed'; reason: string }
-  | { type: 'error'; code: string; message: string }
 
 type DesktopClientMessage =
   | { type: 'pointer_move'; x: number; y: number }
@@ -71,6 +68,7 @@ type DesktopClientMessage =
     modifiers: KeyModifier[]
   }
   | { type: 'release_all' }
+  | { type: 'secure_attention' }
   | { type: 'audio_control'; enabled: boolean }
   | {
     type: 'feedback'
@@ -101,16 +99,28 @@ const isFullscreen = ref(false)
 const isNarrowViewport = ref(false)
 const hasCoarsePointer = ref(false)
 const sessionWarning = ref('')
-const desktopKind = ref<'default' | 'secure' | 'other'>('default')
+const desktopNotice = ref('')
+const desktopKind = ref<DesktopKind>('default')
+const desktopContext = ref<DesktopContext>('default')
+const desktopControllable = ref(true)
+const displayState = ref<DesktopDisplayState>('unknown')
+const displaySource = ref<DesktopDisplaySource>('unknown')
+const sessionAccessMode = ref<'local_consent' | 'unattended'>('local_consent')
+const secureDesktopControl = ref(false)
+const secureAttentionAllowed = ref(false)
+const serverReady = ref(false)
+const firstFrameRendered = ref(false)
 
 let socket: WebSocket | null = null
 let socketGeneration = 0
+let displayGeneration = 0
 let resizeObserver: ResizeObserver | null = null
 let viewportMediaQuery: MediaQueryList | null = null
 let pointerMediaQuery: MediaQueryList | null = null
 let feedbackTimer: number | null = null
 let warningTimer: number | null = null
 let reconnectTimer: number | null = null
+let noticeTimer: number | null = null
 let pendingFrame: DesktopFrame | null = null
 let decodingFrame = false
 let currentBitmap: ImageBitmap | null = null
@@ -156,6 +166,7 @@ const resolutionLabel = computed(() =>
     : '等待画面',
 )
 const statusLabel = computed(() => {
+  if (connectionState.value === 'connecting' && displayState.value === 'preparing') return '准备显示器'
   switch (connectionState.value) {
     case 'connecting': return '连接中'
     case 'ready': return '已连接'
@@ -167,7 +178,28 @@ const statusLabel = computed(() => {
 })
 const showStatusOverlay = computed(() => connectionState.value !== 'ready')
 const showInputHint = computed(() => isNarrowViewport.value || hasCoarsePointer.value)
-const canControl = computed(() => connectionState.value === 'ready' && desktopKind.value === 'default' && !hasCoarsePointer.value)
+const canControl = computed(() =>
+  connectionState.value === 'ready' && desktopControllable.value && !hasCoarsePointer.value,
+)
+const canSendSecureAttention = computed(() => canSendDesktopSecureAttention({
+  accessMode: sessionAccessMode.value,
+  secureDesktopControl: secureDesktopControl.value,
+  secureAttentionAllowed: secureAttentionAllowed.value,
+  desktopControllable: desktopControllable.value,
+  serverReady: serverReady.value,
+  firstFrameRendered: firstFrameRendered.value,
+}))
+const secureAttentionTitle = computed(() => {
+  if (canSendSecureAttention.value) return '向远程 Windows 发送 Ctrl+Alt+Del'
+  if (sessionAccessMode.value !== 'unattended') return '当前会话需要本地同意，不能发送 Ctrl+Alt+Del'
+  if (!secureDesktopControl.value) return '当前 Agent 不能控制 Windows 安全桌面'
+  return '当前桌面尚不能接收 Ctrl+Alt+Del'
+})
+const displaySourceLabel = computed(() => {
+  if (displaySource.value === 'physical') return '物理显示器'
+  if (displaySource.value === 'virtual') return '虚拟显示器'
+  return ''
+})
 
 onMounted(() => {
   viewportMediaQuery = window.matchMedia('(max-width: 760px)')
@@ -200,6 +232,7 @@ onBeforeUnmount(() => {
   socketGeneration += 1
   socket?.close(1000, 'client_closed')
   socket = null
+  if (noticeTimer !== null) window.clearTimeout(noticeTimer)
   resizeObserver?.disconnect()
   viewportMediaQuery?.removeEventListener('change', updateMediaState)
   pointerMediaQuery?.removeEventListener('change', updateMediaState)
@@ -267,6 +300,15 @@ function openConnection() {
   decodeTimes = []
   renderedFps.value = 0
   desktopKind.value = 'default'
+  desktopContext.value = 'default'
+  desktopControllable.value = true
+  displayState.value = 'unknown'
+  displaySource.value = 'unknown'
+  sessionAccessMode.value = 'local_consent'
+  secureDesktopControl.value = false
+  secureAttentionAllowed.value = false
+  serverReady.value = false
+  firstFrameRendered.value = false
   pressedMouseButtons.clear()
   currentBitmap?.close()
   currentBitmap = null
@@ -319,9 +361,9 @@ function openConnection() {
 function handleServerMessage(payload: string) {
   let message: DesktopServerMessage
   try {
-    message = JSON.parse(payload) as DesktopServerMessage
-  } catch {
-    failProtocol('收到无法解析的远程桌面消息')
+    message = parseDesktopServerMessage(payload)
+  } catch (error) {
+    failProtocol(error instanceof Error ? error.message : '收到无法解析的远程桌面消息')
     return
   }
 
@@ -337,15 +379,8 @@ function handleServerMessage(payload: string) {
       statusDetail.value = '等待远程计算机上的用户允许本次查看和控制'
       break
     case 'ready':
-      desktopKind.value = 'default'
-      readyRemoteAudio()
-      connectionState.value = 'ready'
-      statusDetail.value = '键盘和鼠标操作将发送到远程实例'
-      if (!sessionStartedAt) {
-        sessionStartedAt = Date.now()
-        lastInputAt = sessionStartedAt
-      }
-      void nextTick(() => canvasElement.value?.focus())
+      serverReady.value = true
+      updateInteractiveState()
       break
     case 'display':
       if (message.width > 0 && message.height > 0) {
@@ -354,19 +389,63 @@ function handleServerMessage(payload: string) {
         void nextTick(drawCurrentFrame)
       }
       break
+    case 'session_policy':
+      sessionAccessMode.value = message.access_mode
+      secureDesktopControl.value = message.secure_desktop_control
+      secureAttentionAllowed.value = message.secure_attention_allowed
+      if (message.local_consent_required) {
+        statusDetail.value = '当前远程桌面会话需要本地用户同意'
+      }
+      break
+    case 'display_state':
+      displayState.value = message.state
+      displaySource.value = message.source
+      if (message.state === 'preparing') {
+        displayGeneration += 1
+        pendingFrame = null
+        serverReady.value = false
+        firstFrameRendered.value = false
+        pauseRemoteAudio()
+        releaseAllInputs()
+        connectionState.value = 'connecting'
+        statusDetail.value = message.source === 'virtual'
+          ? '正在准备虚拟显示器'
+          : '正在准备远程显示器'
+      } else if (message.state === 'unavailable') {
+        pauseRemoteAudio()
+        releaseAllInputs()
+        connectionState.value = 'error'
+        statusDetail.value = desktopError(message.code || 'display_unavailable', '')
+      } else {
+        updateInteractiveState()
+      }
+      break
     case 'desktop_state':
+      if (
+        message.desktop !== desktopKind.value
+        || (message.context !== undefined && message.context !== desktopContext.value)
+      ) {
+        displayGeneration += 1
+        pendingFrame = null
+        serverReady.value = false
+        firstFrameRendered.value = false
+        releaseAllInputs()
+      }
       desktopKind.value = message.desktop
-      if (desktopStateAllowsAudio(message.desktop)) readyRemoteAudio()
-      else pauseRemoteAudio()
-      connectionState.value = message.desktop === 'default' ? 'ready' : 'paused'
-      statusDetail.value = message.desktop === 'secure'
-        ? 'Windows 正在显示登录或 UAC 安全桌面，远程查看和控制已暂停'
-        : message.desktop === 'other'
-          ? 'Windows 已切换到非默认桌面，远程查看和控制已暂停'
-          : '键盘和鼠标操作将发送到远程实例'
+      desktopContext.value = message.context
+        || (message.desktop === 'default' ? 'default' : message.desktop === 'secure' ? 'winlogon' : 'other')
+      desktopControllable.value = desktopMessageControllable(message)
+      if (!desktopStateAllowsAudio(message.desktop)) pauseRemoteAudio()
+      updateInteractiveState()
       break
     case 'notice':
-      statusDetail.value = message.message || desktopError(message.code, '')
+      statusDetail.value = desktopError(message.code, message.message)
+      desktopNotice.value = statusDetail.value
+      if (noticeTimer !== null) window.clearTimeout(noticeTimer)
+      noticeTimer = window.setTimeout(() => {
+        desktopNotice.value = ''
+        noticeTimer = null
+      }, 5000)
       break
     case 'audio_state':
       handleAudioState(message.state, message.reason)
@@ -394,6 +473,50 @@ function handleServerMessage(payload: string) {
   }
 }
 
+function updateInteractiveState() {
+  const interactionState = resolveDesktopInteractionState({
+    displayState: displayState.value,
+    serverReady: serverReady.value,
+    firstFrameRendered: firstFrameRendered.value,
+    desktopControllable: desktopControllable.value,
+  })
+  if (interactionState === 'preparing' || interactionState === 'unavailable') return
+  if (interactionState === 'waiting_ready' || interactionState === 'waiting_frame') {
+    connectionState.value = 'connecting'
+    statusDetail.value = interactionState === 'waiting_frame'
+      ? '正在等待远程桌面的首个有效画面'
+      : '正在启动 Windows 桌面捕获'
+    return
+  }
+  if (interactionState === 'paused') {
+    connectionState.value = 'paused'
+    statusDetail.value = desktopKind.value === 'secure'
+      ? 'Windows 正在显示登录或 UAC 安全桌面，当前模式已暂停远程控制'
+      : 'Windows 已切换到不可控制的系统桌面'
+    releaseAllInputs()
+    return
+  }
+
+  connectionState.value = 'ready'
+  statusDetail.value = desktopContext.value === 'winlogon'
+    ? '正在控制 Windows 登录或安全桌面'
+    : '键盘和鼠标操作将发送到远程实例'
+  if (desktopStateAllowsAudio(desktopKind.value)) readyRemoteAudio()
+  if (!sessionStartedAt) {
+    sessionStartedAt = Date.now()
+    lastInputAt = sessionStartedAt
+  }
+  void nextTick(() => canvasElement.value?.focus())
+}
+
+function sendSecureAttention() {
+  if (!canSendSecureAttention.value) return
+  if (sendMessage({ type: 'secure_attention' })) {
+    markInputActivity()
+    statusDetail.value = '已请求 Windows 显示安全选项'
+  }
+}
+
 function handleMediaFrame(buffer: ArrayBuffer) {
   try {
     const frame = parseDesktopMediaFrame(buffer, audioNegotiated.value)
@@ -411,6 +534,7 @@ function queueVideoFrame(frame: DesktopVideoFrame) {
   pendingFrame = {
     ...frame,
     generation: socketGeneration,
+    displayGeneration,
   }
   displayWidth.value = frame.width
   displayHeight.value = frame.height
@@ -425,7 +549,10 @@ async function decodeNextFrame() {
     const startedAt = performance.now()
     try {
       const bitmap = await createImageBitmap(new Blob([frame.jpeg], { type: 'image/jpeg' }))
-      if (frame.generation !== socketGeneration) {
+      if (
+        frame.generation !== socketGeneration
+        || frame.displayGeneration !== displayGeneration
+      ) {
         bitmap.close()
         continue
       }
@@ -436,6 +563,10 @@ async function decodeNextFrame() {
       currentBitmap = bitmap
       latestSequence = frame.sequence
       drawCurrentFrame()
+      if (!firstFrameRendered.value) {
+        firstFrameRendered.value = true
+        updateInteractiveState()
+      }
       previousBitmap?.close()
 
       const now = performance.now()
@@ -443,7 +574,10 @@ async function decodeNextFrame() {
       renderTimes = renderTimes.filter((value) => value >= now - 1000)
       renderedFps.value = renderTimes.length
     } catch {
-      if (frame.generation !== socketGeneration) continue
+      if (
+        frame.generation !== socketGeneration
+        || frame.displayGeneration !== displayGeneration
+      ) continue
       failProtocol('浏览器无法解码远程桌面画面')
       pendingFrame = null
     }
@@ -726,6 +860,20 @@ function desktopError(code: string, fallback: string) {
     desktop_locked: 'Windows 桌面已锁定，解锁后可继续操作',
     secure_desktop: 'Windows 正在显示安全桌面，暂不支持远程操作',
     secure_attention_unavailable: 'Windows 或系统策略未允许发送 Ctrl+Alt+Del',
+    secure_attention_denied: '当前远程会话未获准发送 Ctrl+Alt+Del',
+    secure_attention_not_allowed: '当前远程会话未获准发送 Ctrl+Alt+Del',
+    secure_attention_policy_denied: 'Windows 系统策略拒绝发送 Ctrl+Alt+Del',
+    display_unavailable: 'Windows 当前没有可用显示设备，且虚拟显示器未能就绪',
+    no_display_device: '未检测到物理显示器，虚拟显示器尚未就绪',
+    no_display_output: '未检测到可捕获的 Windows 显示输出',
+    virtual_device_reboot_required: 'Windows 需要重启后才能启用虚拟显示器',
+    virtual_devices_disabled: '此 Agent 已禁用虚拟显示设备',
+    driver_bundle_missing: '当前 Agent 未内置虚拟显示驱动',
+    virtual_display_preparing: '正在准备虚拟显示器',
+    virtual_display_driver_missing: '虚拟显示驱动未安装，无法创建远程画面',
+    virtual_display_driver_unhealthy: '虚拟显示驱动运行异常，无法创建远程画面',
+    virtual_display_reboot_required: '虚拟显示驱动需要重启 Windows 后生效',
+    session_changed: 'Windows 交互会话已改变，请重新连接远程桌面',
     unsupported: '当前 Agent 不支持网页远程桌面',
     instance_offline: '实例当前离线，无法建立远程桌面连接',
     unauthorized: '管理员登录已失效，请重新登录',
@@ -744,6 +892,7 @@ function desktopReason(reason: string) {
     idle_timeout: '会话因长时间无键鼠操作而结束',
     session_timeout: '会话已达到最长 2 小时时长',
     browser_disconnected: '浏览器连接已断开',
+    browser_heartbeat_timeout: '浏览器与服务端心跳超时，远程桌面会话已结束',
     agent_disconnected: 'Agent 已断开连接',
     client_closed: '远程桌面会话已关闭',
     browser_closed: '浏览器已关闭远程桌面连接',
@@ -756,8 +905,17 @@ function desktopReason(reason: string) {
     helper_disconnected: 'Windows 桌面捕获进程已断开',
     helper_error: 'Windows 桌面捕获进程发生错误，请查看 Agent 日志',
     agent_data_error: 'Agent 远程桌面数据连接发生错误',
+    data_channel_timeout: 'Agent 远程桌面数据通道连接超时',
     agent_error: 'Agent 处理远程桌面时发生错误，请查看 Agent 日志',
     frame_too_large: '桌面画面复杂度过高，JPEG 帧超过 2 MiB 限制',
+    display_unavailable: 'Windows 当前没有可用显示设备，且虚拟显示器未能就绪',
+    no_display_output: '未检测到可捕获的 Windows 显示输出',
+    unattended_policy_rejected: 'Agent 未能确认无人值守安全策略，已拒绝本次连接',
+    virtual_device_reboot_required: 'Windows 需要重启后才能启用虚拟显示器',
+    virtual_devices_disabled: '此 Agent 已禁用虚拟显示设备',
+    driver_bundle_missing: '当前 Agent 未内置虚拟显示驱动',
+    virtual_display_reboot_required: '虚拟显示驱动需要重启 Windows 后生效',
+    session_changed: 'Windows 交互会话已改变，请重新连接远程桌面',
   }
   return reasons[reason] || reason || '远程桌面会话已结束'
 }
@@ -807,6 +965,8 @@ function isDesktopQuality(value: string | null): value is DesktopQuality {
               <i :class="connectionState"></i>{{ statusLabel }}
               <span>{{ resolutionLabel }}</span>
               <span>{{ renderedFps }} FPS</span>
+              <span v-if="displaySourceLabel">{{ displaySourceLabel }}</span>
+              <span v-if="sessionAccessMode === 'unattended'">无人值守</span>
               <span v-if="desktopKind !== 'default'">{{ desktopKind === 'secure' ? '安全桌面' : '系统桌面' }}</span>
             </p>
           </div>
@@ -845,6 +1005,18 @@ function isDesktopQuality(value: string | null): value is DesktopQuality {
               <Maximize2 :size="15" />1:1
             </button>
           </div>
+          <button
+            v-if="instance.capabilities?.includes('remote_desktop_unattended_v1')"
+            class="desktop-tool-button"
+            type="button"
+            :title="secureAttentionTitle"
+            aria-label="发送 Ctrl+Alt+Del"
+            :disabled="!canSendSecureAttention"
+            @click="sendSecureAttention"
+          >
+            <Keyboard :size="15" />
+            <span>Ctrl+Alt+Del</span>
+          </button>
           <button
             :class="['desktop-tool-button', { active: audioEnabled }]"
             type="button"
@@ -891,7 +1063,10 @@ function isDesktopQuality(value: string | null): value is DesktopQuality {
 
         <Transition name="fade-scale">
           <div v-if="showStatusOverlay" :class="['remote-desktop-status', connectionState]" role="status">
-            <span><Monitor :size="30" /></span>
+            <span>
+              <LoaderCircle v-if="connectionState === 'connecting'" class="spin" :size="30" />
+              <Monitor v-else :size="30" />
+            </span>
             <strong>{{ statusLabel }}</strong>
             <p>{{ statusDetail }}</p>
             <button
@@ -909,6 +1084,9 @@ function isDesktopQuality(value: string | null): value is DesktopQuality {
         </div>
         <div v-if="sessionWarning" class="remote-desktop-session-warning" role="alert">
           {{ sessionWarning }}
+        </div>
+        <div v-if="desktopNotice" class="remote-desktop-notice" role="alert">
+          {{ desktopNotice }}
         </div>
       </div>
     </section>

@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://operation-monitoring.invalid/schemas/windows-driver-bundle-lock-v1.json",
+  "title": "Operation Monitoring Windows driver bundle lock",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "production_ready",
+    "bundle_version",
+    "provider",
+    "minimum_agent_version",
+    "architectures"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "production_ready": { "type": "boolean" },
+    "bundle_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "provider": { "const": "Operation Monitoring" },
+    "minimum_agent_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "maximum_agent_version_exclusive": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "architectures": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "x64": { "$ref": "#/$defs/architecture" },
+        "arm64": { "$ref": "#/$defs/architecture" }
+      },
+      "minProperties": 1
+    }
+  },
+  "$defs": {
+    "architecture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packages"],
+      "properties": {
+        "packages": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/package" }
+        }
+      }
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "driver_version", "hardware_id", "catalog_path", "files"],
+      "properties": {
+        "kind": { "enum": ["display", "audio"] },
+        "driver_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "hardware_id": { "enum": ["ROOT\\OMVIRTUALDISPLAY", "ROOT\\OMVIRTUALAUDIO"] },
+        "catalog_path": { "$ref": "#/$defs/path" },
+        "files": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": { "$ref": "#/$defs/path" },
+              "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" }
+            }
+          }
+        }
+      }
+    },
+    "path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)[^:]+$"
+    }
+  }
+}

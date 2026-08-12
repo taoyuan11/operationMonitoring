@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM64"><Configuration>Debug</Configuration><Platform>ARM64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64"><Configuration>Release</Configuration><Platform>ARM64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{BBD4FB91-EA0A-40B7-A40F-4D54E71FBC70}</ProjectGuid>
+    <RootNamespace>OmVirtualAudio</RootNamespace>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <DriverType>KMDF</DriverType>
+    <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup>
+    <TargetName>OmVirtualAudio</TargetName>
+    <OutDir>$(SolutionDir)artifacts\$(Platform)\$(Configuration)\$(ProjectName)\</OutDir>
+    <IntDir>$(SolutionDir)artifacts\obj\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <EnablePREfast>true</EnablePREfast>
+      <ExceptionHandling>false</ExceptionHandling>
+      <AdditionalIncludeDirectories>Source\Main;Source\Inc;Source\Filters;Source\Utilities;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;PC_IMPLEMENTATION;_USE_WAVERT_;_NEW_DELETE_OPERATORS_;DEBUG_LEVEL=DEBUGLVL_TERSE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>portcls.lib;stdunk.lib;libcntpr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <DriverSign><FileDigestAlgorithm>sha256</FileDigestAlgorithm></DriverSign>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="Source\Main\adapter.cpp" />
+    <ClCompile Include="Source\Main\basetopo.cpp" />
+    <ClCompile Include="Source\Main\common.cpp" />
+    <ClCompile Include="Source\Main\mintopo.cpp" />
+    <ClCompile Include="Source\Main\minwavert.cpp" />
+    <ClCompile Include="Source\Main\minwavertstream.cpp" />
+    <ClCompile Include="Source\Main\NewDelete.cpp" />
+    <ClCompile Include="Source\Filters\speakertopo.cpp" />
+    <ClCompile Include="Source\Utilities\hw.cpp" />
+    <ClCompile Include="Source\Utilities\kshelper.cpp" />
+    <Inf Include="OmVirtualAudio.inf" />
+    <FilesToPackage Include="$(TargetPath)" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Source\Main\minwavert.h" />
+    <ClInclude Include="Source\Main\minwavertstream.h" />
+    <ClInclude Include="Source\Inc\NewDelete.h" />
+    <ClInclude Include="Source\Inc\basetopo.h" />
+    <ClInclude Include="Source\Inc\common.h" />
+    <ClInclude Include="Source\Inc\definitions.h" />
+    <ClInclude Include="Source\Inc\endpoints.h" />
+    <ClInclude Include="Source\Inc\kshelper.h" />
+    <ClInclude Include="Source\Inc\mintopo.h" />
+    <ClInclude Include="Source\Filters\minipairs.h" />
+    <ClInclude Include="Source\Filters\speakertopo.h" />
+    <ClInclude Include="Source\Filters\speakertoptable.h" />
+    <ClInclude Include="Source\Filters\speakerwavtable.h" />
+    <ClInclude Include="Source\Utilities\hw.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

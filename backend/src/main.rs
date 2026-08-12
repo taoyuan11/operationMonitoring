@@ -10,6 +10,7 @@ mod files;
 mod handlers;
 mod jobs;
 mod models;
+mod remote_access;
 mod remote_desktop;
 mod request_security;
 mod state;
@@ -52,6 +53,7 @@ use handlers::{
     public_metrics,
 };
 use jobs::command_timeout_loop;
+use remote_access::admin_remote_access_status;
 use remote_desktop::{admin_desktop_ws, agent_desktop_ws};
 use request_security::{RequestScheme, ensure_same_origin, request_scheme};
 use state::AppState;
@@ -231,6 +233,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/instances/{id}/desktop/ws",
             get(admin_desktop_ws),
+        )
+        .route(
+            "/api/admin/instances/{id}/remote-access/status",
+            get(admin_remote_access_status),
         )
         .nest("/api/admin/instances/{id}/docker", docker::router())
         .route(

@@ -114,6 +114,35 @@
 .detail-command-list button { display: inline-flex; min-height: 36px; align-items: center; gap: 7px; padding: 0 12px; color: #b8c1bd; background: rgba(85, 184, 207, .07); border: 1px solid rgba(85, 184, 207, .16); border-radius: 6px; font-size: 12px; }
 .detail-command-list button:hover:not(:disabled) { color: #dff8fd; background: rgba(85, 184, 207, .12); }
 .operation-empty { padding: 14px 0; color: #717c77; font-size: 12px; }
+.remote-access-section > header .icon-button { flex: 0 0 auto; }
+.remote-access-loading, .remote-access-message {
+  display: flex;
+  min-height: 62px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 12px;
+  color: var(--muted);
+  background: var(--surface-inset);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 11px;
+  text-align: center;
+}
+.remote-access-message.error { color: var(--danger-text); background: rgba(236, 113, 130, .06); border-color: rgba(236, 113, 130, .16); }
+.remote-access-reboot { display: flex; align-items: center; gap: 7px; margin-bottom: 10px; padding: 9px 11px; color: #e2bd76; background: rgba(229, 174, 84, .07); border: 1px solid rgba(229, 174, 84, .18); border-radius: 6px; font-size: 11px; }
+.remote-access-reboot svg { flex: 0 0 auto; }
+.remote-access-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.remote-access-item { display: grid; min-width: 0; min-height: 86px; grid-template-columns: 34px minmax(0, 1fr); align-items: center; gap: 10px; padding: 11px 12px; background: var(--surface-inset); border: 1px solid var(--line); border-radius: 7px; }
+.remote-access-item > span { display: inline-flex; width: 34px; height: 34px; align-items: center; justify-content: center; color: var(--accent-strong); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 6px; }
+.remote-access-item.degraded > span { color: #e1bd77; background: rgba(229, 174, 84, .07); border-color: rgba(229, 174, 84, .18); }
+.remote-access-item.unavailable > span { color: var(--danger-text); background: rgba(236, 113, 130, .07); border-color: rgba(236, 113, 130, .17); }
+.remote-access-item > div { min-width: 0; }
+.remote-access-item small, .remote-access-item strong, .remote-access-item p { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-access-item small { margin-bottom: 4px; color: var(--muted-faint); font-size: 9px; }
+.remote-access-item strong { color: var(--text-strong); font-size: 11px; font-weight: 630; }
+.remote-access-item p { margin-top: 4px; color: var(--muted); font-size: 9px; }
+.remote-access-item .remote-access-code { color: #d8b56f; }
 .danger-zone > header { color: var(--danger); }
 .danger-zone > header svg { color: var(--danger); }
 .danger-actions { display: flex; gap: 8px; }
@@ -220,6 +249,7 @@
   .instance-detail-tabs button { min-width: 0; flex: 1; padding: 0 8px; }
   .instance-overview, .instance-operations { gap: 18px; padding: 14px; }
   .operation-command-grid { grid-template-columns: 1fr; }
+  .remote-access-grid { grid-template-columns: 1fr; }
   .device-inventory-row { grid-template-columns: minmax(0, 1fr) auto; }
   .device-inventory-row span:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
   .device-inventory-row span:nth-child(3) { grid-column: 1; grid-row: 3; }

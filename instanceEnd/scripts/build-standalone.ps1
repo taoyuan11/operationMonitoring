@@ -82,6 +82,7 @@ if ($null -eq $HostTargetLine -or "$HostTargetLine" -notmatch '^host: (.+)$') {
 $HostTarget = $Matches[1]
 $OutputDirectory = Join-Path $Root 'dist/standalone'
 $MinimumGlibcVersion = '2.17'
+$DriverBundleVerifier = Join-Path $Root 'scripts/verify-signed-driver-bundle.ps1'
 
 function Get-BuildFailureReason {
     param(
@@ -131,12 +132,69 @@ function Ensure-RustTargets {
     }
 }
 
+function Invoke-WindowsArtifactSigning {
+    param(
+        [Parameter(Mandatory = $true)][string]$Artifact,
+        [Parameter(Mandatory = $true)][bool]$RequireSignature
+    )
+
+    $Thumbprint = "$($env:OM_WINDOWS_SIGNING_CERTIFICATE_SHA1)".Replace(' ', '')
+    if ([string]::IsNullOrWhiteSpace($Thumbprint)) {
+        if ($RequireSignature) {
+            throw 'OM_WINDOWS_SIGNING_CERTIFICATE_SHA1 is required for a bundled-driver Windows release'
+        }
+        return
+    }
+    if ($Thumbprint -notmatch '^[0-9A-Fa-f]{40}$') {
+        throw 'OM_WINDOWS_SIGNING_CERTIFICATE_SHA1 must be a 40-digit SHA-1 certificate thumbprint'
+    }
+    if ([string]::IsNullOrWhiteSpace($env:OM_WINDOWS_TIMESTAMP_URL)) {
+        throw 'OM_WINDOWS_TIMESTAMP_URL is required when signing a Windows artifact'
+    }
+    $Signtool = if ([string]::IsNullOrWhiteSpace($env:OM_SIGNTOOL_PATH)) {
+        'signtool.exe'
+    } else {
+        $env:OM_SIGNTOOL_PATH
+    }
+    $SignResult = Invoke-NativeCommand `
+        -FilePath $Signtool `
+        -ArgumentList @(
+            'sign', '/sha1', $Thumbprint, '/fd', 'SHA256',
+            '/tr', $env:OM_WINDOWS_TIMESTAMP_URL, '/td', 'SHA256', $Artifact
+        ) `
+        -EchoOutput
+    if ($SignResult.ExitCode -ne 0) {
+        throw "Authenticode signing failed with status $($SignResult.ExitCode)"
+    }
+    $VerifyResult = Invoke-NativeCommand `
+        -FilePath $Signtool `
+        -ArgumentList @('verify', '/pa', '/all', '/v', $Artifact) `
+        -EchoOutput
+    if ($VerifyResult.ExitCode -ne 0) {
+        throw "Authenticode verification failed with status $($VerifyResult.ExitCode)"
+    }
+}
+
 function Build-StandaloneTarget {
     param(
         [string]$Target,
         [ValidateSet('linux', 'windows', 'macos')][string]$OS,
         [string]$Architecture
     )
+
+    $BundleDrivers =
+        $OS -eq 'windows' -and
+        $Architecture -in @('x64', 'arm64') -and
+        -not [string]::IsNullOrWhiteSpace($env:OM_WINDOWS_DRIVER_BUNDLE_DIR)
+    if ($BundleDrivers) {
+        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+            throw 'Bundled Windows driver releases must be built on Windows so signtool /kp can enforce kernel signing policy'
+        }
+        & $DriverBundleVerifier `
+            -BundleDir $env:OM_WINDOWS_DRIVER_BUNDLE_DIR `
+            -Architecture $Architecture `
+            -SigntoolPath $env:OM_SIGNTOOL_PATH | Format-List | Out-Host
+    }
 
     $Builder = $RequestedBuilder
     if ($Builder -eq 'auto') {
@@ -187,6 +245,9 @@ function Build-StandaloneTarget {
         $Target
     }
     $CargoArguments += @('--locked', '--release', '--target', $CargoTarget, '--bin', 'om-agent')
+    if ($BundleDrivers) {
+        $CargoArguments += @('--features', 'bundled-windows-drivers')
+    }
 
     Write-Host "Building $OS/$Architecture ($CargoTarget) with $Builder"
     $SetXWinCompiler =
@@ -230,6 +291,9 @@ function Build-StandaloneTarget {
     New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
     $Artifact = Join-Path $OutputDirectory "om-agent_${Version}_${OS}_${Architecture}.$Extension"
     Copy-Item -LiteralPath $Source -Destination $Artifact -Force
+    if ($OS -eq 'windows') {
+        Invoke-WindowsArtifactSigning -Artifact $Artifact -RequireSignature $BundleDrivers
+    }
     $Hash = (Get-FileHash -LiteralPath $Artifact -Algorithm SHA256).Hash.ToLowerInvariant()
     "$Hash  $([IO.Path]::GetFileName($Artifact))" | Set-Content -LiteralPath "$Artifact.sha256" -Encoding ascii
     Write-Host "Created $Artifact"

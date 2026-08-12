@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import {
   DESKTOP_OPUS_CHANNELS,
   DESKTOP_OPUS_SAMPLE_RATE,
+  type DesktopAudioServerState,
   type DesktopAudioCodec,
   type DesktopAudioFrame,
   shouldReanchorAudio,
@@ -14,7 +15,6 @@ const OPUS_CONFIG: AudioDecoderConfig = {
 }
 const INITIAL_BUFFER_SECONDS = 0.1
 
-export type DesktopAudioServerState = 'off' | 'starting' | 'playing' | 'paused' | 'unavailable'
 type DesktopAudioState = 'checking' | 'unsupported' | 'muted' | 'starting' | 'playing' | 'paused' | 'unavailable' | 'error'
 
 export function useRemoteDesktopAudio(options: {

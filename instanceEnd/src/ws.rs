@@ -1,5 +1,8 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
+#[cfg(windows)]
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Url, redirect::Policy};
@@ -23,6 +26,10 @@ use crate::{
     models::{AgentInbound, AgentOutbound, Identity, RollbackOffer, UpdateOffer, UpdateStatus},
     outbound::AgentEventSender,
     profile::host_profile,
+    remote_access::{
+        RemoteAccessManager, STATUS_CAPABILITY as REMOTE_ACCESS_STATUS_CAPABILITY,
+        UNATTENDED_CAPABILITY as REMOTE_DESKTOP_UNATTENDED_CAPABILITY,
+    },
     remote_desktop::{
         AUDIO_CAPABILITY as DESKTOP_AUDIO_CAPABILITY, AUDIO_SUPPORTED as DESKTOP_AUDIO_SUPPORTED,
         CAPABILITY as DESKTOP_CAPABILITY, DesktopManager, DesktopOpenRequest,
@@ -38,6 +45,8 @@ const MAX_CONCURRENT_COMMANDS: usize = 4;
 const MAX_SERVER_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const ROLLBACK_CAPABILITY: &str = "agent_rollback_v1";
+#[cfg(windows)]
+static WINDOWS_DRIVER_STAGE_STARTED: OnceLock<()> = OnceLock::new();
 
 enum SocketOutcome {
     Disconnected,
@@ -236,6 +245,7 @@ async fn handle_agent_socket(
         TerminalManager::new(outbound_tx.clone(), terminal_stream_tx, activity.clone());
     let mut files = FileManager::new(outbound_tx.clone(), binary_tx, activity.clone());
     let mut desktops = DesktopManager::new(config.clone(), activity.clone(), outbound_tx.clone());
+    let remote_access = RemoteAccessManager::new(config);
     let mut docker = DockerManager::new(
         config,
         outbound_tx.clone(),
@@ -264,6 +274,29 @@ async fn handle_agent_socket(
             Err(error) => {
                 crate::logging::error(format_args!("failed to restore update status: {error:#}"))
             }
+        }
+    }
+    #[cfg(windows)]
+    if config.windows_virtual_devices == crate::config::WindowsVirtualDevices::Auto {
+        // connected_status writes the updater health marker first. PnP coordination then runs
+        // once in the background so it cannot delay websocket metrics or update health.
+        if WINDOWS_DRIVER_STAGE_STARTED.set(()).is_ok() {
+            let driver_config = config.clone();
+            tokio::spawn(async move {
+                match tokio::task::spawn_blocking(move || {
+                    crate::remote_access::stage_bundled_after_agent_health(&driver_config)
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => crate::logging::error(format_args!(
+                        "Windows driver staging after agent health failed: {error:#}"
+                    )),
+                    Err(error) => crate::logging::error(format_args!(
+                        "Windows driver staging worker failed: {error}"
+                    )),
+                }
+            });
         }
     }
     let result: Result<SocketOutcome> = async {
@@ -316,6 +349,7 @@ async fn handle_agent_socket(
                                 .as_ref()
                                 .and_then(UpdateManager::rollback_version),
                             docker_status: docker.status(),
+                            remote_access_status: remote_access.status(),
                             metrics,
                         })?;
                     }
@@ -888,6 +922,8 @@ fn websocket_request(
     ];
     if cfg!(windows) {
         capabilities.push(DESKTOP_CAPABILITY);
+        capabilities.push(REMOTE_ACCESS_STATUS_CAPABILITY);
+        capabilities.push(REMOTE_DESKTOP_UNATTENDED_CAPABILITY);
     }
     if DESKTOP_AUDIO_SUPPORTED {
         capabilities.push(DESKTOP_AUDIO_CAPABILITY);

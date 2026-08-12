@@ -1,12 +1,50 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerEndpoint {
     base: Url,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RemoteDesktopConsent {
+    Required,
+    Unattended,
+}
+
+impl std::fmt::Display for RemoteDesktopConsent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Required => "required",
+            Self::Unattended => "unattended",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WindowsVirtualDevices {
+    Auto,
+    Disabled,
+}
+
+impl std::fmt::Display for WindowsVirtualDevices {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Auto => "auto",
+            Self::Disabled => "disabled",
+        })
+    }
+}
+
+fn default_windows_virtual_devices() -> WindowsVirtualDevices {
+    if cfg!(windows) {
+        WindowsVirtualDevices::Auto
+    } else {
+        WindowsVirtualDevices::Disabled
+    }
 }
 
 impl ServerEndpoint {
@@ -131,6 +169,20 @@ pub enum AgentCommand {
         audio_codec: Option<String>,
         #[arg(long, hide = true)]
         system_helper: bool,
+        #[arg(long, hide = true)]
+        unattended: bool,
+        #[arg(
+            long,
+            hide = true,
+            default_value = "unknown",
+            value_parser = ["physical", "virtual", "none", "unknown"]
+        )]
+        display_source: String,
+    },
+    #[command(name = "device-probe", hide = true)]
+    DeviceProbe {
+        #[arg(long)]
+        pipe: String,
     },
 }
 
@@ -168,6 +220,22 @@ pub struct AgentConfig {
     /// Persistent directory used for downloaded packages and update state
     #[arg(long, env = "OM_AGENT_UPDATE_DIR", global = true)]
     pub update_dir: Option<PathBuf>,
+    /// Require local consent or explicitly allow managed unattended Windows access
+    #[arg(
+        long,
+        env = "OM_REMOTE_DESKTOP_CONSENT",
+        default_value_t = RemoteDesktopConsent::Required,
+        global = true
+    )]
+    pub remote_desktop_consent: RemoteDesktopConsent,
+    /// Automatically lease product-owned virtual display/audio devices when hardware is absent
+    #[arg(
+        long,
+        env = "OM_WINDOWS_VIRTUAL_DEVICES",
+        default_value_t = default_windows_virtual_devices(),
+        global = true
+    )]
+    pub windows_virtual_devices: WindowsVirtualDevices,
 }
 
 impl AgentConfig {
@@ -203,6 +271,11 @@ impl AgentConfig {
         if let Some(path) = &self.update_dir {
             command.arg("--update-dir").arg(path);
         }
+        command
+            .arg("--remote-desktop-consent")
+            .arg(self.remote_desktop_consent.to_string())
+            .arg("--windows-virtual-devices")
+            .arg(self.windows_virtual_devices.to_string());
     }
 }
 
@@ -253,6 +326,59 @@ mod tests {
             }
         );
         assert_eq!(cli.agent.server, "https://monitor.example");
+    }
+
+    #[test]
+    fn remote_access_policy_defaults_are_conservative() {
+        let cli = Cli::try_parse_from(["agent", "start"]).unwrap();
+        assert_eq!(
+            cli.agent.remote_desktop_consent,
+            RemoteDesktopConsent::Required
+        );
+        assert_eq!(
+            cli.agent.windows_virtual_devices,
+            default_windows_virtual_devices()
+        );
+    }
+
+    #[test]
+    fn parses_remote_access_policy_from_cli() {
+        let cli = Cli::try_parse_from([
+            "agent",
+            "install",
+            "--yes",
+            "--remote-desktop-consent",
+            "unattended",
+            "--windows-virtual-devices",
+            "disabled",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.agent.remote_desktop_consent,
+            RemoteDesktopConsent::Unattended
+        );
+        assert_eq!(
+            cli.agent.windows_virtual_devices,
+            WindowsVirtualDevices::Disabled
+        );
+    }
+
+    #[test]
+    fn parses_hidden_device_probe_command() {
+        let cli = Cli::try_parse_from([
+            "agent",
+            "device-probe",
+            "--pipe",
+            r"\\.\pipe\om-device-probe-test",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.command,
+            AgentCommand::DeviceProbe {
+                pipe: r"\\.\pipe\om-device-probe-test".to_string(),
+            }
+        );
     }
 
     #[test]

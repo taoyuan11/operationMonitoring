@@ -31,7 +31,10 @@ use crate::{
     },
     models::{
         AgentInbound, AgentOutbound, MAX_AGENT_UPDATE_RETRY_COUNT, MetricPayload,
-        TerminalClientMessage, TerminalServerMessage, TerminalShellInfo,
+        RemoteAccessStatus, TerminalClientMessage, TerminalServerMessage, TerminalShellInfo,
+    },
+    remote_access::{
+        STATUS_CAPABILITY as REMOTE_ACCESS_STATUS_CAPABILITY, update_current_remote_access_status,
     },
     remote_desktop::{close_connection_desktops, desktop_agent_closed, desktop_agent_opened},
     state::{
@@ -86,6 +89,9 @@ pub async fn agent_socket(
     let docker_capable = capabilities
         .iter()
         .any(|capability| capability == DOCKER_CAPABILITY);
+    let remote_access_status_capable = capabilities
+        .iter()
+        .any(|capability| capability == REMOTE_ACCESS_STATUS_CAPABILITY);
     let replaced = state.agents.write().await.insert(
         instance_id.clone(),
         AgentHandle {
@@ -95,6 +101,7 @@ pub async fn agent_socket(
             shutdown_tx,
             capabilities,
             docker_status: Default::default(),
+            remote_access_status: Default::default(),
         },
     );
     if let Some(replaced) = replaced {
@@ -129,6 +136,12 @@ pub async fn agent_socket(
             update_current_docker_status(&state, &instance_id, connection_id, None).await
     {
         warn!(?error, %instance_id, %connection_id, "failed to clear stale Docker status");
+    }
+    if !remote_access_status_capable
+        && let Err(error) =
+            update_current_remote_access_status(&state, &instance_id, connection_id, None).await
+    {
+        warn!(?error, %instance_id, %connection_id, "failed to clear stale remote access status");
     }
     let _ = sqlx::query("UPDATE instances SET last_seen = $1 WHERE id = $2")
         .bind(now_ts())
@@ -332,6 +345,7 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
             native_arch,
             rollback_version,
             docker_status,
+            remote_access_status,
             ..
         } => {
             if hostname.len() > 255
@@ -347,6 +361,12 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
                     serde_json::to_vec(value)
                         .map(|encoded| encoded.len() > MAX_STATUS_MESSAGE_BYTES)
                         .unwrap_or(true)
+                })
+                || remote_access_status.as_ref().is_some_and(|value| {
+                    !valid_remote_access_status(value)
+                        || serde_json::to_vec(value)
+                            .map(|encoded| encoded.len() > MAX_STATUS_MESSAGE_BYTES)
+                            .unwrap_or(true)
                 })
             {
                 return Err("metrics metadata too large");
@@ -479,6 +499,24 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn valid_remote_access_status(status: &RemoteAccessStatus) -> bool {
+    fn valid_device(device: &crate::models::RemoteAccessDeviceStatus) -> bool {
+        let valid_version = device.driver_version.as_ref().is_none_or(|version| {
+            !version.is_empty() && version.len() <= 64 && !version.chars().any(char::is_control)
+        });
+        let valid_code = device.code.as_ref().is_none_or(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        });
+        valid_version && valid_code
+    }
+
+    status.checked_at > 0 && valid_device(&status.display) && valid_device(&status.audio)
+}
+
 fn serialized_len_exceeds<T: serde::Serialize>(value: &T, max_bytes: usize) -> bool {
     serde_json::to_vec(value)
         .map(|encoded| encoded.len() > max_bytes)
@@ -604,6 +642,7 @@ async fn handle_agent_message(
             rollback_supported,
             rollback_version,
             docker_status,
+            remote_access_status,
             metrics,
         } => {
             store_metrics(
@@ -620,6 +659,7 @@ async fn handle_agent_message(
                 rollback_version.as_deref(),
                 connection_id,
                 docker_status,
+                remote_access_status,
                 metrics,
                 latency_ms,
                 latency_sampled_at,
@@ -832,6 +872,7 @@ async fn store_metrics(
     rollback_version: Option<&str>,
     connection_id: Uuid,
     docker_status: Option<crate::models::DockerStatus>,
+    mut remote_access_status: Option<RemoteAccessStatus>,
     metrics: MetricPayload,
     latency_ms: Option<f64>,
     latency_sampled_at: Option<i64>,
@@ -847,6 +888,11 @@ async fn store_metrics(
     }
     let received_at = now_ts();
     let metric_timestamp = normalize_metric_timestamp(metrics.ts, received_at)?;
+    if let Some(status) = &mut remote_access_status {
+        // Remote access status is a current-state snapshot. Order it by this connection's
+        // receipt time so an Agent clock rollback cannot split the online and persisted views.
+        status.checked_at = received_at;
+    }
     sqlx::query(
         r#"
         UPDATE instances
@@ -892,6 +938,8 @@ async fn store_metrics(
     confirm_update_version(state, instance_id, agent_version).await?;
 
     update_current_docker_status(state, instance_id, connection_id, docker_status).await?;
+    update_current_remote_access_status(state, instance_id, connection_id, remote_access_status)
+        .await?;
 
     sqlx::query(
         r#"
@@ -976,6 +1024,7 @@ mod tests {
             shutdown_tx,
             capabilities: Vec::new(),
             docker_status: Default::default(),
+            remote_access_status: Default::default(),
         };
         let active_session_handle = handle.clone();
 
@@ -1165,6 +1214,37 @@ mod tests {
             session_id: "x".repeat(MAX_AGENT_ID_BYTES + 1),
         };
         assert!(validate_agent_inbound(&oversized_id).is_err());
+    }
+
+    #[test]
+    fn remote_access_status_accepts_stable_codes_and_rejects_raw_diagnostics() {
+        use crate::models::{
+            RemoteAccessAvailability, RemoteAccessDeviceSource, RemoteAccessDeviceStatus,
+            RemoteAccessDriverState, RemoteAccessFallbackMode, RemoteDesktopAccessMode,
+        };
+
+        let device = RemoteAccessDeviceStatus {
+            availability: RemoteAccessAvailability::Ready,
+            source: RemoteAccessDeviceSource::Virtual,
+            driver_state: RemoteAccessDriverState::Active,
+            driver_version: Some("1.0.0".to_string()),
+            code: Some("virtual_device_active".to_string()),
+        };
+        let mut status = RemoteAccessStatus {
+            access_mode: RemoteDesktopAccessMode::Unattended,
+            fallback_mode: RemoteAccessFallbackMode::Auto,
+            display: device.clone(),
+            audio: device,
+            reboot_required: false,
+            checked_at: 123,
+        };
+        assert!(valid_remote_access_status(&status));
+
+        status.display.code = Some("CreateDevice failed: access denied".to_string());
+        assert!(!valid_remote_access_status(&status));
+        status.display.code = None;
+        status.audio.driver_version = Some("x".repeat(65));
+        assert!(!valid_remote_access_status(&status));
     }
 }
 

@@ -15,7 +15,7 @@ use crate::{
     auth::AuthCipher,
     config::Cli,
     models::{
-        AgentOutbound, DockerError, DockerResponse, DockerStatus, FileResponse,
+        AgentOutbound, DockerError, DockerResponse, DockerStatus, FileResponse, RemoteAccessStatus,
         TerminalServerMessage, TerminalShellInfo,
     },
     update_signature::UpdateSigner,
@@ -114,6 +114,7 @@ pub struct AgentHandle {
     pub shutdown_tx: watch::Sender<bool>,
     pub capabilities: Vec<String>,
     pub docker_status: Arc<RwLock<Option<DockerStatus>>>,
+    pub remote_access_status: Arc<RwLock<Option<RemoteAccessStatus>>>,
 }
 
 #[derive(Clone)]
@@ -191,6 +192,7 @@ pub struct DesktopSessionHandle {
     pub frame_tx: watch::Sender<Option<Arc<Vec<u8>>>>,
     pub audio_tx: broadcast::Sender<DesktopAudioPacket>,
     pub audio_codec: Option<String>,
+    pub unattended_capable: bool,
     pub agent_input_rx: Arc<Mutex<Option<mpsc::Receiver<String>>>>,
     pub close_tx: watch::Sender<Option<String>>,
 }

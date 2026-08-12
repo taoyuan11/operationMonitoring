@@ -1,6 +1,9 @@
 #[cfg(not(windows))]
 use crate::lifecycle::run_agent;
-use crate::{config::AgentConfig, lifecycle::stop_if_running};
+use crate::{
+    config::{AgentConfig, RemoteDesktopConsent},
+    lifecycle::stop_if_running,
+};
 use anyhow::{Context, Result, bail};
 use std::{
     env, fs,
@@ -32,6 +35,7 @@ pub fn install(mut config: AgentConfig, non_interactive: bool, yes: bool) -> Res
     if non_interactive && !explicit_server {
         bail!("--server is required with --non-interactive");
     }
+    validate_unattended_install_confirmation(&config, non_interactive, yes)?;
     if !non_interactive {
         if !io::stdin().is_terminal() {
             bail!(
@@ -48,6 +52,18 @@ pub fn install(mut config: AgentConfig, non_interactive: bool, yes: bool) -> Res
         return elevate("install", Some(&config));
     }
     install_elevated(&config)
+}
+
+fn validate_unattended_install_confirmation(
+    config: &AgentConfig,
+    non_interactive: bool,
+    yes: bool,
+) -> Result<()> {
+    if non_interactive && config.remote_desktop_consent == RemoteDesktopConsent::Unattended && !yes
+    {
+        bail!("--yes is required for a non-interactive unattended installation");
+    }
+    Ok(())
 }
 
 pub fn uninstall(config: AgentConfig, yes: bool) -> Result<()> {
@@ -391,11 +407,13 @@ fn env_file(c: &AgentConfig, mac: bool) -> String {
         )
     };
     format!(
-        "OM_SERVER='{}'\nOM_REPORT_INTERVAL='{}'\nOM_AGENT_ID_FILE='{id}'\nOM_AGENT_STATE_DIR='{state}'\nOM_AGENT_LOG_FILE='{log}'\nOM_AGENT_LOG_MAX_BYTES='{}'\nOM_AGENT_LOG_HISTORY='{}'\nOM_AGENT_UPDATE_DIR='{update}'\n",
+        "OM_SERVER='{}'\nOM_REPORT_INTERVAL='{}'\nOM_AGENT_ID_FILE='{id}'\nOM_AGENT_STATE_DIR='{state}'\nOM_AGENT_LOG_FILE='{log}'\nOM_AGENT_LOG_MAX_BYTES='{}'\nOM_AGENT_LOG_HISTORY='{}'\nOM_AGENT_UPDATE_DIR='{update}'\nOM_REMOTE_DESKTOP_CONSENT='{}'\nOM_WINDOWS_VIRTUAL_DEVICES='{}'\n",
         quoted(&c.server),
         c.report_interval,
         c.log_max_bytes,
-        c.log_history
+        c.log_history,
+        c.remote_desktop_consent,
+        c.windows_virtual_devices
     )
 }
 
@@ -599,19 +617,24 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
     copy_self(&binary)?;
     fs::create_dir_all(&data)?;
     crate::windows_security::restrict_to_system_and_administrators(&data)?;
+    let driver_reboot_required = crate::remote_access::stage_bundled_windows_drivers(&data)?;
     let identity_path = data.join("identity.json");
     if identity_path.exists() {
         crate::windows_security::restrict_to_system_and_administrators(&identity_path)?;
     }
     private_file(
         data.join("install.json"),
-        &serde_json::to_string_pretty(
-            &serde_json::json!({"server":c.server,"report_interval":c.report_interval}),
-        )?,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "server": c.server,
+            "report_interval": c.report_interval,
+                "remote_desktop_consent": c.remote_desktop_consent.to_string(),
+                "windows_virtual_devices": c.windows_virtual_devices.to_string(),
+                "driver_reboot_required": driver_reboot_required
+        }))?,
     )?;
     fs::write(data.join("install-type"), "standalone\n")?;
     let image = format!(
-        "\"{}\" service-run --server \"{}\" --report-interval {} --identity-file \"{}\" --state-dir \"{}\" --log-file \"{}\" --log-max-bytes {} --log-history {} --update-dir \"{}\"",
+        "\"{}\" service-run --server \"{}\" --report-interval {} --identity-file \"{}\" --state-dir \"{}\" --log-file \"{}\" --log-max-bytes {} --log-history {} --update-dir \"{}\" --remote-desktop-consent {} --windows-virtual-devices {}",
         binary.display(),
         c.server,
         c.report_interval,
@@ -620,7 +643,9 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
         data.join("logs/agent.log").display(),
         c.log_max_bytes,
         c.log_history,
-        data.join("updates").display()
+        data.join("updates").display(),
+        c.remote_desktop_consent,
+        c.windows_virtual_devices
     );
     success(
         Command::new("sc.exe")
@@ -819,6 +844,7 @@ fn uninstall_windows() -> Result<()> {
         .join("OperationMonitoring");
     stop_and_delete_windows_service(WINDOWS_SERVICE_NAME)?;
     stop_and_delete_windows_service(SHORT_WINDOWS_SERVICE_NAME)?;
+    crate::remote_access::uninstall_product_windows_drivers(&data)?;
     windows_path(&install, false)?;
     windows_path(&legacy_install, false)?;
     let _ = fs::remove_dir_all(data);
@@ -1097,8 +1123,13 @@ fn windows_runas(action: &str, c: Option<&AgentConfig>) -> Result<()> {
 fn windows_elevation_arguments(action: &str, c: Option<&AgentConfig>) -> String {
     if let Some(c) = c {
         format!(
-            "{action} --yes --non-interactive --server \"{}\" --report-interval {} --log-max-bytes {} --log-history {}",
-            c.server, c.report_interval, c.log_max_bytes, c.log_history
+            "{action} --yes --non-interactive --server \"{}\" --report-interval {} --log-max-bytes {} --log-history {} --remote-desktop-consent {} --windows-virtual-devices {}",
+            c.server,
+            c.report_interval,
+            c.log_max_bytes,
+            c.log_history,
+            c.remote_desktop_consent,
+            c.windows_virtual_devices
         )
     } else {
         format!("{action} --yes")
@@ -1135,8 +1166,8 @@ mod tests {
     #[cfg(windows)]
     use super::install_windows_command_entry;
     use super::{
-        migrate_path, update_windows_path, windows_command_paths_from_root,
-        windows_elevation_arguments,
+        migrate_path, update_windows_path, validate_unattended_install_confirmation,
+        windows_command_paths_from_root, windows_elevation_arguments,
     };
     use crate::config::AgentConfig;
     use std::fs;
@@ -1178,12 +1209,33 @@ mod tests {
             log_max_bytes: 2_048,
             log_history: 7,
             update_dir: None,
+            remote_desktop_consent: crate::config::RemoteDesktopConsent::Unattended,
+            windows_virtual_devices: crate::config::WindowsVirtualDevices::Auto,
         };
 
         assert_eq!(
             windows_elevation_arguments("install", Some(&config)),
-            "install --yes --non-interactive --server \"https://monitor.example\" --report-interval 9 --log-max-bytes 2048 --log-history 7"
+            "install --yes --non-interactive --server \"https://monitor.example\" --report-interval 9 --log-max-bytes 2048 --log-history 7 --remote-desktop-consent unattended --windows-virtual-devices auto"
         );
+    }
+
+    #[test]
+    fn non_interactive_unattended_install_requires_explicit_confirmation() {
+        let config = AgentConfig {
+            server: "https://monitor.example".to_string(),
+            identity_file: None,
+            report_interval: 5,
+            state_dir: None,
+            log_file: None,
+            log_max_bytes: 1024,
+            log_history: 1,
+            update_dir: None,
+            remote_desktop_consent: crate::config::RemoteDesktopConsent::Unattended,
+            windows_virtual_devices: crate::config::WindowsVirtualDevices::Auto,
+        };
+        assert!(validate_unattended_install_confirmation(&config, true, false).is_err());
+        assert!(validate_unattended_install_confirmation(&config, true, true).is_ok());
+        assert!(validate_unattended_install_confirmation(&config, false, false).is_ok());
     }
 
     #[test]

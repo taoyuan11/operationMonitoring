@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Server,
   ShieldAlert,
+  ShieldCheck,
   Terminal,
   Timer,
   Trash2,
@@ -29,6 +30,7 @@ import {
   WifiOff,
   X,
   Zap,
+  Volume2,
 } from 'lucide-vue-next'
 import CountryFlag from './CountryFlag.vue'
 import DockerManagerPanel from './DockerManagerPanel.vue'
@@ -37,6 +39,7 @@ import MetricHistoryChart from './MetricHistoryChart.vue'
 import OperatingSystemLogo from './OperatingSystemLogo.vue'
 import { api } from '../api/http'
 import { getDockerStatus } from '../api/docker'
+import { getRemoteAccessStatus, remoteAccessCodeLabel } from '../api/remoteAccess'
 import { getCountryOption } from '../data/countries'
 import type {
   AdminDeviceProfileResponse,
@@ -44,6 +47,8 @@ import type {
   Instance,
   Metric,
   PublicDeviceProfileResponse,
+  RemoteAccessDeviceStatus,
+  RemoteAccessStatus,
 } from '../types/domain'
 import type { DockerStatus } from '../types/docker'
 import { formatBytes, formatDuration, formatTime, metricPercent } from '../utils/format'
@@ -92,24 +97,35 @@ const adminDeviceProfile = ref<AdminDeviceProfileResponse | null>(null)
 const deviceProfileLoading = ref(false)
 const deviceProfileError = ref('')
 const adminDeviceProfileError = ref('')
+const remoteAccessStatus = ref<RemoteAccessStatus | null>(null)
+const remoteAccessLoading = ref(false)
+const remoteAccessError = ref('')
 let dockerStatusRequest = 0
 let deviceProfileRequest = 0
+let remoteAccessRequest = 0
 let dockerStatusTimer: ReturnType<typeof setInterval> | null = null
+let remoteAccessTimer: ReturnType<typeof setInterval> | null = null
 let historyAbort: AbortController | null = null
 
 watch(
   () => props.instance.id,
   () => {
+    remoteAccessRequest += 1
+    remoteAccessLoading.value = false
     activeTab.value = 'details'
     historyMetrics.value = []
     historyFrom.value = 0
     historyTo.value = 0
     historyError.value = ''
     dockerStatus.value = null
+    remoteAccessStatus.value = null
+    remoteAccessError.value = ''
     void loadDeviceProfile()
     if (props.isAdmin) {
       void loadDockerStatus()
       startDockerStatusPolling()
+      void loadRemoteAccessStatus()
+      startRemoteAccessStatusPolling()
     }
   },
   { immediate: true },
@@ -129,7 +145,10 @@ const supportsDocker = computed(() => dockerStatus.value?.protocol_supported ===
 watch(
   () => props.instance.online,
   (online, previousOnline) => {
-    if (props.isAdmin) void loadDockerStatus()
+    if (props.isAdmin) {
+      void loadDockerStatus()
+      void loadRemoteAccessStatus()
+    }
     if (online && previousOnline === false && !publicDeviceProfile.value?.profile) {
       void loadDeviceProfile()
     }
@@ -149,15 +168,25 @@ watch(
   () => props.isAdmin,
   (isAdmin) => {
     dockerStatusRequest += 1
+    remoteAccessRequest += 1
+    remoteAccessLoading.value = false
     if (dockerStatusTimer) {
       clearInterval(dockerStatusTimer)
       dockerStatusTimer = null
     }
+    if (remoteAccessTimer) {
+      clearInterval(remoteAccessTimer)
+      remoteAccessTimer = null
+    }
     dockerStatus.value = null
+    remoteAccessStatus.value = null
+    remoteAccessError.value = ''
     void loadDeviceProfile()
     if (isAdmin) {
       void loadDockerStatus()
       startDockerStatusPolling()
+      void loadRemoteAccessStatus()
+      startRemoteAccessStatusPolling()
     }
   },
 )
@@ -228,7 +257,9 @@ onBeforeUnmount(() => {
   historyAbort?.abort()
   dockerStatusRequest += 1
   deviceProfileRequest += 1
+  remoteAccessRequest += 1
   if (dockerStatusTimer) clearInterval(dockerStatusTimer)
+  if (remoteAccessTimer) clearInterval(remoteAccessTimer)
 })
 
 onMounted(() => {
@@ -354,6 +385,69 @@ function startDockerStatusPolling() {
   if (!props.isAdmin) return
   if (dockerStatusTimer) clearInterval(dockerStatusTimer)
   dockerStatusTimer = setInterval(() => void loadDockerStatus(), 15_000)
+}
+
+async function loadRemoteAccessStatus() {
+  if (!props.isAdmin || !props.instance.os.trim().toLowerCase().includes('windows')) return
+  if (remoteAccessLoading.value) return
+  const request = ++remoteAccessRequest
+  remoteAccessLoading.value = true
+  remoteAccessError.value = ''
+  try {
+    const status = await getRemoteAccessStatus(props.instance.id)
+    if (request === remoteAccessRequest) remoteAccessStatus.value = status
+  } catch {
+    if (request === remoteAccessRequest) remoteAccessError.value = '无法读取远程访问设备状态'
+  } finally {
+    if (request === remoteAccessRequest) remoteAccessLoading.value = false
+  }
+}
+
+function startRemoteAccessStatusPolling() {
+  if (!props.isAdmin || !props.instance.os.trim().toLowerCase().includes('windows')) return
+  if (remoteAccessTimer) clearInterval(remoteAccessTimer)
+  remoteAccessTimer = setInterval(() => void loadRemoteAccessStatus(), 15_000)
+}
+
+function remoteAvailabilityLabel(status: RemoteAccessDeviceStatus) {
+  if (status.availability === 'ready') return '可用'
+  if (status.availability === 'degraded') return '降级可用'
+  if (status.availability === 'unavailable') return '不可用'
+  return '状态未知'
+}
+
+function remoteSourceLabel(status: RemoteAccessDeviceStatus) {
+  if (status.source === 'physical') return '物理设备'
+  if (status.source === 'virtual') return '虚拟设备'
+  if (status.source === 'none') return '无设备'
+  return '来源未知'
+}
+
+function remoteDriverLabel(status: RemoteAccessDeviceStatus) {
+  const labels: Record<RemoteAccessDeviceStatus['driver_state'], string> = {
+    active: '驱动已启用',
+    standby: '驱动待命',
+    missing: '驱动未安装',
+    reboot_required: '驱动等待重启',
+    unhealthy: '驱动异常',
+    unsupported: '平台不支持',
+    unknown: '驱动状态未知',
+  }
+  const version = status.driver_version ? ` · ${status.driver_version}` : ''
+  return `${labels[status.driver_state]}${version}`
+}
+
+function remoteAccessModeLabel(status: RemoteAccessStatus) {
+  if (status.access_mode === 'unattended') return '无人值守'
+  if (status.access_mode === 'required') return '需要本地同意'
+  return '旧版兼容模式'
+}
+
+function remoteFallbackLabel(status: RemoteAccessStatus) {
+  if (status.fallback_mode === 'auto') return '自动虚拟设备兜底'
+  if (status.fallback_mode === 'disabled') return '虚拟设备已停用'
+  if (status.fallback_mode === 'physical_only') return '仅物理设备'
+  return '兜底模式未知'
 }
 </script>
 
@@ -676,6 +770,88 @@ function startDockerStatusPolling() {
                 <small>{{ remoteDesktopUnavailableReason || '浏览器内操作 Windows' }}</small>
               </button>
             </div>
+          </div>
+
+          <div v-if="supportsRemoteDesktop" class="operation-section remote-access-section">
+            <header>
+              <div>
+                <h3>远程访问设备</h3>
+                <p v-if="remoteAccessStatus?.checked_at">检查于 {{ formatTime(remoteAccessStatus.checked_at) }}</p>
+                <p v-else>显示、音频与虚拟设备状态</p>
+              </div>
+              <button
+                class="icon-button subtle"
+                type="button"
+                title="刷新远程访问状态"
+                aria-label="刷新远程访问状态"
+                :disabled="remoteAccessLoading"
+                @click="loadRemoteAccessStatus"
+              >
+                <RefreshCw :class="{ spin: remoteAccessLoading }" :size="15" />
+              </button>
+            </header>
+
+            <div v-if="remoteAccessLoading && !remoteAccessStatus" class="remote-access-loading">
+              <LoaderCircle class="spin" :size="16" />正在读取远程访问状态
+            </div>
+            <div v-else-if="remoteAccessError && !remoteAccessStatus" class="remote-access-message error" role="alert">
+              {{ remoteAccessError }}
+            </div>
+            <template
+              v-else-if="remoteAccessStatus && (!remoteAccessStatus.protocol_supported || !remoteAccessStatus.status_supported)"
+            >
+              <div v-if="remoteAccessError" class="remote-access-message error" role="alert">
+                {{ remoteAccessError }}，当前显示上次成功读取的状态
+              </div>
+              <div class="remote-access-message">
+                当前 Agent 未上报远程设备状态，仍可按旧版远程桌面模式连接。
+              </div>
+            </template>
+            <template v-else-if="remoteAccessStatus">
+              <div v-if="remoteAccessError" class="remote-access-message error" role="alert">
+                {{ remoteAccessError }}，当前显示上次成功读取的状态
+              </div>
+              <div v-if="remoteAccessStatus.reboot_required" class="remote-access-reboot" role="alert">
+                <RefreshCw :size="15" />Windows 需要重启，虚拟显示或音频设备才能生效
+              </div>
+              <div class="remote-access-grid">
+                <div class="remote-access-item">
+                  <span><ShieldCheck :size="16" /></span>
+                  <div>
+                    <small>访问模式</small>
+                    <strong>{{ remoteAccessModeLabel(remoteAccessStatus) }}</strong>
+                    <p>{{ remoteAccessStatus.access_mode === 'unattended' ? '可控制登录与安全桌面' : '每次连接需要本地允许' }}</p>
+                  </div>
+                </div>
+                <div :class="['remote-access-item', remoteAccessStatus.display.availability]">
+                  <span><Monitor :size="16" /></span>
+                  <div>
+                    <small>显示器</small>
+                    <strong>{{ remoteAvailabilityLabel(remoteAccessStatus.display) }} · {{ remoteSourceLabel(remoteAccessStatus.display) }}</strong>
+                    <p>{{ remoteDriverLabel(remoteAccessStatus.display) }}</p>
+                    <p v-if="remoteAccessStatus.display.code" class="remote-access-code">{{ remoteAccessCodeLabel(remoteAccessStatus.display.code) }}</p>
+                  </div>
+                </div>
+                <div :class="['remote-access-item', remoteAccessStatus.audio.availability]">
+                  <span><Volume2 :size="16" /></span>
+                  <div>
+                    <small>音频播放</small>
+                    <strong>{{ remoteAvailabilityLabel(remoteAccessStatus.audio) }} · {{ remoteSourceLabel(remoteAccessStatus.audio) }}</strong>
+                    <p>{{ remoteDriverLabel(remoteAccessStatus.audio) }}</p>
+                    <p v-if="remoteAccessStatus.audio.code" class="remote-access-code">{{ remoteAccessCodeLabel(remoteAccessStatus.audio.code) }}</p>
+                  </div>
+                </div>
+                <div class="remote-access-item">
+                  <span><RefreshCw :size="16" /></span>
+                  <div>
+                    <small>无设备兜底</small>
+                    <strong>{{ remoteFallbackLabel(remoteAccessStatus) }}</strong>
+                    <p>{{ remoteAccessStatus.online ? 'Agent 状态在线' : 'Agent 离线，显示的是最近状态' }}</p>
+                  </div>
+                </div>
+              </div>
+            </template>
+            <div v-else class="remote-access-message">暂无远程访问设备状态</div>
           </div>
 
           <div class="operation-section">

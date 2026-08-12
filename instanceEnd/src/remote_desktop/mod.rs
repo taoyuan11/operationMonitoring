@@ -22,7 +22,7 @@ use crate::{
 };
 
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod windows_audio;
 #[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
@@ -226,6 +226,8 @@ pub struct DesktopOptions {
     pub jpeg_quality: u8,
     pub audio_codec: Option<String>,
     pub system_helper: bool,
+    pub unattended: bool,
+    pub display_source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -423,9 +425,21 @@ pub fn run_helper(options: DesktopOptions) -> Result<()> {
     }
 }
 
+pub fn run_device_probe(pipe: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return tokio::runtime::Runtime::new()?.block_on(windows::run_device_probe(pipe));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pipe;
+        bail!("device-probe is only available on Windows")
+    }
+}
+
 pub(super) fn error_reason(error: &anyhow::Error) -> String {
     let value = error.to_string();
-    const KNOWN: [&str; 11] = [
+    const KNOWN: [&str; 20] = [
         "no_active_session",
         "multiple_active_sessions",
         "desktop_locked",
@@ -437,6 +451,15 @@ pub(super) fn error_reason(error: &anyhow::Error) -> String {
         "agent_draining",
         "data_channel_timeout",
         "frame_too_large",
+        "no_display_output",
+        "session_changed",
+        "unattended_policy_rejected",
+        "virtual_device_reboot_required",
+        "virtual_devices_disabled",
+        "driver_bundle_missing",
+        "device_probe_failed",
+        "virtual_device_create_failed",
+        "virtual_device_not_ready",
     ];
     if let Some(reason) = KNOWN.into_iter().find(|reason| value.contains(reason)) {
         return reason.to_string();
@@ -740,6 +763,8 @@ mod tests {
                 log_max_bytes: 1024,
                 log_history: 1,
                 update_dir: None,
+                remote_desktop_consent: crate::config::RemoteDesktopConsent::Required,
+                windows_virtual_devices: crate::config::WindowsVirtualDevices::Disabled,
             },
             activity,
             outbound,

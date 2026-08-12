@@ -930,6 +930,8 @@ mod tests {
             log_max_bytes: 10 * 1024 * 1024,
             log_history: 3,
             update_dir: None,
+            remote_desktop_consent: crate::config::RemoteDesktopConsent::Required,
+            windows_virtual_devices: crate::config::WindowsVirtualDevices::Disabled,
         }
     }
 

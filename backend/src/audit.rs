@@ -178,7 +178,7 @@ pub async fn finish_session_event(
         r#"
         UPDATE audit_events
         SET status = $1, error_code = $2, error_reason = $3, completed_at = $4
-        WHERE session_id = $5 AND status = 'running'
+        WHERE session_id = $5 AND kind = 'session' AND status = 'running'
         "#,
     )
     .bind(status)

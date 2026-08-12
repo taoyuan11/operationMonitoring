@@ -26,7 +26,9 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, GENERIC_WRITE, HANDLE, HMODULE, HWND, LocalFree, STILL_ACTIVE},
+        Foundation::{
+            CloseHandle, FreeLibrary, GENERIC_WRITE, HANDLE, HMODULE, HWND, LocalFree, STILL_ACTIVE,
+        },
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0},
             Direct3D11::{
@@ -55,12 +57,14 @@ use windows::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
                 SDDL_REVISION_1,
             },
-            DuplicateTokenEx, GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+            CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx, GetTokenInformation,
+            ImpersonateLoggedOnUser, PSECURITY_DESCRIPTOR, RevertToSelf, SECURITY_ATTRIBUTES,
             SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER,
             TokenPrimary, TokenUser,
         },
         System::{
             Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
+            LibraryLoader::{GetProcAddress, LoadLibraryW},
             Pipes::GetNamedPipeClientProcessId,
             RemoteDesktop::{
                 ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
@@ -106,7 +110,11 @@ use super::{
     absolute_pointer_coordinate, dom_code_to_vk, dom_code_uses_extended_key, drop_oldest_channel,
     error_reason, scaled_dimensions, wait_for_input_release_ack, windows_audio,
 };
-use crate::{config::AgentConfig, models::AgentInbound, outbound::AgentEventSender};
+use crate::{
+    config::{AgentConfig, RemoteDesktopConsent},
+    models::AgentInbound,
+    outbound::AgentEventSender,
+};
 
 const CREATE_NO_WINDOW_FLAG: u32 = 0x08000000;
 const PIPE_FRAME: u8 = 1;
@@ -117,13 +125,19 @@ const INTERNAL_STOP: &[u8] = b"stop";
 const INTERNAL_STOPPED: &[u8] = b"stopped";
 const INTERNAL_FATAL_PREFIX: &[u8] = b"fatal:";
 const INTERNAL_AUDIO_CONTROL_ACK_PREFIX: &[u8] = b"audio_control_ack:";
+const INTERNAL_INPUT_BARRIER_PREFIX: &[u8] = b"input_barrier:";
+const INTERNAL_INPUT_READY_PREFIX: &[u8] = b"input_ready:";
 const PIPE_MAX_PACKET: usize = MAX_FRAME_BYTES + 1024;
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const DISPLAY_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
 const DESKTOP_BINDING_LOST: &str = "input_desktop_binding_lost";
 const DESKTOP_HANDLE_CLEANUP_FAILED: &str = "desktop_handle_cleanup_failed";
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+const DEVICE_PROBE_REQUEST: &[u8] = b"probe";
+const DEVICE_PROBE_MAX_RESPONSE: usize = 1024;
+const DEVICE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +146,129 @@ struct AudioControlAck {
     changed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     generation: Option<u64>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperControlEnvelope {
+    input_generation: u64,
+    control: DesktopControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputBarrier {
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputReady {
+    generation: u64,
+    sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputGenerationState {
+    generation: u64,
+    desktop: Option<String>,
+    ready: bool,
+}
+
+#[derive(Debug, Default)]
+struct InputGenerationFence {
+    state: Mutex<InputGenerationState>,
+}
+
+impl Default for InputGenerationState {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            desktop: None,
+            ready: false,
+        }
+    }
+}
+
+impl InputGenerationFence {
+    fn begin_transition(&self, desktop: &str) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation = state.generation.wrapping_add(1).max(1);
+        state.desktop = Some(desktop.to_string());
+        state.ready = false;
+        state.generation
+    }
+
+    fn mark_ready(&self, generation: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation != generation {
+            return false;
+        }
+        state.ready = true;
+        true
+    }
+
+    fn generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
+    fn ready_for_generation(&self, generation: u64) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.ready && state.generation == generation
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RelayInputGate {
+    generation: u64,
+    ready: bool,
+    awaiting_feedback_sequence: Option<u64>,
+}
+
+impl RelayInputGate {
+    fn begin_generation(&mut self, generation: u64) {
+        if generation < self.generation {
+            return;
+        }
+        self.generation = generation;
+        self.ready = false;
+        self.awaiting_feedback_sequence = None;
+    }
+
+    fn arm_after_first_frame(&mut self, sequence: u64) {
+        self.ready = false;
+        self.awaiting_feedback_sequence = Some(sequence);
+    }
+
+    fn observe_feedback(&mut self, sequence: u64) {
+        if self
+            .awaiting_feedback_sequence
+            .is_some_and(|expected| sequence >= expected)
+        {
+            self.awaiting_feedback_sequence = None;
+            self.ready = true;
+        }
+    }
+
+    fn allows(&self, control: &DesktopControl) -> bool {
+        self.ready
+            || matches!(
+                control,
+                DesktopControl::AudioControl { .. } | DesktopControl::Feedback { .. }
+            )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +381,120 @@ impl AudioRelayGate {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+struct SessionAuthorization {
+    session_id: u32,
+    unattended: bool,
+    managed_service: bool,
+}
+
+struct SecureAttentionGate {
+    authorization: SessionAuthorization,
+    policy_confirmed: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionPolicyMessage {
+    #[serde(rename = "type")]
+    kind: String,
+    access_mode: String,
+    local_consent_required: bool,
+    secure_desktop_control: bool,
+    secure_attention_allowed: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesktopStateMessage {
+    #[serde(rename = "type")]
+    kind: String,
+    desktop: String,
+    context: String,
+    controllable: bool,
+}
+
+impl SecureAttentionGate {
+    fn new(authorization: SessionAuthorization) -> Self {
+        Self {
+            authorization,
+            policy_confirmed: false,
+        }
+    }
+
+    fn observe_status(&mut self, status: &str) -> Result<()> {
+        let value: serde_json::Value = serde_json::from_str(status)?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("session_policy") => {
+                let policy: SessionPolicyMessage = serde_json::from_value(value)
+                    .context("invalid desktop helper session_policy")?;
+                let expected_mode = if self.authorization.unattended {
+                    "unattended"
+                } else {
+                    "local_consent"
+                };
+                if policy.kind != "session_policy"
+                    || policy.access_mode != expected_mode
+                    || policy.local_consent_required == self.authorization.unattended
+                    || policy.secure_desktop_control != self.authorization.unattended
+                    || policy.secure_attention_allowed != self.authorization.unattended
+                {
+                    bail!("desktop helper session policy did not match service authorization")
+                }
+                self.policy_confirmed = true;
+            }
+            Some("desktop_state") => {
+                let desktop: DesktopStateMessage = serde_json::from_value(value)
+                    .context("invalid desktop helper desktop_state")?;
+                let consistent = matches!(
+                    (desktop.desktop.as_str(), desktop.context.as_str()),
+                    ("default", "default") | ("secure", "winlogon") | ("other", "other")
+                );
+                if desktop.kind != "desktop_state"
+                    || !matches!(desktop.desktop.as_str(), "default" | "secure" | "other")
+                    || !matches!(desktop.context.as_str(), "default" | "winlogon" | "other")
+                    || !consistent
+                {
+                    bail!("desktop helper reported an invalid desktop state")
+                }
+                let _ = desktop.controllable;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn allowed(&self) -> bool {
+        self.authorization.unattended && self.policy_confirmed
+    }
+}
+
+fn secure_attention_notice(code: &str) -> String {
+    serde_json::json!({
+        "type":"notice",
+        "code":code,
+        "message":"Windows 未允许发送 Ctrl+Alt+Del"
+    })
+    .to_string()
+}
+
+fn secure_attention_result(succeeded: bool, code: Option<&str>) -> String {
+    if succeeded {
+        serde_json::json!({
+            "type":"secure_attention_result",
+            "status":"success"
+        })
+        .to_string()
+    } else {
+        serde_json::json!({
+            "type":"secure_attention_result",
+            "status":"failed",
+            "code":code.unwrap_or("secure_attention_unavailable")
+        })
+        .to_string()
+    }
+}
 // WINSTA_ALL_ACCESS from winuser.h; windows 0.52 does not expose the aggregate constant.
 const WINSTA_ALL_ACCESS_MASK: u32 = 0x0000_037f;
 // SetThreadDesktop constrains subsequent USER calls to the rights on this handle. Generic write
@@ -271,12 +522,12 @@ pub async fn run_session(
     )
     .await
     .map_err(|_| anyhow!("data_channel_timeout"))??;
-    let (socket, pipe, mut child) = established;
+    let (socket, pipe, mut child, authorization) = established;
     let _ = outbound.send(AgentInbound::DesktopOpened {
         session_id: request.session_id.clone(),
     });
 
-    let mut result = relay(socket, pipe, close).await;
+    let mut result = relay(socket, pipe, close, authorization).await;
     if result.is_err()
         && let Some(exit_code) = child.exit_code()
     {
@@ -295,8 +546,16 @@ async fn establish_session(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     tokio::net::windows::named_pipe::NamedPipeServer,
     HelperProcess,
+    SessionAuthorization,
 )> {
-    let (target, user_sid) = helper_target()?;
+    if !crate::remote_access::ensure_ready_for_remote_desktop().await {
+        bail!("device_probe_failed")
+    }
+    if let Some(code) = crate::remote_access::display_readiness_error(config) {
+        bail!(code)
+    }
+    let (target, user_sid) =
+        helper_target(config.remote_desktop_consent == RemoteDesktopConsent::Unattended)?;
     let pipe_name = format!(r"\\.\pipe\omrd-{}", Uuid::new_v4());
     let pipe = create_private_pipe(&pipe_name, &user_sid)?;
 
@@ -306,6 +565,9 @@ async fn establish_session(
         .as_deref()
         .filter(|codec| windows_audio::negotiated(Some(codec)))
         .map(|_| AUDIO_CODEC_NAME.to_string());
+    let managed_unattended = matches!(target, HelperTarget::ServiceSession { .. })
+        && config.remote_desktop_consent == RemoteDesktopConsent::Unattended
+        && current_process_is_local_system()?;
     let options = DesktopOptions {
         pipe: pipe_name,
         max_width: request.max_width.clamp(320, 1920),
@@ -317,6 +579,8 @@ async fn establish_session(
             .clamp(MIN_JPEG_QUALITY, MAX_JPEG_QUALITY),
         audio_codec,
         system_helper: matches!(target, HelperTarget::ServiceSession { .. }),
+        unattended: managed_unattended,
+        display_source: crate::remote_access::expected_display_source(config),
     };
     let mut child = spawn_helper(&options, target, config)?;
 
@@ -360,7 +624,16 @@ async fn establish_session(
         child.terminate();
         return Err(error);
     }
-    Ok((socket, pipe, child))
+    Ok((
+        socket,
+        pipe,
+        child,
+        SessionAuthorization {
+            session_id: target.session_id(),
+            unattended: managed_unattended,
+            managed_service: matches!(target, HelperTarget::ServiceSession { .. }),
+        },
+    ))
 }
 
 fn create_private_pipe(
@@ -401,6 +674,130 @@ fn create_private_pipe(
     }
 }
 
+pub(crate) fn probe_target_session_devices(
+    unattended: bool,
+) -> Result<crate::remote_access::DeviceProbeSnapshot> {
+    static CLIENT: std::sync::OnceLock<Mutex<Option<DeviceProbeClient>>> =
+        std::sync::OnceLock::new();
+
+    let session_id =
+        select_active_session(unattended).map_err(|_| anyhow!("device_probe_failed"))?;
+    let clients = CLIENT.get_or_init(|| Mutex::new(None));
+    let mut client = clients
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if client
+        .as_ref()
+        .is_some_and(|client| client.session_id != session_id)
+    {
+        *client = None;
+    }
+    if client.is_none() {
+        *client = Some(
+            DeviceProbeClient::connect(session_id).map_err(|_| anyhow!("device_probe_failed"))?,
+        );
+    }
+    match client
+        .as_mut()
+        .expect("device probe client was initialized")
+        .probe()
+    {
+        Ok(snapshot) => Ok(snapshot),
+        Err(_) => {
+            *client = None;
+            Err(anyhow!("device_probe_failed"))
+        }
+    }
+}
+
+struct DeviceProbeClient {
+    runtime: tokio::runtime::Runtime,
+    pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+    process: HelperProcess,
+    session_id: u32,
+}
+
+impl DeviceProbeClient {
+    fn connect(session_id: u32) -> Result<Self> {
+        let pipe_name = format!(r"\\.\pipe\om-device-probe-{}", Uuid::new_v4());
+        let pipe = create_private_pipe(&pipe_name, LOCAL_SYSTEM_SID)?;
+        let mut process = spawn_device_probe_in_session(&pipe_name, session_id)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .context("device_probe_failed")?;
+        let connected = runtime.block_on(async {
+            tokio::time::timeout(DEVICE_PROBE_TIMEOUT, pipe.connect())
+                .await
+                .context("device_probe_failed")?
+                .context("device_probe_failed")
+        });
+        if connected.is_err() {
+            process.terminate();
+            return Err(anyhow!("device_probe_failed"));
+        }
+        if validate_pipe_client(&pipe, process.pid(), session_id).is_err() {
+            process.terminate();
+            return Err(anyhow!("device_probe_failed"));
+        }
+        Ok(Self {
+            runtime,
+            pipe,
+            process,
+            session_id,
+        })
+    }
+
+    fn probe(&mut self) -> Result<crate::remote_access::DeviceProbeSnapshot> {
+        if self.process.exit_code().is_some() {
+            bail!("device_probe_failed")
+        }
+        let bytes = self.runtime.block_on(async {
+            tokio::time::timeout(DEVICE_PROBE_TIMEOUT, async {
+                write_packet(&mut self.pipe, PIPE_INTERNAL, DEVICE_PROBE_REQUEST).await?;
+                let (kind, bytes) = read_packet(&mut self.pipe).await?;
+                if kind != PIPE_CONTROL || bytes.len() > DEVICE_PROBE_MAX_RESPONSE {
+                    bail!("device_probe_failed")
+                }
+                Ok::<_, anyhow::Error>(bytes)
+            })
+            .await
+            .context("device_probe_failed")?
+        })?;
+        let snapshot = serde_json::from_slice::<crate::remote_access::DeviceProbeSnapshot>(&bytes)
+            .context("device_probe_failed")?;
+        snapshot.validate(self.session_id)?;
+        Ok(snapshot)
+    }
+}
+
+pub async fn run_device_probe(pipe_name: &str) -> Result<()> {
+    let session_id = current_session_id().map_err(|_| anyhow!("device_probe_failed"))?;
+    if session_id == 0 || !current_process_is_local_system().unwrap_or(false) {
+        bail!("device_probe_failed")
+    }
+    let mut pipe = tokio::time::timeout(DEVICE_PROBE_TIMEOUT, connect_pipe(pipe_name))
+        .await
+        .context("device_probe_failed")??;
+    loop {
+        let (kind, request) = read_packet(&mut pipe)
+            .await
+            .map_err(|_| anyhow!("device_probe_failed"))?;
+        if kind != PIPE_INTERNAL || request != DEVICE_PROBE_REQUEST {
+            bail!("device_probe_failed")
+        }
+        let snapshot = crate::remote_access::probe_current_session_devices(session_id)?;
+        let response = serde_json::to_vec(&snapshot).context("device_probe_failed")?;
+        if response.len() > DEVICE_PROBE_MAX_RESPONSE {
+            bail!("device_probe_failed")
+        }
+        write_packet(&mut pipe, PIPE_CONTROL, &response)
+            .await
+            .map_err(|_| anyhow!("device_probe_failed"))?;
+    }
+}
+
 fn validate_pipe_client(
     pipe: &tokio::net::windows::named_pipe::NamedPipeServer,
     expected_pid: u32,
@@ -430,12 +827,15 @@ async fn relay(
     >,
     pipe: tokio::net::windows::named_pipe::NamedPipeServer,
     mut close: oneshot::Receiver<String>,
+    authorization: SessionAuthorization,
 ) -> Result<String> {
     let (mut ws_write, mut ws_read) = socket.split();
     let (pipe_read, mut pipe_write) = tokio::io::split(pipe);
     let (frame_tx, mut frame_rx) = watch::channel::<Option<Vec<u8>>>(None);
     let (audio_tx, audio_rx) = drop_oldest_channel(AUDIO_CHANNEL_CAPACITY);
     let (status_tx, mut status_rx) = mpsc::channel::<String>(32);
+    let (input_barrier_tx, mut input_barrier_rx) = mpsc::channel::<InputBarrier>(8);
+    let (input_ready_tx, mut input_ready_rx) = mpsc::channel::<InputReady>(8);
     let (release_ack_tx, mut release_ack_rx) = mpsc::channel::<()>(1);
     let (audio_ack_tx, mut audio_ack_rx) = mpsc::channel::<AudioControlAck>(32);
     let (fatal_tx, mut fatal_rx) = mpsc::channel::<String>(1);
@@ -444,17 +844,22 @@ async fn relay(
         frame_tx,
         audio_tx,
         status_tx,
+        input_barrier_tx,
+        input_ready_tx,
         release_ack_tx,
         audio_ack_tx,
         fatal_tx,
     ));
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut session_check = tokio::time::interval(Duration::from_secs(1));
+    session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_browser_message = tokio::time::Instant::now();
     let mut control_rate = ControlRateLimiter::new(Instant::now());
-    let mut input_ready = false;
+    let mut input_gate = RelayInputGate::default();
     let mut audio_open = true;
     let mut audio_relay = AudioRelayGate::new();
+    let mut secure_attention = SecureAttentionGate::new(authorization);
 
     let result: Result<String> = async {
         let reason = loop {
@@ -467,6 +872,16 @@ async fn relay(
             reason = &mut close => {
                 break reason.unwrap_or_else(|_| "agent_disconnected".to_string());
             }
+            barrier = input_barrier_rx.recv() => {
+                let Some(barrier) = barrier else { break "helper_disconnected".to_string() };
+                input_gate.begin_generation(barrier.generation);
+            }
+            ready = input_ready_rx.recv() => {
+                let Some(ready) = ready else { break "helper_disconnected".to_string() };
+                if ready.generation == input_gate.generation {
+                    input_gate.arm_after_first_frame(ready.sequence);
+                }
+            }
             incoming = ws_read.next() => {
                 let Some(incoming) = incoming else { break "browser_disconnected".to_string() };
                 last_browser_message = tokio::time::Instant::now();
@@ -478,7 +893,61 @@ async fn relay(
                         if !control_rate.allow(Instant::now()) {
                             bail!("control_rate_limited: desktop control rate exceeded")
                         }
-                        if !control_is_allowed(input_ready, &control) {
+                        if let DesktopControl::Feedback { sequence, .. } = &control {
+                            input_gate.observe_feedback(*sequence);
+                        }
+                        if !input_gate.allows(&control) {
+                            continue;
+                        }
+                        if matches!(&control, DesktopControl::SecureAttention) {
+                            if !secure_attention.allowed() {
+                                let notice = secure_attention_notice("secure_attention_unavailable");
+                                tokio::time::timeout(
+                                    SOCKET_SEND_TIMEOUT,
+                                    ws_write.send(Message::Text(notice.into())),
+                                )
+                                .await
+                                .context("desktop secure attention notice timed out")??;
+                                let result = secure_attention_result(
+                                    false,
+                                    Some("secure_attention_unavailable"),
+                                );
+                                tokio::time::timeout(
+                                    SOCKET_SEND_TIMEOUT,
+                                    ws_write.send(Message::Text(result.into())),
+                                )
+                                .await
+                                .context("desktop secure attention result timed out")??;
+                                continue;
+                            }
+                            let (succeeded, code) =
+                                match send_service_secure_attention(authorization.session_id) {
+                                    Ok(()) => (true, None),
+                                    Err(error) => {
+                                        crate::logging::error(format_args!(
+                                            "Windows secure attention request was rejected: {error:#}"
+                                        ));
+                                        let notice = secure_attention_notice(
+                                            "secure_attention_policy_denied",
+                                        );
+                                        tokio::time::timeout(
+                                            SOCKET_SEND_TIMEOUT,
+                                            ws_write.send(Message::Text(notice.into())),
+                                        )
+                                        .await
+                                        .context(
+                                            "desktop secure attention failure notice timed out",
+                                        )??;
+                                        (false, Some("secure_attention_policy_denied"))
+                                    }
+                                };
+                            let result = secure_attention_result(succeeded, code);
+                            tokio::time::timeout(
+                                SOCKET_SEND_TIMEOUT,
+                                ws_write.send(Message::Text(result.into())),
+                            )
+                            .await
+                            .context("desktop secure attention result timed out")??;
                             continue;
                         }
                         if let DesktopControl::AudioControl {
@@ -488,9 +957,13 @@ async fn relay(
                         {
                             audio_relay.register_control(generation, enabled)?;
                         }
+                        let command = serde_json::to_vec(&HelperControlEnvelope {
+                            input_generation: input_gate.generation,
+                            control,
+                        })?;
                         tokio::time::timeout(
                             PIPE_WRITE_TIMEOUT,
-                            write_packet(&mut pipe_write, PIPE_CONTROL, text.as_bytes()),
+                            write_packet(&mut pipe_write, PIPE_CONTROL, &command),
                         )
                         .await
                         .context("desktop helper pipe control write timed out")??;
@@ -523,7 +996,7 @@ async fn relay(
             }
             status = status_rx.recv() => {
                 let Some(status) = status else { break "helper_disconnected".to_string() };
-                update_remote_input_gate(&status, &mut input_ready);
+                secure_attention.observe_status(&status)?;
                 audio_relay.observe_status(&status);
                 tokio::time::timeout(
                     SOCKET_SEND_TIMEOUT,
@@ -569,6 +1042,13 @@ async fn relay(
                 )
                 .await
                 .context("desktop data websocket ping send timed out")??;
+            }
+            _ = session_check.tick(), if authorization.managed_service => {
+                if select_active_session(authorization.unattended)
+                    .is_ok_and(|session_id| session_id != authorization.session_id)
+                {
+                    break "session_changed".to_string();
+                }
             }
             }
         };
@@ -620,31 +1100,13 @@ async fn relay(
     result
 }
 
-fn control_is_allowed(input_ready: bool, control: &DesktopControl) -> bool {
-    input_ready || matches!(control, DesktopControl::AudioControl { .. })
-}
-
-fn update_remote_input_gate(status: &str, input_ready: &mut bool) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(status) else {
-        return;
-    };
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("ready") => *input_ready = true,
-        Some("consent_required" | "paused" | "closed" | "error") => *input_ready = false,
-        Some("desktop_state")
-            if value.get("desktop").and_then(serde_json::Value::as_str) != Some("default") =>
-        {
-            *input_ready = false;
-        }
-        _ => {}
-    }
-}
-
 async fn pipe_reader<R: AsyncRead + Unpin>(
     mut reader: R,
     frame_tx: watch::Sender<Option<Vec<u8>>>,
     audio_tx: super::DropOldestSender<Vec<u8>>,
     status_tx: mpsc::Sender<String>,
+    input_barrier_tx: mpsc::Sender<InputBarrier>,
+    input_ready_tx: mpsc::Sender<InputReady>,
     release_ack_tx: mpsc::Sender<()>,
     audio_ack_tx: mpsc::Sender<AudioControlAck>,
     fatal_tx: mpsc::Sender<String>,
@@ -669,6 +1131,9 @@ async fn pipe_reader<R: AsyncRead + Unpin>(
                 }
                 PIPE_CONTROL => {
                     let text = String::from_utf8(value).context("helper sent non-UTF8 control")?;
+                    if status_is_display_preparing(&text) {
+                        frame_tx.send_replace(None);
+                    }
                     if audio_state_clears_queue(&text) {
                         audio_tx.clear();
                     }
@@ -676,6 +1141,17 @@ async fn pipe_reader<R: AsyncRead + Unpin>(
                 }
                 PIPE_INTERNAL if value == INTERNAL_STOPPED => {
                     let _ = release_ack_tx.try_send(());
+                }
+                PIPE_INTERNAL if value.starts_with(INTERNAL_INPUT_BARRIER_PREFIX) => {
+                    let barrier =
+                        serde_json::from_slice(&value[INTERNAL_INPUT_BARRIER_PREFIX.len()..])
+                            .context("invalid desktop input generation barrier")?;
+                    input_barrier_tx.send(barrier).await?;
+                }
+                PIPE_INTERNAL if value.starts_with(INTERNAL_INPUT_READY_PREFIX) => {
+                    let ready = serde_json::from_slice(&value[INTERNAL_INPUT_READY_PREFIX.len()..])
+                        .context("invalid desktop input generation readiness")?;
+                    input_ready_tx.send(ready).await?;
                 }
                 PIPE_INTERNAL if value.starts_with(INTERNAL_FATAL_PREFIX) => {
                     let reason = String::from_utf8(value[INTERNAL_FATAL_PREFIX.len()..].to_vec())
@@ -710,6 +1186,19 @@ fn audio_state_clears_queue(status: &str) -> bool {
         && value.get("state").and_then(serde_json::Value::as_str) != Some("playing")
 }
 
+fn status_is_display_preparing(status: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(status).is_ok_and(|value| {
+        value.get("type").and_then(serde_json::Value::as_str) == Some("display_state")
+            && value.get("state").and_then(serde_json::Value::as_str) == Some("preparing")
+    })
+}
+
+fn current_display_source(fallback: &str) -> String {
+    crate::remote_access::detected_display_source()
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 fn encode_audio_control_ack(ack: AudioControlAck) -> Result<Vec<u8>> {
     let encoded = serde_json::to_vec(&ack)?;
     let mut packet = Vec::with_capacity(INTERNAL_AUDIO_CONTROL_ACK_PREFIX.len() + encoded.len());
@@ -727,6 +1216,14 @@ fn parse_audio_control_ack(value: &[u8]) -> Result<Option<AudioControlAck>> {
     )?))
 }
 
+fn encode_internal_message<T: serde::Serialize>(prefix: &[u8], value: &T) -> Result<Vec<u8>> {
+    let encoded = serde_json::to_vec(value)?;
+    let mut packet = Vec::with_capacity(prefix.len() + encoded.len());
+    packet.extend_from_slice(prefix);
+    packet.extend_from_slice(&encoded);
+    Ok(packet)
+}
+
 fn audio_control_ack_status(generation: u64) -> String {
     serde_json::json!({
         "type":"audio_state",
@@ -740,20 +1237,44 @@ fn audio_control_ack_status(generation: u64) -> String {
 pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     bind_interactive_window_station()?;
     log_helper_security_context(&options)?;
+    let unattended = options.unattended
+        && options.system_helper
+        && current_process_is_local_system().unwrap_or(false);
+    if options.unattended && !unattended {
+        bail!("unattended_policy_rejected")
+    }
     let audio_negotiated = windows_audio::negotiated(options.audio_codec.as_deref());
     let pipe = tokio::time::timeout(DATA_CHANNEL_JOIN_TIMEOUT, connect_pipe(&options.pipe))
         .await
         .map_err(|_| anyhow!("desktop helper pipe connection timeout"))??;
     let (read, mut write) = tokio::io::split(pipe);
-    let consent_required = serde_json::json!({"type":"consent_required"}).to_string();
-    write_packet(&mut write, PIPE_CONTROL, consent_required.as_bytes()).await?;
-    let consent_granted =
-        tokio::task::spawn_blocking(move || request_local_control_consent(audio_negotiated))
-            .await
-            .context("local consent prompt task failed")?;
-    if !consent_granted {
-        write_fatal_packet(&mut write, "local_consent_denied").await?;
-        bail!("local_consent_denied")
+    let session_policy = serde_json::json!({
+        "type":"session_policy",
+        "access_mode": if unattended { "unattended" } else { "local_consent" },
+        "local_consent_required": !unattended,
+        "secure_desktop_control": unattended,
+        "secure_attention_allowed": unattended
+    })
+    .to_string();
+    write_packet(&mut write, PIPE_CONTROL, session_policy.as_bytes()).await?;
+    let preparing = serde_json::json!({
+        "type":"display_state",
+        "state":"preparing",
+        "source":&options.display_source
+    })
+    .to_string();
+    write_packet(&mut write, PIPE_CONTROL, preparing.as_bytes()).await?;
+    if !unattended {
+        let consent_required = serde_json::json!({"type":"consent_required"}).to_string();
+        write_packet(&mut write, PIPE_CONTROL, consent_required.as_bytes()).await?;
+        let consent_granted =
+            tokio::task::spawn_blocking(move || request_local_control_consent(audio_negotiated))
+                .await
+                .context("local consent prompt task failed")?;
+        if !consent_granted {
+            write_fatal_packet(&mut write, "local_consent_denied").await?;
+            bail!("local_consent_denied")
+        }
     }
     let mut local_stop = spawn_local_session_indicator(audio_negotiated)?;
 
@@ -772,12 +1293,21 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     )));
     let capture_settings = settings.clone();
     let capture_options = options.clone();
+    let input_fence = Arc::new(InputGenerationFence::default());
+    let capture_input_fence = input_fence.clone();
     std::thread::Builder::new()
         .name("om-desktop-capture".to_string())
-        .spawn(move || capture_loop(capture_options, capture_settings, capture_tx))?;
+        .spawn(move || {
+            capture_loop(
+                capture_options,
+                capture_settings,
+                capture_input_fence,
+                capture_tx,
+            )
+        })?;
 
-    let mut input = InputState::default();
-    let mut input_desktop_available = default_input_desktop();
+    let mut input = InputState::new(unattended);
+    let mut input_desktop_available = controllable_input_desktop(unattended);
     let (audio_frame_tx, audio_frame_rx) = drop_oldest_channel(AUDIO_CHANNEL_CAPACITY);
     let (audio_status_tx, mut audio_status_rx) = mpsc::channel::<String>(8);
     let mut audio_frames_open = audio_negotiated;
@@ -788,7 +1318,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
             windows_audio::spawn(
                 options.system_helper,
                 session_id,
-                input_desktop_available,
+                default_input_desktop(),
                 audio_frame_tx,
                 audio_status_tx,
             )
@@ -822,8 +1352,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     let mut suppressed_input_errors = 0_u64;
     let mut desktop_check = tokio::time::interval(Duration::from_millis(100));
     desktop_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let ready = serde_json::json!({"type":"ready"}).to_string();
-    write_packet(&mut write, PIPE_CONTROL, ready.as_bytes()).await?;
+    let mut frame_ready = false;
     loop {
         tokio::select! {
             biased;
@@ -832,7 +1361,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                     if let Some(audio) = &audio_runtime {
                         audio.stop();
                     }
-                    let _ = release_on_input_desktop(&mut input);
+                    let _ = release_current_input_generation(&input_fence, &mut input);
                     write_fatal_packet(&mut write, "local_consent_revoked").await?;
                     bail!("local_consent_revoked")
                 }
@@ -845,7 +1374,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                     if let Some(audio) = &audio_runtime {
                         audio.stop();
                     }
-                    pending_release = !release_on_input_desktop(&mut input)?;
+                    pending_release = !release_current_input_generation(&input_fence, &mut input)?;
                     if !pending_release {
                         write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
                         break;
@@ -853,7 +1382,9 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                     continue;
                 }
                 if kind != PIPE_CONTROL { bail!("unexpected service packet type") }
-                let control: DesktopControl = serde_json::from_slice(&value)?;
+                let command: HelperControlEnvelope = serde_json::from_slice(&value)?;
+                let generation = command.input_generation;
+                let control = command.control;
                 match control {
                     DesktopControl::AudioControl {
                         enabled,
@@ -882,19 +1413,29 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                         );
                     }
                     DesktopControl::ReleaseAll => {
-                        pending_release = !release_on_input_desktop(&mut input)?;
+                        if input_fence.generation() == generation {
+                            pending_release = !release_on_input_generation(
+                                &input_fence,
+                                &mut input,
+                                generation,
+                            )?;
+                        }
                     }
                     control if !stopping => {
-                        let available = default_input_desktop();
+                        let available = controllable_input_desktop(unattended);
                         if input_desktop_available && !available {
-                            pending_release = !release_on_input_desktop(&mut input)?;
+                            input.discard_for_generation(input_fence.generation());
+                            pending_release = false;
                         }
                         input_desktop_available = available;
                         if let Some(audio) = &audio_runtime {
-                            audio.set_default_desktop(available);
+                            audio.set_default_desktop(default_input_desktop());
                         }
                         if available && pending_release {
-                            pending_release = !release_on_input_desktop(&mut input)?;
+                            pending_release = !release_current_input_generation(
+                                &input_fence,
+                                &mut input,
+                            )?;
                         }
                         if available && !pending_release {
                             let secure_attention = matches!(&control, DesktopControl::SecureAttention);
@@ -903,7 +1444,12 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                                 DesktopControl::Key { down: false, .. }
                                     | DesktopControl::PointerButton { down: false, .. }
                             );
-                            if let Err(error) = apply_on_input_desktop(&mut input, control) {
+                            if let Err(error) = apply_on_input_generation(
+                                &input_fence,
+                                &mut input,
+                                generation,
+                                control,
+                            ) {
                                 if error.to_string().contains(DESKTOP_BINDING_LOST)
                                     || error.to_string().contains(DESKTOP_HANDLE_CLEANUP_FAILED)
                                 {
@@ -934,16 +1480,17 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                 }
             }
             _ = desktop_check.tick() => {
-                let available = default_input_desktop();
+                let available = controllable_input_desktop(unattended);
                 if input_desktop_available && !available {
-                    pending_release = !release_on_input_desktop(&mut input)?;
+                    input.discard_for_generation(input_fence.generation());
+                    pending_release = false;
                 }
                 input_desktop_available = available;
                 if let Some(audio) = &audio_runtime {
-                    audio.set_default_desktop(available);
+                    audio.set_default_desktop(default_input_desktop());
                 }
                 if available && pending_release {
-                    pending_release = !release_on_input_desktop(&mut input)?;
+                    pending_release = !release_current_input_generation(&input_fence, &mut input)?;
                 }
                 if stopping && !pending_release {
                     write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
@@ -974,8 +1521,48 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                     bail!(reason)
                 };
                 match event {
-                    HelperEvent::Frame(frame) if !stopping => write_packet(&mut write, PIPE_FRAME, &frame).await?,
-                    HelperEvent::Status(status) if !stopping => write_packet(&mut write, PIPE_CONTROL, status.as_bytes()).await?,
+                    HelperEvent::Frame { generation, sequence, bytes } if !stopping => {
+                        if generation != input_fence.generation() {
+                            continue;
+                        }
+                        write_packet(&mut write, PIPE_FRAME, &bytes).await?;
+                        if !frame_ready {
+                            if !input_fence.mark_ready(generation) {
+                                continue;
+                            }
+                            let ready = encode_internal_message(
+                                INTERNAL_INPUT_READY_PREFIX,
+                                &InputReady { generation, sequence },
+                            )?;
+                            write_packet(&mut write, PIPE_INTERNAL, &ready).await?;
+                            let display_ready = serde_json::json!({
+                                "type":"display_state",
+                                "state":"ready",
+                                "source":current_display_source(&options.display_source)
+                            })
+                            .to_string();
+                            write_packet(&mut write, PIPE_CONTROL, display_ready.as_bytes()).await?;
+                            let ready = serde_json::json!({"type":"ready"}).to_string();
+                            write_packet(&mut write, PIPE_CONTROL, ready.as_bytes()).await?;
+                            frame_ready = true;
+                        }
+                    }
+                    HelperEvent::InputBarrier(barrier) if !stopping => {
+                        input.discard_for_generation(barrier.generation);
+                        pending_release = false;
+                        frame_ready = false;
+                        let barrier = encode_internal_message(
+                            INTERNAL_INPUT_BARRIER_PREFIX,
+                            &barrier,
+                        )?;
+                        write_packet(&mut write, PIPE_INTERNAL, &barrier).await?;
+                    }
+                    HelperEvent::Status(status) if !stopping => {
+                        if status_is_display_preparing(&status) {
+                            frame_ready = false;
+                        }
+                        write_packet(&mut write, PIPE_CONTROL, status.as_bytes()).await?
+                    },
                     HelperEvent::Fatal(reason) => {
                         if let Some(audio) = &audio_runtime {
                             audio.stop();
@@ -984,7 +1571,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
                         fatal.extend_from_slice(reason.as_bytes());
                         write_packet(&mut write, PIPE_INTERNAL, &fatal).await?;
                         stopping = true;
-                        pending_release = !release_on_input_desktop(&mut input)?;
+                        pending_release = !release_current_input_generation(&input_fence, &mut input)?;
                         if !pending_release {
                             write_packet(&mut write, PIPE_INTERNAL, INTERNAL_STOPPED).await?;
                             break;
@@ -998,7 +1585,7 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     if let Some(audio) = &audio_runtime {
         audio.stop();
     }
-    let _ = release_on_input_desktop(&mut input)?;
+    let _ = release_current_input_generation(&input_fence, &mut input)?;
     Ok(())
 }
 
@@ -1030,7 +1617,12 @@ async fn connect_pipe(name: &str) -> Result<NamedPipeClient> {
 }
 
 enum HelperEvent {
-    Frame(Vec<u8>),
+    Frame {
+        generation: u64,
+        sequence: u64,
+        bytes: Vec<u8>,
+    },
+    InputBarrier(InputBarrier),
     Status(String),
     Fatal(String),
 }
@@ -1038,6 +1630,7 @@ enum HelperEvent {
 fn capture_loop(
     options: DesktopOptions,
     settings: Arc<Mutex<AdaptiveSettings>>,
+    input_fence: Arc<InputGenerationFence>,
     tx: mpsc::Sender<HelperEvent>,
 ) {
     let mut capture: Option<DxgiCapture> = None;
@@ -1052,6 +1645,9 @@ fn capture_loop(
     };
     let mut sequence = 0_u64;
     let mut foreground_secure_paused = false;
+    let mut awaiting_first_frame = true;
+    let mut input_generation = 0_u64;
+    let mut output_wait_started = Some(Instant::now());
     let mut next_capture = Instant::now();
     loop {
         let now = Instant::now();
@@ -1066,10 +1662,39 @@ fn capture_loop(
         let desktop_name = match attach_input_desktop(&mut attached_desktop) {
             Ok((name, changed)) => {
                 if changed {
+                    input_generation = input_fence.begin_transition(&name);
+                    if tx
+                        .blocking_send(HelperEvent::InputBarrier(InputBarrier {
+                            generation: input_generation,
+                        }))
+                        .is_err()
+                    {
+                        return;
+                    }
                     capture = None;
                     let kind = desktop_kind(&name);
+                    let context = desktop_context(&name);
+                    let controllable = desktop_controllable(&name, options.unattended);
+                    if controllable {
+                        let _ = tx.blocking_send(HelperEvent::Status(
+                            serde_json::json!({
+                                "type":"display_state",
+                                "state":"preparing",
+                                "source":current_display_source(&options.display_source)
+                            })
+                            .to_string(),
+                        ));
+                        awaiting_first_frame = true;
+                        output_wait_started = Some(Instant::now());
+                    }
                     let _ = tx.blocking_send(HelperEvent::Status(
-                        serde_json::json!({"type":"desktop_state","desktop":kind}).to_string(),
+                        serde_json::json!({
+                            "type":"desktop_state",
+                            "desktop":kind,
+                            "context":context,
+                            "controllable":controllable
+                        })
+                        .to_string(),
                     ));
                 }
                 name
@@ -1085,7 +1710,7 @@ fn capture_loop(
                 continue;
             }
         };
-        if !desktop_name.eq_ignore_ascii_case("Default") {
+        if !desktop_controllable(&desktop_name, options.unattended) {
             if !foreground_secure_paused {
                 let _ = tx.blocking_send(HelperEvent::Status(
                     serde_json::json!({
@@ -1097,12 +1722,10 @@ fn capture_loop(
                 foreground_secure_paused = true;
             }
             capture = None;
+            output_wait_started = None;
             continue;
         }
         if foreground_secure_paused {
-            let _ = tx.blocking_send(HelperEvent::Status(
-                serde_json::json!({"type":"ready"}).to_string(),
-            ));
             foreground_secure_paused = false;
         }
         let result = if desktop_name.eq_ignore_ascii_case("Default") {
@@ -1140,7 +1763,26 @@ fn capture_loop(
                 );
                 frame.extend_from_slice(&jpeg);
                 if frame.len() <= MAX_FRAME_BYTES {
-                    let _ = tx.try_send(HelperEvent::Frame(frame));
+                    if awaiting_first_frame {
+                        if tx
+                            .blocking_send(HelperEvent::Frame {
+                                generation: input_generation,
+                                sequence,
+                                bytes: frame,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        awaiting_first_frame = false;
+                    } else {
+                        let _ = tx.try_send(HelperEvent::Frame {
+                            generation: input_generation,
+                            sequence,
+                            bytes: frame,
+                        });
+                    }
+                    output_wait_started = None;
                 }
             }
             Ok(None) => {}
@@ -1154,6 +1796,18 @@ fn capture_loop(
                 capture = None;
             }
         }
+        if output_wait_started.is_some_and(|started| started.elapsed() >= DISPLAY_PREPARE_TIMEOUT) {
+            let unavailable = serde_json::json!({
+                "type":"display_state",
+                "state":"unavailable",
+                "source":"none",
+                "code":"no_display_output"
+            })
+            .to_string();
+            let _ = tx.blocking_send(HelperEvent::Status(unavailable));
+            let _ = tx.blocking_send(HelperEvent::Fatal("no_display_output".to_string()));
+            return;
+        }
     }
 }
 
@@ -1165,6 +1819,20 @@ fn desktop_kind(name: &str) -> &'static str {
     } else {
         "other"
     }
+}
+
+fn desktop_context(name: &str) -> &'static str {
+    if name.eq_ignore_ascii_case("Default") {
+        "default"
+    } else if name.eq_ignore_ascii_case("Winlogon") {
+        "winlogon"
+    } else {
+        "other"
+    }
+}
+
+fn desktop_controllable(name: &str, unattended: bool) -> bool {
+    name.eq_ignore_ascii_case("Default") || (unattended && name.eq_ignore_ascii_case("Winlogon"))
 }
 
 struct OwnedDesktop(Option<HDESK>);
@@ -1354,7 +2022,19 @@ fn log_helper_security_context(options: &DesktopOptions) -> Result<()> {
     }
 }
 
-fn apply_on_input_desktop(input: &mut InputState, control: DesktopControl) -> Result<()> {
+fn apply_on_input_generation(
+    fence: &InputGenerationFence,
+    input: &mut InputState,
+    generation: u64,
+    control: DesktopControl,
+) -> Result<()> {
+    let fence_state = fence
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !fence_state.ready || fence_state.generation != generation {
+        return Ok(());
+    }
     unsafe {
         let original = GetThreadDesktop(GetCurrentThreadId())?;
         let desktop = OwnedDesktop::new(
@@ -1362,9 +2042,19 @@ fn apply_on_input_desktop(input: &mut InputState, control: DesktopControl) -> Re
                 .context("input desktop is unavailable for input injection")?,
         );
         let name = desktop_name(desktop.handle())?;
-        if !name.eq_ignore_ascii_case("Default") {
+        if !name.eq_ignore_ascii_case("Default")
+            && !(input.allow_winlogon && name.eq_ignore_ascii_case("Winlogon"))
+        {
             bail!("secure_desktop: input injection is restricted to the default desktop")
         }
+        if !fence_state
+            .desktop
+            .as_deref()
+            .is_some_and(|desktop| desktop.eq_ignore_ascii_case(&name))
+        {
+            return Ok(());
+        }
+        input.bind_generation(generation, &name);
         SetThreadDesktop(desktop.handle())
             .context("failed to bind input thread to input desktop")?;
         let applied = input
@@ -1380,8 +2070,16 @@ fn apply_on_input_desktop(input: &mut InputState, control: DesktopControl) -> Re
     }
 }
 
-fn release_on_input_desktop(input: &mut InputState) -> Result<bool> {
-    match apply_on_input_desktop(input, DesktopControl::ReleaseAll) {
+fn release_on_input_generation(
+    fence: &InputGenerationFence,
+    input: &mut InputState,
+    generation: u64,
+) -> Result<bool> {
+    if !fence.ready_for_generation(generation) {
+        input.discard_for_generation(fence.generation());
+        return Ok(true);
+    }
+    match apply_on_input_generation(fence, input, generation, DesktopControl::ReleaseAll) {
         Ok(()) => Ok(true),
         Err(error)
             if error.to_string().contains(DESKTOP_BINDING_LOST)
@@ -1391,6 +2089,21 @@ fn release_on_input_desktop(input: &mut InputState) -> Result<bool> {
         }
         Err(_) => Ok(false),
     }
+}
+
+fn release_current_input_generation(
+    fence: &InputGenerationFence,
+    input: &mut InputState,
+) -> Result<bool> {
+    let generation = input.generation;
+    if generation == 0 {
+        return Ok(true);
+    }
+    if fence.generation() != generation {
+        input.discard_for_generation(fence.generation());
+        return Ok(true);
+    }
+    release_on_input_generation(fence, input, generation)
 }
 
 struct DxgiCapture {
@@ -1668,13 +2381,54 @@ fn capture_gdi_jpeg(
     }
 }
 
-#[derive(Default)]
 struct InputState {
     keys: HashSet<(u16, bool)>,
     buttons: HashSet<u8>,
+    allow_winlogon: bool,
+    generation: u64,
+    generation_desktop: Option<String>,
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 impl InputState {
+    fn new(allow_winlogon: bool) -> Self {
+        Self {
+            keys: HashSet::new(),
+            buttons: HashSet::new(),
+            allow_winlogon,
+            generation: 0,
+            generation_desktop: None,
+        }
+    }
+
+    fn bind_generation(&mut self, generation: u64, desktop: &str) {
+        if self.generation == generation
+            && self
+                .generation_desktop
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(desktop))
+        {
+            return;
+        }
+        // Never release input remembered from one desktop into a newly attached desktop.
+        self.keys.clear();
+        self.buttons.clear();
+        self.generation = generation;
+        self.generation_desktop = Some(desktop.to_string());
+    }
+
+    fn discard_for_generation(&mut self, generation: u64) {
+        self.keys.clear();
+        self.buttons.clear();
+        self.generation = generation;
+        self.generation_desktop = None;
+    }
+
     fn apply(&mut self, control: DesktopControl) -> Result<()> {
         match control {
             DesktopControl::PointerMove { x, y } => send_pointer_move(x, y),
@@ -1740,9 +2494,44 @@ impl InputState {
 
 impl Drop for InputState {
     fn drop(&mut self) {
-        if !self.keys.is_empty() || !self.buttons.is_empty() {
-            let _ = apply_on_input_desktop(self, DesktopControl::ReleaseAll);
+        self.keys.clear();
+        self.buttons.clear();
+    }
+}
+
+struct ImpersonationGuard;
+
+impl Drop for ImpersonationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = RevertToSelf();
         }
+    }
+}
+
+fn send_service_secure_attention(session_id: u32) -> Result<()> {
+    if current_session_id()? != 0 || !current_process_is_local_system()? {
+        bail!("secure_attention_unavailable: caller is not the managed LocalSystem service")
+    }
+    unsafe {
+        let token = duplicate_session_system_token(session_id)?;
+        let impersonated = ImpersonateLoggedOnUser(token);
+        let _ = CloseHandle(token);
+        impersonated.context("secure_attention_unavailable: Winlogon impersonation failed")?;
+        let _impersonation = ImpersonationGuard;
+
+        let library_name = wide("sas.dll");
+        let library = LoadLibraryW(PCWSTR(library_name.as_ptr()))
+            .context("secure_attention_unavailable: failed to load sas.dll")?;
+        let address = GetProcAddress(library, windows::core::s!("SendSAS"));
+        let Some(address) = address else {
+            let _ = FreeLibrary(library);
+            bail!("secure_attention_unavailable: SendSAS is unavailable")
+        };
+        let send_sas: unsafe extern "system" fn(i32) = std::mem::transmute(address);
+        send_sas(0);
+        let _ = FreeLibrary(library);
+        Ok(())
     }
 }
 
@@ -1899,6 +2688,17 @@ fn default_input_desktop() -> bool {
     }
 }
 
+fn controllable_input_desktop(unattended: bool) -> bool {
+    unsafe {
+        let Ok(desktop) = OpenInputDesktop(Default::default(), false, DESKTOP_READOBJECTS) else {
+            return false;
+        };
+        let name = desktop_name(desktop).ok();
+        let _ = CloseDesktop(desktop);
+        name.is_some_and(|name| desktop_controllable(&name, unattended))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum HelperTarget {
     Current { session_id: u32 },
@@ -2018,12 +2818,17 @@ fn append_helper_args(command: &mut Command, options: &DesktopOptions) {
         .arg("--max-fps")
         .arg(options.max_fps.to_string())
         .arg("--jpeg-quality")
-        .arg(options.jpeg_quality.to_string());
+        .arg(options.jpeg_quality.to_string())
+        .arg("--display-source")
+        .arg(&options.display_source);
     if let Some(codec) = &options.audio_codec {
         command.arg("--audio-codec").arg(codec);
     }
     if options.system_helper {
         command.arg("--system-helper");
+    }
+    if options.unattended {
+        command.arg("--unattended");
     }
 }
 
@@ -2035,10 +2840,10 @@ fn current_session_id() -> Result<u32> {
     Ok(id)
 }
 
-fn helper_target() -> Result<(HelperTarget, String)> {
+fn helper_target(unattended: bool) -> Result<(HelperTarget, String)> {
     let current_session_id = current_session_id()?;
     if current_session_id == 0 {
-        let session_id = select_active_session()?;
+        let session_id = select_active_session(unattended)?;
         Ok((
             HelperTarget::ServiceSession { session_id },
             "SY".to_string(),
@@ -2056,6 +2861,17 @@ fn helper_target() -> Result<(HelperTarget, String)> {
             },
             sid?,
         ))
+    }
+}
+
+fn current_process_is_local_system() -> Result<bool> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .context("failed to inspect remote desktop service token")?;
+        let sid = token_user_sid(token);
+        let _ = CloseHandle(token);
+        Ok(sid? == LOCAL_SYSTEM_SID)
     }
 }
 
@@ -2086,7 +2902,7 @@ fn token_user_sid(token: HANDLE) -> Result<String> {
     }
 }
 
-fn select_active_session() -> Result<u32> {
+fn select_active_session(unattended: bool) -> Result<u32> {
     unsafe {
         let console = WTSGetActiveConsoleSessionId();
         let mut sessions: *mut WTS_SESSION_INFOW = null_mut();
@@ -2105,12 +2921,26 @@ fn select_active_session() -> Result<u32> {
         if !sessions.is_null() {
             WTSFreeMemory(sessions.cast());
         }
-        choose_active_session(console, &active)
+        let console_has_winlogon = unattended
+            && console != u32::MAX
+            && duplicate_session_system_token(console).is_ok_and(|token| {
+                let _ = CloseHandle(token);
+                true
+            });
+        choose_active_session(console, &active, unattended, console_has_winlogon)
     }
 }
 
-fn choose_active_session(console: u32, active: &[u32]) -> Result<u32> {
+fn choose_active_session(
+    console: u32,
+    active: &[u32],
+    unattended: bool,
+    console_has_winlogon: bool,
+) -> Result<u32> {
     if active.contains(&console) {
+        return Ok(console);
+    }
+    if unattended && console != u32::MAX && console_has_winlogon {
         return Ok(console);
     }
     match active {
@@ -2256,6 +3086,66 @@ fn spawn_helper_in_active_session(
             })
         })();
         let _ = CloseHandle(primary_token);
+        result
+    }
+}
+
+fn spawn_device_probe_in_session(pipe_name: &str, session_id: u32) -> Result<HelperProcess> {
+    unsafe {
+        let primary_token = duplicate_session_system_token(session_id)
+            .map_err(|_| anyhow!("device_probe_failed"))?;
+        let mut restricted_token = HANDLE::default();
+        let restricted = CreateRestrictedToken(
+            primary_token,
+            DISABLE_MAX_PRIVILEGE,
+            None,
+            None,
+            None,
+            &mut restricted_token,
+        );
+        let _ = CloseHandle(primary_token);
+        restricted.map_err(|_| anyhow!("device_probe_failed"))?;
+
+        let result = (|| -> Result<HelperProcess> {
+            let executable = std::env::current_exe().context("device_probe_failed")?;
+            let mut command_line = wide(&format!(
+                "\"{}\" \"device-probe\" \"--pipe\" {}",
+                executable.display(),
+                quote_arg(OsStr::new(pipe_name)),
+            ));
+            let application = wide(executable.as_os_str());
+            let desktop = wide("winsta0\\default");
+            let mut environment: *mut c_void = null_mut();
+            CreateEnvironmentBlock(&mut environment, restricted_token, false)
+                .map_err(|_| anyhow!("device_probe_failed"))?;
+            let startup = STARTUPINFOW {
+                cb: size_of::<STARTUPINFOW>() as u32,
+                lpDesktop: PWSTR(desktop.as_ptr() as *mut _),
+                ..zeroed()
+            };
+            let mut process: PROCESS_INFORMATION = zeroed();
+            let created = CreateProcessAsUserW(
+                restricted_token,
+                PCWSTR(application.as_ptr()),
+                PWSTR(command_line.as_mut_ptr()),
+                None,
+                None,
+                false,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                Some(environment),
+                PCWSTR(null()),
+                &startup,
+                &mut process,
+            );
+            let _ = DestroyEnvironmentBlock(environment);
+            created.map_err(|_| anyhow!("device_probe_failed"))?;
+            let _ = CloseHandle(process.hThread);
+            Ok(HelperProcess::Handle {
+                handle: process.hProcess,
+                pid: process.dwProcessId,
+            })
+        })();
+        let _ = CloseHandle(restricted_token);
         result
     }
 }
@@ -2422,6 +3312,8 @@ mod tests {
         let (frame_tx, _frame_rx) = watch::channel(None);
         let (audio_tx, audio_rx) = drop_oldest_channel(AUDIO_CHANNEL_CAPACITY);
         let (status_tx, mut status_rx) = mpsc::channel(1);
+        let (input_barrier_tx, _input_barrier_rx) = mpsc::channel(1);
+        let (input_ready_tx, _input_ready_rx) = mpsc::channel(1);
         let (release_ack_tx, _release_ack_rx) = mpsc::channel(1);
         let (audio_ack_tx, _audio_ack_rx) = mpsc::channel(1);
         let (fatal_tx, mut fatal_rx) = mpsc::channel(1);
@@ -2430,6 +3322,8 @@ mod tests {
             frame_tx,
             audio_tx,
             status_tx,
+            input_barrier_tx,
+            input_ready_tx,
             release_ack_tx,
             audio_ack_tx,
             fatal_tx,
@@ -2610,6 +3504,8 @@ mod tests {
         let (frame_tx, _frame_rx) = watch::channel(None);
         let (audio_tx, audio_rx) = drop_oldest_channel(AUDIO_CHANNEL_CAPACITY);
         let (status_tx, _status_rx) = mpsc::channel(1);
+        let (input_barrier_tx, _input_barrier_rx) = mpsc::channel(1);
+        let (input_ready_tx, _input_ready_rx) = mpsc::channel(1);
         let (release_ack_tx, _release_ack_rx) = mpsc::channel(1);
         let (audio_ack_tx, mut audio_ack_rx) = mpsc::channel(1);
         let (fatal_tx, _fatal_rx) = mpsc::channel(1);
@@ -2618,6 +3514,8 @@ mod tests {
             frame_tx,
             audio_tx,
             status_tx,
+            input_barrier_tx,
+            input_ready_tx,
             release_ack_tx,
             audio_ack_tx,
             fatal_tx,
@@ -2696,32 +3594,40 @@ mod tests {
     }
 
     #[test]
-    fn helper_statuses_gate_remote_input_until_consent_and_default_desktop() {
-        let mut ready = false;
-        update_remote_input_gate(r#"{"type":"consent_required"}"#, &mut ready);
-        assert!(!ready);
-        update_remote_input_gate(r#"{"type":"ready"}"#, &mut ready);
-        assert!(ready);
-        update_remote_input_gate(r#"{"type":"desktop_state","desktop":"secure"}"#, &mut ready);
-        assert!(!ready);
-        update_remote_input_gate(r#"{"type":"ready"}"#, &mut ready);
-        update_remote_input_gate(r#"{"type":"paused","reason":"secure_desktop"}"#, &mut ready);
-        assert!(!ready);
+    fn input_generation_gate_waits_for_current_first_frame_feedback() {
+        let mut gate = RelayInputGate::default();
+        gate.begin_generation(1);
+        assert!(!gate.allows(&DesktopControl::PointerMove { x: 0.5, y: 0.5 }));
+        gate.arm_after_first_frame(10);
+        gate.observe_feedback(9);
+        assert!(!gate.allows(&DesktopControl::PointerMove { x: 0.5, y: 0.5 }));
+        gate.observe_feedback(10);
+        assert!(gate.allows(&DesktopControl::PointerMove { x: 0.5, y: 0.5 }));
+
+        gate.begin_generation(2);
+        assert!(!gate.allows(&DesktopControl::PointerMove { x: 0.5, y: 0.5 }));
+        gate.observe_feedback(10);
+        assert!(!gate.ready);
+        gate.arm_after_first_frame(20);
+        gate.observe_feedback(19);
+        assert!(!gate.ready);
+        gate.observe_feedback(20);
+        assert!(gate.ready);
     }
 
     #[test]
     fn audio_control_bypasses_the_remote_input_gate() {
-        assert!(control_is_allowed(
-            false,
-            &DesktopControl::AudioControl {
-                enabled: false,
-                generation: Some(1),
-            }
-        ));
-        assert!(!control_is_allowed(
-            false,
-            &DesktopControl::PointerMove { x: 0.5, y: 0.5 }
-        ));
+        let gate = RelayInputGate::default();
+        assert!(gate.allows(&DesktopControl::AudioControl {
+            enabled: false,
+            generation: Some(1),
+        }));
+        assert!(gate.allows(&DesktopControl::Feedback {
+            sequence: 1,
+            fps: 1.0,
+            decode_ms: 1.0,
+        }));
+        assert!(!gate.allows(&DesktopControl::PointerMove { x: 0.5, y: 0.5 }));
     }
 
     #[test]
@@ -2738,6 +3644,8 @@ mod tests {
                 jpeg_quality: 50,
                 audio_codec: Some("opus".to_string()),
                 system_helper: true,
+                unattended: true,
+                display_source: "virtual".to_string(),
             },
         );
         let args = command
@@ -2749,6 +3657,7 @@ mod tests {
                 .any(|pair| pair == ["--audio-codec", "opus"])
         );
         assert!(args.iter().any(|value| value == "--system-helper"));
+        assert!(args.iter().any(|value| value == "--unattended"));
     }
 
     #[test]
@@ -2771,27 +3680,93 @@ mod tests {
 
     #[test]
     fn active_console_session_is_preferred() {
-        assert_eq!(choose_active_session(2, &[1, 2]).unwrap(), 2);
+        assert_eq!(choose_active_session(2, &[1, 2], false, false).unwrap(), 2);
     }
 
     #[test]
     fn unique_active_rdp_session_is_selected_without_active_console() {
-        assert_eq!(choose_active_session(u32::MAX, &[3]).unwrap(), 3);
+        assert_eq!(
+            choose_active_session(u32::MAX, &[3], false, false).unwrap(),
+            3
+        );
     }
 
     #[test]
     fn ambiguous_or_missing_active_sessions_are_rejected() {
         assert_eq!(
-            choose_active_session(u32::MAX, &[])
+            choose_active_session(u32::MAX, &[], false, false)
                 .unwrap_err()
                 .to_string(),
             "no_active_session"
         );
         assert_eq!(
-            choose_active_session(u32::MAX, &[1, 2])
+            choose_active_session(u32::MAX, &[1, 2], false, false)
                 .unwrap_err()
                 .to_string(),
             "multiple_active_sessions"
         );
+    }
+
+    #[test]
+    fn unattended_can_select_a_logged_out_console_with_system_winlogon() {
+        assert_eq!(choose_active_session(7, &[], true, true).unwrap(), 7);
+        assert!(choose_active_session(7, &[], true, false).is_err());
+    }
+
+    #[test]
+    fn secure_attention_requires_matching_managed_unattended_policy() {
+        let authorization = SessionAuthorization {
+            session_id: 7,
+            unattended: true,
+            managed_service: true,
+        };
+        let mut gate = SecureAttentionGate::new(authorization);
+        gate.observe_status(r#"{"type":"session_policy","access_mode":"unattended","local_consent_required":false,"secure_desktop_control":true,"secure_attention_allowed":true}"#)
+            .unwrap();
+        assert!(gate.allowed());
+        gate.observe_status(r#"{"type":"desktop_state","desktop":"secure","context":"winlogon","controllable":true}"#)
+            .unwrap();
+        assert!(gate.allowed());
+        gate.observe_status(r#"{"type":"desktop_state","desktop":"default","context":"default","controllable":true}"#)
+            .unwrap();
+        assert!(gate.allowed());
+    }
+
+    #[test]
+    fn stale_generation_release_is_discarded_without_becoming_current_input() {
+        let fence = InputGenerationFence::default();
+        let first = fence.begin_transition("Default");
+        assert!(!fence.ready_for_generation(first));
+        assert!(fence.mark_ready(first));
+        let mut input = InputState::new(true);
+        input.bind_generation(first, "Default");
+        input.keys.insert((0x41, false));
+
+        let second = fence.begin_transition("Winlogon");
+        assert!(!fence.ready_for_generation(second));
+        input.discard_for_generation(second);
+        assert!(input.keys.is_empty());
+        assert_eq!(input.generation, second);
+        assert!(input.generation_desktop.is_none());
+        assert!(!fence.mark_ready(first));
+        assert!(fence.mark_ready(second));
+    }
+
+    #[test]
+    fn stale_release_clears_bookkeeping_without_input_injection() {
+        let fence = InputGenerationFence::default();
+        let first = fence.begin_transition("Default");
+        assert!(fence.mark_ready(first));
+        let mut input = InputState::new(true);
+        input.bind_generation(first, "Default");
+        input.keys.insert((0x41, false));
+        input.buttons.insert(0);
+
+        let second = fence.begin_transition("Winlogon");
+        assert!(release_on_input_generation(&fence, &mut input, first).unwrap());
+        assert!(input.keys.is_empty());
+        assert!(input.buttons.is_empty());
+        assert_eq!(input.generation, second);
+        assert!(input.generation_desktop.is_none());
     }
 }

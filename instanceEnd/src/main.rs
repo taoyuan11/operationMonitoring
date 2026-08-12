@@ -14,12 +14,17 @@ mod models;
 mod outbound;
 mod profile;
 mod pty_io;
+mod remote_access;
 mod remote_desktop;
 mod terminal;
 mod time;
 mod update;
 #[cfg(windows)]
 mod windows_security;
+#[cfg(windows)]
+mod windows_driver_assets {
+    include!(concat!(env!("OUT_DIR"), "/windows_driver_assets.rs"));
+}
 mod ws;
 
 use anyhow::{Context, Result, bail};
@@ -38,6 +43,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     if cli.command == AgentCommand::ServiceRun {
         init_agent_logging(&cli.agent)?;
+        remote_access::initialize_service_devices(&cli.agent);
         return install::run_service(cli.agent);
     }
 
@@ -81,6 +87,8 @@ fn run() -> Result<()> {
             jpeg_quality,
             audio_codec,
             system_helper,
+            unattended,
+            display_source,
         } => {
             init_agent_logging(&cli.agent)?;
             std::panic::set_hook(Box::new(|panic| {
@@ -95,8 +103,11 @@ fn run() -> Result<()> {
                 jpeg_quality,
                 audio_codec,
                 system_helper,
+                unattended,
+                display_source,
             })
         }
+        AgentCommand::DeviceProbe { pipe } => remote_desktop::run_device_probe(&pipe),
     }
 }
 

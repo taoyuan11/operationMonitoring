@@ -116,6 +116,14 @@ build_target() {
   local source artifact extension xwin_tool_path cargo_target
   local -a build_command
 
+  if [ "$os" = windows ] && { \
+    { [ "$arch" = x64 ] || [ "$arch" = arm64 ]; } && [ -n "${OM_WINDOWS_DRIVER_BUNDLE_DIR:-}" ] \
+      || [ -n "${OM_WINDOWS_SIGNING_CERTIFICATE_SHA1:-}" ]; \
+  }; then
+    echo 'Signed Windows releases must use build-standalone.ps1 on Windows so signtool policy checks and Authenticode timestamping cannot be bypassed.' >&2
+    return 1
+  fi
+
   case "$os" in
     linux|macos)
       source="$ROOT/target/$target/release/om-agent"

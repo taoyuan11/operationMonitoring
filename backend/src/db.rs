@@ -243,6 +243,18 @@ pub async fn init_db(db: &PgPool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS instance_remote_access_status (
+            instance_id TEXT PRIMARY KEY REFERENCES instances(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            checked_at BIGINT NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS pending_instances (
             id TEXT PRIMARY KEY,
             secret TEXT NOT NULL,
@@ -802,6 +814,7 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
             &["retry_count", "created_at", "updated_at", "completed_at"][..],
         ),
         ("instance_docker_status", &["checked_at"][..]),
+        ("instance_remote_access_status", &["checked_at"][..]),
     ] {
         for column in columns {
             let data_type: Option<String> = sqlx::query_scalar(

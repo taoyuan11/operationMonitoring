@@ -347,6 +347,16 @@ cd instanceEnd
 .\scripts\build-standalone.cmd i686-pc-windows-msvc
 ```
 
+Windows x64/ARM64 的无显示器/无播放设备正式产物必须在原生 Windows 构建机上生成。先按
+[`instanceEnd/windows-drivers/README.md`](instanceEnd/windows-drivers/README.md) 完成 WDK、HLK、
+Driver Verifier 和 Hardware Partner Center 签名流程，再设置 `OM_WINDOWS_DRIVER_BUNDLE_DIR`
+为包含 `bundle-lock.json` 的 Microsoft 签名驱动目录。脚本会自动启用
+`bundled-windows-drivers` feature，并用 `OM_SIGNTOOL_PATH`（未设置时使用 `signtool.exe`）执行
+`/kp` 校验。最终 EXE 的 Authenticode 签名使用证书存储中的
+`OM_WINDOWS_SIGNING_CERTIFICATE_SHA1` 和 RFC 3161 地址 `OM_WINDOWS_TIMESTAMP_URL`；只有签名及
+`/pa` 校验成功后才生成 SHA-256。未设置驱动目录的普通开发构建不嵌入驱动，保持
+physical-only；Windows x86 始终不嵌入虚拟设备驱动。
+
 脚本默认自动选择构建器：GNU/Linux 目标固定使用 `cargo-zigbuild` 并以 glibc 2.17 为最低兼容基线，其他 Linux 交叉目标在工具可用时也使用 `cargo-zigbuild`，Windows MSVC 交叉目标使用 `cargo-xwin`。因此执行 `all` 前必须安装 Zig 和 cargo-zigbuild。如果系统缺少 `llvm-lib`，Bash 脚本会使用项目内置包装器和 `zig ar` 完成 Windows 静态库归档。也可以通过 `OM_STANDALONE_BUILDER=cargo|zigbuild|xwin` 强制选择构建器，但 GNU/Linux 目标不允许覆盖为其他构建器，以免绕过 glibc 2.17 基线。
 
 `all` 会依次尝试 Linux 5 个目标、Windows 3 个目标和 macOS 2 个目标。单个目标失败后仍会继续构建，最后统一汇总失败原因。产物和同名 SHA-256 文件位于 `instanceEnd/dist/standalone/`：
@@ -558,7 +568,14 @@ OM_AGENT_LOG_FILE=/path/to/agent.log
 OM_AGENT_LOG_MAX_BYTES=10485760
 OM_AGENT_LOG_HISTORY=3
 OM_AGENT_UPDATE_DIR=/path/to/persistent/updates
+OM_REMOTE_DESKTOP_CONSENT=required
+OM_WINDOWS_VIRTUAL_DEVICES=auto
 ```
+
+`OM_REMOTE_DESKTOP_CONSENT` 可设为 `required`（默认）或 `unattended`。无人值守模式是
+Windows 机器级安全授权，仅受管 LocalSystem 服务会实际启用；非交互安装还必须显式传入
+`--yes`。`OM_WINDOWS_VIRTUAL_DEVICES` 可设为 `auto`（Windows 默认）或 `disabled`；普通
+开发构建没有 Microsoft 签名 bundle 时会明确降级为 physical-only，并且不会修改设备。
 
 实例端日志默认在单个文件达到 10 MiB 时滚动，保留 `agent.log.1` 至
 `agent.log.3` 三个历史文件，超过保留数量的旧日志会直接删除。updater 日志使用相同的

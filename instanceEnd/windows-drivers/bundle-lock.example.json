@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "production_ready": false,
+  "bundle_version": "1.0.0",
+  "provider": "Operation Monitoring",
+  "minimum_agent_version": "0.1.23",
+  "maximum_agent_version_exclusive": null,
+  "architectures": {
+    "x64": {
+      "packages": [
+        {
+          "kind": "display",
+          "driver_version": "1.0.0.0",
+          "hardware_id": "ROOT\\OMVIRTUALDISPLAY",
+          "catalog_path": "x64/display/OmVirtualDisplay.cat",
+          "files": [
+            { "path": "x64/display/OmVirtualDisplay.inf", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+            { "path": "x64/display/OmVirtualDisplay.cat", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+            { "path": "x64/display/OmVirtualDisplay.dll", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+          ]
+        },
+        {
+          "kind": "audio",
+          "driver_version": "1.0.0.0",
+          "hardware_id": "ROOT\\OMVIRTUALAUDIO",
+          "catalog_path": "x64/audio/OmVirtualAudio.cat",
+          "files": [
+            { "path": "x64/audio/OmVirtualAudio.inf", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+            { "path": "x64/audio/OmVirtualAudio.cat", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+            { "path": "x64/audio/OmVirtualAudio.sys", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+          ]
+        }
+      ]
+    },
+    "arm64": {
+      "packages": [
+        {
+          "kind": "display",
+          "driver_version": "1.0.0.0",
+          "hardware_id": "ROOT\\OMVIRTUALDISPLAY",
+          "catalog_path": "arm64/display/OmVirtualDisplay.cat",
+          "files": [
+            { "path": "arm64/display/OmVirtualDisplay.inf", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+            { "path": "arm64/display/OmVirtualDisplay.cat", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+            { "path": "arm64/display/OmVirtualDisplay.dll", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+          ]
+        },
+        {
+          "kind": "audio",
+          "driver_version": "1.0.0.0",
+          "hardware_id": "ROOT\\OMVIRTUALAUDIO",
+          "catalog_path": "arm64/audio/OmVirtualAudio.cat",
+          "files": [
+            { "path": "arm64/audio/OmVirtualAudio.inf", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+            { "path": "arm64/audio/OmVirtualAudio.cat", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" },
+            { "path": "arm64/audio/OmVirtualAudio.sys", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+          ]
+        }
+      ]
+    }
+  }
+}
+

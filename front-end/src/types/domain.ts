@@ -40,6 +40,37 @@ export type Instance = {
   metrics: Metric | null
 }
 
+export type RemoteAccessAvailability = 'ready' | 'degraded' | 'unavailable' | 'unknown'
+export type RemoteAccessSource = 'physical' | 'virtual' | 'none' | 'unknown'
+export type RemoteAccessDriverState =
+  | 'active'
+  | 'standby'
+  | 'missing'
+  | 'reboot_required'
+  | 'unhealthy'
+  | 'unsupported'
+  | 'unknown'
+
+export type RemoteAccessDeviceStatus = {
+  availability: RemoteAccessAvailability
+  source: RemoteAccessSource
+  driver_state: RemoteAccessDriverState
+  driver_version: string | null
+  code: string | null
+}
+
+export type RemoteAccessStatus = {
+  protocol_supported: boolean
+  status_supported: boolean
+  online: boolean
+  access_mode: 'required' | 'unattended' | 'unknown'
+  fallback_mode: 'auto' | 'disabled' | 'physical_only' | 'unknown'
+  display: RemoteAccessDeviceStatus
+  audio: RemoteAccessDeviceStatus
+  reboot_required: boolean
+  checked_at: number | null
+}
+
 export type TerminalShellInfo = {
   label: string
   program: string

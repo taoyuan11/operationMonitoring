@@ -27,7 +27,7 @@ use crate::{
     auth::{AdminSessionGuard, require_admin},
     db::get_instance,
     error::{AppError, AppResult},
-    models::{AgentOutbound, DesktopAgentWsQuery},
+    models::{AgentOutbound, DesktopAgentWsQuery, RemoteDesktopAccessMode},
     request_security::{ensure_same_origin, request_scheme},
     state::{AppState, DesktopAudioPacket, DesktopSessionHandle},
     utils::now_ts,
@@ -35,6 +35,7 @@ use crate::{
 
 const DESKTOP_CAPABILITY: &str = "remote_desktop_v1";
 const DESKTOP_AUDIO_CAPABILITY: &str = "remote_desktop_audio_v1";
+const DESKTOP_UNATTENDED_CAPABILITY: &str = "remote_desktop_unattended_v1";
 const AUDIO_CODEC_OPUS: &str = "opus";
 const TOKEN_TTL_SECONDS: i64 = 30;
 const CONTROL_MESSAGE_MAX_BYTES: usize = 16 * 1024;
@@ -54,6 +55,35 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const CONTROL_RATE_PER_SECOND: f64 = 120.0;
 const CONTROL_RATE_BURST: f64 = 240.0;
+const SECURE_ATTENTION_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DesktopSessionPolicy {
+    access_mode: RemoteDesktopAccessMode,
+    local_consent_required: bool,
+    secure_desktop_control: bool,
+    secure_attention_allowed: bool,
+}
+
+impl Default for DesktopSessionPolicy {
+    fn default() -> Self {
+        Self {
+            access_mode: RemoteDesktopAccessMode::LocalConsent,
+            local_consent_required: true,
+            secure_desktop_control: false,
+            secure_attention_allowed: false,
+        }
+    }
+}
+
+impl DesktopSessionPolicy {
+    fn permits_secure_attention(self) -> bool {
+        self.access_mode == RemoteDesktopAccessMode::Unattended
+            && !self.local_consent_required
+            && self.secure_desktop_control
+            && self.secure_attention_allowed
+    }
+}
 
 struct ControlRateLimiter {
     tokens: f64,
@@ -255,6 +285,7 @@ async fn desktop_browser_socket(
         return;
     }
     let audio_codec = negotiate_audio_codec(requested_audio_codec, &agent.capabilities);
+    let remote_access_status = agent.remote_access_status.read().await.clone();
 
     let session_id = Uuid::new_v4().to_string();
     let (stream_token, token_hash) = new_stream_token();
@@ -290,6 +321,10 @@ async fn desktop_browser_socket(
                 frame_tx,
                 audio_tx,
                 audio_codec: audio_codec.map(|codec| codec.as_str().to_string()),
+                unattended_capable: agent
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == DESKTOP_UNATTENDED_CAPABILITY),
                 agent_input_rx: Arc::new(tokio::sync::Mutex::new(Some(agent_input_rx))),
                 close_tx,
             },
@@ -302,7 +337,7 @@ async fn desktop_browser_socket(
             category: "desktop".to_string(),
             kind: "session".to_string(),
             actor: actor.clone(),
-            user_id: Some(user_id),
+            user_id: Some(user_id.clone()),
             action: "desktop_session".to_string(),
             target: instance_id.clone(),
             detail: "启动远程桌面会话".to_string(),
@@ -311,10 +346,19 @@ async fn desktop_browser_socket(
                 "audio_requested": requested_audio_codec.is_some(),
                 "audio_enabled": audio_codec.is_some(),
                 "audio_codec": audio_codec.map(DesktopAudioCodec::as_str),
+                "access_mode": remote_access_status.as_ref().map(|status| status.access_mode),
+                "local_consent_required": remote_access_status.as_ref()
+                    .map(|status| status.access_mode == RemoteDesktopAccessMode::LocalConsent),
+                "fallback_mode": remote_access_status.as_ref().map(|status| status.fallback_mode),
+                "display_source": remote_access_status.as_ref().map(|status| status.display.source),
+                "display_driver_state": remote_access_status.as_ref().map(|status| status.display.driver_state),
+                "audio_source": remote_access_status.as_ref().map(|status| status.audio.source),
+                "audio_driver_state": remote_access_status.as_ref().map(|status| status.audio.driver_state),
+                "reboot_required": remote_access_status.as_ref().map(|status| status.reboot_required),
             }),
             instance_id: Some(instance_id.clone()),
             node_snapshot: audit::instance_snapshot(&state.db, &instance_id).await,
-            context: audit_context,
+            context: audit_context.clone(),
             session_id: Some(session_id.clone()),
             operation_id: None,
             status: "running".to_string(),
@@ -368,7 +412,9 @@ async fn desktop_browser_socket(
     let mut last_inbound = started;
     let mut control_rate = ControlRateLimiter::new(started);
     let mut joined = false;
-    let mut control_ready = false;
+    let mut helper_ready = false;
+    let mut session_policy = DesktopSessionPolicy::default();
+    let mut desktop_state = None;
     let mut browser_audio = BrowserAudioRelayGate::new();
     let mut helper_timeout = Box::pin(tokio::time::sleep(HELPER_JOIN_TIMEOUT));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -392,6 +438,7 @@ async fn desktop_browser_socket(
     });
     let mut reason = "browser_disconnected".to_string();
     let mut deferred_browser_message = None;
+    let mut pending_secure_attention_audit: Option<(String, Instant)> = None;
 
     loop {
         tokio::select! {
@@ -421,7 +468,11 @@ async fn desktop_browser_socket(
                 match incoming {
                     Ok(Message::Text(text)) => {
                         last_inbound = Instant::now();
-                        match validate_browser_message(&text, audio_codec.is_some()) {
+                        match validate_browser_message_with_policy(
+                            &text,
+                            audio_codec.is_some(),
+                            session_policy.permits_secure_attention(),
+                        ) {
                             Ok(is_activity) => {
                                 if !control_rate.allow(Instant::now()) {
                                     deferred_browser_message = Some(server_error(
@@ -431,6 +482,10 @@ async fn desktop_browser_socket(
                                     reason = "control_rate_limited".to_string();
                                     break;
                                 }
+                                let control_ready = helper_ready
+                                    && desktop_state.as_deref().is_none_or(|message| {
+                                        desktop_message_control_allowed(message, session_policy)
+                                    });
                                 if !control_ready && !bypasses_desktop_control_gate(&text) {
                                     continue;
                                 }
@@ -449,6 +504,30 @@ async fn desktop_browser_socket(
                                 };
                                 if is_activity { last_activity = Instant::now(); }
                                 let reliable = is_reliable_browser_message(&text);
+                                let secure_attention =
+                                    message_type(&text).as_deref() == Some("secure_attention");
+                                if secure_attention && pending_secure_attention_audit.is_some() {
+                                    let message = server_error(
+                                        "secure_attention_in_progress",
+                                        "上一条 Ctrl+Alt+Del 请求仍在等待 Windows 确认",
+                                    );
+                                    if !send_text(&mut sender, &message).await { break; }
+                                    continue;
+                                }
+                                let secure_attention_audit = if secure_attention {
+                                    begin_secure_attention_audit(
+                                        &state,
+                                        &instance_id,
+                                        &session_id,
+                                        &actor,
+                                        &user_id,
+                                        &audit_context,
+                                        session_policy,
+                                    )
+                                    .await
+                                } else {
+                                    None
+                                };
                                 let delivered = match forwarded {
                                     None => true,
                                     Some(forwarded) if reliable => {
@@ -458,10 +537,25 @@ async fn desktop_browser_socket(
                                     Some(forwarded) => agent_input_tx.try_send(forwarded).is_ok(),
                                 };
                                 if reliable && !delivered {
+                                    if let Some(event_id) = secure_attention_audit.as_deref() {
+                                        finish_secure_attention_audit(
+                                            &state,
+                                            event_id,
+                                            false,
+                                            Some("input_queue_overflow"),
+                                        )
+                                        .await;
+                                    }
                                     deferred_browser_message =
                                         Some(server_error("input_queue_overflow", "远程输入队列拥塞"));
                                     reason = "input_queue_overflow".to_string();
                                     break;
+                                }
+                                if delivered && let Some(event_id) = secure_attention_audit {
+                                    pending_secure_attention_audit = Some((
+                                        event_id,
+                                        Instant::now() + SECURE_ATTENTION_RESULT_TIMEOUT,
+                                    ));
                                 }
                             }
                             Err((code, message)) => {
@@ -488,6 +582,20 @@ async fn desktop_browser_socket(
             message = browser_rx.recv() => {
                 let Some(message) = message else { break; };
                 let kind = message_type(&message);
+                if kind.as_deref() == Some("secure_attention_result") {
+                    if let Some((event_id, _)) = pending_secure_attention_audit.take()
+                        && let Some((succeeded, code)) = secure_attention_result(&message)
+                    {
+                        finish_secure_attention_audit(
+                            &state,
+                            &event_id,
+                            succeeded,
+                            code.as_deref(),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
                 if browser_audio.observe_state(&message) {
                     clear_pending_audio(&mut audio_rx);
                 }
@@ -495,11 +603,17 @@ async fn desktop_browser_socket(
                 if stops_audio_stream(&message) {
                     clear_pending_audio(&mut audio_rx);
                 }
+                if let Some(policy) = message_session_policy(&message) {
+                    session_policy = policy;
+                }
                 match kind.as_deref() {
-                    Some("ready") => control_ready = true,
-                    Some("consent_required" | "paused" | "closed" | "error") => control_ready = false,
-                    Some("desktop_state") if message_desktop(&message).as_deref() != Some("default") => {
-                        control_ready = false;
+                    Some("ready") => helper_ready = true,
+                    Some("consent_required" | "paused" | "closed" | "error") => helper_ready = false,
+                    Some("display_state") if message_display_state(&message).as_deref() != Some("ready") => {
+                        helper_ready = false;
+                    }
+                    Some("desktop_state") => {
+                        desktop_state = Some(message.clone());
                     }
                     _ => {}
                 }
@@ -554,6 +668,18 @@ async fn desktop_browser_socket(
             }
             _ = heartbeat.tick() => {
                 let now = Instant::now();
+                if pending_secure_attention_audit
+                    .as_ref()
+                    .is_some_and(|(_, deadline)| now >= *deadline)
+                    && let Some((event_id, _)) = pending_secure_attention_audit.take()
+                {
+                    cancel_secure_attention_audit(
+                        &state,
+                        &event_id,
+                        "secure_attention_result_timeout",
+                    )
+                    .await;
+                }
                 if now.duration_since(last_inbound) > HEARTBEAT_TIMEOUT {
                     reason = "browser_heartbeat_timeout".to_string();
                     break;
@@ -579,6 +705,17 @@ async fn desktop_browser_socket(
     }
 
     let _ = authorization_cancel_tx.send(());
+    while let Ok(message) = browser_rx.try_recv() {
+        if message_type(&message).as_deref() == Some("secure_attention_result")
+            && let Some((event_id, _)) = pending_secure_attention_audit.take()
+            && let Some((succeeded, code)) = secure_attention_result(&message)
+        {
+            finish_secure_attention_audit(&state, &event_id, succeeded, code.as_deref()).await;
+        }
+    }
+    if let Some((event_id, _)) = pending_secure_attention_audit {
+        cancel_secure_attention_audit(&state, &event_id, "secure_attention_result_missing").await;
+    }
     end_desktop_session(&state, &session_id, &reason).await;
     if let Some(message) = deferred_browser_message {
         let _ = send_text(&mut sender, &message).await;
@@ -620,9 +757,19 @@ async fn desktop_agent_socket(state: AppState, session_id: String, socket: WebSo
                 match incoming {
                     Ok(Message::Text(text)) => {
                         last_inbound = Instant::now();
-                        match validate_agent_message(&text, handle.audio_codec.is_some()) {
+                        match validate_agent_message_with_policy(
+                            &text,
+                            handle.audio_codec.is_some(),
+                            handle.unattended_capable,
+                        ) {
                             Ok(message) => {
                                 audio_relay.observe_state(&message);
+                                if message_type(&message).as_deref() == Some("display_state")
+                                    && message_display_state(&message).as_deref()
+                                        == Some("preparing")
+                                {
+                                    handle.frame_tx.send_replace(None);
+                                }
                                 let close_reason = (message_type(&message).as_deref() == Some("closed"))
                                     .then(|| message_reason(&message).unwrap_or_else(|| "agent_closed".to_string()));
                                 let delivered = tokio::time::timeout(
@@ -826,6 +973,102 @@ async fn end_desktop_session(state: &AppState, session_id: &str, reason: &str) {
         &reason,
     )
     .await;
+}
+
+async fn begin_secure_attention_audit(
+    state: &AppState,
+    instance_id: &str,
+    session_id: &str,
+    actor: &str,
+    user_id: &str,
+    context: &audit::AuditContext,
+    policy: DesktopSessionPolicy,
+) -> Option<String> {
+    let status = state
+        .agents
+        .read()
+        .await
+        .get(instance_id)
+        .cloned()
+        .map(|agent| agent.remote_access_status);
+    let status = match status {
+        Some(status) => status.read().await.clone(),
+        None => None,
+    };
+    match audit::insert_event(
+        &state.db,
+        &audit::AuditEventInput {
+            category: "desktop".to_string(),
+            kind: "operation".to_string(),
+            actor: actor.to_string(),
+            user_id: Some(user_id.to_string()),
+            action: "desktop_secure_attention".to_string(),
+            target: instance_id.to_string(),
+            detail: "请求发送 Ctrl+Alt+Del".to_string(),
+            metadata: json!({
+                "access_mode": policy.access_mode,
+                "local_consent_required": policy.local_consent_required,
+                "secure_desktop_control": policy.secure_desktop_control,
+                "secure_attention_allowed": policy.secure_attention_allowed,
+                "display_source": status.as_ref().map(|status| status.display.source),
+                "display_driver_state": status.as_ref().map(|status| status.display.driver_state),
+                "audio_source": status.as_ref().map(|status| status.audio.source),
+                "audio_driver_state": status.as_ref().map(|status| status.audio.driver_state),
+                "reboot_required": status.as_ref().map(|status| status.reboot_required),
+            }),
+            instance_id: Some(instance_id.to_string()),
+            node_snapshot: audit::instance_snapshot(&state.db, instance_id).await,
+            context: context.clone(),
+            session_id: Some(session_id.to_string()),
+            operation_id: None,
+            status: "running".to_string(),
+            error_code: None,
+            error_reason: String::new(),
+            created_at: now_ts(),
+            completed_at: None,
+        },
+    )
+    .await
+    {
+        Ok(event_id) => Some(event_id),
+        Err(error) => {
+            warn!(?error, %session_id, "failed to begin secure attention action log");
+            None
+        }
+    }
+}
+
+async fn finish_secure_attention_audit(
+    state: &AppState,
+    event_id: &str,
+    succeeded: bool,
+    code: Option<&str>,
+) {
+    let (status, error_code, error_reason) = if succeeded {
+        ("success", None, "")
+    } else {
+        let code = code.unwrap_or("secure_attention_failed");
+        ("failed", Some(code), "Windows 未执行 Ctrl+Alt+Del")
+    };
+    if let Err(error) =
+        audit::finish_event(&state.db, event_id, status, error_code, error_reason).await
+    {
+        warn!(?error, %event_id, "failed to finish secure attention action log");
+    }
+}
+
+async fn cancel_secure_attention_audit(state: &AppState, event_id: &str, code: &str) {
+    if let Err(error) = audit::finish_event(
+        &state.db,
+        event_id,
+        "cancelled",
+        Some(code),
+        "Ctrl+Alt+Del 执行结果未确认",
+    )
+    .await
+    {
+        warn!(?error, %event_id, "failed to cancel secure attention action log");
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> AppResult<&str> {
@@ -1175,9 +1418,18 @@ fn opus_frame_samples_48k(toc: u8) -> usize {
     }
 }
 
+#[cfg(test)]
 fn validate_browser_message(
     text: &str,
     audio_enabled: bool,
+) -> Result<bool, (&'static str, &'static str)> {
+    validate_browser_message_with_policy(text, audio_enabled, false)
+}
+
+fn validate_browser_message_with_policy(
+    text: &str,
+    audio_enabled: bool,
+    secure_attention_allowed: bool,
 ) -> Result<bool, (&'static str, &'static str)> {
     if text.len() > CONTROL_MESSAGE_MAX_BYTES {
         return Err(("message_too_large", "远程桌面控制消息过大"));
@@ -1238,10 +1490,18 @@ fn validate_browser_message(
             }
             Ok(false)
         }
-        "secure_attention" => Err((
-            "secure_attention_unavailable",
-            "不允许通过远程桌面发送 Ctrl+Alt+Del",
-        )),
+        "secure_attention" => {
+            if !has_only_fields(&value, &["type"]) {
+                return Err(("invalid_message", "安全注意序列消息无效"));
+            }
+            if !secure_attention_allowed {
+                return Err((
+                    "secure_attention_unavailable",
+                    "当前会话不允许发送 Ctrl+Alt+Del",
+                ));
+            }
+            Ok(true)
+        }
         "feedback" => {
             if value.get("sequence").and_then(Value::as_u64).is_none() {
                 return Err(("invalid_message", "桌面反馈消息无效"));
@@ -1291,6 +1551,66 @@ fn stops_audio_stream(text: &str) -> bool {
     }
 }
 
+fn message_session_policy(text: &str) -> Option<DesktopSessionPolicy> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("session_policy") {
+        return None;
+    }
+    Some(DesktopSessionPolicy {
+        access_mode: match value.get("access_mode").and_then(Value::as_str)? {
+            "local_consent" => RemoteDesktopAccessMode::LocalConsent,
+            "unattended" => RemoteDesktopAccessMode::Unattended,
+            _ => return None,
+        },
+        local_consent_required: value.get("local_consent_required")?.as_bool()?,
+        secure_desktop_control: value.get("secure_desktop_control")?.as_bool()?,
+        secure_attention_allowed: value.get("secure_attention_allowed")?.as_bool()?,
+    })
+}
+
+fn desktop_message_controllable(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    value
+        .get("controllable")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| value.get("desktop").and_then(Value::as_str) == Some("default"))
+}
+
+fn desktop_message_control_allowed(text: &str, policy: DesktopSessionPolicy) -> bool {
+    if !desktop_message_controllable(text) {
+        return false;
+    }
+    let value = serde_json::from_str::<Value>(text).ok();
+    let desktop = value
+        .as_ref()
+        .and_then(|value| value.get("desktop"))
+        .and_then(Value::as_str);
+    let context = value
+        .as_ref()
+        .and_then(|value| value.get("context"))
+        .and_then(Value::as_str);
+    desktop == Some("default")
+        || (desktop == Some("secure")
+            && context == Some("winlogon")
+            && policy.access_mode == RemoteDesktopAccessMode::Unattended
+            && !policy.local_consent_required
+            && policy.secure_desktop_control)
+}
+
+fn message_display_state(text: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    (value.get("type").and_then(Value::as_str) == Some("display_state"))
+        .then(|| {
+            value
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten()
+}
+
 fn clear_pending_audio<T: Clone>(receiver: &mut broadcast::Receiver<T>) {
     loop {
         match receiver.try_recv() {
@@ -1302,9 +1622,18 @@ fn clear_pending_audio<T: Clone>(receiver: &mut broadcast::Receiver<T>) {
     }
 }
 
+#[cfg(test)]
 fn validate_agent_message(
     text: &str,
     audio_enabled: bool,
+) -> Result<String, (&'static str, &'static str)> {
+    validate_agent_message_with_policy(text, audio_enabled, false)
+}
+
+fn validate_agent_message_with_policy(
+    text: &str,
+    audio_enabled: bool,
+    unattended_supported: bool,
 ) -> Result<String, (&'static str, &'static str)> {
     if text.len() > CONTROL_MESSAGE_MAX_BYTES {
         return Err(("message_too_large", "远程桌面状态消息过大"));
@@ -1347,21 +1676,160 @@ fn validate_agent_message(
         }
         .to_string());
     }
+    if kind == "session_policy" {
+        let access_mode = value.get("access_mode").and_then(Value::as_str);
+        let local_consent_required = value.get("local_consent_required").and_then(Value::as_bool);
+        let secure_desktop_control = value.get("secure_desktop_control").and_then(Value::as_bool);
+        let secure_attention_allowed = value
+            .get("secure_attention_allowed")
+            .and_then(Value::as_bool);
+        let consistent = match (
+            access_mode,
+            local_consent_required,
+            secure_desktop_control,
+            secure_attention_allowed,
+        ) {
+            (Some("local_consent"), Some(true), Some(false), Some(false)) => true,
+            (Some("unattended"), Some(false), Some(secure_control), Some(sas_allowed)) => {
+                unattended_supported && (!sas_allowed || secure_control)
+            }
+            _ => false,
+        };
+        if !has_only_fields(
+            &value,
+            &[
+                "type",
+                "access_mode",
+                "local_consent_required",
+                "secure_desktop_control",
+                "secure_attention_allowed",
+            ],
+        ) || secure_desktop_control.is_none()
+            || secure_attention_allowed.is_none()
+            || !consistent
+        {
+            return Err(("invalid_message", "远程桌面会话策略消息无效"));
+        }
+        return Ok(json!({
+            "type": "session_policy",
+            "access_mode": access_mode,
+            "local_consent_required": local_consent_required,
+            "secure_desktop_control": secure_desktop_control,
+            "secure_attention_allowed": secure_attention_allowed,
+        })
+        .to_string());
+    }
+    if kind == "display_state" {
+        let state = value.get("state").and_then(Value::as_str);
+        let source = value.get("source").and_then(Value::as_str);
+        let code_value = value.get("code");
+        let code = code_value.and_then(Value::as_str);
+        if !has_only_fields(&value, &["type", "state", "source", "code"])
+            || !matches!(state, Some("preparing" | "ready" | "unavailable"))
+            || !matches!(source, Some("physical" | "virtual" | "none" | "unknown"))
+            || code_value.is_some_and(|value| !value.is_null() && !value.is_string())
+            || !valid_remote_access_code(code)
+        {
+            return Err(("invalid_message", "远程显示状态消息无效"));
+        }
+        return Ok(match code {
+            Some(code) => {
+                json!({"type":"display_state", "state":state, "source":source, "code":code})
+            }
+            None => json!({"type":"display_state", "state":state, "source":source}),
+        }
+        .to_string());
+    }
+    if kind == "secure_attention_result" {
+        let status = value.get("status").and_then(Value::as_str);
+        let code_value = value.get("code");
+        let code = code_value.and_then(Value::as_str);
+        let valid_result = matches!(status, Some("success")) && code_value.is_none()
+            || matches!(status, Some("failed"))
+                && matches!(
+                    code,
+                    Some("secure_attention_unavailable" | "secure_attention_policy_denied")
+                );
+        if !unattended_supported
+            || !has_only_fields(&value, &["type", "status", "code"])
+            || !valid_result
+        {
+            return Err(("invalid_message", "安全注意序列执行结果无效"));
+        }
+        return Ok(match code {
+            Some(code) => {
+                json!({"type":"secure_attention_result", "status":status, "code":code})
+            }
+            None => json!({"type":"secure_attention_result", "status":status}),
+        }
+        .to_string());
+    }
+    if kind == "desktop_state" {
+        let desktop = value.get("desktop").and_then(Value::as_str);
+        let context = value.get("context").and_then(Value::as_str);
+        let controllable = value.get("controllable").and_then(Value::as_bool);
+        let legacy = !value.as_object().is_some_and(|object| {
+            object.contains_key("context") || object.contains_key("controllable")
+        });
+        let extended = context.is_some() && controllable.is_some();
+        let extended_consistent = matches!(
+            (desktop, context),
+            (Some("default"), Some("default"))
+                | (Some("secure"), Some("winlogon"))
+                | (Some("other"), Some("other"))
+        );
+        if !has_only_fields(&value, &["type", "desktop", "context", "controllable"])
+            || !matches!(desktop, Some("default" | "secure" | "other"))
+            || !(legacy || extended)
+            || context.is_some_and(|context| !matches!(context, "default" | "winlogon" | "other"))
+            || (extended && !extended_consistent)
+        {
+            return Err(("invalid_message", "远程桌面上下文状态消息无效"));
+        }
+        return if legacy {
+            Ok(json!({"type":"desktop_state", "desktop":desktop}).to_string())
+        } else {
+            Ok(json!({
+                "type":"desktop_state",
+                "desktop":desktop,
+                "context":context,
+                "controllable":controllable,
+            })
+            .to_string())
+        };
+    }
+    if kind == "closed" {
+        if !has_only_fields(&value, &["type", "reason"])
+            || value
+                .get("reason")
+                .is_some_and(|reason| !reason.is_string())
+        {
+            return Err(("invalid_message", "远程桌面关闭消息无效"));
+        }
+        return Ok(json!({
+            "type": "closed",
+            "reason": message_reason(text).unwrap_or_else(|| "agent_closed".to_string()),
+        })
+        .to_string());
+    }
     if matches!(
         kind,
-        "consent_required"
-            | "ready"
-            | "display"
-            | "desktop_state"
-            | "notice"
-            | "paused"
-            | "closed"
-            | "error"
+        "consent_required" | "ready" | "display" | "notice" | "paused" | "error"
     ) {
         Ok(text.to_string())
     } else {
         Err(("unknown_message", "未知的远程桌面状态消息"))
     }
+}
+
+fn valid_remote_access_code(code: Option<&str>) -> bool {
+    code.is_none_or(|code| {
+        !code.is_empty()
+            && code.len() <= 64
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    })
 }
 
 fn has_only_fields(value: &Value, allowed: &[&str]) -> bool {
@@ -1440,19 +1908,49 @@ fn message_type(text: &str) -> Option<String> {
 }
 
 fn message_reason(text: &str) -> Option<String> {
-    serde_json::from_str::<Value>(text)
-        .ok()?
-        .get("reason")?
-        .as_str()
-        .map(sanitize_reason)
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let reason = value.get("reason")?.as_str().map(str::trim)?;
+    Some(
+        matches!(
+            reason,
+            "agent_closed"
+                | "agent_data_error"
+                | "agent_disconnected"
+                | "agent_draining"
+                | "browser_closed"
+                | "browser_disconnected"
+                | "browser_heartbeat_timeout"
+                | "control_rate_limited"
+                | "data_channel_timeout"
+                | "desktop_locked"
+                | "driver_bundle_missing"
+                | "frame_too_large"
+                | "helper_disconnected"
+                | "helper_error"
+                | "local_consent_denied"
+                | "local_consent_revoked"
+                | "multiple_active_sessions"
+                | "no_active_session"
+                | "no_display_output"
+                | "secure_desktop"
+                | "session_changed"
+                | "unattended_policy_rejected"
+                | "unsupported_platform"
+                | "virtual_device_reboot_required"
+                | "virtual_devices_disabled"
+        )
+        .then(|| reason.to_string())
+        .unwrap_or_else(|| "agent_error".to_string()),
+    )
 }
 
-fn message_desktop(text: &str) -> Option<String> {
-    serde_json::from_str::<Value>(text)
-        .ok()?
-        .get("desktop")?
-        .as_str()
-        .map(str::to_string)
+fn secure_attention_result(text: &str) -> Option<(bool, Option<String>)> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    match value.get("status")?.as_str()? {
+        "success" => Some((true, None)),
+        "failed" => Some((false, value.get("code")?.as_str().map(str::to_string))),
+        _ => None,
+    }
 }
 
 fn sanitize_reason(reason: &str) -> String {
@@ -1817,8 +2315,20 @@ mod tests {
             validate_browser_message(r#"{"type":"secure_attention"}"#, false),
             Err((
                 "secure_attention_unavailable",
-                "不允许通过远程桌面发送 Ctrl+Alt+Del"
+                "当前会话不允许发送 Ctrl+Alt+Del"
             ))
+        );
+        assert_eq!(
+            validate_browser_message_with_policy(r#"{"type":"secure_attention"}"#, false, true,),
+            Ok(true)
+        );
+        assert!(
+            validate_browser_message_with_policy(
+                r#"{"type":"secure_attention","key":"raw"}"#,
+                false,
+                true,
+            )
+            .is_err()
         );
         assert!(validate_browser_message(r#"{"type":"pointer_move","x":2,"y":0}"#, false).is_err());
         assert!(validate_browser_message(r#"{"type":"unknown"}"#, false).is_err());
@@ -1827,6 +2337,94 @@ mod tests {
     #[test]
     fn validates_local_consent_status_message() {
         assert!(validate_agent_message(r#"{"type":"consent_required"}"#, false).is_ok());
+    }
+
+    #[test]
+    fn validates_session_policy_and_requires_consistent_security_flags() {
+        let unattended = r#"{"type":"session_policy","access_mode":"unattended","local_consent_required":false,"secure_desktop_control":true,"secure_attention_allowed":true}"#;
+        assert!(validate_agent_message(unattended, false).is_err());
+        let message = validate_agent_message_with_policy(unattended, false, true).unwrap();
+        let policy = message_session_policy(&message).unwrap();
+        assert!(policy.permits_secure_attention());
+
+        for invalid in [
+            r#"{"type":"session_policy","access_mode":"unattended","local_consent_required":true,"secure_desktop_control":true,"secure_attention_allowed":true}"#,
+            r#"{"type":"session_policy","access_mode":"local_consent","local_consent_required":true,"secure_desktop_control":true,"secure_attention_allowed":true}"#,
+            r#"{"type":"session_policy","access_mode":"unattended","local_consent_required":false,"secure_desktop_control":true,"secure_attention_allowed":true,"raw_error":"secret"}"#,
+        ] {
+            assert!(validate_agent_message(invalid, false).is_err());
+        }
+    }
+
+    #[test]
+    fn validates_secure_attention_results_only_for_unattended_agents() {
+        let success = r#"{"type":"secure_attention_result","status":"success"}"#;
+        let denied = r#"{"type":"secure_attention_result","status":"failed","code":"secure_attention_policy_denied"}"#;
+        assert!(validate_agent_message(success, false).is_err());
+        assert!(validate_agent_message_with_policy(success, false, true).is_ok());
+        assert!(validate_agent_message_with_policy(denied, false, true).is_ok());
+        assert_eq!(secure_attention_result(success), Some((true, None)));
+        assert_eq!(
+            secure_attention_result(denied),
+            Some((false, Some("secure_attention_policy_denied".to_string())))
+        );
+        for invalid in [
+            r#"{"type":"secure_attention_result","status":"failed"}"#,
+            r#"{"type":"secure_attention_result","status":"success","code":"secure_attention_policy_denied"}"#,
+            r#"{"type":"secure_attention_result","status":"failed","code":"raw_windows_error"}"#,
+        ] {
+            assert!(validate_agent_message_with_policy(invalid, false, true).is_err());
+        }
+    }
+
+    #[test]
+    fn validates_display_and_desktop_state_with_legacy_control_fallback() {
+        assert!(validate_agent_message(
+            r#"{"type":"display_state","state":"preparing","source":"none","code":"no_display_device"}"#,
+            false,
+        )
+        .is_ok());
+        assert!(validate_agent_message(
+            r#"{"type":"display_state","state":"unavailable","source":"none","code":"raw error C:\\\\driver"}"#,
+            false,
+        )
+        .is_err());
+
+        let legacy_default =
+            validate_agent_message(r#"{"type":"desktop_state","desktop":"default"}"#, false)
+                .unwrap();
+        let legacy_secure =
+            validate_agent_message(r#"{"type":"desktop_state","desktop":"secure"}"#, false)
+                .unwrap();
+        assert!(desktop_message_controllable(&legacy_default));
+        assert!(!desktop_message_controllable(&legacy_secure));
+
+        let secure = validate_agent_message(
+            r#"{"type":"desktop_state","desktop":"secure","context":"winlogon","controllable":true}"#,
+            false,
+        )
+        .unwrap();
+        assert!(desktop_message_controllable(&secure));
+        assert!(!desktop_message_control_allowed(
+            &secure,
+            DesktopSessionPolicy::default(),
+        ));
+        assert!(desktop_message_control_allowed(
+            &secure,
+            DesktopSessionPolicy {
+                access_mode: RemoteDesktopAccessMode::Unattended,
+                local_consent_required: false,
+                secure_desktop_control: true,
+                secure_attention_allowed: true,
+            },
+        ));
+        assert!(
+            validate_agent_message(
+                r#"{"type":"desktop_state","desktop":"secure","context":"winlogon"}"#,
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2083,6 +2681,11 @@ mod tests {
         assert_eq!(
             message_reason(r#"{"type":"closed","reason":" helper_error "}"#).as_deref(),
             Some("helper_error")
+        );
+        assert_eq!(
+            message_reason(r#"{"type":"closed","reason":"C:\\Windows\\INF\\oem42.inf failed"}"#)
+                .as_deref(),
+            Some("agent_error")
         );
         assert_eq!(message_reason(r#"{"type":"closed"}"#), None);
     }

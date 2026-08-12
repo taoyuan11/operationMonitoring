@@ -114,6 +114,72 @@ pub struct MetricPayload {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum RemoteAccessMode {
+    LocalConsent,
+    Unattended,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAccessFallbackMode {
+    Auto,
+    Disabled,
+    PhysicalOnly,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAccessAvailability {
+    Ready,
+    Degraded,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAccessSource {
+    Physical,
+    Virtual,
+    None,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAccessDriverState {
+    Active,
+    Standby,
+    Missing,
+    RebootRequired,
+    Unhealthy,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteAccessComponent {
+    pub availability: RemoteAccessAvailability,
+    pub source: RemoteAccessSource,
+    pub driver_state: RemoteAccessDriverState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteAccessStatus {
+    pub access_mode: RemoteAccessMode,
+    pub fallback_mode: RemoteAccessFallbackMode,
+    pub display: RemoteAccessComponent,
+    pub audio: RemoteAccessComponent,
+    pub reboot_required: bool,
+    pub checked_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DockerStatusState {
     NotInstalled,
     DaemonUnreachable,
@@ -789,6 +855,8 @@ pub enum AgentInbound {
         rollback_version: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         docker_status: Option<DockerStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_access_status: Option<RemoteAccessStatus>,
         metrics: MetricPayload,
     },
     CommandResult {

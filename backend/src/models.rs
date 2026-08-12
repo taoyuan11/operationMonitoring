@@ -229,6 +229,74 @@ pub struct DockerStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum RemoteDesktopAccessMode {
+    LocalConsent,
+    Unattended,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAccessFallbackMode {
+    Auto,
+    Disabled,
+    PhysicalOnly,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAccessAvailability {
+    Ready,
+    Degraded,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAccessDeviceSource {
+    Physical,
+    Virtual,
+    None,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAccessDriverState {
+    Active,
+    Standby,
+    Missing,
+    RebootRequired,
+    Unhealthy,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAccessDeviceStatus {
+    pub availability: RemoteAccessAvailability,
+    pub source: RemoteAccessDeviceSource,
+    pub driver_state: RemoteAccessDriverState,
+    #[serde(default)]
+    pub driver_version: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAccessStatus {
+    pub access_mode: RemoteDesktopAccessMode,
+    pub fallback_mode: RemoteAccessFallbackMode,
+    pub display: RemoteAccessDeviceStatus,
+    pub audio: RemoteAccessDeviceStatus,
+    pub reboot_required: bool,
+    pub checked_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DockerErrorCode {
     InvalidRequest,
     NotFound,
@@ -1213,6 +1281,8 @@ pub enum AgentInbound {
         rollback_version: Option<String>,
         #[serde(default)]
         docker_status: Option<DockerStatus>,
+        #[serde(default)]
+        remote_access_status: Option<RemoteAccessStatus>,
         metrics: MetricPayload,
     },
     CommandResult {

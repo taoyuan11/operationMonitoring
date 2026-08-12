@@ -196,6 +196,24 @@
 
 .remote-desktop-session-warning { right: auto; left: 14px; color: #f0a0ac; background: rgba(40, 17, 22, .94); border-color: rgba(236, 113, 130, .27); }
 
+.remote-desktop-notice {
+  position: absolute;
+  z-index: 5;
+  top: 12px;
+  left: 50%;
+  max-width: min(520px, calc(100% - 28px));
+  padding: 9px 12px;
+  color: #f0a0ac;
+  background: rgba(40, 17, 22, .94);
+  border: 1px solid rgba(236, 113, 130, .27);
+  border-radius: 6px;
+  box-shadow: 0 8px 25px rgba(0, 0, 0, .3);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+  transform: translateX(-50%);
+}
+
 @media (max-width: 900px) {
   .remote-desktop-head { gap: 10px; }
   .desktop-tool-button span { display: none; }

@@ -6,7 +6,7 @@ use std::{
 use axum::{
     extract::{
         ConnectInfo, Path, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
     response::Response,
@@ -55,6 +55,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const CONTROL_RATE_PER_SECOND: f64 = 120.0;
 const CONTROL_RATE_BURST: f64 = 240.0;
+// Unreliable messages (pointer_move/feedback) over the rate limit are dropped
+// instead of ending the session; only this many consecutive drops indicate a
+// sustained flood worth disconnecting for (~5s at the maximum inbound rate).
+const CONTROL_RATE_DROP_LIMIT: u32 = 600;
 const SECURE_ATTENTION_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +415,7 @@ async fn desktop_browser_socket(
     let mut last_activity = started;
     let mut last_inbound = started;
     let mut control_rate = ControlRateLimiter::new(started);
+    let mut rate_limited_drops = 0u32;
     let mut joined = false;
     let mut helper_ready = false;
     let mut session_policy = DesktopSessionPolicy::default();
@@ -475,13 +480,30 @@ async fn desktop_browser_socket(
                         ) {
                             Ok(is_activity) => {
                                 if !control_rate.allow(Instant::now()) {
-                                    deferred_browser_message = Some(server_error(
-                                        "control_rate_limited",
-                                        "远程桌面控制消息速率过高",
-                                    ));
-                                    reason = "control_rate_limited".to_string();
-                                    break;
+                                    // Bursts of queued pointer_move/feedback after
+                                    // network jitter are expected; drop them instead
+                                    // of ending the session. Reliable input over the
+                                    // limit cannot come from a real user.
+                                    if is_reliable_browser_message(&text) {
+                                        deferred_browser_message = Some(server_error(
+                                            "control_rate_limited",
+                                            "远程桌面控制消息速率过高",
+                                        ));
+                                        reason = "control_rate_limited".to_string();
+                                        break;
+                                    }
+                                    rate_limited_drops += 1;
+                                    if rate_limited_drops >= CONTROL_RATE_DROP_LIMIT {
+                                        deferred_browser_message = Some(server_error(
+                                            "control_rate_limited",
+                                            "远程桌面控制消息速率过高",
+                                        ));
+                                        reason = "control_rate_limited".to_string();
+                                        break;
+                                    }
+                                    continue;
                                 }
+                                rate_limited_drops = 0;
                                 let control_ready = helper_ready
                                     && desktop_state.as_deref().is_none_or(|message| {
                                         desktop_message_control_allowed(message, session_policy)
@@ -570,7 +592,13 @@ async fn desktop_browser_socket(
                         last_inbound = Instant::now();
                         if !send_socket_message(&mut sender, Message::Pong(data)).await { break; }
                     }
-                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(Message::Close(frame)) => {
+                        if let Some(close_reason) = browser_close_reason(frame.as_ref()) {
+                            reason = close_reason.to_string();
+                        }
+                        break;
+                    }
+                    Err(_) => break,
                     Ok(Message::Binary(_)) => {
                         deferred_browser_message =
                             Some(server_error("invalid_message", "浏览器不得发送二进制数据"));
@@ -1905,6 +1933,16 @@ fn message_type(text: &str) -> Option<String> {
         .get("type")?
         .as_str()
         .map(str::to_string)
+}
+
+// The browser announces intentional closes through the WebSocket close frame
+// (see RemoteDesktopModal.vue). Both variants are deliberate client actions and
+// must be audited as "client_closed" instead of an abnormal disconnect.
+fn browser_close_reason(frame: Option<&CloseFrame>) -> Option<&'static str> {
+    match frame?.reason.as_ref() {
+        "client_closed" | "reconnecting" => Some("client_closed"),
+        _ => None,
+    }
 }
 
 fn message_reason(text: &str) -> Option<String> {

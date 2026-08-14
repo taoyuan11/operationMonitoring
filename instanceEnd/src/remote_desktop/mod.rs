@@ -52,6 +52,10 @@ const AUDIO_KNOWN_FLAGS: u8 = AUDIO_FLAG_DISCONTINUITY;
 pub(super) const AUDIO_CHANNEL_CAPACITY: usize = 8;
 pub(super) const CONTROL_RATE_PER_SECOND: f64 = 120.0;
 pub(super) const CONTROL_RATE_BURST: f64 = 240.0;
+// Rate-limited unreliable messages (pointer_move/feedback) are dropped rather
+// than ending the session; this many consecutive drops indicate a sustained
+// flood (~5s at the maximum inbound rate) and terminate the connection.
+pub(super) const CONTROL_RATE_DROP_LIMIT: u32 = 600;
 pub(super) const DATA_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const INPUT_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);

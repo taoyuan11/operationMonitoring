@@ -39,6 +39,7 @@ use windows::{
             },
             Dxgi::{
                 Common::{
+                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
                     DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180,
                     DXGI_MODE_ROTATION_ROTATE270,
                 },
@@ -66,6 +67,7 @@ use windows::{
             Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
             LibraryLoader::{GetProcAddress, LoadLibraryW},
             Pipes::GetNamedPipeClientProcessId,
+            Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW},
             RemoteDesktop::{
                 ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
                 WTS_SESSION_INFOW, WTSActive, WTSEnumerateProcessesW, WTSEnumerateSessionsW,
@@ -104,7 +106,8 @@ use windows::{
 use super::{
     AUDIO_CHANNEL_CAPACITY, AUDIO_CHANNELS, AUDIO_CODEC_NAME, AUDIO_FRAME_HEADER_LEN,
     AUDIO_SAMPLE_RATE, AUDIO_SAMPLES_PER_FRAME, AdaptiveSettings, AudioFrameHeader,
-    ControlRateLimiter, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl, DesktopOpenRequest,
+    ControlRateLimiter, DATA_CHANNEL_JOIN_TIMEOUT, CONTROL_RATE_DROP_LIMIT, DesktopControl,
+    DesktopOpenRequest,
     DesktopOptions, FrameHeader, INPUT_RELEASE_ACK_TIMEOUT, MAX_AUDIO_FRAME_BYTES,
     MAX_CONTROL_BYTES, MAX_FRAME_BYTES, MAX_JPEG_QUALITY, MIN_JPEG_QUALITY,
     absolute_pointer_coordinate, dom_code_to_vk, dom_code_uses_extended_key, drop_oldest_channel,
@@ -856,6 +859,7 @@ async fn relay(
     session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_browser_message = tokio::time::Instant::now();
     let mut control_rate = ControlRateLimiter::new(Instant::now());
+    let mut rate_limited_drops = 0u32;
     let mut input_gate = RelayInputGate::default();
     let mut audio_open = true;
     let mut audio_relay = AudioRelayGate::new();
@@ -891,8 +895,22 @@ async fn relay(
                         let control = serde_json::from_str::<DesktopControl>(&text)
                             .context("invalid desktop control message")?;
                         if !control_rate.allow(Instant::now()) {
-                            bail!("control_rate_limited: desktop control rate exceeded")
+                            // Mirror the backend policy: drop unreliable messages over
+                            // the limit and only end the session on a sustained flood
+                            // or on reliable input that a real user cannot produce.
+                            if !matches!(
+                                &control,
+                                DesktopControl::PointerMove { .. } | DesktopControl::Feedback { .. }
+                            ) {
+                                bail!("control_rate_limited: desktop control rate exceeded")
+                            }
+                            rate_limited_drops += 1;
+                            if rate_limited_drops >= CONTROL_RATE_DROP_LIMIT {
+                                bail!("control_rate_limited: desktop control rate exceeded")
+                            }
+                            continue;
                         }
+                        rate_limited_drops = 0;
                         if let DesktopControl::Feedback { sequence, .. } = &control {
                             input_gate.observe_feedback(*sequence);
                         }
@@ -1634,6 +1652,10 @@ fn capture_loop(
     tx: mpsc::Sender<HelperEvent>,
 ) {
     let mut capture: Option<DxgiCapture> = None;
+    // Set when DXGI duplication delivers a pixel format we cannot decode
+    // (e.g. HDR R10G10B10A2); the loop then stays on GDI capture instead of
+    // re-initializing DXGI and failing again every frame.
+    let mut dxgi_format_unsupported = false;
     let mut attached_desktop = match ThreadDesktopBinding::new() {
         Ok(binding) => binding,
         Err(error) => {
@@ -1672,6 +1694,7 @@ fn capture_loop(
                         return;
                     }
                     capture = None;
+                    dxgi_format_unsupported = false;
                     let kind = desktop_kind(&name);
                     let context = desktop_context(&name);
                     let controllable = desktop_controllable(&name, options.unattended);
@@ -1729,7 +1752,7 @@ fn capture_loop(
             foreground_secure_paused = false;
         }
         let result = if desktop_name.eq_ignore_ascii_case("Default") {
-            if capture.is_none() {
+            if capture.is_none() && !dxgi_format_unsupported {
                 match DxgiCapture::new() {
                     Ok(value) => capture = Some(value),
                     Err(error) => {
@@ -1786,7 +1809,19 @@ fn capture_loop(
                 }
             }
             Ok(None) => {}
-            Err(error) if error.to_string().contains("DXGI_ERROR_ACCESS_LOST") => capture = None,
+            Err(error) if error.to_string().contains("DXGI_ERROR_ACCESS_LOST") => {
+                // A display mode change (including toggling HDR) invalidates the
+                // duplication; allow DXGI to be retried with the new mode.
+                capture = None;
+                dxgi_format_unsupported = false;
+            }
+            Err(error) if error.to_string().contains("unsupported_capture_format") => {
+                crate::logging::error(format_args!(
+                    "DXGI desktop duplication pixel format is unsupported, using GDI: {error:#}"
+                ));
+                capture = None;
+                dxgi_format_unsupported = true;
+            }
             Err(error) if error.to_string().contains("frame_too_large") => {
                 let _ = tx.blocking_send(HelperEvent::Fatal("frame_too_large".to_string()));
                 return;
@@ -2205,6 +2240,19 @@ impl DxgiCapture {
                 let texture: ID3D11Texture2D = resource.context("missing DXGI frame")?.cast()?;
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 texture.GetDesc(&mut desc);
+                // copy_bgra_to_rgb assumes 8-bit BGRA. HDR/10-bit outputs deliver
+                // R10G10B10A2 (or FP16) textures; decoding those as BGRA corrupts
+                // colors, so report a distinct error and let the caller fall back
+                // to GDI capture instead.
+                if !matches!(
+                    desc.Format,
+                    DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                ) {
+                    bail!(
+                        "unsupported_capture_format: DXGI duplication produced format {:?}",
+                        desc.Format
+                    )
+                }
                 let staging_desc = D3D11_TEXTURE2D_DESC {
                     Usage: D3D11_USAGE_STAGING,
                     BindFlags: 0,
@@ -2509,10 +2557,47 @@ impl Drop for ImpersonationGuard {
     }
 }
 
+// SendSAS is void and never reports whether Winlogon acted on the request; the
+// SoftwareSASGeneration policy decides that. Check it up front so a disallowed
+// request fails with a real error instead of a fabricated success.
+fn ensure_service_sas_generation_allowed() -> Result<()> {
+    const SAS_GENERATED_BY_SERVICES: u32 = 1;
+    const SAS_GENERATED_BY_SERVICES_AND_EASE_OF_ACCESS: u32 = 3;
+    let subkey = wide(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System");
+    let value_name = wide("SoftwareSASGeneration");
+    let mut value = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value_name.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+        .ok()
+        .context(
+            "secure_attention_policy_denied: the SoftwareSASGeneration policy is not configured",
+        )?;
+    }
+    if !matches!(
+        value,
+        SAS_GENERATED_BY_SERVICES | SAS_GENERATED_BY_SERVICES_AND_EASE_OF_ACCESS
+    ) {
+        bail!(
+            "secure_attention_policy_denied: SoftwareSASGeneration={value} does not permit services to simulate Ctrl+Alt+Del"
+        )
+    }
+    Ok(())
+}
+
 fn send_service_secure_attention(session_id: u32) -> Result<()> {
     if current_session_id()? != 0 || !current_process_is_local_system()? {
         bail!("secure_attention_unavailable: caller is not the managed LocalSystem service")
     }
+    ensure_service_sas_generation_allowed()?;
     unsafe {
         let token = duplicate_session_system_token(session_id)?;
         let impersonated = ImpersonateLoggedOnUser(token);

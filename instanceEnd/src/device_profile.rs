@@ -87,8 +87,7 @@ fn collect_static_profile() -> DeviceProfile {
         cpu: DeviceCpuInfo {
             model: clean_text(first_cpu.map(|cpu| cpu.brand()).unwrap_or_default()),
             vendor: clean_text(first_cpu.map(|cpu| cpu.vendor_id()).unwrap_or_default()),
-            physical_cores: system
-                .physical_core_count()
+            physical_cores: System::physical_core_count()
                 .and_then(|count| u32::try_from(count).ok()),
             logical_cores: u32::try_from(system.cpus().len()).unwrap_or(u32::MAX),
             frequency_mhz,
@@ -320,7 +319,7 @@ fn parse_nvidia_gpus(output: &str) -> Vec<DeviceGpuInfo> {
 #[cfg(target_os = "windows")]
 fn collect_windows_gpus(skip_nvidia: bool) -> Vec<DeviceGpuInfo> {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
+        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
     };
 
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
@@ -331,9 +330,10 @@ fn collect_windows_gpus(skip_nvidia: bool) -> Vec<DeviceGpuInfo> {
         let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
             break;
         };
-        let mut description = DXGI_ADAPTER_DESC1::default();
-        if unsafe { adapter.GetDesc1(&mut description) }.is_err()
-            || description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+        let Ok(description) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        if description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
             || description.VendorId == 0
             || (skip_nvidia && description.VendorId == 0x10de)
         {

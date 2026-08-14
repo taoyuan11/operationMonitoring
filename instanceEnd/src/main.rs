@@ -4,6 +4,7 @@ mod config;
 mod device_profile;
 mod docker;
 mod file_manager;
+mod hex;
 mod http;
 mod identity;
 mod install;
@@ -18,6 +19,7 @@ mod remote_access;
 mod remote_desktop;
 mod terminal;
 mod time;
+mod tls;
 mod update;
 #[cfg(windows)]
 mod windows_security;
@@ -40,6 +42,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    tls::install_crypto_provider();
     let cli = Cli::parse();
     if cli.command == AgentCommand::ServiceRun {
         init_agent_logging(&cli.agent)?;

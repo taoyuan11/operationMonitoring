@@ -35,7 +35,7 @@ import {
   Webhook,
   Wrench,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { ALERT_RULE_PRESETS, type AlertingConsole } from '../composables/useAlertingConsole'
 import type {
   AlertChannelType,

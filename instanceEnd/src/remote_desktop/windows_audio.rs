@@ -594,7 +594,7 @@ struct ComApartment;
 
 impl ComApartment {
     fn new() -> Result<Self> {
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED)? };
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
         Ok(Self)
     }
 }

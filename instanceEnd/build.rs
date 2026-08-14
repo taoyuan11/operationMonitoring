@@ -199,7 +199,7 @@ fn generate_windows_driver_assets() {
                     source_path.display()
                 )
             });
-            let actual = format!("{:x}", Sha256::digest(&contents));
+            let actual = encode_lower_hex(Sha256::digest(&contents));
             assert!(
                 actual.eq_ignore_ascii_case(&file.sha256),
                 "SHA-256 mismatch for {}: expected {}, got {actual}",
@@ -276,7 +276,7 @@ fn generate_windows_driver_assets() {
         });
     }
 
-    let lock_sha256 = format!("{:x}", Sha256::digest(&lock_bytes));
+    let lock_sha256 = encode_lower_hex(Sha256::digest(&lock_bytes));
     let generated = render_windows_driver_assets(
         &lock.bundle_version,
         architecture,
@@ -287,6 +287,18 @@ fn generate_windows_driver_assets() {
     );
     fs::write(generated_path, generated)
         .expect("failed to generate bundled Windows driver assets module");
+}
+
+fn encode_lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = bytes.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(DIGITS[usize::from(byte >> 4)] as char);
+        encoded.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
 }
 
 fn validate_bundle_metadata(lock: &DriverBundleLock, architecture: &str) {

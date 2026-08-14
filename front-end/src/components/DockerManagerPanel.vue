@@ -31,7 +31,7 @@ import {
   Trash2,
   Unlink,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import {
   connectDockerNetwork,
   createDockerContainer,

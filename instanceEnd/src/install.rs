@@ -900,10 +900,11 @@ fn windows_path(path: &Path, add: bool) -> Result<()> {
         RegOpenKeyExW(
             HKEY_LOCAL_MACHINE,
             PCWSTR(subkey.as_ptr()),
-            0,
+            None,
             KEY_QUERY_VALUE | KEY_SET_VALUE,
             &mut raw_key,
         )
+        .ok()
         .context("failed to open the machine environment registry key")?;
     }
     let key = RegistryKey(raw_key);
@@ -919,6 +920,7 @@ fn windows_path(path: &Path, add: bool) -> Result<()> {
             None,
             Some(&mut byte_len),
         )
+        .ok()
         .context("failed to read the machine PATH size")?;
     }
     if value_type != REG_SZ && value_type != REG_EXPAND_SZ {
@@ -938,6 +940,7 @@ fn windows_path(path: &Path, add: bool) -> Result<()> {
             Some(buffer.as_mut_ptr().cast()),
             Some(&mut byte_len),
         )
+        .ok()
         .context("failed to read the machine PATH")?;
     }
     let current = String::from_utf16(buffer.strip_suffix(&[0]).unwrap_or(buffer.as_slice()))
@@ -956,10 +959,11 @@ fn windows_path(path: &Path, add: bool) -> Result<()> {
         RegSetValueExW(
             key.0,
             PCWSTR(value_name.as_ptr()),
-            0,
+            None,
             value_type,
             Some(bytes),
         )
+        .ok()
         .context("failed to update the machine PATH")?;
     }
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Download, Pause, Play, ScrollText, Trash2, X } from 'lucide-vue-next'
+import { Download, Pause, Play, ScrollText, Trash2, X } from '@lucide/vue'
 import { dockerWebSocketUrl } from '../api/docker'
 import type { DockerLogServerMessage } from '../types/docker'
 

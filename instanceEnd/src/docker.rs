@@ -1946,7 +1946,10 @@ async fn load_compose_config(
         secret_count: object_len(&config, "secrets"),
     };
     let warnings = compose_warnings(&config);
-    let config_digest = format!("sha256:{:x}", Sha256::digest(&output.stdout));
+    let config_digest = format!(
+        "sha256:{}",
+        crate::hex::encode_lower(Sha256::digest(&output.stdout))
+    );
     Ok(LoadedComposeConfig {
         validation: DockerComposeValidation {
             project,
@@ -2285,10 +2288,10 @@ impl ComposeSnapshot {
             })?;
         }
         let project_key = project.map_or_else(
-            || format!("{:x}", Sha256::digest(config)),
-            |project| format!("{:x}", Sha256::digest(project.as_bytes())),
+            || crate::hex::encode_lower(Sha256::digest(config)),
+            |project| crate::hex::encode_lower(Sha256::digest(project.as_bytes())),
         );
-        let config_key = format!("{:x}", Sha256::digest(config));
+        let config_key = crate::hex::encode_lower(Sha256::digest(config));
         let version = uuid::Uuid::new_v4();
         let path = directory.join(format!("{project_key}-{config_key}.yaml"));
         if snapshot_matches(&path, config)? {

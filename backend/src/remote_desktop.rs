@@ -13,7 +13,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1112,7 +1112,9 @@ fn bearer_token(headers: &HeaderMap) -> AppResult<&str> {
 
 fn new_stream_token() -> (String, [u8; 32]) {
     let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("operating system random number generator failed");
     let token = URL_SAFE_NO_PAD.encode(bytes);
     let hash = Sha256::digest(token.as_bytes()).into();
     (token, hash)

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { BellRing, ClipboardList, Home, ListChecks, PackageCheck, Settings, Terminal, Users } from 'lucide-vue-next'
+import { BellRing, ClipboardList, Home, ListChecks, PackageCheck, Settings, Terminal, Users } from '@lucide/vue'
 import type { AppPage } from '../types/domain'
 
 defineProps<{

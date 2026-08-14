@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Cpu, MemoryStick, Radio, Server } from 'lucide-vue-next'
+import { Cpu, MemoryStick, Radio, Server } from '@lucide/vue'
 import { computed } from 'vue'
 import { formatPercent } from '../utils/format'
 

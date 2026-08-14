@@ -10,7 +10,7 @@ use axum::{
     routing::{get, patch, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     address::Address,
@@ -21,7 +21,7 @@ use reqwest::{Client, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{AssertSqlSafe, FromRow, PgPool, Postgres, Transaction};
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -2205,7 +2205,7 @@ async fn list_events(
                OR e.node_snapshot->>'hostname' ILIKE $8)
     "#;
     let count_sql = format!("SELECT COUNT(*) {filter}");
-    let total: i64 = sqlx::query_scalar(&count_sql)
+    let total: i64 = sqlx::query_scalar(AssertSqlSafe(count_sql))
         .bind(query.status.as_deref())
         .bind(query.severity.as_deref())
         .bind(query.metric.as_deref())
@@ -2219,7 +2219,7 @@ async fn list_events(
     let list_sql = format!(
         "SELECT e.* {filter} ORDER BY CASE WHEN e.status='resolved' THEN 1 ELSE 0 END, e.fired_at DESC, e.id LIMIT $9 OFFSET $10"
     );
-    let items = sqlx::query_as::<_, EventRow>(&list_sql)
+    let items = sqlx::query_as::<_, EventRow>(AssertSqlSafe(list_sql))
         .bind(query.status.as_deref())
         .bind(query.severity.as_deref())
         .bind(query.metric.as_deref())
@@ -3648,16 +3648,16 @@ async fn list_deliveries(
           AND ($3::TEXT IS NULL OR d.channel_id=$3)
           AND ($4::TEXT IS NULL OR d.event_id=$4)
     "#;
-    let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {filter}"))
+    let total: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT COUNT(*) {filter}")))
         .bind(query.status.as_deref())
         .bind(query.kind.as_deref())
         .bind(query.channel_id.as_deref())
         .bind(query.event_id.as_deref())
         .fetch_one(&state.db)
         .await?;
-    let items = sqlx::query_as::<_, DeliveryRow>(&format!(
+    let items = sqlx::query_as::<_, DeliveryRow>(AssertSqlSafe(format!(
         "SELECT d.* {filter} ORDER BY d.created_at DESC,d.id LIMIT $5 OFFSET $6"
-    ))
+    )))
     .bind(query.status.as_deref())
     .bind(query.kind.as_deref())
     .bind(query.channel_id.as_deref())
@@ -4910,7 +4910,7 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect test database");
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&bootstrap)
             .await
             .expect("create isolated alert schema");
@@ -4936,7 +4936,7 @@ mod tests {
 
     async fn drop_test_schema(db: PgPool, bootstrap: PgPool, schema: String) {
         db.close().await;
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&bootstrap)
             .await
             .expect("drop isolated alert schema");

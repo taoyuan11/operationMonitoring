@@ -6,15 +6,15 @@ use std::{
 };
 
 use aes_gcm::{
-    Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit},
+    Aes256Gcm,
+    aead::{Aead, KeyInit, Nonce},
 };
 use anyhow::{Context, anyhow};
 use axum::http::{HeaderMap, header};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use data_encoding::BASE32_NOPAD;
-use hmac::{Hmac, Mac};
-use rand::{RngCore, rngs::OsRng};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
+use rand::{TryRng, rngs::SysRng};
 use sha1::Sha1;
 use subtle::ConstantTimeEq;
 use tokio::sync::watch;
@@ -99,10 +99,14 @@ impl AuthCipher {
 
     pub fn encrypt(&self, plaintext: &[u8]) -> anyhow::Result<String> {
         let mut nonce_bytes = [0_u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        SysRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .context("failed to generate authentication nonce")?;
+        let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes.as_slice())
+            .expect("authentication nonce has a fixed length");
         let ciphertext = self
             .0
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|_| anyhow!("failed to encrypt authenticator secret"))?;
         let mut encoded = nonce_bytes.to_vec();
         encoded.extend_from_slice(&ciphertext);
@@ -116,8 +120,10 @@ impl AuthCipher {
         if bytes.len() <= 12 {
             return Err(anyhow!("invalid encrypted authenticator secret"));
         }
+        let nonce = Nonce::<Aes256Gcm>::try_from(&bytes[..12])
+            .expect("encrypted authentication nonce has a validated length");
         self.0
-            .decrypt(Nonce::from_slice(&bytes[..12]), &bytes[12..])
+            .decrypt(&nonce, &bytes[12..])
             .map_err(|_| anyhow!("unable to decrypt authenticator secret"))
     }
 }
@@ -154,7 +160,9 @@ fn load_or_create_key_file(path: &Path) -> anyhow::Result<Vec<u8>> {
                 })?;
             }
             let mut key = [0_u8; 32];
-            OsRng.fill_bytes(&mut key);
+            SysRng
+                .try_fill_bytes(&mut key)
+                .context("failed to generate authentication key")?;
             let encoded = STANDARD.encode(key);
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -193,7 +201,9 @@ fn load_or_create_key_file(path: &Path) -> anyhow::Result<Vec<u8>> {
 
 pub fn generate_totp_secret() -> Vec<u8> {
     let mut secret = vec![0_u8; 20];
-    OsRng.fill_bytes(&mut secret);
+    SysRng
+        .try_fill_bytes(&mut secret)
+        .expect("operating system random number generator failed");
     secret
 }
 
@@ -227,7 +237,8 @@ pub fn verify_totp_counter(secret: &[u8], code: &str, timestamp: i64) -> Option<
 }
 
 fn totp_code(secret: &[u8], counter: u64) -> String {
-    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha1> as HmacKeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(&counter.to_be_bytes());
     let digest = mac.finalize().into_bytes();
     let offset = (digest[19] & 0x0f) as usize;

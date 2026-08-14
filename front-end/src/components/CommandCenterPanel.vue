@@ -12,7 +12,7 @@ import {
   Terminal,
   Trash2,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import type { CommandJob, CommandRecord } from '../types/domain'
 import { formatTime } from '../utils/format'
 import WorkspaceDrawer from './WorkspaceDrawer.vue'

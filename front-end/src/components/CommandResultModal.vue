@@ -7,7 +7,7 @@ import {
   LoaderCircle,
   Terminal,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import type { CommandExecutionState } from '../types/domain'
 import { formatTime } from '../utils/format'
 

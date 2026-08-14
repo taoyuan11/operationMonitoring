@@ -11,7 +11,7 @@ import {
   UserPlus,
   Users,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import QrcodeVue from 'qrcode.vue'
 import type {
   AdminUser,

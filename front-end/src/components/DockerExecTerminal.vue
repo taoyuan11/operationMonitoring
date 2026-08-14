@@ -3,7 +3,7 @@ import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
-import { TerminalSquare, X } from 'lucide-vue-next'
+import { TerminalSquare, X } from '@lucide/vue'
 import { dockerWebSocketUrl } from '../api/docker'
 import type { DockerTerminalClientMessage, DockerTerminalServerMessage } from '../types/docker'
 

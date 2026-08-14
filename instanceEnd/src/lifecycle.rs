@@ -868,9 +868,14 @@ fn macos_agent_process_status() -> Option<InstalledServiceStatus> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn is_macos_agent_process(executable: Option<&Path>, name: &str, command: &[String]) -> bool {
-    let known_name =
-        matches!(name, "om-agent" | "operation-monitoring-agent") || name.starts_with("om-agent_");
+fn is_macos_agent_process(
+    executable: Option<&Path>,
+    name: &std::ffi::OsStr,
+    command: &[std::ffi::OsString],
+) -> bool {
+    let name = name.to_string_lossy();
+    let known_name = matches!(name.as_ref(), "om-agent" | "operation-monitoring-agent")
+        || name.starts_with("om-agent_");
     let known_executable = executable.is_some_and(|path| {
         path.file_name().is_some_and(|value| {
             let value = value.to_string_lossy();
@@ -878,9 +883,15 @@ fn is_macos_agent_process(executable: Option<&Path>, name: &str, command: &[Stri
                 || value.starts_with("om-agent_")
         })
     });
-    let service_mode = command.iter().any(|argument| argument == "service-run")
-        || (command.iter().any(|argument| argument == "start")
-            && command.iter().any(|argument| argument == "--daemon-child"));
+    let service_mode = command
+        .iter()
+        .any(|argument| argument == std::ffi::OsStr::new("service-run"))
+        || (command
+            .iter()
+            .any(|argument| argument == std::ffi::OsStr::new("start"))
+            && command
+                .iter()
+                .any(|argument| argument == std::ffi::OsStr::new("--daemon-child")));
     (known_name || known_executable) && service_mode
 }
 
@@ -1140,17 +1151,17 @@ mod tests {
     fn recognizes_only_installed_macos_service_processes() {
         assert!(is_macos_agent_process(
             Some(Path::new("/usr/local/bin/om-agent")),
-            "om-agent",
+            std::ffi::OsStr::new("om-agent"),
             &["/usr/local/bin/om-agent".into(), "service-run".into()],
         ));
         assert!(is_macos_agent_process(
             None,
-            "om-agent",
+            std::ffi::OsStr::new("om-agent"),
             &["/usr/local/bin/om-agent".into(), "service-run".into()],
         ));
         assert!(is_macos_agent_process(
             Some(Path::new("/tmp/om-agent_0.1.5_macos_arm64.bin")),
-            "om-agent_0.1.5_macos_arm64.bin",
+            std::ffi::OsStr::new("om-agent_0.1.5_macos_arm64.bin"),
             &[
                 "/tmp/om-agent_0.1.5_macos_arm64.bin".into(),
                 "start".into(),
@@ -1159,12 +1170,12 @@ mod tests {
         ));
         assert!(!is_macos_agent_process(
             Some(Path::new("/usr/local/bin/om-agent")),
-            "om-agent",
+            std::ffi::OsStr::new("om-agent"),
             &["/usr/local/bin/om-agent".into(), "log".into()],
         ));
         assert!(!is_macos_agent_process(
             Some(Path::new("/tmp/om-agent")),
-            "unrelated",
+            std::ffi::OsStr::new("unrelated"),
             &["/tmp/unrelated".into(), "status".into()],
         ));
     }

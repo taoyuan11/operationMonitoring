@@ -12,7 +12,7 @@ import {
   RefreshCw,
   Search,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import type {
   AuditEvent,
   AuditExportFormat,

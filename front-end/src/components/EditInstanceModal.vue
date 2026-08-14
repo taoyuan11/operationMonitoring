@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref } from 'vue'
-import { CalendarClock, Check, ChevronDown, Globe2, MapPin, Pencil, Search, X } from 'lucide-vue-next'
+import { CalendarClock, Check, ChevronDown, Globe2, MapPin, Pencil, Search, X } from '@lucide/vue'
 import {
   COUNTRY_OPTIONS,
   getCountryFlagUrl,

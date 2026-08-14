@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Activity, ArrowDown, ArrowUp, Clock3, LockKeyhole, LogOut, RefreshCw, ShieldCheck, Wifi } from 'lucide-vue-next'
+import { Activity, ArrowDown, ArrowUp, Clock3, LockKeyhole, LogOut, RefreshCw, ShieldCheck, Wifi } from '@lucide/vue'
 import { computed } from 'vue'
 import { formatBytes } from '../utils/format'
 

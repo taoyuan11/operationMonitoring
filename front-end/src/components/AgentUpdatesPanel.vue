@@ -23,7 +23,7 @@ import {
   Upload,
   UserPlus,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import AgentRolloutSelectorModal from './AgentRolloutSelectorModal.vue'
 import WorkspaceDrawer from './WorkspaceDrawer.vue'
 import type {

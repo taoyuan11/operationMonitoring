@@ -45,7 +45,7 @@ pub fn restrict_to_system_and_administrators(path: &Path) -> Result<()> {
         )
         .ok()
         .with_context(|| format!("failed to protect {}", path.display()));
-        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(descriptor.0));
+        let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(descriptor.0)));
         result
     }
 }

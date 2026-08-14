@@ -31,7 +31,7 @@ import {
   X,
   Zap,
   Volume2,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import CountryFlag from './CountryFlag.vue'
 import DockerManagerPanel from './DockerManagerPanel.vue'
 import FileManagerPanel from './FileManagerPanel.vue'

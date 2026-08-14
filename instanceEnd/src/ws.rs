@@ -84,7 +84,7 @@ pub async fn agent_ws_loop(
 ) -> Result<()> {
     #[cfg(windows)]
     let mut identity = identity;
-    let http_client = reqwest::Client::builder()
+    let http_client = crate::tls::http_client_builder()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(30))
         .redirect(agent_redirect_policy())

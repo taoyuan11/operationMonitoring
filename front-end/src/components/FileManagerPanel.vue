@@ -20,7 +20,7 @@ import {
   Trash2,
   Upload,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { ApiError, api } from '../api/http'
 import {
   UploadCancelledError,

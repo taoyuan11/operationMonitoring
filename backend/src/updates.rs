@@ -1950,7 +1950,7 @@ async fn receive_artifact(
                 .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "缺少原生架构"))?,
             file_name: file_name.expect("file name exists after received_file check"),
             size_bytes,
-            sha256: format!("{:x}", digest.finalize()),
+            sha256: data_encoding::HEXLOWER.encode(digest.finalize().as_slice()),
             checksum_file_name: checksum_file_name.expect("checksum file name exists after check"),
             checksum_contents: checksum_contents.expect("checksum contents exists after check"),
             first_bytes,

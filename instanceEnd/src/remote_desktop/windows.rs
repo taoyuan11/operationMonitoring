@@ -27,7 +27,7 @@ use uuid::Uuid;
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, FreeLibrary, GENERIC_WRITE, HANDLE, HMODULE, HWND, LocalFree, STILL_ACTIVE,
+            CloseHandle, FreeLibrary, GENERIC_WRITE, HANDLE, HMODULE, LocalFree, STILL_ACTIVE,
         },
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0},
@@ -44,8 +44,8 @@ use windows::{
                     DXGI_MODE_ROTATION_ROTATE270,
                 },
                 CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-                DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
-                IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+                DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
+                IDXGIOutputDuplication, IDXGIResource,
             },
             Gdi::{
                 BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
@@ -100,16 +100,15 @@ use windows::{
             MB_SYSTEMMODAL, MB_TOPMOST, MB_YESNO, MessageBoxW, SM_CXSCREEN, SM_CYSCREEN,
         },
     },
-    core::{ComInterface, PCWSTR, PWSTR},
+    core::{Interface, PCWSTR, PWSTR},
 };
 
 use super::{
     AUDIO_CHANNEL_CAPACITY, AUDIO_CHANNELS, AUDIO_CODEC_NAME, AUDIO_FRAME_HEADER_LEN,
     AUDIO_SAMPLE_RATE, AUDIO_SAMPLES_PER_FRAME, AdaptiveSettings, AudioFrameHeader,
-    ControlRateLimiter, DATA_CHANNEL_JOIN_TIMEOUT, CONTROL_RATE_DROP_LIMIT, DesktopControl,
-    DesktopOpenRequest,
-    DesktopOptions, FrameHeader, INPUT_RELEASE_ACK_TIMEOUT, MAX_AUDIO_FRAME_BYTES,
-    MAX_CONTROL_BYTES, MAX_FRAME_BYTES, MAX_JPEG_QUALITY, MIN_JPEG_QUALITY,
+    CONTROL_RATE_DROP_LIMIT, ControlRateLimiter, DATA_CHANNEL_JOIN_TIMEOUT, DesktopControl,
+    DesktopOpenRequest, DesktopOptions, FrameHeader, INPUT_RELEASE_ACK_TIMEOUT,
+    MAX_AUDIO_FRAME_BYTES, MAX_CONTROL_BYTES, MAX_FRAME_BYTES, MAX_JPEG_QUALITY, MIN_JPEG_QUALITY,
     absolute_pointer_coordinate, dom_code_to_vk, dom_code_uses_extended_key, drop_oldest_channel,
     error_reason, scaled_dimensions, wait_for_input_release_ack, windows_audio,
 };
@@ -672,7 +671,7 @@ fn create_private_pipe(
                 (&mut attributes as *mut SECURITY_ATTRIBUTES).cast(),
             )
             .context("failed to create private desktop helper pipe");
-        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(descriptor.0));
+        let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(descriptor.0)));
         pipe
     }
 }
@@ -807,7 +806,7 @@ fn validate_pipe_client(
     expected_session_id: u32,
 ) -> Result<()> {
     unsafe {
-        let handle = HANDLE(pipe.as_raw_handle() as isize);
+        let handle = HANDLE(pipe.as_raw_handle());
         let mut client_pid = 0_u32;
         GetNamedPipeClientProcessId(handle, &mut client_pid)
             .context("failed to identify desktop helper pipe client")?;
@@ -1997,7 +1996,7 @@ fn request_local_control_consent(audio_negotiated: bool) -> bool {
     };
     unsafe {
         MessageBoxW(
-            HWND(0),
+            None,
             PCWSTR(message.as_ptr()),
             PCWSTR(title.as_ptr()),
             MB_YESNO
@@ -2025,7 +2024,7 @@ fn spawn_local_session_indicator(audio_negotiated: bool) -> Result<mpsc::Receive
             };
             unsafe {
                 let _ = MessageBoxW(
-                    HWND(0),
+                    None,
                     PCWSTR(message.as_ptr()),
                     PCWSTR(title.as_ptr()),
                     MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST | MB_SYSTEMMODAL,
@@ -2164,8 +2163,7 @@ unsafe fn primary_output() -> Result<(
             let Ok(output) = (unsafe { adapter.EnumOutputs(output_index) }) else {
                 break;
             };
-            let mut description = DXGI_OUTPUT_DESC::default();
-            unsafe { output.GetDesc(&mut description)? };
+            let description = unsafe { output.GetDesc()? };
             let bounds = description.DesktopCoordinates;
             if description.AttachedToDesktop.as_bool()
                 && bounds.left <= 0
@@ -2192,7 +2190,7 @@ impl DxgiCapture {
             D3D11CreateDevice(
                 &adapter,
                 D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE(0),
+                HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 Some(&[D3D_FEATURE_LEVEL_11_0]),
                 D3D11_SDK_VERSION,
@@ -2343,24 +2341,24 @@ fn capture_gdi_jpeg(
         if width <= 0 || height <= 0 {
             bail!("no_active_session: invalid desktop dimensions")
         }
-        let screen = GetDC(HWND(0));
-        if screen.0 == 0 {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
             bail!("failed to acquire desktop DC")
         }
-        let memory = CreateCompatibleDC(screen);
+        let memory = CreateCompatibleDC(Some(screen));
         let bitmap = CreateCompatibleBitmap(screen, width, height);
-        if memory.0 == 0 || bitmap.0 == 0 {
-            if bitmap.0 != 0 {
-                let _ = DeleteObject(bitmap);
+        if memory.is_invalid() || bitmap.is_invalid() {
+            if !bitmap.is_invalid() {
+                let _ = DeleteObject(bitmap.into());
             }
-            if memory.0 != 0 {
+            if !memory.is_invalid() {
                 let _ = DeleteDC(memory);
             }
-            let _ = ReleaseDC(HWND(0), screen);
+            let _ = ReleaseDC(None, screen);
             bail!("failed to create GDI desktop capture objects")
         }
-        let previous = SelectObject(memory, bitmap);
-        let copied = BitBlt(memory, 0, 0, width, height, screen, 0, 0, SRCCOPY).is_ok();
+        let previous = SelectObject(memory, bitmap.into());
+        let copied = BitBlt(memory, 0, 0, width, height, Some(screen), 0, 0, SRCCOPY).is_ok();
         let mut pixels = vec![0_u8; width as usize * height as usize * 4];
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -2390,9 +2388,9 @@ fn capture_gdi_jpeg(
             let _ = SelectObject(memory, previous);
             0
         };
-        let _ = DeleteObject(bitmap);
+        let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(memory);
-        let _ = ReleaseDC(HWND(0), screen);
+        let _ = ReleaseDC(None, screen);
         if rows == 0 {
             bail!("failed to capture input desktop with GDI")
         }
@@ -2811,7 +2809,7 @@ impl HelperProcess {
             Self::Child(child) => {
                 let _ = child.kill();
                 unsafe {
-                    let handle = HANDLE(child.as_raw_handle() as isize);
+                    let handle = HANDLE(child.as_raw_handle());
                     let _ = WaitForSingleObject(handle, 5_000);
                 }
                 let _ = child.try_wait();
@@ -2982,7 +2980,9 @@ fn token_user_sid(token: HANDLE) -> Result<String> {
         let sid = string_sid
             .to_string()
             .context("Windows user SID was not UTF-16")?;
-        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(string_sid.0.cast()));
+        let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(
+            string_sid.0.cast(),
+        )));
         Ok(sid)
     }
 }
@@ -2992,8 +2992,14 @@ fn select_active_session(unattended: bool) -> Result<u32> {
         let console = WTSGetActiveConsoleSessionId();
         let mut sessions: *mut WTS_SESSION_INFOW = null_mut();
         let mut count = 0_u32;
-        WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sessions, &mut count)
-            .context("failed to enumerate Windows sessions")?;
+        WTSEnumerateSessionsW(
+            Some(WTS_CURRENT_SERVER_HANDLE),
+            0,
+            1,
+            &mut sessions,
+            &mut count,
+        )
+        .context("failed to enumerate Windows sessions")?;
         let active = if sessions.is_null() {
             Vec::new()
         } else {
@@ -3042,8 +3048,14 @@ fn duplicate_session_system_token(session_id: u32) -> Result<HANDLE> {
         // token for this session, so duplicate that token after validating its SID.
         let mut processes: *mut WTS_PROCESS_INFOW = null_mut();
         let mut count = 0_u32;
-        WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut processes, &mut count)
-            .context("failed to enumerate target session processes")?;
+        WTSEnumerateProcessesW(
+            Some(WTS_CURRENT_SERVER_HANDLE),
+            0,
+            1,
+            &mut processes,
+            &mut count,
+        )
+        .context("failed to enumerate target session processes")?;
 
         let result = (|| -> Result<HANDLE> {
             if processes.is_null() {
@@ -3142,7 +3154,7 @@ fn spawn_helper_in_active_session(
             let application = wide(executable.as_os_str());
             let desktop = wide("winsta0\\default");
             let mut environment: *mut c_void = null_mut();
-            CreateEnvironmentBlock(&mut environment, primary_token, false)?;
+            CreateEnvironmentBlock(&mut environment, Some(primary_token), false)?;
             let startup = STARTUPINFOW {
                 cb: size_of::<STARTUPINFOW>() as u32,
                 lpDesktop: PWSTR(desktop.as_ptr() as *mut _),
@@ -3150,9 +3162,9 @@ fn spawn_helper_in_active_session(
             };
             let mut process: PROCESS_INFORMATION = zeroed();
             let created = CreateProcessAsUserW(
-                primary_token,
+                Some(primary_token),
                 PCWSTR(application.as_ptr()),
-                PWSTR(command_line.as_mut_ptr()),
+                Some(PWSTR(command_line.as_mut_ptr())),
                 None,
                 None,
                 false,
@@ -3201,7 +3213,7 @@ fn spawn_device_probe_in_session(pipe_name: &str, session_id: u32) -> Result<Hel
             let application = wide(executable.as_os_str());
             let desktop = wide("winsta0\\default");
             let mut environment: *mut c_void = null_mut();
-            CreateEnvironmentBlock(&mut environment, restricted_token, false)
+            CreateEnvironmentBlock(&mut environment, Some(restricted_token), false)
                 .map_err(|_| anyhow!("device_probe_failed"))?;
             let startup = STARTUPINFOW {
                 cb: size_of::<STARTUPINFOW>() as u32,
@@ -3210,9 +3222,9 @@ fn spawn_device_probe_in_session(pipe_name: &str, session_id: u32) -> Result<Hel
             };
             let mut process: PROCESS_INFORMATION = zeroed();
             let created = CreateProcessAsUserW(
-                restricted_token,
+                Some(restricted_token),
                 PCWSTR(application.as_ptr()),
-                PWSTR(command_line.as_mut_ptr()),
+                Some(PWSTR(command_line.as_mut_ptr())),
                 None,
                 None,
                 false,

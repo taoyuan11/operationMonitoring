@@ -13,7 +13,7 @@ import {
   Volume2,
   VolumeX,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import {
   DESKTOP_AUDIO_CAPABILITY,
   canSendDesktopSecureAttention,

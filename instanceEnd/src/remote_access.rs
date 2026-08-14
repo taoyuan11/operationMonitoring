@@ -737,6 +737,7 @@ fn display_device_presence() -> anyhow::Result<DevicePresence> {
         unsafe {
             GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
         }
+        .ok()
         .context("display_probe_size_failed")?;
         if path_count == 0 {
             return Ok(DevicePresence::default());
@@ -839,12 +840,12 @@ fn audio_device_presence() -> anyhow::Result<DevicePresence> {
     use anyhow::Context;
     use windows::{
         Win32::{
+            Foundation::PROPERTYKEY,
             Media::Audio::{DEVICE_STATE_ACTIVE, IMMDeviceEnumerator, MMDeviceEnumerator, eRender},
             System::Com::{
                 CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STGM_READ,
                 StructuredStorage::{PropVariantClear, PropVariantToString},
             },
-            UI::Shell::PropertiesSystem::PROPERTYKEY,
         },
         core::{GUID, HRESULT},
     };
@@ -859,7 +860,7 @@ fn audio_device_presence() -> anyhow::Result<DevicePresence> {
         pid: 256,
     };
     unsafe {
-        let initialized = match CoInitializeEx(None, COINIT_MULTITHREADED) {
+        let initialized = match CoInitializeEx(None, COINIT_MULTITHREADED).ok() {
             Ok(()) => true,
             Err(error) if error.code() == RPC_E_CHANGED_MODE => false,
             Err(error) => return Err(error).context("audio_probe_com_failed"),
@@ -1027,7 +1028,7 @@ pub fn stage_bundled_windows_drivers(program_data: &std::path::Path) -> anyhow::
     let version = assets::BUNDLE_VERSION.context("driver_bundle_metadata_missing")?;
     let architecture = assets::ARCHITECTURE.context("driver_bundle_metadata_missing")?;
     let expected_lock_hash = assets::LOCK_SHA256.context("driver_bundle_metadata_missing")?;
-    let actual_lock_hash = format!("{:x}", Sha256::digest(assets::LOCK_BYTES));
+    let actual_lock_hash = crate::hex::encode_lower(Sha256::digest(assets::LOCK_BYTES));
     if actual_lock_hash != expected_lock_hash {
         bail!("driver_bundle_hash_mismatch")
     }
@@ -1619,7 +1620,7 @@ fn write_driver_json(path: &std::path::Path, value: &serde_json::Value) -> anyho
     use sha2::{Digest, Sha256};
 
     let bytes = serde_json::to_vec_pretty(value)?;
-    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let hash = crate::hex::encode_lower(Sha256::digest(&bytes));
     write_verified_asset(path, &hash, &bytes)
 }
 
@@ -2311,7 +2312,7 @@ fn write_verified_asset(
     use anyhow::{Context, bail};
     use sha2::{Digest, Sha256};
 
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let actual = crate::hex::encode_lower(Sha256::digest(bytes));
     if actual != expected {
         bail!("driver_bundle_hash_mismatch")
     }
@@ -2319,7 +2320,7 @@ fn write_verified_asset(
         fs::create_dir_all(parent).context("driver_stage_directory_failed")?;
     }
     if let Ok(existing) = fs::read(path) {
-        let existing_hash = format!("{:x}", Sha256::digest(existing));
+        let existing_hash = crate::hex::encode_lower(Sha256::digest(existing));
         if existing_hash == expected {
             return Ok(());
         }

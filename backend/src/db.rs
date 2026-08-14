@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::IpAddr, str::FromStr, time::Duration};
 use axum::http::StatusCode;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Executor, FromRow, PgPool, Postgres,
+    AssertSqlSafe, Executor, FromRow, PgPool, Postgres,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use subtle::ConstantTimeEq;
@@ -65,7 +65,7 @@ impl IsolatedTestDatabase {
             .connect(&database_url)
             .await
             .expect("connect test database");
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&bootstrap)
             .await
             .expect("create isolated test schema");
@@ -105,10 +105,13 @@ impl IsolatedTestDatabase {
 
     pub(crate) async fn cleanup(self) {
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .execute(&self.bootstrap)
-            .await
-            .expect("drop isolated test schema");
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            self.schema
+        )))
+        .execute(&self.bootstrap)
+        .await
+        .expect("drop isolated test schema");
         self.bootstrap.close().await;
     }
 }
@@ -154,9 +157,11 @@ async fn create_database(options: &PgConnectOptions) -> anyhow::Result<()> {
         .connect_with(options.clone().database("postgres"))
         .await?;
     let quoted_database = database.replace('"', "\"\"");
-    sqlx::query(&format!("CREATE DATABASE \"{quoted_database}\""))
-        .execute(&maintenance)
-        .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE DATABASE \"{quoted_database}\""
+    )))
+    .execute(&maintenance)
+    .await?;
     maintenance.close().await;
     Ok(())
 }
@@ -832,9 +837,9 @@ async fn ensure_bigint_columns(db: &PgPool) -> anyhow::Result<()> {
             .await?;
 
             if matches!(data_type.as_deref(), Some("integer" | "smallint")) {
-                sqlx::query(&format!(
+                sqlx::query(AssertSqlSafe(format!(
                     "ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT USING {column}::BIGINT"
-                ))
+                )))
                 .execute(db)
                 .await?;
             }
@@ -852,9 +857,9 @@ async fn ensure_instance_location_columns(db: &PgPool) -> anyhow::Result<()> {
         ("province", "TEXT NOT NULL DEFAULT ''"),
         ("city", "TEXT NOT NULL DEFAULT ''"),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE instances ADD COLUMN IF NOT EXISTS {name} {definition}"
-        ))
+        )))
         .execute(db)
         .await?;
     }
@@ -897,9 +902,9 @@ async fn ensure_capability_columns(db: &PgPool, table: &str) -> anyhow::Result<(
         ("rollback_supported", "BIGINT NOT NULL DEFAULT 0"),
         ("rollback_version", "TEXT NOT NULL DEFAULT ''"),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}"
-        ))
+        )))
         .execute(db)
         .await?;
     }
@@ -1242,15 +1247,17 @@ fn agent_secret_is_authorized(current_secret: &str, payload: &AgentRegisterReque
 }
 
 pub fn agent_secret_verifier(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
     format!(
-        "{AGENT_SECRET_VERIFIER_PREFIX}{:x}",
-        Sha256::digest(secret.as_bytes())
+        "{AGENT_SECRET_VERIFIER_PREFIX}{}",
+        data_encoding::HEXLOWER.encode(digest.as_slice())
     )
 }
 
 pub fn agent_secret_matches(stored: &str, presented: &str) -> bool {
     if let Some(expected) = agent_secret_digest(stored) {
-        let actual = format!("{:x}", Sha256::digest(presented.as_bytes()));
+        let digest = Sha256::digest(presented.as_bytes());
+        let actual = data_encoding::HEXLOWER.encode(digest.as_slice());
         return bool::from(expected.as_bytes().ct_eq(actual.as_bytes()));
     }
     bool::from(stored.as_bytes().ct_eq(presented.as_bytes()))
@@ -1264,17 +1271,18 @@ fn agent_secret_digest(stored: &str) -> Option<&str> {
 
 async fn migrate_agent_secret_verifiers(db: &PgPool) -> anyhow::Result<()> {
     for table in ["instances", "pending_instances"] {
-        let rows =
-            sqlx::query_as::<_, (String, String)>(&format!("SELECT id, secret FROM {table}"))
-                .fetch_all(db)
-                .await?;
+        let rows = sqlx::query_as::<_, (String, String)>(AssertSqlSafe(format!(
+            "SELECT id, secret FROM {table}"
+        )))
+        .fetch_all(db)
+        .await?;
         for (id, secret) in rows {
             if agent_secret_digest(&secret).is_some() {
                 continue;
             }
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {table} SET secret = $1 WHERE id = $2 AND secret = $3"
-            ))
+            )))
             .bind(agent_secret_verifier(&secret))
             .bind(id)
             .bind(secret)

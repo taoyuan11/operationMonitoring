@@ -1508,8 +1508,10 @@ fn agent_websocket_secret<'a>(
 fn agent_registration_source_key(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(ip) => ip.to_string(),
-        IpAddr::V6(ip) if let Some(ip) = ip.to_ipv4_mapped() => ip.to_string(),
         IpAddr::V6(ip) => {
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return ip.to_string();
+            }
             let mut octets = ip.octets();
             octets[8..].fill(0);
             format!("{}/64", Ipv6Addr::from(octets))

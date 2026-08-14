@@ -16,7 +16,7 @@ import {
   Wifi,
   WifiOff,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import CountryFlag from './CountryFlag.vue'
 import OperatingSystemLogo from './OperatingSystemLogo.vue'
 import { getCountryOption } from '../data/countries'

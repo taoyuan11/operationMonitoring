@@ -361,7 +361,7 @@ pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
             credential_version: 1,
             previous_secret: None,
         },
-        client: Client::new(),
+        client: crate::tls::http_client(),
         activity: ActivityTracker::default(),
         capability,
         paths,
@@ -1263,7 +1263,7 @@ impl UpdateManager {
             temporary_path,
             final_path,
             size_bytes: received,
-            sha256: format!("{:x}", hasher.finalize()),
+            sha256: crate::hex::encode_lower(hasher.finalize()),
         })
     }
 
@@ -3141,7 +3141,7 @@ fn verify_package_at_rest(
         }
         hasher.update(&buffer[..count]);
     }
-    let actual_sha256 = format!("{:x}", hasher.finalize());
+    let actual_sha256 = crate::hex::encode_lower(hasher.finalize());
     if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
         bail!("staged package SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}");
     }
@@ -3189,7 +3189,7 @@ fn file_integrity(path: &Path) -> Result<(u64, String)> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok((size, format!("{:x}", hasher.finalize())))
+    Ok((size, crate::hex::encode_lower(hasher.finalize())))
 }
 
 fn standalone_install_marker() -> Option<PathBuf> {
@@ -3828,7 +3828,7 @@ mod tests {
                 credential_version: 1,
                 previous_secret: None,
             },
-            client: Client::new(),
+            client: crate::tls::http_client(),
             activity: ActivityTracker::default(),
             capability: UpdateCapability {
                 package_type: Some("standalone".to_string()),
@@ -3889,7 +3889,7 @@ mod tests {
                 credential_version: 1,
                 previous_secret: None,
             },
-            client: Client::new(),
+            client: crate::tls::http_client(),
             activity: ActivityTracker::default(),
             capability: UpdateCapability {
                 package_type: Some("standalone".to_string()),
@@ -3954,7 +3954,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("download.part");
         fs::write(&path, package).unwrap();
-        let digest = format!("{:x}", Sha256::digest(package));
+        let digest = crate::hex::encode_lower(Sha256::digest(package));
         let offer = UpdateOffer {
             attempt_id: None,
             instance_id: None,
@@ -4025,7 +4025,7 @@ mod tests {
                 credential_version: 1,
                 previous_secret: None,
             },
-            client: Client::new(),
+            client: crate::tls::http_client(),
             activity: ActivityTracker::default(),
             capability: UpdateCapability {
                 package_type: Some("standalone".to_string()),
@@ -4219,7 +4219,7 @@ mod tests {
         #[cfg(all(unix, not(target_os = "macos")))]
         let original: &[u8] = b"\x7fELFtrusted-executable";
         fs::write(&executable, original).unwrap();
-        let sha256 = format!("{:x}", Sha256::digest(original));
+        let sha256 = crate::hex::encode_lower(Sha256::digest(original));
 
         verify_package_at_rest(
             &executable,
@@ -4464,7 +4464,7 @@ mod tests {
                 credential_version: 1,
                 previous_secret: None,
             },
-            client: Client::new(),
+            client: crate::tls::http_client(),
             activity: ActivityTracker::default(),
             capability: UpdateCapability {
                 package_type: Some("standalone".to_string()),
@@ -4651,7 +4651,7 @@ mod tests {
                 credential_version: 1,
                 previous_secret: None,
             },
-            client: Client::new(),
+            client: crate::tls::http_client(),
             activity: ActivityTracker::default(),
             capability: UpdateCapability {
                 package_type: Some("standalone".to_string()),

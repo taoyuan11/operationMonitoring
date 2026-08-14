@@ -13,7 +13,7 @@ import {
   Terminal,
   Trash2,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import type {
   AdminTab,
   PendingInstance,

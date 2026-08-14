@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{Executor, FromRow, PgPool, Postgres, QueryBuilder};
+use sqlx::{AssertSqlSafe, Executor, FromRow, PgPool, Postgres, QueryBuilder};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -289,12 +289,12 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
     for column in ["metadata", "node_snapshot"] {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE audit_events ALTER COLUMN {column} DROP DEFAULT"
-        ))
+        )))
         .execute(db)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             r#"
             DO $$
             BEGIN
@@ -311,22 +311,22 @@ pub async fn ensure_schema(db: &PgPool) -> anyhow::Result<()> {
             END
             $$;
             "#
-        ))
+        )))
         .execute(db)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "UPDATE audit_events SET {column} = '{{}}'::jsonb WHERE {column} IS NULL"
-        ))
+        )))
         .execute(db)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE audit_events ALTER COLUMN {column} SET DEFAULT '{{}}'::jsonb"
-        ))
+        )))
         .execute(db)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE audit_events ALTER COLUMN {column} SET NOT NULL"
-        ))
+        )))
         .execute(db)
         .await?;
     }
@@ -752,7 +752,7 @@ pub struct AuditPage {
     pub pages: i64,
 }
 
-fn add_filters<'a>(builder: &mut QueryBuilder<'a, Postgres>, query: &'a AuditQuery) {
+fn add_filters(builder: &mut QueryBuilder<Postgres>, query: &AuditQuery) {
     if let Some(value) = query.from {
         builder.push(" AND created_at >= ").push_bind(value);
     }
@@ -991,8 +991,8 @@ pub async fn admin_audit_export(
     let export_db = state.db.clone();
     let export_query = query;
     let excluded_event_id = export_event_id.clone();
+    let mut audit_guard = ExportAuditGuard::new(export_db.clone(), export_event_id);
     let body_stream = stream! {
-        let mut audit_guard = ExportAuditGuard::new(export_db.clone(), export_event_id);
         if json_export {
             yield Ok::<Vec<u8>, io::Error>(b"[".to_vec());
         } else {
@@ -1161,7 +1161,7 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect test database");
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&bootstrap)
             .await
             .expect("create isolated audit schema");
@@ -1187,7 +1187,7 @@ mod tests {
 
     async fn drop_test_schema(db: PgPool, bootstrap: PgPool, schema: String) {
         db.close().await;
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&bootstrap)
             .await
             .expect("drop isolated audit schema");
@@ -1628,24 +1628,22 @@ mod tests {
                 .await
                 .expect("insert running export");
         drop(ExportAuditGuard::new(db.clone(), export_event.clone()));
-        for _ in 0..50 {
-            let status: String =
-                sqlx::query_scalar("SELECT status FROM audit_events WHERE id = $1")
-                    .bind(&export_event)
-                    .fetch_one(&db)
-                    .await
-                    .expect("load disconnected export status");
-            if status == "cancelled" {
-                break;
+        let disconnected_export = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state: (String, Option<String>) =
+                    sqlx::query_as("SELECT status, error_code FROM audit_events WHERE id = $1")
+                        .bind(&export_event)
+                        .fetch_one(&db)
+                        .await
+                        .expect("load disconnected export status");
+                if state.0 == "cancelled" {
+                    break state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::task::yield_now().await;
-        }
-        let disconnected_export: (String, Option<String>) =
-            sqlx::query_as("SELECT status, error_code FROM audit_events WHERE id = $1")
-                .bind(&export_event)
-                .fetch_one(&db)
-                .await
-                .expect("load finalized disconnected export");
+        })
+        .await
+        .expect("finalize disconnected export before timeout");
         assert_eq!(
             disconnected_export,
             (

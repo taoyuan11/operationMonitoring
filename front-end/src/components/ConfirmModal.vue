@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { CircleAlert, X } from 'lucide-vue-next'
+import { CircleAlert, X } from '@lucide/vue'
 
 const props = withDefaults(defineProps<{
   title: string

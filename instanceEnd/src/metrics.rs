@@ -29,13 +29,11 @@ use sysinfo::{Disk, Disks, Networks, System};
 #[cfg(target_os = "windows")]
 use windows::{
     Win32::{
-        Graphics::Dxgi::{
-            CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
-        },
+        Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1},
         System::Performance::{
             PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W,
-            PDH_FMT_DOUBLE, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery,
-            PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
+            PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PdhAddEnglishCounterW,
+            PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
         },
     },
     core::{PCWSTR, w},
@@ -131,8 +129,8 @@ impl MetricsCollector {
 
     pub fn sample(&mut self) -> MetricPayload {
         self.system.refresh_all();
-        self.disks.refresh_list();
-        self.networks.refresh();
+        self.disks.refresh(true);
+        self.networks.refresh(true);
 
         let disk_samples = self.disks.iter().map(disk_sample).collect::<Vec<_>>();
         let (disk_used, disk_total) = aggregate_disk_metrics(&disk_samples);
@@ -150,7 +148,7 @@ impl MetricsCollector {
             .sample(self.system.total_memory().min(i64::MAX as u64) as i64);
         MetricPayload {
             ts: now_ts(),
-            cpu_percent: self.system.global_cpu_info().cpu_usage() as f64,
+            cpu_percent: self.system.global_cpu_usage() as f64,
             memory_used: self.system.used_memory() as i64,
             memory_total: self.system.total_memory() as i64,
             disk_used,
@@ -177,7 +175,7 @@ impl MetricsSampler {
     fn spawn<F, S>(timeout: Duration, initialize: F) -> io::Result<Self>
     where
         F: FnOnce() -> S + Send + 'static,
-        S: FnMut() -> MetricPayload + Send + 'static,
+        S: FnMut() -> MetricPayload + 'static,
     {
         let (request_tx, request_rx) = mpsc::sync_channel(METRICS_WORKER_QUEUE_CAPACITY);
         let (result_tx, result_rx) = tokio::sync::mpsc::channel(METRICS_WORKER_QUEUE_CAPACITY);
@@ -605,9 +603,9 @@ struct WindowsGpuCollector {
 
 #[cfg(target_os = "windows")]
 struct WindowsGpuPerformanceQuery {
-    query: isize,
-    engine_counter: isize,
-    memory_counter: Option<isize>,
+    query: PDH_HQUERY,
+    engine_counter: PDH_HCOUNTER,
+    memory_counter: Option<PDH_HCOUNTER>,
 }
 
 #[cfg(target_os = "windows")]
@@ -682,12 +680,12 @@ impl WindowsGpuCollector {
 #[cfg(target_os = "windows")]
 impl WindowsGpuPerformanceQuery {
     fn new() -> Option<Self> {
-        let mut query = 0;
+        let mut query = PDH_HQUERY::default();
         if unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) } != 0 {
             return None;
         }
 
-        let mut engine_counter = 0;
+        let mut engine_counter = PDH_HCOUNTER::default();
         if unsafe {
             PdhAddEnglishCounterW(
                 query,
@@ -701,7 +699,7 @@ impl WindowsGpuPerformanceQuery {
             return None;
         }
 
-        let mut memory_counter = 0;
+        let mut memory_counter = PDH_HCOUNTER::default();
         let memory_counter = (unsafe {
             PdhAddEnglishCounterW(
                 query,
@@ -749,7 +747,7 @@ impl Drop for WindowsGpuPerformanceQuery {
 }
 
 #[cfg(target_os = "windows")]
-fn formatted_counter_values(counter: isize) -> Vec<(String, f64)> {
+fn formatted_counter_values(counter: PDH_HCOUNTER) -> Vec<(String, f64)> {
     for _ in 0..3 {
         let mut buffer_size = 0;
         let mut item_count = 0;
@@ -885,10 +883,10 @@ fn enumerate_windows_gpu_adapters() -> Vec<WindowsGpuAdapter> {
         let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
             break;
         };
-        let mut description = DXGI_ADAPTER_DESC1::default();
-        if unsafe { adapter.GetDesc1(&mut description) }.is_err()
-            || description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
-            || description.VendorId == 0
+        let Ok(description) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        if description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || description.VendorId == 0
         {
             continue;
         }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { KeyRound, LoaderCircle, LockKeyhole, LogIn, RotateCcw, ShieldCheck, User, X } from 'lucide-vue-next'
+import { KeyRound, LoaderCircle, LockKeyhole, LogIn, RotateCcw, ShieldCheck, User, X } from '@lucide/vue'
 import QrcodeVue from 'qrcode.vue'
 import type { AuthEnrollment, AuthMode } from '../types/domain'
 

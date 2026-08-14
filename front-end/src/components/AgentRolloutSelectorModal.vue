@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Check, LoaderCircle, Search, Server, ShieldAlert, Wifi, WifiOff, X } from 'lucide-vue-next'
+import { Check, LoaderCircle, Search, Server, ShieldAlert, Wifi, WifiOff, X } from '@lucide/vue'
 import type { AgentRelease, AgentRolloutCandidate } from '../types/domain'
 
 const props = defineProps<{

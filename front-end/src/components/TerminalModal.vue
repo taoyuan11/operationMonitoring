@@ -7,7 +7,7 @@ import {
   Server,
   TerminalSquare,
   X,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import ConfirmModal from './ConfirmModal.vue'
 import TerminalSession from './TerminalSession.vue'
 import {

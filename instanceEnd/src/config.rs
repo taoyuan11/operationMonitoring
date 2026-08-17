@@ -224,7 +224,7 @@ pub struct AgentConfig {
     #[arg(
         long,
         env = "OM_REMOTE_DESKTOP_CONSENT",
-        default_value_t = RemoteDesktopConsent::Required,
+        default_value_t = RemoteDesktopConsent::Unattended,
         global = true
     )]
     pub remote_desktop_consent: RemoteDesktopConsent,
@@ -329,11 +329,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_access_policy_defaults_are_conservative() {
+    fn remote_access_policy_defaults_to_unattended() {
         let cli = Cli::try_parse_from(["agent", "start"]).unwrap();
         assert_eq!(
             cli.agent.remote_desktop_consent,
-            RemoteDesktopConsent::Required
+            RemoteDesktopConsent::Unattended
         );
         assert_eq!(
             cli.agent.windows_virtual_devices,

@@ -45,10 +45,10 @@ type PointerButton = 0 | 1 | 2
 type KeyModifier = 'alt' | 'ctrl' | 'shift' | 'meta'
 
 const desktopQualityOptions: Array<{ value: DesktopQuality; label: string }> = [
-  { value: 'low', label: '省流 540p' },
-  { value: 'balanced', label: '均衡 720p' },
-  { value: 'high', label: '清晰 900p' },
-  { value: 'original', label: '原画 1080p' },
+  { value: 'low', label: '540P' },
+  { value: 'balanced', label: '720P' },
+  { value: 'high', label: '900P' },
+  { value: 'original', label: '1080P' },
 ]
 
 type DesktopFrame = DesktopVideoFrame & {

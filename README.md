@@ -568,13 +568,14 @@ OM_AGENT_LOG_FILE=/path/to/agent.log
 OM_AGENT_LOG_MAX_BYTES=10485760
 OM_AGENT_LOG_HISTORY=3
 OM_AGENT_UPDATE_DIR=/path/to/persistent/updates
-OM_REMOTE_DESKTOP_CONSENT=required
+OM_REMOTE_DESKTOP_CONSENT=unattended
 OM_WINDOWS_VIRTUAL_DEVICES=auto
 ```
 
-`OM_REMOTE_DESKTOP_CONSENT` 可设为 `required`（默认）或 `unattended`。无人值守模式是
+`OM_REMOTE_DESKTOP_CONSENT` 可设为 `unattended`（默认）或 `required`。无人值守模式是
 Windows 机器级安全授权，仅受管 LocalSystem 服务会实际启用；非交互安装还必须显式传入
-`--yes`。`OM_WINDOWS_VIRTUAL_DEVICES` 可设为 `auto`（Windows 默认）或 `disabled`；普通
+`--yes`。如需每次连接都由本地用户确认，请显式设为 `required`。`OM_WINDOWS_VIRTUAL_DEVICES`
+可设为 `auto`（Windows 默认）或 `disabled`；普通
 开发构建没有 Microsoft 签名 bundle 时会明确降级为 physical-only，并且不会修改设备。
 
 实例端日志默认在单个文件达到 10 MiB 时滚动，保留 `agent.log.1` 至

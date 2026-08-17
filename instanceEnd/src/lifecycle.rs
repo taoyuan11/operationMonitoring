@@ -291,7 +291,10 @@ fn print_running(prefix: &str, pid: Option<u32>, log_file: &Path) {
 }
 
 pub fn log_file(config: &AgentConfig) -> Result<PathBuf> {
-    Ok(RuntimePaths::from_config(config)?.log_file)
+    let paths = RuntimePaths::from_config(config)?;
+    paths.prepare()?;
+    paths.prepare_log()?;
+    Ok(paths.log_file)
 }
 
 pub(crate) fn docker_protected_paths(config: &AgentConfig) -> Result<Vec<PathBuf>> {
@@ -461,11 +464,13 @@ impl Drop for RuntimeGuard {
 #[derive(Debug)]
 struct RuntimePaths {
     state_dir: PathBuf,
+    configured_state_dir: bool,
     lock_file: PathBuf,
     pid_file: PathBuf,
     ready_file: PathBuf,
     stop_file: PathBuf,
     log_file: PathBuf,
+    configured_log_file: bool,
 }
 
 impl RuntimePaths {
@@ -499,27 +504,58 @@ impl RuntimePaths {
             ready_file: state_dir.join("agent.ready"),
             stop_file: state_dir.join("agent.stop"),
             state_dir,
+            configured_state_dir: config.state_dir.is_some(),
             log_file,
+            configured_log_file: config.log_file.is_some(),
         })
     }
 
     fn prepare(&self) -> Result<()> {
-        fs::create_dir_all(&self.state_dir).with_context(|| {
-            format!(
-                "failed to create agent state directory {}",
-                self.state_dir.display()
-            )
-        })
+        crate::privileged_path::prepare_configured_directory(
+            &self.state_dir,
+            self.configured_state_dir,
+            "agent state directory",
+        )?;
+        Ok(())
+    }
+
+    fn prepare_log(&self) -> Result<()> {
+        let parent = self
+            .log_file
+            .parent()
+            .context("agent log path has no parent directory")?;
+        crate::privileged_path::prepare_configured_directory(
+            parent,
+            self.configured_log_file || self.configured_state_dir,
+            "agent log directory",
+        )?;
+        if self.log_file.try_exists()? {
+            crate::privileged_path::validate_regular_file(&self.log_file, "agent log file")?;
+        }
+        Ok(())
     }
 
     fn open_lock(&self) -> Result<File> {
-        OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
+        if self.lock_file.try_exists()? {
+            crate::privileged_path::validate_regular_file(&self.lock_file, "agent process lock")?;
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
             .open(&self.lock_file)
-            .with_context(|| format!("failed to open process lock {}", self.lock_file.display()))
+            .with_context(|| format!("failed to open process lock {}", self.lock_file.display()))?;
+        if !file.metadata()?.is_file() {
+            bail!(
+                "agent process lock {} is not a regular file",
+                self.lock_file.display()
+            );
+        }
+        Ok(file)
     }
 
     fn process_state(&self) -> Result<ProcessState> {

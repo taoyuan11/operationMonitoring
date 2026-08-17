@@ -1,7 +1,7 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -17,8 +17,9 @@ const IDENTITY_READ_RETRY: Duration = Duration::from_millis(10);
 const CURRENT_CREDENTIAL_VERSION: u32 = 1;
 
 pub fn load_or_create_identity(path: Option<PathBuf>) -> Result<Identity> {
+    let configured = path.is_some();
     let path = identity_path(path)?;
-    prepare_identity_location(&path)?;
+    let path = prepare_identity_location(&path, configured)?;
     match read_identity(&path) {
         Ok(identity) => return finish_loaded_identity(&path, identity),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -39,17 +40,11 @@ pub fn load_or_create_identity(path: Option<PathBuf>) -> Result<Identity> {
         credential_version: CURRENT_CREDENTIAL_VERSION,
         previous_secret: None,
     };
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(&path) {
+    match create_identity_file(&path) {
         Ok(mut file) => {
             file.write_all(serde_json::to_string_pretty(&identity)?.as_bytes())?;
             file.sync_all()?;
+            drop(file);
             protect_identity_file(&path)?;
             Ok(identity)
         }
@@ -68,32 +63,64 @@ pub fn load_or_create_identity(path: Option<PathBuf>) -> Result<Identity> {
     }
 }
 
-fn prepare_identity_location(path: &std::path::Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-        #[cfg(windows)]
-        if is_system_identity_path(path) {
-            crate::windows_security::restrict_to_system_and_administrators(parent)?;
-        }
+fn create_identity_file(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    if crate::privileged_path::is_process_privileged() {
+        return crate::windows_security::create_private_file(path);
     }
-    protect_identity_file(path)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
 }
 
-fn protect_identity_file(path: &std::path::Path) -> Result<()> {
+fn prepare_identity_location(path: &Path, configured: bool) -> Result<PathBuf> {
+    let path = if let Some(parent) = path.parent() {
+        let parent = crate::privileged_path::prepare_configured_directory(
+            parent,
+            configured,
+            "agent identity directory",
+        )?;
+        let file_name = path
+            .file_name()
+            .context("agent identity path has no file name")?;
+        let path = parent.join(file_name);
+        #[cfg(windows)]
+        if is_system_identity_path(&path) {
+            crate::windows_security::restrict_to_system_and_administrators(&parent)?;
+        }
+        path
+    } else {
+        path.to_owned()
+    };
+    protect_identity_file(&path)?;
+    Ok(path)
+}
+
+fn protect_identity_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => crate::privileged_path::validate_regular_file(path, "agent identity file")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
     #[cfg(unix)]
-    if path.exists() {
+    {
         use std::os::unix::fs::PermissionsExt;
 
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(windows)]
-    if is_system_identity_path(path) && path.exists() {
+    if crate::privileged_path::is_process_privileged() {
         crate::windows_security::restrict_to_system_and_administrators(path)?;
     }
     Ok(())
 }
 
-fn finish_loaded_identity(path: &std::path::Path, identity: Identity) -> Result<Identity> {
+fn finish_loaded_identity(path: &Path, identity: Identity) -> Result<Identity> {
     protect_identity_file(path)?;
     #[cfg(windows)]
     if is_system_identity_path(path) && identity.credential_version < CURRENT_CREDENTIAL_VERSION {
@@ -125,7 +152,8 @@ pub fn complete_secret_rotation(path: Option<PathBuf>, identity: &mut Identity) 
     if identity.previous_secret.is_none() {
         return Ok(());
     }
-    let path = identity_path(path)?;
+    let configured = path.is_some();
+    let path = prepare_identity_location(&identity_path(path)?, configured)?;
     let mut completed = identity.clone();
     completed.previous_secret = None;
     write_system_identity(&path, &completed).with_context(|| {
@@ -139,16 +167,14 @@ pub fn complete_secret_rotation(path: Option<PathBuf>, identity: &mut Identity) 
 }
 
 #[cfg(windows)]
-fn write_system_identity(path: &std::path::Path, identity: &Identity) -> Result<()> {
+fn write_system_identity(path: &Path, identity: &Identity) -> Result<()> {
     let temporary = path.with_extension(format!("rotate-{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut file = create_identity_file(&temporary)?;
         file.write_all(serde_json::to_string_pretty(identity)?.as_bytes())?;
         file.sync_all()?;
-        crate::windows_security::restrict_to_system_and_administrators(&temporary)?;
+        drop(file);
+        protect_identity_file(&temporary)?;
         crate::windows_security::replace_file(&temporary, path)?;
         Ok(())
     })();
@@ -159,7 +185,22 @@ fn write_system_identity(path: &std::path::Path, identity: &Identity) -> Result<
 }
 
 fn read_identity(path: &std::path::Path) -> std::io::Result<Identity> {
-    let content = fs::read_to_string(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "identity path is not a regular file",
+        ));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
     serde_json::from_str(&content)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }

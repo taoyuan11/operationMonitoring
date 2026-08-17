@@ -452,12 +452,16 @@ pub async fn admin_reject_instance(
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
 
-    sqlx::query("DELETE FROM pending_instances WHERE id = $1")
+    let mut tx = state.db.begin().await?;
+    let result = sqlx::query("DELETE FROM pending_instances WHERE id = $1")
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "待审批实例不存在"));
+    }
     write_action_log(
-        &state.db,
+        &mut *tx,
         &admin.username,
         Some(&admin.user_id),
         "reject_instance",
@@ -465,6 +469,7 @@ pub async fn admin_reject_instance(
         "拒绝实例接入",
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Json(AgentRegisterResponse {
         approved: false,
@@ -1066,12 +1071,16 @@ pub async fn admin_disable_command(
     Path(id): Path<String>,
 ) -> AppResult<Json<AgentRegisterResponse>> {
     let admin = require_admin(&state, &headers).await?;
-    sqlx::query("UPDATE commands SET enabled = 0 WHERE id = $1")
+    let mut tx = state.db.begin().await?;
+    let result = sqlx::query("UPDATE commands SET enabled = 0 WHERE id = $1")
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "快捷操作不存在"));
+    }
     write_action_log(
-        &state.db,
+        &mut *tx,
         &admin.username,
         Some(&admin.user_id),
         "disable_command",
@@ -1079,6 +1088,7 @@ pub async fn admin_disable_command(
         "停用快捷操作",
     )
     .await?;
+    tx.commit().await?;
     Ok(Json(AgentRegisterResponse {
         approved: true,
         disabled: true,

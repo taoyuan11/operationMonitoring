@@ -583,6 +583,12 @@ Windows 机器级安全授权，仅受管 LocalSystem 服务会实际启用；�
 
 同一状态目录只允许一个实例端进程运行。若要在一台机器上运行多个实例端，请为每个进程设置不同的 `OM_AGENT_STATE_DIR`、`OM_AGENT_ID_FILE` 和 `OM_AGENT_UPDATE_DIR`。更新目录保存可执行文件、回滚基线、状态和 updater 日志，不能放在重启后会清空的临时目录中。OpenWrt standalone 安装默认使用 `/var/lib/om-agent/updates`。
 
+以 root、LocalSystem 或提升权限的管理员身份运行 Agent 时，上述自定义路径及
+`OM_AGENT_LOG_FILE` 的所有祖先必须由特权账户拥有，且不能授予普通用户写入、删除或
+修改 ACL 的权限。身份和 updater 文件不能是符号链接或 Windows 重解析点；不满足条件时
+Agent 会拒绝启动或更新。不要将这些路径放在 `/tmp`、普通用户主目录、共享目录或可由
+普通用户替换子项的 Windows 目录中。
+
 ## 验证命令
 
 ```bash

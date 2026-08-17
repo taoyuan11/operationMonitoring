@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::{Duration, Instant},
 };
 
@@ -16,6 +17,7 @@ use lettre::{
     address::Address,
     message::{Mailbox, header::ContentType},
     transport::smtp::authentication::Credentials,
+    transport::smtp::client::{Tls, TlsParameters},
 };
 use reqwest::{Client, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
@@ -2616,6 +2618,10 @@ async fn delete_maintenance(
 }
 
 fn validate_webhook_url(value: &str) -> AppResult<String> {
+    validate_webhook_url_with_policy(value, DestinationPolicy::PublicOnly)
+}
+
+fn validate_webhook_url_with_policy(value: &str, policy: DestinationPolicy) -> AppResult<String> {
     let value = value.trim();
     if value.len() > 4_096 {
         return Err(AppError::bad_request("Webhook URL 过长"));
@@ -2627,7 +2633,159 @@ fn validate_webhook_url(value: &str) -> AppResult<String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(AppError::bad_request("Webhook URL 不能包含用户凭据"));
     }
+    if url
+        .host_str()
+        .and_then(parse_url_ip)
+        .is_some_and(|address| !destination_is_allowed(address, policy))
+    {
+        return Err(AppError::bad_request(
+            "Webhook URL 不能指向本机、内网或保留地址",
+        ));
+    }
+    if url.host_str().is_some_and(is_obviously_local_hostname) {
+        return Err(AppError::bad_request("Webhook URL 不能使用本机或本地域名"));
+    }
     Ok(url.to_string())
+}
+
+fn parse_url_ip(host: &str) -> Option<IpAddr> {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
+fn is_obviously_local_hostname(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host == "metadata.google.internal"
+        || host == "metadata"
+}
+
+fn is_public_destination(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    let first = octets[0];
+    let second = octets[1];
+    let blocked = address.is_unspecified()
+        || address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_multicast()
+        || address.is_broadcast()
+        || (first == 0)
+        || (first == 100 && (64..=127).contains(&second))
+        || (first == 192 && second == 0 && octets[2] == 0)
+        || (first == 192 && second == 0 && octets[2] == 2)
+        || (first == 192 && second == 88 && octets[2] == 99)
+        || (first == 198 && (18..=19).contains(&second))
+        || (first == 198 && second == 51 && octets[2] == 100)
+        || (first == 203 && second == 0 && octets[2] == 113)
+        || (first >= 240);
+    !blocked
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    let [first, second, ..] = address.segments();
+    // Public IPv6 unicast is allocated from 2000::/3. Starting from this
+    // whitelist excludes ULA, link/site-local, multicast, NAT64, and other
+    // special ranges; the remaining exclusions are special-use subnets inside
+    // the global allocation.
+    (first & 0xe000) == 0x2000
+        && !(first == 0x2001 && second & 0xfe00 == 0) // IETF assignments.
+        && !(first == 0x2001 && second == 0x0db8) // Documentation.
+        && first != 0x2002 // 6to4 embeds an arbitrary IPv4 destination.
+        && !(first == 0x3fff && second & 0xf000 == 0) // Documentation.
+}
+
+#[derive(Clone, Copy)]
+enum DestinationPolicy {
+    PublicOnly,
+    #[cfg(test)]
+    AllowLoopback,
+}
+
+fn destination_is_allowed(address: IpAddr, policy: DestinationPolicy) -> bool {
+    match policy {
+        DestinationPolicy::PublicOnly => is_public_destination(address),
+        #[cfg(test)]
+        DestinationPolicy::AllowLoopback => is_public_destination(address) || address.is_loopback(),
+    }
+}
+
+async fn public_socket_addresses(
+    host: &str,
+    port: u16,
+    policy: DestinationPolicy,
+) -> AppResult<Vec<SocketAddr>> {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let addresses = if let Ok(address) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(address, port)]
+    } else {
+        tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|_| AppError::new(StatusCode::BAD_GATEWAY, "通知目标域名解析失败"))?
+            .collect()
+    };
+    let mut unique = Vec::new();
+    for address in addresses {
+        if !destination_is_allowed(address.ip(), policy) {
+            return Err(AppError::new(
+                StatusCode::BAD_GATEWAY,
+                "通知目标解析到了本机、内网或保留地址",
+            ));
+        }
+        if !unique.contains(&address) {
+            unique.push(address);
+        }
+    }
+    if unique.is_empty() {
+        return Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            "通知目标没有可用的公网地址",
+        ));
+    }
+    Ok(unique)
+}
+
+async fn secure_http_client(
+    url: &Url,
+    timeout: Duration,
+    policy: DestinationPolicy,
+) -> AppResult<Client> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::bad_request("Webhook URL 缺少主机名"))?;
+    let port = url
+        .port()
+        .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+    let addresses = public_socket_addresses(host, port, policy).await?;
+    let mut builder = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .timeout(timeout);
+    // Literal IP URLs do not perform DNS resolution. Domain destinations are
+    // pinned to the complete address set that was validated above.
+    if parse_url_ip(host).is_none() {
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    builder.build().map_err(|error| {
+        AppError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("通知 HTTP 客户端初始化失败: {error}"),
+        )
+    })
 }
 
 fn validate_webhook_headers(
@@ -2739,6 +2897,17 @@ fn validate_email_config(mut config: EmailChannelConfig) -> AppResult<EmailChann
     }
     if config.smtp_port == 0 {
         return Err(AppError::bad_request("SMTP 端口必须大于 0"));
+    }
+    if config
+        .smtp_host
+        .parse::<IpAddr>()
+        .ok()
+        .is_some_and(|address| !is_public_destination(address))
+        || is_obviously_local_hostname(&config.smtp_host)
+    {
+        return Err(AppError::bad_request(
+            "SMTP 主机不能指向本机、内网或保留地址",
+        ));
     }
     if !matches!(config.security.as_str(), "starttls" | "smtps") {
         return Err(AppError::bad_request(
@@ -4348,13 +4517,16 @@ fn channel_response_error(channel_type: &str, status: StatusCode, body: &[u8]) -
 }
 
 async fn send_http_channel(
-    client: &Client,
     state: &AppState,
     channel: &ChannelRow,
     delivery: &DeliveryRow,
+    timeout: Duration,
+    policy: DestinationPolicy,
 ) -> AppResult<(StatusCode, String, Option<String>)> {
     let url = decrypt_string(state, &channel.url_ciphertext)?;
-    let url = validate_webhook_url(&url)?;
+    let url = validate_webhook_url_with_policy(&url, policy)?;
+    let parsed_url = Url::parse(&url).map_err(|_| AppError::bad_request("Webhook URL 格式无效"))?;
+    let client = secure_http_client(&parsed_url, timeout, policy).await?;
     let timestamp = now_ts();
     let mut request = client.post(&url).header("content-type", "application/json");
     let body = match channel.channel_type.as_str() {
@@ -4459,6 +4631,16 @@ async fn send_email_channel(
     delivery: &DeliveryRow,
 ) -> AppResult<String> {
     let config = decrypt_email_config(state, channel)?;
+    let addresses = public_socket_addresses(
+        &config.smtp_host,
+        config.smtp_port,
+        DestinationPolicy::PublicOnly,
+    )
+    .await?;
+    let connect_host = addresses
+        .first()
+        .map(|address| address.ip().to_string())
+        .ok_or_else(|| AppError::new(StatusCode::BAD_GATEWAY, "SMTP 主机没有可用的公网地址"))?;
     let (subject, body) = email_notification_content(&delivery.payload);
     let from_address = config
         .from_address
@@ -4481,12 +4663,19 @@ async fn send_email_channel(
     let message = message
         .body(body)
         .map_err(|_| AppError::new(StatusCode::BAD_GATEWAY, "smtp_message_build_failed"))?;
+    let tls_parameters = TlsParameters::new(config.smtp_host.clone()).map_err(|error| {
+        AppError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("SMTP TLS 参数无效: {error}"),
+        )
+    })?;
     let mut transport = match config.security.as_str() {
-        "starttls" => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host),
-        "smtps" => AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host),
+        "starttls" => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(connect_host)
+            .tls(Tls::Required(tls_parameters)),
+        "smtps" => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(connect_host)
+            .tls(Tls::Wrapper(tls_parameters)),
         _ => return Err(AppError::bad_request("SMTP security 配置无效")),
     }
-    .map_err(|error| AppError::new(StatusCode::BAD_GATEWAY, smtp_delivery_error_code(&error)))?
     .port(config.smtp_port)
     .timeout(Some(Duration::from_secs(SMTP_TIMEOUT_SECONDS)));
     if let (Some(username), Some(password)) = (config.username, config.password) {
@@ -4527,10 +4716,21 @@ fn smtp_delivery_error_code(error: &lettre::transport::smtp::Error) -> String {
     }
 }
 
-async fn send_webhook(
-    client: &Client,
+async fn send_webhook(state: &AppState, delivery: &DeliveryRow) -> WebhookAttemptOutcome {
+    send_webhook_with_options(
+        state,
+        delivery,
+        Duration::from_secs(WEBHOOK_TIMEOUT_SECONDS),
+        DestinationPolicy::PublicOnly,
+    )
+    .await
+}
+
+async fn send_webhook_with_options(
     state: &AppState,
     delivery: &DeliveryRow,
+    timeout: Duration,
+    policy: DestinationPolicy,
 ) -> WebhookAttemptOutcome {
     let started = Instant::now();
     let outcome = async {
@@ -4543,7 +4743,7 @@ async fn send_webhook(
             Ok::<_, AppError>((None, response_excerpt, None))
         } else {
             let (status, response_excerpt, error) =
-                send_http_channel(client, state, &channel, delivery).await?;
+                send_http_channel(state, &channel, delivery, timeout, policy).await?;
             Ok((Some(i64::from(status.as_u16())), response_excerpt, error))
         }
     }
@@ -4565,6 +4765,15 @@ async fn send_webhook(
             response_excerpt: String::new(),
         },
     }
+}
+
+#[cfg(test)]
+async fn send_webhook_to_loopback(
+    state: &AppState,
+    delivery: &DeliveryRow,
+    timeout: Duration,
+) -> WebhookAttemptOutcome {
+    send_webhook_with_options(state, delivery, timeout, DestinationPolicy::AllowLoopback).await
 }
 
 async fn finish_delivery_attempt(
@@ -4768,7 +4977,7 @@ fn transient_channel_cooldown_delay(
     retry_delay_after(cycle_attempts).or_else(|| DELIVERY_RETRY_DELAYS.last().copied())
 }
 
-async fn notification_delivery_worker(state: AppState, client: Client) {
+async fn notification_delivery_worker(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -4812,7 +5021,7 @@ async fn notification_delivery_worker(state: AppState, client: Client) {
             }) else {
                 continue;
             };
-            let outcome = send_webhook(&client, &state, &delivery).await;
+            let outcome = send_webhook(&state, &delivery).await;
             if let Err(error) = finish_delivery_attempt(&state.db, &delivery, outcome).await {
                 warn!(?error, delivery_id=%delivery.id, "failed to record notification attempt");
             }
@@ -4821,25 +5030,13 @@ async fn notification_delivery_worker(state: AppState, client: Client) {
 }
 
 pub async fn webhook_delivery_loop(state: AppState) {
-    let client = match Client::builder()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(WEBHOOK_TIMEOUT_SECONDS))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            error!(?error, "failed to initialize alert notification client");
-            return;
-        }
-    };
-
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..DELIVERY_WORKER_COUNT {
-        workers.spawn(notification_delivery_worker(state.clone(), client.clone()));
+        workers.spawn(notification_delivery_worker(state.clone()));
     }
     while let Some(result) = workers.join_next().await {
         error!(?result, "alert notification worker stopped unexpectedly");
-        workers.spawn(notification_delivery_worker(state.clone(), client.clone()));
+        workers.spawn(notification_delivery_worker(state.clone()));
     }
 }
 
@@ -4894,7 +5091,6 @@ mod tests {
     };
 
     use axum::{body::Bytes, response::IntoResponse};
-    use reqwest::redirect::Policy;
     use sqlx::postgres::PgPoolOptions;
     use tokio::sync::Mutex;
 
@@ -5330,6 +5526,53 @@ mod tests {
         let mut invalid = config;
         invalid.password = None;
         assert!(validate_email_config(invalid).is_err());
+    }
+
+    #[test]
+    fn notification_targets_reject_non_public_addresses() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "::1",
+            "fc00::1",
+            "fd00::1",
+            "fe80::1",
+            "fec0::1",
+            "2001:db8::1",
+            "3fff::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                !is_public_destination(address.parse().unwrap()),
+                "address should be blocked: {address}"
+            );
+        }
+        assert!(is_public_destination("8.8.8.8".parse().unwrap()));
+        assert!(is_public_destination("192.0.1.1".parse().unwrap()));
+        assert!(is_public_destination(
+            "2001:4860:4860::8888".parse().unwrap()
+        ));
+        assert!(validate_webhook_url("http://127.0.0.1/hook").is_err());
+        assert!(validate_webhook_url("http://localhost/hook").is_err());
+        assert!(validate_webhook_url("http://[::1]/hook").is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_notification_resolution_rejects_loopback() {
+        assert!(
+            public_socket_addresses("127.0.0.1", 80, DestinationPolicy::PublicOnly)
+                .await
+                .is_err()
+        );
+        assert!(
+            public_socket_addresses("::1", 80, DestinationPolicy::PublicOnly)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -5815,11 +6058,6 @@ mod tests {
         let state = test_state(db.clone());
         let capture = WebhookCapture::default();
         let (base_url, server) = spawn_webhook_receiver(capture.clone()).await;
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .timeout(Duration::from_secs(2))
-            .build()
-            .expect("build webhook test client");
         let mut custom_headers = BTreeMap::new();
         custom_headers.insert("x-test-header".to_string(), "header-value".to_string());
         set_test_channel(
@@ -5832,7 +6070,7 @@ mod tests {
         .await;
         let delivery = test_delivery("transport-channel");
 
-        let success = send_webhook(&client, &state, &delivery).await;
+        let success = send_webhook_to_loopback(&state, &delivery, Duration::from_secs(2)).await;
         assert!(success.succeeded);
         assert_eq!(success.http_status, Some(204));
         let requests = capture.requests.lock().await;
@@ -5876,7 +6114,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
-        let failed = send_webhook(&client, &state, &delivery).await;
+        let failed = send_webhook_to_loopback(&state, &delivery, Duration::from_secs(2)).await;
         assert!(!failed.succeeded);
         assert_eq!(failed.http_status, Some(500));
         assert_eq!(failed.error, "http_status_500");
@@ -5890,7 +6128,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
-        let redirected = send_webhook(&client, &state, &delivery).await;
+        let redirected = send_webhook_to_loopback(&state, &delivery, Duration::from_secs(2)).await;
         assert!(!redirected.succeeded);
         assert_eq!(redirected.http_status, Some(302));
         assert_eq!(capture.redirect_target_hits.load(Ordering::SeqCst), 0);
@@ -5903,7 +6141,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
-        let truncated = send_webhook(&client, &state, &delivery).await;
+        let truncated = send_webhook_to_loopback(&state, &delivery, Duration::from_secs(2)).await;
         assert!(truncated.succeeded);
         assert_eq!(truncated.response_excerpt.len(), MAX_RESPONSE_BYTES);
 
@@ -5915,12 +6153,8 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
-        let timeout_client = Client::builder()
-            .redirect(Policy::none())
-            .timeout(Duration::from_millis(50))
-            .build()
-            .expect("build timeout webhook client");
-        let timed_out = send_webhook(&timeout_client, &state, &delivery).await;
+        let timed_out =
+            send_webhook_to_loopback(&state, &delivery, Duration::from_millis(50)).await;
         assert!(!timed_out.succeeded);
         assert_eq!(timed_out.http_status, None);
         assert!(timed_out.error.contains("webhook request failed"));
@@ -7182,11 +7416,6 @@ mod tests {
                 .expect("serve webhook receiver");
         });
 
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .timeout(Duration::from_millis(100))
-            .build()
-            .expect("build webhook test client");
         let mut custom_headers = BTreeMap::new();
         custom_headers.insert("x-test-token".to_string(), "configured".to_string());
         let delivery = test_delivery("channel-webhook");
@@ -7199,7 +7428,7 @@ mod tests {
         )
         .await;
 
-        let success = send_webhook(&client, &state, &delivery).await;
+        let success = send_webhook_to_loopback(&state, &delivery, Duration::from_millis(100)).await;
         assert!(success.succeeded);
         assert_eq!(success.http_status, Some(204));
         let captured = capture.requests.lock().await;
@@ -7241,7 +7470,7 @@ mod tests {
             &custom_headers,
         )
         .await;
-        let large = send_webhook(&client, &state, &delivery).await;
+        let large = send_webhook_to_loopback(&state, &delivery, Duration::from_millis(100)).await;
         assert!(large.succeeded);
         assert_eq!(large.response_excerpt.len(), MAX_RESPONSE_BYTES);
 
@@ -7253,7 +7482,8 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
-        let redirected = send_webhook(&client, &state, &delivery).await;
+        let redirected =
+            send_webhook_to_loopback(&state, &delivery, Duration::from_millis(100)).await;
         assert!(!redirected.succeeded);
         assert_eq!(redirected.http_status, Some(302));
         assert_eq!(capture.redirect_target_hits.load(Ordering::SeqCst), 0);
@@ -7266,7 +7496,8 @@ mod tests {
             &BTreeMap::new(),
         )
         .await;
-        let timed_out = send_webhook(&client, &state, &delivery).await;
+        let timed_out =
+            send_webhook_to_loopback(&state, &delivery, Duration::from_millis(100)).await;
         assert!(!timed_out.succeeded);
         assert_eq!(timed_out.http_status, None);
         assert!(!timed_out.error.contains("secret=hidden"));
@@ -7300,7 +7531,8 @@ mod tests {
         .execute(&db)
         .await
         .expect("insert failed delivery candidate");
-        let failure = send_webhook(&client, &state, &failed_delivery).await;
+        let failure =
+            send_webhook_to_loopback(&state, &failed_delivery, Duration::from_millis(100)).await;
         assert_eq!(failure.http_status, Some(500));
         finish_delivery_attempt(&db, &failed_delivery, failure)
             .await

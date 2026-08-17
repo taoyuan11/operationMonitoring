@@ -372,10 +372,13 @@ pub async fn admin_login(
         ));
     };
     let account_attempt_key = format!("login:{}", user.id);
-    ensure_account_attempt_allowed(&state, &account_attempt_key).await?;
+    // Verify before consulting the account limiter so a valid code can recover from
+    // failures injected by other sources. Invalid attempts remain rate-limited below.
     let Some((device, counter)) = verify_user_code(&state, &user.id, &payload.code).await? else {
         record_source_auth_failure(&state, &source_attempt_key).await;
+        let account_limit = ensure_account_attempt_allowed(&state, &account_attempt_key).await;
         record_account_auth_failure(&state, &account_attempt_key).await;
+        account_limit?;
         return Err(AppError::new(
             StatusCode::UNAUTHORIZED,
             "用户名或验证码错误",
@@ -912,7 +915,6 @@ async fn create_enrollment(
 
 async fn verify_step_up(state: &AppState, principal: &AdminPrincipal, code: &str) -> AppResult<()> {
     let key = format!("step-up:{}", principal.user_id);
-    ensure_account_attempt_allowed(state, &key).await?;
     let verified_with_new_counter = verify_user_code(state, &principal.user_id, code)
         .await?
         .is_some();
@@ -923,7 +925,9 @@ async fn verify_step_up(state: &AppState, principal: &AdminPrincipal, code: &str
         consume_login_counter_for_step_up(state, principal, code).await?
     };
     if !verified {
+        let account_limit = ensure_account_attempt_allowed(state, &key).await;
         record_account_auth_failure(state, &key).await;
+        account_limit?;
         return Err(AppError::new(
             StatusCode::UNAUTHORIZED,
             "当前管理员验证码错误",
@@ -1672,6 +1676,63 @@ mod tests {
         .await
         .expect_err("bootstrap must stay disabled");
         assert_eq!(error.status, StatusCode::CONFLICT);
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn valid_totp_bypasses_remote_account_failure_lockout() {
+        let (state, test_db) = test_state("om_admin_auth_lockout").await;
+        let secret = b"12345678901234567890";
+        insert_user_with_device(&state, "user-lockout", "Known.Admin", secret).await;
+
+        for source in 1..=AUTH_FAILURE_LIMIT {
+            let error = admin_login(
+                State(state.clone()),
+                ConnectInfo(
+                    format!("198.51.100.{source}:12345")
+                        .parse()
+                        .expect("peer address"),
+                ),
+                HeaderMap::new(),
+                Json(LoginRequest {
+                    username: "known.admin".to_string(),
+                    code: "invalid".to_string(),
+                }),
+            )
+            .await
+            .expect_err("invalid TOTP must fail");
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        }
+        assert!(
+            state
+                .auth_account_attempts
+                .read()
+                .await
+                .get("login:user-lockout")
+                .is_some_and(|attempt| attempt.blocked_until > now_ts())
+        );
+
+        let response = admin_login(
+            State(state.clone()),
+            ConnectInfo("203.0.113.20:12345".parse().expect("peer address")),
+            HeaderMap::new(),
+            Json(LoginRequest {
+                username: "known.admin".to_string(),
+                code: totp_code_at(secret, now_ts()),
+            }),
+        )
+        .await
+        .expect("valid TOTP must bypass account failure state");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !state
+                .auth_account_attempts
+                .read()
+                .await
+                .contains_key("login:user-lockout")
+        );
+
         test_db.cleanup().await;
     }
 

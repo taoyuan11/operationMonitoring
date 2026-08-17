@@ -13,6 +13,7 @@ mod logging;
 mod metrics;
 mod models;
 mod outbound;
+mod privileged_path;
 mod profile;
 mod pty_io;
 mod remote_access;

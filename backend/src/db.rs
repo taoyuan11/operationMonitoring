@@ -919,6 +919,32 @@ pub async fn register_or_touch_pending(
 ) -> AppResult<()> {
     validate_agent_registration(payload)?;
     let secret_verifier = agent_secret_verifier(&payload.secret);
+    let now = now_ts();
+    let (instance_secret, pending_secret, source_count, pending_count) =
+        sqlx::query_as::<_, (Option<String>, Option<String>, i64, i64)>(
+            r#"
+            SELECT
+                (SELECT secret FROM instances WHERE id = $1),
+                (SELECT secret FROM pending_instances WHERE id = $1),
+                (SELECT COUNT(*) FROM pending_instances
+                 WHERE source_key = $2 AND first_seen >= $3),
+                (SELECT COUNT(*) FROM pending_instances WHERE first_seen >= $3)
+            "#,
+        )
+        .bind(&payload.instance_id)
+        .bind(source_key)
+        .bind(now - PENDING_INSTANCE_MAX_AGE)
+        .fetch_one(db)
+        .await?;
+
+    if let Some(secret) = instance_secret.as_deref().or(pending_secret.as_deref()) {
+        if !agent_secret_is_authorized(secret, payload) {
+            return Err(AppError::new(StatusCode::UNAUTHORIZED, "实例密钥不匹配"));
+        }
+    } else {
+        enforce_pending_instance_limits(source_count, pending_count)?;
+    }
+
     let mut tx = db.begin().await?;
     let mut instance = sqlx::query_as::<_, InstanceRecord>(
         r#"
@@ -928,24 +954,28 @@ pub async fn register_or_touch_pending(
                approved, disabled, first_seen, last_seen, expires_at
         FROM instances
         WHERE id = $1
-        FOR UPDATE
+        FOR UPDATE NOWAIT
         "#,
     )
     .bind(&payload.instance_id)
     .fetch_optional(&mut *tx)
-    .await?;
+    .await
+    .map_err(map_registration_lock_error)?;
 
     let mut pending_secret: Option<String> = None;
     if instance.is_none() {
-        pending_secret =
-            sqlx::query_scalar("SELECT secret FROM pending_instances WHERE id = $1 FOR UPDATE")
-                .bind(&payload.instance_id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        pending_secret = sqlx::query_scalar(
+            "SELECT secret FROM pending_instances WHERE id = $1 FOR UPDATE NOWAIT",
+        )
+        .bind(&payload.instance_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_registration_lock_error)?;
         if pending_secret.is_none() {
-            sqlx::query("LOCK TABLE pending_instances IN SHARE ROW EXCLUSIVE MODE")
+            sqlx::query("LOCK TABLE pending_instances IN SHARE ROW EXCLUSIVE MODE NOWAIT")
                 .execute(&mut *tx)
-                .await?;
+                .await
+                .map_err(map_registration_lock_error)?;
             instance = sqlx::query_as::<_, InstanceRecord>(
                 r#"
                 SELECT id, secret, name, region, country_code, country, province_code, province, city,
@@ -954,19 +984,21 @@ pub async fn register_or_touch_pending(
                        approved, disabled, first_seen, last_seen, expires_at
                 FROM instances
                 WHERE id = $1
-                FOR UPDATE
+                FOR UPDATE NOWAIT
                 "#,
             )
             .bind(&payload.instance_id)
             .fetch_optional(&mut *tx)
-            .await?;
+            .await
+            .map_err(map_registration_lock_error)?;
             if instance.is_none() {
                 pending_secret = sqlx::query_scalar(
-                    "SELECT secret FROM pending_instances WHERE id = $1 FOR UPDATE",
+                    "SELECT secret FROM pending_instances WHERE id = $1 FOR UPDATE NOWAIT",
                 )
                 .bind(&payload.instance_id)
                 .fetch_optional(&mut *tx)
-                .await?;
+                .await
+                .map_err(map_registration_lock_error)?;
             }
         }
     }
@@ -1039,7 +1071,6 @@ pub async fn register_or_touch_pending(
         .execute(&mut *tx)
         .await?;
     } else {
-        let now = now_ts();
         sqlx::query("DELETE FROM pending_instances WHERE first_seen < $1")
             .bind(now - PENDING_INSTANCE_MAX_AGE)
             .execute(&mut *tx)
@@ -1049,29 +1080,10 @@ pub async fn register_or_touch_pending(
                 .bind(source_key)
                 .fetch_one(&mut *tx)
                 .await?;
-        if source_count >= MAX_PENDING_INSTANCES_PER_SOURCE {
-            return Err(AppError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "该来源的待审批实例数量已达上限",
-            ));
-        }
         let pending_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_instances")
             .fetch_one(&mut *tx)
             .await?;
-        if pending_count >= MAX_PENDING_INSTANCES {
-            sqlx::query(
-                r#"
-                DELETE FROM pending_instances
-                WHERE id = (
-                    SELECT id FROM pending_instances
-                    ORDER BY last_seen ASC, first_seen ASC, id ASC
-                    LIMIT 1
-                )
-                "#,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
+        enforce_pending_instance_limits(source_count, pending_count)?;
         sqlx::query(
             r#"
             INSERT INTO pending_instances(id, secret, hostname, os, arch, agent_version,
@@ -1099,6 +1111,36 @@ pub async fn register_or_touch_pending(
     tx.commit().await?;
 
     Ok(())
+}
+
+fn enforce_pending_instance_limits(source_count: i64, pending_count: i64) -> AppResult<()> {
+    if source_count >= MAX_PENDING_INSTANCES_PER_SOURCE {
+        return Err(AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "该来源的待审批实例数量已达上限",
+        ));
+    }
+    if pending_count >= MAX_PENDING_INSTANCES {
+        return Err(AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "待审批实例总数已达上限",
+        ));
+    }
+    Ok(())
+}
+
+fn map_registration_lock_error(error: sqlx::Error) -> AppError {
+    if matches!(
+        &error,
+        sqlx::Error::Database(database_error)
+            if database_error.code().as_deref() == Some("55P03")
+    ) {
+        return AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "实例注册请求繁忙，请稍后重试",
+        );
+    }
+    error.into()
 }
 
 fn validate_agent_registration(payload: &AgentRegisterRequest) -> AppResult<()> {
@@ -1954,6 +1996,121 @@ mod tests {
                 .await
                 .expect("load pending secret");
         assert_eq!(stored_secret, agent_secret_verifier(&original.secret));
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn capped_registration_source_is_rejected_before_waiting_for_table_lock() {
+        let test_db = IsolatedTestDatabase::connect("om_db_pending_source_limit", 2).await;
+        let db = test_db.pool();
+        init_db(&db).await.expect("initialize database");
+        let now = now_ts();
+        sqlx::query(
+            r#"
+            INSERT INTO pending_instances(
+                id, secret, hostname, os, arch, agent_version, first_seen, last_seen, source_key
+            )
+            SELECT 'source-limit-' || value, 'secret', 'host', 'linux', 'x86_64', '0.1.0',
+                   $1, $1, 'capped-source'
+            FROM generate_series(1, $2) AS value
+            "#,
+        )
+        .bind(now)
+        .bind(MAX_PENDING_INSTANCES_PER_SOURCE)
+        .execute(&db)
+        .await
+        .expect("fill source quota");
+
+        let mut lock_tx = db.begin().await.expect("begin table lock transaction");
+        sqlx::query("LOCK TABLE pending_instances IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await
+            .expect("lock pending instances");
+
+        let mut payload = registration_payload();
+        payload.instance_id = "source-limit-new".to_string();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            register_or_touch_pending(&db, &payload, "capped-source"),
+        )
+        .await
+        .expect("source limit check must not wait for the table lock")
+        .expect_err("source quota must reject a new pending instance");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+
+        lock_tx.rollback().await.expect("release table lock");
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn contended_pending_registration_fails_fast() {
+        let test_db = IsolatedTestDatabase::connect("om_db_pending_lock", 2).await;
+        let db = test_db.pool();
+        init_db(&db).await.expect("initialize database");
+
+        let mut lock_tx = db.begin().await.expect("begin table lock transaction");
+        sqlx::query("LOCK TABLE pending_instances IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await
+            .expect("lock pending instances");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            register_or_touch_pending(&db, &registration_payload(), "new-source"),
+        )
+        .await
+        .expect("registration must not wait for the table lock")
+        .expect_err("contended registration must be retried");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+
+        lock_tx.rollback().await.expect("release table lock");
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn global_pending_limit_preserves_existing_approval_items() {
+        let test_db = IsolatedTestDatabase::connect("om_db_pending_global_limit", 1).await;
+        let db = test_db.pool();
+        init_db(&db).await.expect("initialize database");
+        let now = now_ts();
+        sqlx::query(
+            r#"
+            INSERT INTO pending_instances(
+                id, secret, hostname, os, arch, agent_version, first_seen, last_seen, source_key
+            )
+            SELECT 'global-limit-' || value, 'secret', 'host', 'linux', 'x86_64', '0.1.0',
+                   $1, $1, 'source-' || value
+            FROM generate_series(1, $2) AS value
+            "#,
+        )
+        .bind(now)
+        .bind(MAX_PENDING_INSTANCES)
+        .execute(&db)
+        .await
+        .expect("fill global quota");
+
+        let mut payload = registration_payload();
+        payload.instance_id = "global-limit-new".to_string();
+        let error = register_or_touch_pending(&db, &payload, "new-source")
+            .await
+            .expect_err("global quota must reject a new pending instance");
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+
+        let (pending_count, oldest_exists): (i64, bool) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*), BOOL_OR(id = 'global-limit-1')
+            FROM pending_instances
+            "#,
+        )
+        .fetch_one(&db)
+        .await
+        .expect("inspect pending queue");
+        assert_eq!(pending_count, MAX_PENDING_INSTANCES);
+        assert!(oldest_exists);
+
         test_db.cleanup().await;
     }
 

@@ -123,6 +123,7 @@ struct UpdateManifest {
 #[derive(Debug, Clone)]
 struct UpdatePaths {
     root: PathBuf,
+    configured_root: bool,
     packages: PathBuf,
     state_file: PathBuf,
     health_file: PathBuf,
@@ -1434,6 +1435,11 @@ impl UpdateManager {
         installed_executable: PathBuf,
         verify_ownership: bool,
     ) -> Result<()> {
+        crate::privileged_path::validate_configured_directory(
+            &self.paths.root,
+            self.paths.configured_root,
+            "agent update directory",
+        )?;
         let mut state = read_update_state(&self.paths.state_file)?;
         let mut previous_package = state
             .attempt
@@ -1498,13 +1504,23 @@ impl UpdateManager {
         };
         write_json_atomic(&plan_path, &plan)?;
 
-        fs::copy(std::env::current_exe()?, &updater_path).with_context(|| {
+        if updater_path.try_exists()? {
+            crate::privileged_path::validate_regular_file(
+                &updater_path,
+                "detached updater executable",
+            )?;
+            fs::remove_file(&updater_path)?;
+        }
+        copy_private_executable(&std::env::current_exe()?, &updater_path).with_context(|| {
             format!(
                 "failed to create detached updater {}",
                 updater_path.display()
             )
         })?;
-        set_owner_only_executable(&updater_path)?;
+        crate::privileged_path::validate_regular_file(
+            &updater_path,
+            "detached updater executable",
+        )?;
 
         let spawned_with_systemd = try_spawn_systemd_updater(
             &updater_path,
@@ -1546,16 +1562,32 @@ fn update_delay_seconds(instance_id: &str, artifact_id: &str) -> u64 {
 }
 
 fn replace_file(source: &Path, target: &Path) -> Result<()> {
-    if target.exists() {
-        fs::remove_file(target)?;
-    }
+    #[cfg(windows)]
+    crate::windows_security::replace_file(source, target).with_context(|| {
+        format!(
+            "failed to atomically replace {} with {}",
+            target.display(),
+            source.display()
+        )
+    })?;
+    #[cfg(not(windows))]
     fs::rename(source, target).with_context(|| {
         format!(
-            "failed to move {} to {}",
-            source.display(),
-            target.display()
+            "failed to atomically replace {} with {}",
+            target.display(),
+            source.display()
         )
-    })
+    })?;
+    #[cfg(unix)]
+    {
+        let parent = target
+            .parent()
+            .ok_or_else(|| anyhow!("{} has no parent directory", target.display()))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync directory {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn safe_component(value: &str) -> String {
@@ -1654,12 +1686,18 @@ fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&temporary)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    drop(file);
-    replace_file(&temporary, path)
+    let result = (|| -> Result<()> {
+        let mut file = options.open(&temporary)?;
+        serde_json::to_writer(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn update_status_message(
@@ -1896,13 +1934,47 @@ fn mutate_attempt(
     write_update_state(state_file, &state)
 }
 
+fn copy_private_executable(source: &Path, target: &Path) -> Result<()> {
+    let mut source_file = File::open(source)?;
+    if !source_file.metadata()?.is_file() {
+        bail!("updater source {} is not a regular file", source.display());
+    }
+    let mut target_file = create_new_executable(target)?;
+    io::copy(&mut source_file, &mut target_file)?;
+    target_file.sync_all()?;
+    drop(target_file);
+    set_owner_only_executable(target)
+}
+
+fn create_new_executable(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    if crate::privileged_path::is_process_privileged() {
+        return crate::windows_security::create_private_file(path);
+    }
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o700).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
 #[cfg(unix)]
 fn set_owner_only_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_owner_only_directory(path: &Path) -> Result<()> {
+    if crate::privileged_path::is_process_privileged() {
+        crate::windows_security::restrict_to_system_and_administrators(path)?;
+    }
+    Ok(())
+}
+#[cfg(not(any(unix, windows)))]
 fn set_owner_only_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -1912,7 +1984,14 @@ fn set_owner_only_executable(path: &Path) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_owner_only_executable(path: &Path) -> Result<()> {
+    if crate::privileged_path::is_process_privileged() {
+        crate::windows_security::restrict_to_system_and_administrators(path)?;
+    }
+    Ok(())
+}
+#[cfg(not(any(unix, windows)))]
 fn set_owner_only_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -2061,6 +2140,7 @@ fn update_lock_is_contended(error: &io::Error) -> bool {
 
 impl UpdatePaths {
     fn from_config(config: &AgentConfig) -> Result<Self> {
+        let configured_root = config.update_dir.is_some() || config.state_dir.is_some();
         let root = if let Some(path) = &config.update_dir {
             path.clone()
         } else if let Some(path) = &config.state_dir {
@@ -2076,17 +2156,22 @@ impl UpdatePaths {
             health_file: root.join("health.json"),
             lock_file: root.join("updater.lock"),
             lock_owner_file: root.join("updater-owner.json"),
+            configured_root,
             root,
         })
     }
 
     fn prepare(&self) -> Result<()> {
-        fs::create_dir_all(&self.packages).with_context(|| {
-            format!(
-                "failed to create update directory {}",
-                self.packages.display()
-            )
-        })?;
+        crate::privileged_path::prepare_configured_directory(
+            &self.root,
+            self.configured_root,
+            "agent update directory",
+        )?;
+        crate::privileged_path::prepare_configured_directory(
+            &self.packages,
+            self.configured_root,
+            "agent update package directory",
+        )?;
         set_owner_only_directory(&self.root)?;
         set_owner_only_directory(&self.packages)?;
         for entry in fs::read_dir(&self.packages)? {
@@ -2104,6 +2189,17 @@ pub(crate) fn docker_protected_update_root(config: &AgentConfig) -> Result<PathB
 }
 
 pub fn apply_update(plan_file: &Path) -> Result<()> {
+    if crate::privileged_path::is_process_privileged() {
+        let parent = plan_file
+            .parent()
+            .context("update plan path has no parent directory")?;
+        crate::privileged_path::validate_configured_directory(
+            parent,
+            true,
+            "updater plan directory",
+        )?;
+        crate::privileged_path::validate_regular_file(plan_file, "updater plan")?;
+    }
     let content = fs::read_to_string(plan_file)
         .with_context(|| format!("failed to read update plan {}", plan_file.display()))?;
     let plan: ApplyPlan = serde_json::from_str(&content)?;
@@ -3461,7 +3557,7 @@ fn standalone_restart_candidates() -> Vec<CommandSpec> {
 }
 
 fn detect_update_capability() -> UpdateCapability {
-    let privileged = is_update_privileged();
+    let privileged = crate::privileged_path::is_process_privileged();
     if standalone_install_marker().is_some() {
         UpdateCapability {
             package_type: Some(PackageType::Standalone.as_str().to_string()),
@@ -3488,45 +3584,6 @@ fn windows_native_arch() -> String {
         "x86" | "i386" | "i586" | "i686" => "x86".to_string(),
         value => value.to_string(),
     }
-}
-
-#[cfg(unix)]
-fn is_update_privileged() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-
-#[cfg(windows)]
-fn is_update_privileged() -> bool {
-    use std::mem::{size_of, zeroed};
-    use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
-    };
-
-    unsafe {
-        let mut token = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return false;
-        }
-        let mut elevation: TOKEN_ELEVATION = zeroed();
-        let mut returned = 0_u32;
-        let elevated = GetTokenInformation(
-            token,
-            TokenElevation,
-            &mut elevation as *mut _ as *mut _,
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut returned,
-        ) != 0
-            && elevation.TokenIsElevated != 0;
-        CloseHandle(token);
-        elevated
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn is_update_privileged() -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -4787,6 +4844,35 @@ mod tests {
                 0o600
             );
         }
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_atomic_replacement_preserves_the_previous_file() {
+        let directory = std::env::temp_dir().join(format!("om-update-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("state.json");
+        fs::write(&target, b"previous-state").unwrap();
+
+        assert!(replace_file(&directory.join("missing.tmp"), &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"previous-state");
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn atomic_replacement_commits_the_complete_new_file() {
+        let directory = std::env::temp_dir().join(format!("om-update-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("state.tmp");
+        let target = directory.join("state.json");
+        fs::write(&source, b"complete-new-state").unwrap();
+        fs::write(&target, b"previous-state").unwrap();
+
+        replace_file(&source, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"complete-new-state");
+        assert!(!source.exists());
+
         let _ = fs::remove_dir_all(directory);
     }
 }

@@ -1137,13 +1137,27 @@ fn append_csv_row(output: &mut String, item: &AuditEventRecord) {
 }
 
 fn csv_escape(value: &str) -> String {
+    let formula_candidate = value.trim_start_matches([' ', '\t']);
+    let starts_with_control = value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b'\t' | b'\r' | b'\n'));
+    let starts_with_formula = formula_candidate
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b'=' | b'+' | b'-' | b'@'));
+    let value = if starts_with_control || starts_with_formula {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
     if value
         .bytes()
         .any(|byte| matches!(byte, b',' | b'"' | b'\n' | b'\r'))
     {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
-        value.to_string()
+        value
     }
 }
 
@@ -1242,6 +1256,26 @@ mod tests {
     #[test]
     fn csv_quotes_special_values() {
         assert_eq!(csv_escape("a,b\"c"), "\"a,b\"\"c\"");
+    }
+
+    #[test]
+    fn csv_neutralizes_spreadsheet_formula_cells() {
+        for value in [
+            "=1+1",
+            "+cmd|' /C calc'!A0",
+            "-2+3",
+            "@SUM(1,2)",
+            "  =WEBSERVICE(\"https://example.invalid\")",
+            "\t=HYPERLINK(\"https://example.invalid\")",
+        ] {
+            let escaped = csv_escape(value);
+            let cell = escaped.strip_prefix('"').unwrap_or(&escaped);
+            assert!(
+                cell.starts_with('\''),
+                "formula was not neutralized: {escaped}"
+            );
+        }
+        assert_eq!(csv_escape("ordinary-value"), "ordinary-value");
     }
 
     #[test]

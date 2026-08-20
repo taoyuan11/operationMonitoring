@@ -64,11 +64,12 @@ use update_signature::load_update_signer;
 use updates::{
     admin_add_agent_rollout_targets, admin_agent_releases, admin_agent_rollout_candidates,
     admin_agent_update_attempts, admin_create_agent_release, admin_delete_agent_artifact,
-    admin_delete_agent_release, admin_pause_agent_rollout, admin_promote_agent_rollout,
-    admin_publish_agent_release, admin_resume_agent_rollout, admin_retry_agent_update,
-    admin_reupgrade_agent_instance, admin_rollback_agent_instance, admin_rollback_agent_release,
-    admin_update_agent_release, admin_upload_agent_artifact, agent_download_artifact,
-    agent_download_artifact_checksum, agent_update_manifest, update_timeout_loop,
+    admin_delete_agent_release, admin_download_agent_artifact, admin_pause_agent_rollout,
+    admin_promote_agent_rollout, admin_publish_agent_release, admin_resume_agent_rollout,
+    admin_retry_agent_update, admin_reupgrade_agent_instance, admin_rollback_agent_instance,
+    admin_rollback_agent_release, admin_update_agent_release, admin_upload_agent_artifact,
+    agent_download_artifact, agent_download_artifact_checksum, agent_update_manifest,
+    update_timeout_loop,
 };
 use utils::now_ts;
 use uuid::Uuid;
@@ -282,6 +283,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/agent-releases/{release_id}/artifacts/{artifact_id}",
             delete(admin_delete_agent_artifact),
+        )
+        .route(
+            "/api/admin/agent-releases/{release_id}/artifacts/{artifact_id}/download",
+            get(admin_download_agent_artifact),
         )
         .route(
             "/api/admin/agent-releases/{release_id}/publish",

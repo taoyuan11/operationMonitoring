@@ -904,7 +904,7 @@ fn content_length(headers: &HeaderMap) -> AppResult<u64> {
         })
 }
 
-fn content_disposition(name: &str) -> AppResult<HeaderValue> {
+pub(crate) fn content_disposition(name: &str) -> AppResult<HeaderValue> {
     let fallback = name
         .chars()
         .map(|character| {

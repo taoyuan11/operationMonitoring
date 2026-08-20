@@ -6,7 +6,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
 use semver::Version;
@@ -24,6 +24,7 @@ use crate::{
     auth::require_admin,
     db::{agent_secret_matches, get_instance, write_action_log},
     error::{AppError, AppResult},
+    files::content_disposition,
     models::{
         AgentArtifactRecord, AgentOutbound, AgentReleaseCoverage, AgentReleaseDetail,
         AgentReleaseRecord, AgentReleaseTargetsRequest, AgentRollbackCoverage, AgentRollbackOffer,
@@ -412,6 +413,34 @@ pub async fn admin_delete_agent_artifact(
     remove_stored_file(&state, &artifact.storage_path).await;
     remove_stored_file(&state, &format!("{}.sha256", artifact.storage_path)).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn admin_download_agent_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((release_id, artifact_id)): Path<(String, String)>,
+) -> AppResult<Response> {
+    let admin = require_admin(&state, &headers).await?;
+    let artifact = get_artifact(&state, &artifact_id)
+        .await?
+        .filter(|artifact| artifact.release_id == release_id)
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Agent 更新包不存在"))?;
+    let response =
+        artifact_download_response(&state, &artifact, content_disposition(&artifact.file_name)?)
+            .await?;
+    write_action_log(
+        &state.db,
+        &admin.username,
+        Some(&admin.user_id),
+        "download_agent_artifact",
+        &artifact.id,
+        &format!(
+            "下载 Agent 更新包 {}（{} 字节）",
+            artifact.file_name, artifact.size_bytes
+        ),
+    )
+    .await?;
+    Ok(response)
 }
 
 pub async fn admin_publish_agent_release(
@@ -1337,8 +1366,24 @@ pub async fn agent_download_artifact(
     Path(artifact_id): Path<String>,
 ) -> AppResult<Response> {
     let artifact = authorized_artifact_download(&state, &headers, &artifact_id).await?;
+    let extension = FsPath::new(&artifact.file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin");
+    let disposition = HeaderValue::from_str(&format!(
+        "attachment; filename=\"agent-update-{}.{}\"",
+        artifact.id, extension
+    ))
+    .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "下载文件名格式无效"))?;
+    artifact_download_response(&state, &artifact, disposition).await
+}
 
-    let path = safe_storage_path(&state, &artifact.storage_path)?;
+async fn artifact_download_response(
+    state: &AppState,
+    artifact: &AgentArtifactRecord,
+    disposition: HeaderValue,
+) -> AppResult<Response> {
+    let path = safe_storage_path(state, &artifact.storage_path)?;
     let file = File::open(&path).await.map_err(|error| {
         warn!(?error, path = %path.display(), "agent artifact file is missing");
         AppError::new(StatusCode::NOT_FOUND, "Agent 可执行文件文件不存在")
@@ -1350,14 +1395,6 @@ pub async fn agent_download_artifact(
             "Agent 可执行文件大小校验失败",
         ));
     }
-    let extension = FsPath::new(&artifact.file_name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("bin");
-    let disposition = format!(
-        "attachment; filename=\"agent-update-{}.{}\"",
-        artifact.id, extension
-    );
     let body = Body::from_stream(ReaderStream::new(file));
     Response::builder()
         .status(StatusCode::OK)
@@ -4222,6 +4259,44 @@ mod tests {
         fs::remove_dir_all(&root)
             .await
             .expect("remove artifact cleanup directory");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn admin_can_download_a_draft_artifact_with_its_original_file_name() {
+        let (state, resources) = test_state().await;
+        let fixture = insert_stored_release(&state, "draft", None).await;
+        let headers = admin_headers(&state).await;
+
+        let response = admin_download_agent_artifact(
+            State(state.clone()),
+            headers,
+            Path((fixture.release_id.clone(), fixture.artifact_id.clone())),
+        )
+        .await
+        .expect("download draft artifact");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok()),
+            Some("attachment; filename=\"agent.bin\"; filename*=UTF-8''agent.bin")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read artifact response body");
+        assert_eq!(body.as_ref(), b"program");
+
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'download_agent_artifact' AND target = $1",
+        )
+        .bind(&fixture.artifact_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("load download audit event");
+        assert_eq!(audit_count, 1);
+        resources.cleanup().await;
     }
 
     #[tokio::test]

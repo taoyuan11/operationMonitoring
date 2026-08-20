@@ -5,6 +5,7 @@ import {
   Check,
   CircleAlert,
   Clock3,
+  Download,
   EllipsisVertical,
   FileArchive,
   LoaderCircle,
@@ -223,6 +224,19 @@ function createUploadRow(os = 'linux', nativeArch = 'x86_64'): AgentArtifactUplo
 
 function artifactAccept(target: AgentArtifactTarget) {
   return target.os === 'windows' ? '.exe' : '.bin'
+}
+
+function artifactDownloadUrl(releaseId: string, artifactId: string) {
+  return `/api/admin/agent-releases/${encodeURIComponent(releaseId)}/artifacts/${encodeURIComponent(artifactId)}/download`
+}
+
+function downloadArtifact(releaseId: string, artifact: AgentRelease['artifacts'][number]) {
+  const anchor = document.createElement('a')
+  anchor.href = artifactDownloadUrl(releaseId, artifact.id)
+  anchor.download = artifact.file_name
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
 }
 
 function uploadRowsFor(releaseId: string) {
@@ -1297,18 +1311,27 @@ function handleMenuKeydown(event: KeyboardEvent) {
                 <span>{{ formatBytes(artifact.size_bytes) }}</span>
                 <code :title="artifact.sha256">{{ artifact.sha256.slice(0, 12) }}</code>
               </div>
-              <button
-                v-if="artifact.status === 'draft'"
-                class="icon-button danger"
-                type="button"
-                title="移除更新包"
-                :aria-label="`移除 ${artifact.file_name}`"
-                :disabled="Boolean(operation)"
-                @click="$emit('deleteArtifact', selectedRelease.id, artifact.id)"
-              >
-                <LoaderCircle v-if="isBusy(artifact.id) && operation === 'deleting'" class="spin" :size="15" />
-                <Trash2 v-else :size="15" />
-              </button>
+              <div class="artifact-row-actions">
+                <button
+                  class="icon-button subtle"
+                  type="button"
+                  title="下载更新包"
+                  :aria-label="`下载 ${artifact.file_name}`"
+                  @click="downloadArtifact(selectedRelease.id, artifact)"
+                ><Download :size="15" /></button>
+                <button
+                  v-if="artifact.status === 'draft'"
+                  class="icon-button danger"
+                  type="button"
+                  title="移除更新包"
+                  :aria-label="`移除 ${artifact.file_name}`"
+                  :disabled="Boolean(operation)"
+                  @click="$emit('deleteArtifact', selectedRelease.id, artifact.id)"
+                >
+                  <LoaderCircle v-if="isBusy(artifact.id) && operation === 'deleting'" class="spin" :size="15" />
+                  <Trash2 v-else :size="15" />
+                </button>
+              </div>
             </article>
           </div>
         </section>

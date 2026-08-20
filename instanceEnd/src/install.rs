@@ -1422,10 +1422,16 @@ mod macos_tests {
 
 #[cfg(windows)]
 mod windows_service_impl {
-    use super::WINDOWS_SERVICE_NAME;
+    use super::{SHORT_WINDOWS_SERVICE_NAME, WINDOWS_SERVICE_NAME};
     use crate::{config::AgentConfig, lifecycle::run_agent};
     use anyhow::{Context, Result};
-    use std::{ffi::OsString, fs, sync::OnceLock, time::Duration};
+    use std::{
+        ffi::OsString,
+        fs::{self, OpenOptions},
+        io::Write,
+        sync::OnceLock,
+        time::Duration,
+    };
     use windows_service::{
         define_windows_service,
         service::{
@@ -1442,18 +1448,116 @@ mod windows_service_impl {
         CONFIG
             .set(c)
             .map_err(|_| anyhow::anyhow!("service config already initialized"))?;
-        let service_name = WINDOWS_SERVICE_NAME;
-        ACTIVE_SERVICE_NAME
-            .set(service_name)
-            .map_err(|_| anyhow::anyhow!("service name already initialized"))?;
-        service_dispatcher::start(service_name, ffi_main)?;
-        Ok(())
-    }
-    fn service_main(_: Vec<OsString>) {
-        if let Err(e) = inner() {
-            crate::logging::error(format_args!("service failed: {e:#}"))
+        match service_dispatcher::start(WINDOWS_SERVICE_NAME, ffi_main) {
+            Ok(()) => Ok(()),
+            Err(legacy_error) => service_dispatcher::start(SHORT_WINDOWS_SERVICE_NAME, ffi_main)
+                .map_err(|short_error| {
+                    anyhow::anyhow!(
+                        "failed to connect to either Windows service name: {WINDOWS_SERVICE_NAME}: {legacy_error}; {SHORT_WINDOWS_SERVICE_NAME}: {short_error}"
+                    )
+                }),
         }
     }
+    fn service_main(arguments: Vec<OsString>) {
+        let service_name = service_name_from_arguments(&arguments);
+        let _ = ACTIVE_SERVICE_NAME.set(service_name);
+        if let Err(error) = inner() {
+            // Logging is initialized after the legacy ACL migration. Keep a small bootstrap
+            // record so a service that dies during that phase is diagnosable from the machine.
+            if let Some(config) = CONFIG.get() {
+                write_bootstrap_error(config, &error);
+            }
+            crate::logging::error(format_args!("service failed: {error:#}"));
+        }
+    }
+
+    fn service_name_from_arguments(arguments: &[OsString]) -> &'static str {
+        arguments
+            .first()
+            .map(|name| name.to_string_lossy())
+            .filter(|name| name.eq_ignore_ascii_case(SHORT_WINDOWS_SERVICE_NAME))
+            .map(|_| SHORT_WINDOWS_SERVICE_NAME)
+            .unwrap_or(WINDOWS_SERVICE_NAME)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn accepts_both_supported_service_names() {
+            assert_eq!(
+                service_name_from_arguments(&[OsString::from("operation-monitoring-agent")]),
+                WINDOWS_SERVICE_NAME
+            );
+            assert_eq!(
+                service_name_from_arguments(&[OsString::from("OM-AGENT")]),
+                SHORT_WINDOWS_SERVICE_NAME
+            );
+            assert_eq!(service_name_from_arguments(&[]), WINDOWS_SERVICE_NAME);
+        }
+    }
+
+    fn write_bootstrap_error(config: &AgentConfig, error: &anyhow::Error) {
+        let path = config.log_file.clone().or_else(|| {
+            std::env::var_os("ProgramData").map(|program_data| {
+                std::path::PathBuf::from(program_data)
+                    .join("OperationMonitoring")
+                    .join("logs")
+                    .join("agent.log")
+            })
+        });
+        let Some(path) = path else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Ok(parent) = crate::privileged_path::prepare_configured_directory(
+            parent,
+            true,
+            "agent bootstrap log directory",
+        ) else {
+            return;
+        };
+        let Some(file_name) = path.file_name() else {
+            return;
+        };
+        let path = parent.join(file_name);
+        if path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            || (path.try_exists().is_ok_and(|exists| exists)
+                && crate::privileged_path::validate_regular_file(&path, "agent bootstrap log")
+                    .is_err())
+        {
+            return;
+        }
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+            return;
+        };
+        let _ = writeln!(
+            file,
+            "[{}] [ERROR] Windows service bootstrap failed: {error:#}",
+            crate::time::now_ts()
+        );
+    }
+
+    fn set_stopped_status(
+        handle: &windows_service::service_control_handler::ServiceStatusHandle,
+        result: &Result<()>,
+    ) {
+        let _ = handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(if result.is_ok() { 0 } else { 1 }),
+            checkpoint: 0,
+            wait_hint: Duration::ZERO,
+            process_id: None,
+        });
+    }
+
     fn inner() -> Result<()> {
         let c = CONFIG.get().cloned().context("missing service config")?;
         let service_name = ACTIVE_SERVICE_NAME
@@ -1479,37 +1583,40 @@ mod windows_service_impl {
             wait_hint: Duration::from_secs(30),
             process_id: None,
         })?;
-        crate::windows_security::repair_legacy_product_tree()?;
-        crate::logging::init(
-            &crate::lifecycle::log_file(&c)?,
-            c.log_max_bytes,
-            c.log_history,
-        )?;
-        crate::remote_access::initialize_service_devices(&c);
-        if let Err(error) = super::repair_windows_global_command(&std::env::current_exe()?) {
-            crate::logging::error(format_args!(
-                "failed to repair the global Windows command: {error:#}"
-            ));
+        let result = (|| -> Result<()> {
+            crate::windows_security::repair_legacy_product_tree()?;
+            crate::logging::init(
+                &crate::lifecycle::log_file(&c)?,
+                c.log_max_bytes,
+                c.log_history,
+            )?;
+            crate::remote_access::initialize_service_devices(&c);
+            if let Err(error) = super::repair_windows_global_command(&std::env::current_exe()?) {
+                crate::logging::error(format_args!(
+                    "failed to repair the global Windows command: {error:#}"
+                ));
+            }
+            h.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Running,
+                controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 0,
+                wait_hint: Duration::ZERO,
+                process_id: None,
+            })?;
+            tokio::runtime::Runtime::new()?.block_on(run_agent(c))
+        })();
+        if let Err(error) = &result {
+            if let Some(config) = CONFIG.get() {
+                write_bootstrap_error(
+                    config,
+                    &anyhow::anyhow!("agent lifecycle failed: {error:#}"),
+                );
+            }
+            crate::logging::error(format_args!("agent lifecycle failed: {error:#}"));
         }
-        h.set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: ServiceState::Running,
-            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::ZERO,
-            process_id: None,
-        })?;
-        let result = tokio::runtime::Runtime::new()?.block_on(run_agent(c));
-        h.set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: ServiceState::Stopped,
-            controls_accepted: ServiceControlAccept::empty(),
-            exit_code: ServiceExitCode::Win32(if result.is_ok() { 0 } else { 1 }),
-            checkpoint: 0,
-            wait_hint: Duration::ZERO,
-            process_id: None,
-        })?;
+        set_stopped_status(&h, &result);
         result
     }
 }

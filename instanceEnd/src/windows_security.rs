@@ -31,8 +31,8 @@ use windows::{
             BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
             FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle,
             MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
             WRITE_DAC, WRITE_OWNER,
         },
@@ -60,9 +60,44 @@ fn repair_existing_product_tree(root: &Path) -> Result<()> {
         repair_known_product_entry(&root.join(relative), true)?;
     }
     for relative in legacy_product_files() {
-        repair_known_product_entry(&root.join(relative), false)?;
+        let path = root.join(relative);
+        match repair_known_product_entry(&path, false) {
+            Ok(_) => {}
+            // The detached updater may keep its log and ownership lock open, or remove a rotated
+            // file, while it starts the replacement service. The containing update directory is
+            // protected above; the next updater run will retry these non-critical entries.
+            Err(error) if is_deferred_legacy_entry(relative, &error) => {
+                crate::logging::error(format_args!(
+                    "deferred Windows ACL migration for {}: {error:#}",
+                    path.display()
+                ));
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
+}
+
+fn is_deferred_legacy_entry(relative: &str, error: &anyhow::Error) -> bool {
+    let dynamic = matches!(
+        relative,
+        r"updates\updater.lock"
+            | r"updates\updater-owner.json"
+            | r"updates\updater.log"
+            | r"updates\updater.log.1"
+            | r"updates\updater.log.2"
+            | r"updates\updater.log.3"
+    );
+    if !dynamic {
+        return false;
+    }
+
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            .is_some_and(|code| matches!(code, 2 | 3 | 32 | 33))
+    })
 }
 
 fn legacy_product_files() -> &'static [&'static str] {
@@ -108,8 +143,20 @@ fn repair_known_product_entry(path: &Path, expected_directory: bool) -> Result<b
     ) {
         bail!("legacy data entry {} {reason}", path.display());
     }
-    restrict_to_system_and_administrators(path)?;
+    // SetFileSecurityW reopens the path with WRITE_DAC. Keep the inspection handle out of the
+    // way first: it deliberately omits FILE_SHARE_DELETE, and Windows can otherwise report a
+    // sharing violation even when this process is the only opener of the entry.
     drop(handle);
+    // Avoid rewriting an already private entry while the detached updater is holding related
+    // handles. This also makes service startup idempotent on trees created by current agents.
+    let already_private = if expected_directory {
+        validate_privileged_directory(path).is_ok()
+    } else {
+        validate_privileged_file(path).is_ok()
+    };
+    if !already_private {
+        restrict_to_system_and_administrators(path)?;
+    }
     Ok(true)
 }
 
@@ -123,7 +170,7 @@ fn open_product_entry(path: &Path) -> io::Result<(File, BY_HANDLE_FILE_INFORMATI
         CreateFileW(
             PCWSTR(path_wide.as_ptr()),
             0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -565,5 +612,22 @@ mod tests {
         assert!(legacy_product_files().contains(&r"runtime\agent.lock"));
         assert!(!legacy_product_files().contains(&r"updates\apply-release.json"));
         assert!(!legacy_product_files().contains(&r"updates\updater-release.exe"));
+    }
+
+    #[test]
+    fn only_transient_updater_entry_failures_are_deferred() {
+        let sharing = anyhow::Error::new(io::Error::from_raw_os_error(32));
+        let access_denied = anyhow::Error::new(io::Error::from_raw_os_error(5));
+        let missing = anyhow::Error::new(io::Error::from_raw_os_error(2));
+        let reparse = anyhow::anyhow!("is a reparse point");
+
+        assert!(is_deferred_legacy_entry(r"updates\updater.log", &sharing));
+        assert!(is_deferred_legacy_entry(r"updates\updater.lock", &missing));
+        assert!(!is_deferred_legacy_entry(
+            r"updates\updater.lock",
+            &access_denied
+        ));
+        assert!(!is_deferred_legacy_entry(r"updates\updater.log", &reparse));
+        assert!(!is_deferred_legacy_entry(r"updates\state.json", &sharing));
     }
 }

@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "instanceEnd"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

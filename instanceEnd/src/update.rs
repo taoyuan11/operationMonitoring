@@ -47,6 +47,10 @@ const OLD_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVICE_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(windows)]
+const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(windows)]
+const SERVICE_STABILITY_WINDOW: Duration = Duration::from_secs(2);
 const PACKAGE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const PARENT_HANDOFF_GRACE: Duration = Duration::from_secs(1);
 #[cfg(windows)]
@@ -2424,9 +2428,12 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
         None,
     )?;
     if let Err(error) = restart_agent_service(package_type) {
-        crate::logging::error(format_args!(
-            "failed to request agent service restart: {error:#}"
-        ));
+        let reason = format!(
+            "agent service restart failed after installing {}: {error:#}",
+            plan.offer.version
+        );
+        crate::logging::error(format_args!("{reason}"));
+        return attempt_rollback(plan, reason);
     }
 
     crate::logging::info(format_args!(
@@ -2536,9 +2543,17 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
         Some(reason.clone()),
     )?;
     if let Err(error) = restart_agent_service(previous.package_type) {
-        crate::logging::error(format_args!(
-            "failed to request rolled-back service restart: {error:#}"
-        ));
+        let message = format!(
+            "{reason}; failed to restart restored agent {}: {error:#}",
+            previous.version
+        );
+        persist_apply_status(
+            plan,
+            UpdateStatus::Failed,
+            AttemptPhase::Completed,
+            Some(message.clone()),
+        )?;
+        bail!("{message}");
     }
 
     if !wait_for_health(
@@ -2895,11 +2910,12 @@ fn query_windows_agent_service(service_name: &str) -> Result<ScServiceState> {
     let output =
         run_command_output_with_timeout(&spec, SERVICE_RESTART_TIMEOUT, "Windows service query")?;
     if !output.status.success() {
-        bail!(
-            "sc query exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+        let details = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
+        bail!("sc query exited with {}: {}", output.status, details.trim());
     }
     parse_sc_query_state(&String::from_utf8_lossy(&output.stdout))
         .ok_or_else(|| anyhow!("sc query did not report a service state"))
@@ -2935,22 +2951,63 @@ fn stop_windows_agent_service(service_name: &str) -> Result<()> {
 fn restart_windows_agent_service(service_name: &str) -> Result<()> {
     stop_windows_agent_service(service_name)?;
 
+    crate::logging::info(format_args!(
+        "starting Windows agent service: service={service_name:?}"
+    ));
     let start = CommandSpec {
         program: "sc.exe".into(),
         args: vec!["start".into(), service_name.into()],
     };
     let output =
         run_command_output_with_timeout(&start, SERVICE_RESTART_TIMEOUT, "Windows service start")?;
-    if output.status.success()
-        || query_windows_agent_service(service_name)? == ScServiceState::Running
-    {
-        return Ok(());
+    if !output.status.success() {
+        // `sc start` can race with the service recovery manager. A non-zero result is still
+        // acceptable when the service is already running, but every other state is a real
+        // startup failure and must be reported to the updater immediately.
+        if query_windows_agent_service(service_name)? != ScServiceState::Running {
+            let details = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            bail!("sc start exited with {}: {}", output.status, details.trim());
+        }
     }
-    bail!(
-        "sc start exited with {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    )
+
+    wait_for_windows_agent_service_running(service_name, SERVICE_START_TIMEOUT)
+}
+
+#[cfg(windows)]
+fn wait_for_windows_agent_service_running(service_name: &str, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    let mut running_since = None;
+    loop {
+        match query_windows_agent_service(service_name)? {
+            ScServiceState::Running => {
+                let first_running = running_since.get_or_insert_with(Instant::now);
+                if first_running.elapsed() >= SERVICE_STABILITY_WINDOW {
+                    crate::logging::info(format_args!(
+                        "Windows agent service is running: service={service_name:?}"
+                    ));
+                    return Ok(());
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            ScServiceState::Stopped => {
+                bail!("Windows agent service stopped during startup: service={service_name:?}");
+            }
+            ScServiceState::Other if started.elapsed() >= timeout => {
+                bail!(
+                    "Windows agent service did not reach RUNNING within {} seconds: service={service_name:?}",
+                    timeout.as_secs()
+                );
+            }
+            ScServiceState::Other => {
+                running_since = None;
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
 }
 
 fn wait_for_health(

@@ -183,39 +183,76 @@ pub async fn follow_logs(config: &AgentConfig) -> Result<()> {
 }
 
 pub async fn run_agent(mut config: AgentConfig) -> Result<()> {
+    let started_at = Instant::now();
     config.normalize_server()?;
+    crate::logging::info(format_args!(
+        "agent starting: version={} pid={} server={:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        config.server
+    ));
     let paths = RuntimePaths::from_config(&config)?;
     paths.prepare()?;
     let guard = RuntimeGuard::acquire(paths)?;
     let identity = load_or_create_identity(config.identity_file.clone())?;
 
-    crate::logging::info(format_args!("agent instance_id: {}", identity.instance_id));
-    crate::logging::info(format_args!("server: {}", config.server));
     guard.mark_ready()?;
+    crate::logging::info(format_args!(
+        "agent started: version={} pid={} instance_id={:?} server={:?}",
+        env!("CARGO_PKG_VERSION"),
+        guard.pid(),
+        identity.instance_id,
+        config.server
+    ));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let websocket = agent_ws_loop(config, identity, shutdown_rx);
     tokio::pin!(websocket);
-    let lifecycle_result = tokio::select! {
-        result = &mut websocket => return result,
+    let (stop_reason, lifecycle_result) = tokio::select! {
+        result = &mut websocket => {
+            log_agent_stopped("websocket_loop_ended", started_at.elapsed(), &result);
+            return result;
+        },
         result = wait_for_stop(guard.stop_file(), guard.pid()) => {
             if result.is_ok() {
-                crate::logging::info(format_args!("stop requested; agent is shutting down"));
+                crate::logging::info(format_args!(
+                    "agent stopping: reason=stop_request pid={}",
+                    guard.pid()
+                ));
             }
-            result
+            ("stop_request", result)
         },
         result = wait_for_shutdown_signal() => {
             if result.is_ok() {
-                crate::logging::info(format_args!("shutdown signal received; agent is shutting down"));
+                crate::logging::info(format_args!(
+                    "agent stopping: reason=shutdown_signal pid={}",
+                    guard.pid()
+                ));
             }
-            result
+            ("shutdown_signal", result)
         },
     };
 
     shutdown_tx.send_replace(true);
     let websocket_result = websocket.await;
-    lifecycle_result?;
-    websocket_result
+    let result = lifecycle_result.and(websocket_result);
+    log_agent_stopped(stop_reason, started_at.elapsed(), &result);
+    result
+}
+
+fn log_agent_stopped(reason: &str, uptime: Duration, result: &Result<()>) {
+    match result {
+        Ok(()) => crate::logging::info(format_args!(
+            "agent stopped: reason={reason} pid={} uptime_ms={}",
+            std::process::id(),
+            uptime.as_millis()
+        )),
+        Err(error) => crate::logging::error(format_args!(
+            "agent stopped with error: reason={reason} pid={} uptime_ms={} error={error:#}",
+            std::process::id(),
+            uptime.as_millis()
+        )),
+    }
 }
 
 #[cfg(unix)]

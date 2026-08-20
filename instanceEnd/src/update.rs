@@ -269,6 +269,18 @@ pub fn rollback_baseline_version(config: &AgentConfig) -> Option<String> {
     Some(package.version)
 }
 
+pub(crate) fn update_handoff_pending(config: &AgentConfig) -> Result<bool> {
+    let paths = UpdatePaths::from_config(config)?;
+    let state = read_update_state(&paths.state_file)?;
+    Ok(state.attempt.is_some_and(|attempt| {
+        matches!(attempt.phase, AttemptPhase::Target | AttemptPhase::Rollback)
+            && matches!(
+                attempt.status,
+                UpdateStatus::Installing | UpdateStatus::AwaitingRestart
+            )
+    }))
+}
+
 pub fn force_update(config: &AgentConfig, package: &Path) -> Result<()> {
     let capability = update_capability();
     if capability.package_type.as_deref() != Some(PackageType::Standalone.as_str()) {
@@ -599,7 +611,20 @@ impl UpdateManager {
             _ => (attempt.status, None, attempt.message.clone(), false),
         };
 
+        if let Some((artifact_id, version, retry_count)) = &health {
+            write_json_atomic(
+                &self.paths.health_file,
+                &HealthMarker {
+                    artifact_id: artifact_id.clone(),
+                    version: version.clone(),
+                    retry_count: *retry_count,
+                    connected_at: now_ts(),
+                },
+            )?;
+        }
+
         let mut stale_package = None;
+        let mut finalized_log = None;
         if finalize {
             if status == target_success_status(&attempt.operation) {
                 stale_package = rotate_successful_package_state(&mut state, &attempt)?;
@@ -611,23 +636,19 @@ impl UpdateManager {
                 current_attempt.message = message.clone();
                 current_attempt.phase = AttemptPhase::Completed;
                 current_attempt.updated_at = now_ts();
+                finalized_log = Some(attempt_status_log_line(
+                    current_attempt,
+                    status,
+                    current_attempt.message.as_deref(),
+                ));
             }
             write_update_state(&self.paths.state_file, &state)?;
+            if let Some(log_line) = finalized_log.as_deref() {
+                log_update_status(status, log_line);
+            }
         }
         if let Some(path) = stale_package {
             let _ = fs::remove_file(path);
-        }
-
-        if let Some((artifact_id, version, retry_count)) = health {
-            write_json_atomic(
-                &self.paths.health_file,
-                &HealthMarker {
-                    artifact_id,
-                    version,
-                    retry_count,
-                    connected_at: now_ts(),
-                },
-            )?;
         }
 
         if attempt.manual {
@@ -719,7 +740,10 @@ impl UpdateManager {
             Err(error) => {
                 self.activity.stop_draining();
                 let message = format!("{error:#}");
-                crate::logging::error(format_args!("rejected agent update offer: {message}"));
+                crate::logging::error(format_args!(
+                    "rejected agent update offer: {} error={message:?}",
+                    update_offer_log_fields(&offer)
+                ));
                 let _ = outbound.send(update_status_message(
                     &offer,
                     UpdateStatus::Failed,
@@ -728,11 +752,20 @@ impl UpdateManager {
                 return PrepareResult::Finished;
             }
         };
+        crate::logging::info(format_args!(
+            "accepted agent update offer: current_version={:?} {}",
+            env!("CARGO_PKG_VERSION"),
+            update_offer_log_fields(&offer)
+        ));
         match self.prepare_inner(&offer, package_type, &outbound).await {
             Ok(result) => result,
             Err(error) => {
                 self.activity.stop_draining();
                 let message = format!("{error:#}");
+                crate::logging::error(format_args!(
+                    "agent update preparation failed: {} error={message:?}",
+                    update_offer_log_fields(&offer)
+                ));
                 if let Err(persist_error) =
                     self.send_status(&offer, UpdateStatus::Failed, Some(message), &outbound)
                 {
@@ -821,8 +854,8 @@ impl UpdateManager {
                 self.activity.stop_draining();
                 let message = format!("{error:#}");
                 crate::logging::error(format_args!(
-                    "failed to prepare agent rollback {}: {message}",
-                    rollback.attempt_id
+                    "agent rollback preparation failed: {} error={message:?}",
+                    rollback_offer_log_fields(&rollback)
                 ));
                 if let Ok(state) = read_update_state(&self.paths.state_file)
                     && state.attempt.as_ref().is_some_and(|attempt| {
@@ -861,6 +894,11 @@ impl UpdateManager {
         outbound: &AgentEventSender,
     ) -> Result<PrepareResult> {
         self.validate_rollback_offer(rollback)?;
+        crate::logging::info(format_args!(
+            "accepted agent rollback offer: current_version={:?} {}",
+            env!("CARGO_PKG_VERSION"),
+            rollback_offer_log_fields(rollback)
+        ));
         let current_version = Version::parse(env!("CARGO_PKG_VERSION"))?;
         let from_version = Version::parse(&rollback.from_version).with_context(|| {
             format!("invalid rollback source version {}", rollback.from_version)
@@ -998,6 +1036,10 @@ impl UpdateManager {
     }
 
     pub fn launch_prepared_update(&self, offer: &UpdateOffer, outbound: &AgentEventSender) -> bool {
+        crate::logging::info(format_args!(
+            "launching detached updater: {}",
+            update_offer_log_fields(offer)
+        ));
         let result = (|| {
             let state = read_update_state(&self.paths.state_file)?;
             let package_path = state
@@ -1012,6 +1054,10 @@ impl UpdateManager {
         if let Err(error) = result {
             self.activity.stop_draining();
             let message = format!("failed to launch detached updater: {error:#}");
+            crate::logging::error(format_args!(
+                "agent update handoff failed: {} error={message:?}",
+                update_offer_log_fields(offer)
+            ));
             if let Err(persist_error) =
                 self.send_status(offer, UpdateStatus::Failed, Some(message), outbound)
             {
@@ -1374,8 +1420,10 @@ impl UpdateManager {
             attempt.phase = AttemptPhase::Completed;
         }
         let outbound_message = attempt_status_message(attempt, status, message);
+        let log_line = attempt_status_log_line(attempt, status, attempt.message.as_deref());
         write_update_state(&self.paths.state_file, &state)?;
         let _ = outbound.send(outbound_message);
+        log_update_status(status, &log_line);
         Ok(())
     }
 
@@ -1419,8 +1467,14 @@ impl UpdateManager {
         attempt.updated_at = now_ts();
         let outbound_message =
             attempt_status_message(attempt, UpdateStatus::AwaitingRestart, message.clone());
+        let log_line = attempt_status_log_line(
+            attempt,
+            UpdateStatus::AwaitingRestart,
+            attempt.message.as_deref(),
+        );
         write_update_state(&self.paths.state_file, &state)?;
         let _ = outbound.send(outbound_message);
+        log_update_status(UpdateStatus::AwaitingRestart, &log_line);
         Ok(())
     }
 
@@ -1627,6 +1681,99 @@ fn offer_generation_label(offer: &UpdateOffer) -> String {
         offer.attempt_id.as_deref().unwrap_or(&offer.artifact_id),
         offer.retry_count
     )
+}
+
+pub(crate) fn update_offer_log_fields(offer: &UpdateOffer) -> String {
+    format!(
+        "version={:?} attempt_id={:?} release_id={:?} artifact_id={:?} retry_count={} size_bytes={}",
+        offer.version,
+        offer.attempt_id.as_deref(),
+        offer.release_id,
+        offer.artifact_id,
+        offer.retry_count,
+        offer.size_bytes
+    )
+}
+
+pub(crate) fn rollback_offer_log_fields(offer: &RollbackOffer) -> String {
+    let package = offer.package.as_ref().map_or_else(
+        || "package_source=local".to_string(),
+        |package| {
+            format!(
+                "package_source=server_or_local artifact_id={:?} size_bytes={}",
+                package.artifact_id, package.size_bytes
+            )
+        },
+    );
+    format!(
+        "from_version={:?} target_version={:?} attempt_id={:?} release_id={:?} retry_count={} {package}",
+        offer.from_version,
+        offer.target_version,
+        offer.attempt_id,
+        offer.release_id,
+        offer.retry_count
+    )
+}
+
+fn update_status_label(status: UpdateStatus) -> &'static str {
+    match status {
+        UpdateStatus::Waiting => "waiting",
+        UpdateStatus::Downloading => "downloading",
+        UpdateStatus::Verifying => "verifying",
+        UpdateStatus::WaitingIdle => "waiting_idle",
+        UpdateStatus::Installing => "installing",
+        UpdateStatus::AwaitingRestart => "awaiting_restart",
+        UpdateStatus::Succeeded => "succeeded",
+        UpdateStatus::RollbackSucceeded => "rollback_succeeded",
+        UpdateStatus::Failed => "failed",
+    }
+}
+
+fn attempt_phase_label(phase: AttemptPhase) -> &'static str {
+    match phase {
+        AttemptPhase::Staging => "staging",
+        AttemptPhase::Target => "target",
+        AttemptPhase::Rollback => "rollback",
+        AttemptPhase::Completed => "completed",
+    }
+}
+
+fn attempt_status_log_line(
+    attempt: &PersistedAttempt,
+    status: UpdateStatus,
+    message: Option<&str>,
+) -> String {
+    let message = message
+        .map(|message| format!(" message={message:?}"))
+        .unwrap_or_default();
+    match &attempt.operation {
+        AttemptOperation::Upgrade => format!(
+            "agent update status: status={} phase={} {}{message}",
+            update_status_label(status),
+            attempt_phase_label(attempt.phase),
+            update_offer_log_fields(&attempt.offer)
+        ),
+        AttemptOperation::Rollback {
+            attempt_id,
+            release_id,
+            from_version,
+            target_version,
+            retry_count,
+        } => format!(
+            "agent rollback status: status={} phase={} from_version={from_version:?} target_version={target_version:?} attempt_id={attempt_id:?} release_id={release_id:?} artifact_id={:?} retry_count={retry_count}{message}",
+            update_status_label(status),
+            attempt_phase_label(attempt.phase),
+            attempt.offer.artifact_id
+        ),
+    }
+}
+
+fn log_update_status(status: UpdateStatus, line: &str) {
+    if status == UpdateStatus::Failed {
+        crate::logging::error(format_args!("{line}"));
+    } else {
+        crate::logging::info(format_args!("{line}"));
+    }
 }
 
 fn offer_storage_component(offer: &UpdateOffer) -> String {
@@ -2205,8 +2352,13 @@ pub fn apply_update(plan_file: &Path) -> Result<()> {
     let plan: ApplyPlan = serde_json::from_str(&content)?;
     let _ownership = acquire_worker_ownership(&plan)?;
     crate::logging::info(format_args!(
-        "applying agent update {} from {}",
-        plan.offer.version,
+        "detached updater started: operation={} old_pid={} {} package_path={}",
+        match &plan.operation {
+            AttemptOperation::Upgrade => "upgrade",
+            AttemptOperation::Rollback { .. } => "rollback",
+        },
+        plan.old_pid,
+        update_offer_log_fields(&plan.offer),
         plan.package_path.display()
     ));
     thread::sleep(PARENT_HANDOFF_GRACE);
@@ -2227,8 +2379,17 @@ pub fn apply_update(plan_file: &Path) -> Result<()> {
 fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
     ensure_plan_generation_is_current(plan)?;
     let package_type: PackageType = plan.offer.package_type.parse()?;
+    crate::logging::info(format_args!(
+        "updater stopping agent service: old_pid={} {}",
+        plan.old_pid,
+        update_offer_log_fields(&plan.offer)
+    ));
     stop_standalone_service()?;
     wait_for_process_exit(plan.old_pid, OLD_PROCESS_TIMEOUT)?;
+    crate::logging::info(format_args!(
+        "previous agent process stopped; beginning installation: {}",
+        update_offer_log_fields(&plan.offer)
+    ));
     ensure_plan_handoff_is_active(plan)?;
     let _ = fs::remove_file(&plan.health_file);
     persist_apply_status(plan, UpdateStatus::Installing, AttemptPhase::Target, None)?;
@@ -2252,6 +2413,10 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
         );
     }
 
+    crate::logging::info(format_args!(
+        "agent package installed; requesting service restart: {}",
+        update_offer_log_fields(&plan.offer)
+    ));
     persist_apply_status(
         plan,
         UpdateStatus::AwaitingRestart,
@@ -2264,6 +2429,11 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
         ));
     }
 
+    crate::logging::info(format_args!(
+        "waiting for updated agent health confirmation: timeout_seconds={} {}",
+        HEALTH_TIMEOUT.as_secs(),
+        update_offer_log_fields(&plan.offer)
+    ));
     if wait_for_health(
         &plan.health_file,
         &plan.offer.artifact_id,
@@ -2273,8 +2443,8 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
     ) {
         complete_target_update(plan, package_type)?;
         crate::logging::info(format_args!(
-            "agent update {} is healthy",
-            plan.offer.version
+            "agent update completed and is healthy: {}",
+            update_offer_log_fields(&plan.offer)
         ));
         return Ok(());
     }
@@ -2526,7 +2696,10 @@ fn persist_apply_status(
     attempt.phase = phase;
     attempt.message = message;
     attempt.updated_at = now_ts();
-    write_update_state(&plan.state_file, &state)
+    let log_line = attempt_status_log_line(attempt, status, attempt.message.as_deref());
+    write_update_state(&plan.state_file, &state)?;
+    log_update_status(status, &log_line);
+    Ok(())
 }
 
 fn run_command_with_timeout(
@@ -3647,6 +3820,32 @@ mod tests {
         (offer, signing_key)
     }
 
+    #[test]
+    fn update_offer_logs_include_operational_ids_without_sensitive_metadata() {
+        let (offer, _) = signed_test_offer();
+
+        let fields = update_offer_log_fields(&offer);
+
+        assert!(fields.contains("version=\"1.2.3\""));
+        assert!(fields.contains("attempt_id=Some(\"attempt-signed\")"));
+        assert!(fields.contains("release_id=\"release-signed\""));
+        assert!(fields.contains("artifact_id=\"artifact-signed\""));
+        assert!(fields.contains("size_bytes=42"));
+        assert!(!fields.contains(&offer.download_url));
+        assert!(!fields.contains(&offer.sha256));
+        assert!(!fields.contains(offer.signature.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn rollback_offer_logs_include_versions_and_package_source() {
+        let (offer, _) = signed_test_rollback_offer();
+
+        assert_eq!(
+            rollback_offer_log_fields(&offer),
+            "from_version=\"2.0.0\" target_version=\"1.2.3\" attempt_id=\"rollback-attempt-1\" release_id=\"release-rollback\" retry_count=3 package_source=server_or_local artifact_id=\"artifact-baseline\" size_bytes=42"
+        );
+    }
+
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn distinguishes_openwrt_x86_64_musl_updates() {
@@ -4497,7 +4696,65 @@ mod tests {
     }
 
     #[test]
-    fn connected_target_finalizes_cache_before_signaling_health() {
+    fn pending_handoff_detection_distinguishes_active_and_terminal_state() {
+        let directory = std::env::temp_dir().join(format!(
+            "om-update-handoff-detection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = AgentConfig {
+            server: "http://127.0.0.1:13500".to_string(),
+            identity_file: None,
+            report_interval: 5,
+            state_dir: None,
+            log_file: None,
+            log_max_bytes: 10 * 1024 * 1024,
+            log_history: 3,
+            update_dir: Some(directory.clone()),
+            remote_desktop_consent: crate::config::RemoteDesktopConsent::Required,
+            windows_virtual_devices: crate::config::WindowsVirtualDevices::Disabled,
+        };
+        let paths = UpdatePaths::from_config(&config).unwrap();
+        assert!(!update_handoff_pending(&config).unwrap());
+
+        let (offer, _) = signed_test_offer();
+        let mut state = UpdateState {
+            schema_version: UPDATE_SCHEMA_VERSION,
+            current_package: None,
+            rollback_package: None,
+            attempt: Some(PersistedAttempt {
+                offer,
+                operation: AttemptOperation::Upgrade,
+                manual: false,
+                status: UpdateStatus::AwaitingRestart,
+                message: None,
+                package_path: None,
+                previous_package: None,
+                phase: AttemptPhase::Target,
+                updated_at: now_ts(),
+            }),
+        };
+        write_update_state(&paths.state_file, &state).unwrap();
+        assert!(update_handoff_pending(&config).unwrap());
+
+        let attempt = state.attempt.as_mut().unwrap();
+        attempt.phase = AttemptPhase::Rollback;
+        attempt.status = UpdateStatus::Installing;
+        write_update_state(&paths.state_file, &state).unwrap();
+        assert!(update_handoff_pending(&config).unwrap());
+
+        let attempt = state.attempt.as_mut().unwrap();
+        attempt.phase = AttemptPhase::Completed;
+        attempt.status = UpdateStatus::Succeeded;
+        write_update_state(&paths.state_file, &state).unwrap();
+        assert!(!update_handoff_pending(&config).unwrap());
+
+        fs::write(&paths.state_file, b"not-json").unwrap();
+        assert!(update_handoff_pending(&config).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn connected_target_signals_health_and_finalizes_cache() {
         let directory = std::env::temp_dir().join(format!("om-update-{}", uuid::Uuid::new_v4()));
         let config = AgentConfig {
             server: "http://127.0.0.1:13500".to_string(),

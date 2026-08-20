@@ -5,9 +5,11 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, SecondsFormat, Utc};
 
 static LOG_FILE: OnceLock<Mutex<RollingLog>> = OnceLock::new();
 
@@ -27,25 +29,53 @@ pub fn error(arguments: fmt::Arguments<'_>) {
 }
 
 fn write(is_error: bool, arguments: fmt::Arguments<'_>) {
+    let timestamp = utc_now();
     if let Some(log) = LOG_FILE.get() {
         match log.lock() {
             Ok(mut log) => {
-                if let Err(error) = log.write_line(arguments) {
-                    let _ = writeln!(io::stderr().lock(), "failed to write agent log: {error:#}");
+                if let Err(error) = log.write_line(is_error, arguments) {
+                    write_stderr_line(
+                        timestamp,
+                        format_args!("failed to write agent log: {error:#}"),
+                    );
                 }
             }
             Err(_) => {
-                let _ = writeln!(io::stderr().lock(), "agent log lock is poisoned");
+                write_stderr_line(timestamp, format_args!("agent log lock is poisoned"));
             }
         }
         return;
     }
 
     if is_error {
-        let _ = writeln!(io::stderr().lock(), "{arguments}");
+        write_stderr_line(timestamp, arguments);
     } else {
-        let _ = writeln!(io::stdout().lock(), "{arguments}");
+        let _ = writeln!(
+            io::stdout().lock(),
+            "{}",
+            format_line(timestamp, false, arguments)
+        );
     }
+}
+
+fn write_stderr_line(timestamp: DateTime<Utc>, arguments: fmt::Arguments<'_>) {
+    let _ = writeln!(
+        io::stderr().lock(),
+        "{}",
+        format_line(timestamp, true, arguments)
+    );
+}
+
+fn format_line(timestamp: DateTime<Utc>, is_error: bool, arguments: fmt::Arguments<'_>) -> String {
+    format!(
+        "[{}] [{}] {arguments}",
+        timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
+        if is_error { "ERROR" } else { "INFO" }
+    )
+}
+
+fn utc_now() -> DateTime<Utc> {
+    SystemTime::now().into()
 }
 
 struct RollingLog {
@@ -80,8 +110,17 @@ impl RollingLog {
         })
     }
 
-    fn write_line(&mut self, arguments: fmt::Arguments<'_>) -> Result<()> {
-        let mut line = arguments.to_string();
+    fn write_line(&mut self, is_error: bool, arguments: fmt::Arguments<'_>) -> Result<()> {
+        self.write_line_at(utc_now(), is_error, arguments)
+    }
+
+    fn write_line_at(
+        &mut self,
+        timestamp: DateTime<Utc>,
+        is_error: bool,
+        arguments: fmt::Arguments<'_>,
+    ) -> Result<()> {
+        let mut line = format_line(timestamp, is_error, arguments);
         line.push('\n');
         let line_size = u64::try_from(line.len()).unwrap_or(u64::MAX);
         if self.size > 0 && self.size.saturating_add(line_size) > self.max_bytes {
@@ -235,6 +274,15 @@ fn secure_existing_history(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn assert_log_message(path: &Path, expected: &str) {
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.starts_with('['), "missing timestamp: {content:?}");
+        assert!(
+            content.ends_with(&format!("] [INFO] {expected}\n")),
+            "{content:?}"
+        );
+    }
+
     fn temp_log() -> PathBuf {
         std::env::temp_dir()
             .join(format!("om-agent-log-{}", uuid::Uuid::new_v4()))
@@ -247,18 +295,12 @@ mod tests {
         let mut log = RollingLog::open(&path, 10, 2).unwrap();
 
         for value in ["11111", "22222", "33333", "44444"] {
-            log.write_line(format_args!("{value}")).unwrap();
+            log.write_line(false, format_args!("{value}")).unwrap();
         }
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "44444\n");
-        assert_eq!(
-            fs::read_to_string(history_path(&path, 1)).unwrap(),
-            "33333\n"
-        );
-        assert_eq!(
-            fs::read_to_string(history_path(&path, 2)).unwrap(),
-            "22222\n"
-        );
+        assert_log_message(&path, "44444");
+        assert_log_message(&history_path(&path, 1), "33333");
+        assert_log_message(&history_path(&path, 2), "22222");
         assert!(!history_path(&path, 3).exists());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -272,12 +314,32 @@ mod tests {
 
         assert!(!history_path(&path, 1).exists());
 
-        log.write_line(format_args!("11111")).unwrap();
-        log.write_line(format_args!("22222")).unwrap();
+        log.write_line(false, format_args!("11111")).unwrap();
+        log.write_line(false, format_args!("22222")).unwrap();
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "22222\n");
+        assert_log_message(&path, "22222");
         assert!(!history_path(&path, 1).exists());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn formats_log_timestamp_as_utc_with_milliseconds() {
+        let timestamp = "2026-08-19T08:30:12.345Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(
+            format_line(timestamp, false, format_args!("websocket connected")),
+            "[2026-08-19T08:30:12.345Z] [INFO] websocket connected"
+        );
+    }
+
+    #[test]
+    fn distinguishes_error_log_entries() {
+        let timestamp = "2026-08-19T08:30:12.345Z".parse::<DateTime<Utc>>().unwrap();
+
+        assert_eq!(
+            format_line(timestamp, true, format_args!("update failed")),
+            "[2026-08-19T08:30:12.345Z] [ERROR] update failed"
+        );
     }
 
     #[cfg(unix)]

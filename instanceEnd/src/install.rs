@@ -1479,6 +1479,13 @@ mod windows_service_impl {
             wait_hint: Duration::from_secs(30),
             process_id: None,
         })?;
+        crate::windows_security::repair_legacy_product_tree()?;
+        crate::logging::init(
+            &crate::lifecycle::log_file(&c)?,
+            c.log_max_bytes,
+            c.log_history,
+        )?;
+        crate::remote_access::initialize_service_devices(&c);
         if let Err(error) = super::repair_windows_global_command(&std::env::current_exe()?) {
             crate::logging::error(format_args!(
                 "failed to repair the global Windows command: {error:#}"

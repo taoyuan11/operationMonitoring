@@ -35,7 +35,10 @@ use crate::{
         CAPABILITY as DESKTOP_CAPABILITY, DesktopManager, DesktopOpenRequest,
     },
     terminal::{CAPABILITY as TERMINAL_SHELLS_CAPABILITY, TerminalManager, available_shells},
-    update::{PrepareResult, UpdateManager, update_capability},
+    update::{
+        PrepareResult, UpdateManager, rollback_offer_log_fields, update_capability,
+        update_handoff_pending, update_offer_log_fields,
+    },
 };
 
 const MANIFEST_INTERVAL: Duration = Duration::from_secs(60);
@@ -98,6 +101,14 @@ pub async fn agent_ws_loop(
     ) {
         Ok(manager) => Some(manager),
         Err(error) => {
+            let handoff_pending = update_handoff_pending(&config).with_context(|| {
+                format!(
+                    "agent updates are unavailable ({error:#}) and pending update state could not be inspected"
+                )
+            })?;
+            if handoff_pending {
+                return Err(error).context("failed to restore a pending agent update handoff");
+            }
             crate::logging::error(format_args!("agent updates are unavailable: {error:#}"));
             None
         }
@@ -185,7 +196,14 @@ pub async fn agent_ws_loop(
                     Ok(SocketOutcome::ApplyUpdate) => return Ok(()),
                     Ok(SocketOutcome::Shutdown) => return Ok(()),
                     Ok(SocketOutcome::Disconnected) => {}
-                    Err(error) => crate::logging::error(format_args!("websocket error: {error:#}")),
+                    Err(error) => {
+                        let handoff_pending = update_handoff_pending(&config)?;
+                        if handoff_pending {
+                            return Err(error)
+                                .context("websocket failed during agent update handoff");
+                        }
+                        crate::logging::error(format_args!("websocket error: {error:#}"));
+                    }
                 }
             }
             Err(error) => {
@@ -265,16 +283,12 @@ async fn handle_agent_socket(
     let mut active_update: Option<ActiveUpdate> = None;
     let capability = update_capability();
 
-    if let Some(manager) = &update_manager {
-        match manager.connected_status() {
-            Ok(Some(status)) => {
-                let _ = outbound_tx.send(status);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                crate::logging::error(format_args!("failed to restore update status: {error:#}"))
-            }
-        }
+    if let Some(manager) = &update_manager
+        && let Some(status) = manager
+            .connected_status()
+            .context("failed to restore update status")?
+    {
+        let _ = outbound_tx.send(status);
     }
     #[cfg(windows)]
     if config.windows_virtual_devices == crate::config::WindowsVirtualDevices::Auto {
@@ -374,6 +388,10 @@ async fn handle_agent_socket(
                         if let Some(offer) = rollback {
                             match manager.can_start_rollback(&offer) {
                                 Ok(true) => {
+                                    crate::logging::info(format_args!(
+                                        "received agent rollback offer via manifest: {}",
+                                        rollback_offer_log_fields(&offer)
+                                    ));
                                     active_update = Some(spawn_rollback_task(
                                         manager.clone(),
                                         offer,
@@ -389,6 +407,10 @@ async fn handle_agent_socket(
                         } else if let Some(offer) = update {
                             match manager.can_start_offer(&offer) {
                             Ok(true) => {
+                                crate::logging::info(format_args!(
+                                    "received agent update offer via manifest: {}",
+                                    update_offer_log_fields(&offer)
+                                ));
                                 active_update = Some(spawn_update_task(
                                     manager.clone(),
                                     offer,
@@ -449,6 +471,10 @@ async fn handle_agent_socket(
                                     "timed out flushing final update status before exiting"
                                 )),
                             }
+                            crate::logging::info(format_args!(
+                                "agent exiting for update handoff: {}",
+                                update_offer_log_fields(&offer)
+                            ));
                             break SocketOutcome::ApplyUpdate;
                         }
                     }
@@ -640,6 +666,10 @@ async fn handle_agent_socket(
                                     signature_v2,
                                     retry_count,
                                 };
+                                let offer_fields = update_offer_log_fields(&offer);
+                                crate::logging::info(format_args!(
+                                    "received agent update offer via websocket: {offer_fields}"
+                                ));
                                 if active_update.is_none() {
                                     if let Some(manager) = &update_manager {
                                         match manager.can_start_offer(&offer) {
@@ -652,14 +682,16 @@ async fn handle_agent_socket(
                                                 ));
                                             }
                                             Ok(false) => crate::logging::info(format_args!(
-                                                "ignored duplicate update offer for active handoff {}",
-                                                offer.artifact_id
+                                                "ignored duplicate agent update offer: {offer_fields}"
                                             )),
                                             Err(error) => crate::logging::error(format_args!(
                                                 "failed to inspect local update state before websocket offer: {error:#}"
                                             )),
                                         }
                                     } else {
+                                        crate::logging::error(format_args!(
+                                            "cannot process agent update offer because update storage is unavailable: {offer_fields}"
+                                        ));
                                         let _ = outbound_tx.send(AgentInbound::UpdateStatus {
                                             attempt_id: offer.attempt_id,
                                             release_id: offer.release_id,
@@ -673,9 +705,17 @@ async fn handle_agent_socket(
                                             ),
                                         });
                                     }
+                                } else {
+                                    crate::logging::info(format_args!(
+                                        "ignored agent update offer because another update is active: {offer_fields}"
+                                    ));
                                 }
                             }
                             AgentOutbound::RollbackAvailable { offer } => {
+                                let offer_fields = rollback_offer_log_fields(&offer);
+                                crate::logging::info(format_args!(
+                                    "received agent rollback offer via websocket: {offer_fields}"
+                                ));
                                 if active_update.is_none() {
                                     if let Some(manager) = &update_manager {
                                         match manager.can_start_rollback(&offer) {
@@ -688,14 +728,16 @@ async fn handle_agent_socket(
                                                 ));
                                             }
                                             Ok(false) => crate::logging::info(format_args!(
-                                                "ignored duplicate rollback offer {}",
-                                                offer.attempt_id
+                                                "ignored duplicate agent rollback offer: {offer_fields}"
                                             )),
                                             Err(error) => crate::logging::error(format_args!(
                                                 "failed to inspect local update state before websocket rollback offer: {error:#}"
                                             )),
                                         }
                                     } else {
+                                        crate::logging::error(format_args!(
+                                            "cannot process agent rollback offer because update storage is unavailable: {offer_fields}"
+                                        ));
                                         let _ = outbound_tx.send(AgentInbound::RollbackStatus {
                                             attempt_id: offer.attempt_id,
                                             retry_count: offer.retry_count,
@@ -706,6 +748,10 @@ async fn handle_agent_socket(
                                             ),
                                         });
                                     }
+                                } else {
+                                    crate::logging::info(format_args!(
+                                        "ignored agent rollback offer because another update is active: {offer_fields}"
+                                    ));
                                 }
                             }
                             AgentOutbound::DesktopOpen {

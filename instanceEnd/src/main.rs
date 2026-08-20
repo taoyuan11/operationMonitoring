@@ -46,8 +46,11 @@ fn run() -> Result<()> {
     tls::install_crypto_provider();
     let cli = Cli::parse();
     if cli.command == AgentCommand::ServiceRun {
-        init_agent_logging(&cli.agent)?;
-        remote_access::initialize_service_devices(&cli.agent);
+        #[cfg(not(windows))]
+        {
+            init_agent_logging(&cli.agent)?;
+            remote_access::initialize_service_devices(&cli.agent);
+        }
         return install::run_service(cli.agent);
     }
 

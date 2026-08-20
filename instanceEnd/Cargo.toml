@@ -1,6 +1,6 @@
 [package]
 name = "instanceEnd"
-version = "0.1.24"
+version = "0.1.25"
 edition = "2024"
 rust-version = "1.89"
 
@@ -15,6 +15,7 @@ bundled-windows-drivers = []
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
 directories = "6.0"
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["signature"] }

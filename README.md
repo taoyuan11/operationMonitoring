@@ -578,9 +578,13 @@ Windows 机器级安全授权，仅受管 LocalSystem 服务会实际启用；�
 可设为 `auto`（Windows 默认）或 `disabled`；普通
 开发构建没有 Microsoft 签名 bundle 时会明确降级为 physical-only，并且不会修改设备。
 
-实例端日志默认在单个文件达到 10 MiB 时滚动，保留 `agent.log.1` 至
+实例端和 updater 的每条日志均以毫秒精度的 UTC ISO 8601 时间及 `INFO`/`ERROR` 级别
+开头。实例端日志默认在
+单个文件达到 10 MiB 时滚动，保留 `agent.log.1` 至
 `agent.log.3` 三个历史文件，超过保留数量的旧日志会直接删除。updater 日志使用相同的
-大小和保留策略。将 `OM_AGENT_LOG_HISTORY` 设为 `0` 可在滚动时直接丢弃旧日志。
+大小和保留策略。日志会记录 Agent 启停原因，以及更新指令的来源、版本、任务标识、
+下载校验、等待空闲、安装、重启、健康确认、回滚和失败阶段。将
+`OM_AGENT_LOG_HISTORY` 设为 `0` 可在滚动时直接丢弃旧日志。
 
 同一状态目录只允许一个实例端进程运行。若要在一台机器上运行多个实例端，请为每个进程设置不同的 `OM_AGENT_STATE_DIR`、`OM_AGENT_ID_FILE` 和 `OM_AGENT_UPDATE_DIR`。更新目录保存可执行文件、回滚基线、状态和 updater 日志，不能放在重启后会清空的临时目录中。OpenWrt standalone 安装默认使用 `/var/lib/om-agent/updates`。
 

@@ -24,7 +24,7 @@ pub fn prepare_configured_directory(
     }
 
     let (existing, missing) = nearest_existing_ancestor(&path, description)?;
-    validate_directory_chain(&existing, description)?;
+    validate_directory_chain_with_terminal_ancestor(&existing, description, !missing.is_empty())?;
     let mut directory = existing.clone();
     for component in missing.iter().rev() {
         directory.push(component);
@@ -139,8 +139,26 @@ fn nearest_existing_ancestor(path: &Path, description: &str) -> Result<(PathBuf,
     }
 }
 
+#[cfg(not(unix))]
+fn validate_directory_chain_with_terminal_ancestor(
+    path: &Path,
+    description: &str,
+    _terminal_is_ancestor: bool,
+) -> Result<()> {
+    validate_directory_chain(path, description)
+}
+
 #[cfg(unix)]
 fn validate_directory_chain(path: &Path, description: &str) -> Result<()> {
+    validate_directory_chain_with_terminal_ancestor(path, description, false)
+}
+
+#[cfg(unix)]
+fn validate_directory_chain_with_terminal_ancestor(
+    path: &Path,
+    description: &str,
+    terminal_is_ancestor: bool,
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
@@ -171,7 +189,8 @@ fn validate_directory_chain(path: &Path, description: &str) -> Result<()> {
                 ancestor.display()
             );
         }
-        if metadata.mode() & 0o022 != 0 {
+        let allow_sticky = ancestor != path || terminal_is_ancestor;
+        if !unix_directory_permissions_are_safe(metadata.uid(), metadata.mode(), allow_sticky) {
             bail!(
                 "{description} ancestor {} is writable by group or other users",
                 ancestor.display()
@@ -189,7 +208,14 @@ fn validate_directory_chain(path: &Path, description: &str) -> Result<()> {
                     ancestor.display()
                 )
             })?;
-            if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            let allow_sticky = ancestor != canonical || terminal_is_ancestor;
+            if !metadata.is_dir()
+                || !unix_directory_permissions_are_safe(
+                    metadata.uid(),
+                    metadata.mode(),
+                    allow_sticky,
+                )
+            {
                 bail!(
                     "resolved {description} ancestor {} is not root-owned and protected",
                     ancestor.display()
@@ -198,6 +224,11 @@ fn validate_directory_chain(path: &Path, description: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn unix_directory_permissions_are_safe(uid: u32, mode: u32, allow_sticky: bool) -> bool {
+    uid == 0 && (mode & 0o022 == 0 || (allow_sticky && mode & 0o1000 != 0))
 }
 
 #[cfg(windows)]
@@ -362,5 +393,14 @@ mod tests {
     fn privileged_paths_reject_parent_components() {
         assert!(absolute_path(Path::new("../state"), "test directory", true).is_err());
         assert!(absolute_path(Path::new("../state"), "test directory", false).is_ok());
+    }
+
+    #[test]
+    fn sticky_root_owned_directories_are_only_allowed_as_ancestors() {
+        assert!(unix_directory_permissions_are_safe(0, 0o1777, true));
+        assert!(!unix_directory_permissions_are_safe(0, 0o1777, false));
+        assert!(!unix_directory_permissions_are_safe(1000, 0o1777, true));
+        assert!(!unix_directory_permissions_are_safe(0, 0o0777, true));
+        assert!(unix_directory_permissions_are_safe(0, 0o0755, false));
     }
 }

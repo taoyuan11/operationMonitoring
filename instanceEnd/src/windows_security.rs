@@ -1,15 +1,17 @@
 use std::{
+    env,
+    ffi::OsStr,
     fs::File,
     io,
     os::windows::ffi::OsStrExt,
-    os::windows::io::FromRawHandle,
+    os::windows::io::{AsRawHandle, FromRawHandle},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use windows::{
     Win32::{
-        Foundation::{ERROR_SUCCESS, GENERIC_ALL, GENERIC_WRITE, HLOCAL, LocalFree},
+        Foundation::{ERROR_SUCCESS, GENERIC_ALL, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree},
         Security::{
             ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT,
             ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -26,14 +28,142 @@ use windows::{
             WinCreatorOwnerSid, WinLocalSystemSid, WinWorldSid,
         },
         Storage::FileSystem::{
-            CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE,
-            FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_DELETE_CHILD, FILE_SHARE_MODE,
-            FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, MOVEFILE_REPLACE_EXISTING,
-            MOVEFILE_WRITE_THROUGH, MoveFileExW, WRITE_DAC, WRITE_OWNER,
+            BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
+            FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle,
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
+            WRITE_DAC, WRITE_OWNER,
         },
     },
     core::{PCWSTR, PWSTR},
 };
+
+pub fn repair_legacy_product_tree() -> Result<()> {
+    let Some(root) = legacy_product_root(env::var_os("ProgramData").as_deref()) else {
+        return Ok(());
+    };
+    repair_existing_product_tree(&root)
+}
+
+fn legacy_product_root(program_data: Option<&OsStr>) -> Option<PathBuf> {
+    Some(PathBuf::from(program_data?).join("OperationMonitoring"))
+}
+
+fn repair_existing_product_tree(root: &Path) -> Result<()> {
+    if !repair_known_product_entry(root, true)? {
+        return Ok(());
+    }
+
+    for relative in ["logs", "runtime", "updates", r"updates\packages"] {
+        repair_known_product_entry(&root.join(relative), true)?;
+    }
+    for relative in legacy_product_files() {
+        repair_known_product_entry(&root.join(relative), false)?;
+    }
+    Ok(())
+}
+
+fn legacy_product_files() -> &'static [&'static str] {
+    &[
+        "identity.json",
+        "install.json",
+        "install-type",
+        "driver-state.json",
+        "driver-stage-journal.json",
+        r"logs\agent.log",
+        r"logs\agent.log.1",
+        r"logs\agent.log.2",
+        r"logs\agent.log.3",
+        r"runtime\agent.lock",
+        r"runtime\agent.pid",
+        r"runtime\agent.ready",
+        r"runtime\agent.stop",
+        r"updates\state.json",
+        r"updates\health.json",
+        r"updates\updater.lock",
+        r"updates\updater-owner.json",
+        r"updates\updater.log",
+        r"updates\updater.log.1",
+        r"updates\updater.log.2",
+        r"updates\updater.log.3",
+    ]
+}
+
+fn repair_known_product_entry(path: &Path, expected_directory: bool) -> Result<bool> {
+    let (handle, information) = match open_product_entry(path) {
+        Ok(entry) => entry,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect legacy data entry {}", path.display())
+            });
+        }
+    };
+    if let Err(reason) = migratable_entry_policy(
+        information.dwFileAttributes,
+        information.nNumberOfLinks,
+        expected_directory,
+    ) {
+        bail!("legacy data entry {} {reason}", path.display());
+    }
+    restrict_to_system_and_administrators(path)?;
+    drop(handle);
+    Ok(true)
+}
+
+fn open_product_entry(path: &Path) -> io::Result<(File, BY_HANDLE_FILE_INFORMATION)> {
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(windows_error)?;
+    let file = unsafe { File::from_raw_handle(handle.0) };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information)
+            .map_err(windows_error)?;
+    }
+    Ok((file, information))
+}
+
+fn migratable_entry_policy(
+    file_attributes: u32,
+    number_of_links: u32,
+    expected_directory: bool,
+) -> std::result::Result<(), &'static str> {
+    if file_attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err("is a reparse point");
+    }
+    let is_directory = file_attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+    if is_directory != expected_directory {
+        return Err(if expected_directory {
+            "is not a directory"
+        } else {
+            "is not a regular file"
+        });
+    }
+    if !is_directory && number_of_links > 1 {
+        return Err("has multiple hard links");
+    }
+    if !is_directory && number_of_links == 0 {
+        return Err("has an invalid zero link count");
+    }
+    Ok(())
+}
 
 pub fn restrict_to_system_and_administrators(path: &Path) -> Result<()> {
     let path_wide = path
@@ -376,5 +506,64 @@ pub fn replace_file(source: &Path, target: &Path) -> Result<()> {
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
         .context("failed to atomically replace protected file")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_product_root_is_always_the_fixed_program_data_child() {
+        assert_eq!(
+            legacy_product_root(Some(OsStr::new(r"C:\ProgramData"))),
+            Some(PathBuf::from(r"C:\ProgramData\OperationMonitoring"))
+        );
+        assert_eq!(legacy_product_root(None), None);
+    }
+
+    #[test]
+    fn missing_legacy_product_tree_needs_no_repair() {
+        let root = env::temp_dir().join(format!(
+            "om-agent-missing-acl-migration-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        repair_existing_product_tree(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn migration_policy_rejects_reparse_points_and_file_hard_links() {
+        assert_eq!(
+            migratable_entry_policy(FILE_ATTRIBUTE_REPARSE_POINT.0, 1, false),
+            Err("is a reparse point")
+        );
+        assert_eq!(
+            migratable_entry_policy(FILE_ATTRIBUTE_NORMAL.0, 2, false),
+            Err("has multiple hard links")
+        );
+        assert!(migratable_entry_policy(FILE_ATTRIBUTE_NORMAL.0, 1, false).is_ok());
+        assert!(migratable_entry_policy(FILE_ATTRIBUTE_DIRECTORY.0, 2, true).is_ok());
+    }
+
+    #[test]
+    fn migration_policy_requires_the_whitelisted_entry_type() {
+        assert_eq!(
+            migratable_entry_policy(FILE_ATTRIBUTE_NORMAL.0, 1, true),
+            Err("is not a directory")
+        );
+        assert_eq!(
+            migratable_entry_policy(FILE_ATTRIBUTE_DIRECTORY.0, 1, false),
+            Err("is not a regular file")
+        );
+    }
+
+    #[test]
+    fn migration_file_allowlist_excludes_dynamic_update_artifacts() {
+        assert!(legacy_product_files().contains(&r"updates\state.json"));
+        assert!(legacy_product_files().contains(&r"runtime\agent.lock"));
+        assert!(!legacy_product_files().contains(&r"updates\apply-release.json"));
+        assert!(!legacy_product_files().contains(&r"updates\updater-release.exe"));
     }
 }

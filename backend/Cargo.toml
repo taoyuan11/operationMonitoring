@@ -4,6 +4,19 @@ version = "0.1.6"
 edition = "2024"
 rust-version = "1.94"
 
+[profile.dev]
+# Line tables retain useful debugger locations while avoiding the larger full
+# debug information set on small development hosts.
+debug = 1
+
+[profile.test]
+debug = 1
+
+[profile.release]
+# Match code generation parallelism to the four-core deployment host without
+# letting LLVM create the default 16 release codegen units.
+codegen-units = 4
+
 [dependencies]
 aes-gcm = "0.11.0"
 anyhow = "1.0.104"
@@ -19,7 +32,7 @@ hmac = "0.13.0"
 ipnet = "2.12.1"
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 rand = "0.10.2"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

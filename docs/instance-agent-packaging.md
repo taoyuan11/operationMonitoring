@@ -152,6 +152,12 @@ cargo xwin --version
 
 ### 3.2 构建全部平台
 
+`instanceEnd/.cargo/config.toml` 默认将 Cargo 并行任务限制为 2，适合 J4125/4 GB 等低内存构建机。构建机内存充足时，可通过 `CARGO_BUILD_JOBS` 临时覆盖，例如：
+
+```bash
+CARGO_BUILD_JOBS=4 ./scripts/build-standalone.sh x86_64-unknown-linux-gnu linux x86_64
+```
+
 从项目根目录执行：
 
 ```bash

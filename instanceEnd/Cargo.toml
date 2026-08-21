@@ -4,6 +4,14 @@ version = "0.1.26"
 edition = "2024"
 rust-version = "1.89"
 
+[profile.dev]
+# Line tables retain useful debugger locations while avoiding the larger full
+# debug information set on small development hosts.
+debug = 1
+
+[profile.test]
+debug = 1
+
 [[bin]]
 name = "om-agent"
 path = "src/main.rs"
@@ -92,7 +100,10 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 
 [profile.release]
-codegen-units = 1
-lto = "thin"
+# A single codegen unit plus ThinLTO gives a small runtime win at a substantial
+# compile-time and memory cost. Four units keep release builds practical on
+# low-memory hosts while retaining full opt-level=3 code generation.
+codegen-units = 4
+lto = false
 panic = "abort"
 strip = "symbols"

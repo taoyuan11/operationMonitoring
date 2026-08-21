@@ -1,0 +1,5 @@
+# J4125/4 GB hosts are more stable with bounded rustc concurrency than Cargo's
+# default (one rustc process per logical CPU). Override per invocation with
+# CARGO_BUILD_JOBS when a larger build machine is available.
+[build]
+jobs = 2

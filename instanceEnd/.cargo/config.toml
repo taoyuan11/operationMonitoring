@@ -1,0 +1,5 @@
+# Keep the agent build within the memory budget of the deployment host.
+# Override per invocation with CARGO_BUILD_JOBS when a larger build machine is
+# available.
+[build]
+jobs = 2

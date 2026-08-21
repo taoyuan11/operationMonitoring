@@ -24,4 +24,9 @@ export default defineConfig({
     host: '127.0.0.1',
     proxy,
   },
+  build: {
+    // Compression-size calculation is useful for bundle analysis but adds
+    // avoidable CPU time to every production build on small hosts.
+    reportCompressedSize: false,
+  },
 })

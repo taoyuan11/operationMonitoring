@@ -142,6 +142,14 @@ pnpm dev
 
 开发服务器仅监听 `127.0.0.1`，默认访问地址为 `http://127.0.0.1:5173`。需要从其他设备调试时，应通过受控反向代理访问，不要将带管理能力的开发服务器直接暴露到公网。
 
+J4125/4 GB 主机的 Cargo 配置默认将并行编译任务限制为 2，并将开发/测试构建的调试信息保留为行号级别，以降低峰值内存和磁盘占用。实例端 release 构建使用 4 个 codegen 单元并关闭 LTO，缩短编译时间；`panic=abort` 和符号剥离仍保持不变。需要在更大机器上加速单次构建时，可临时覆盖并行度，例如 `CARGO_BUILD_JOBS=4 cargo build --release`。Docker 构建会先缓存 Rust registry 下载；4 GB 主机建议串行构建镜像：
+
+```bash
+OM_COMPOSE_BUILD_PARALLELISM=1 ./deploy.sh deploy docker-compose.with-db.yml
+```
+
+部署脚本默认使用 `OM_COMPOSE_BUILD_PARALLELISM=1`；内存充足时可设置为 `2`，让后端和前端镜像并行构建。
+
 构建并在后台启动实例端：
 
 ```bash

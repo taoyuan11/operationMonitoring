@@ -19,6 +19,8 @@ The compose file may be an absolute path or a path relative to the project root.
 Environment:
   OM_DEPLOY_BACKEND_TIMEOUT_SECONDS
     Maximum time to wait for database migrations and backend health (default: 1800).
+  OM_COMPOSE_BUILD_PARALLELISM
+    Maximum number of Compose services built at once (default: 1).
 USAGE
 }
 
@@ -127,6 +129,13 @@ backend_start_timeout_seconds() {
   [[ $timeout =~ ^[1-9][0-9]*$ ]] && ((10#$timeout >= 30)) \
     || die 'OM_DEPLOY_BACKEND_TIMEOUT_SECONDS must be an integer of at least 30 seconds'
   printf '%s\n' "$timeout"
+}
+
+compose_build_parallelism() {
+  local parallelism=${OM_COMPOSE_BUILD_PARALLELISM:-1}
+  [[ $parallelism =~ ^[1-9][0-9]*$ ]] \
+    || die 'OM_COMPOSE_BUILD_PARALLELISM must be a positive integer'
+  printf '%s\n' "$parallelism"
 }
 
 compose_has_service() {
@@ -241,7 +250,7 @@ start_stack() {
 deploy() {
   printf 'Deploying with %s\n' "$COMPOSE_FILE"
   validate_compose
-  docker compose -f "$COMPOSE_FILE" build
+  docker compose --parallel "$(compose_build_parallelism)" -f "$COMPOSE_FILE" build
   start_stack
 }
 
@@ -276,7 +285,7 @@ update() {
   validate_compose_file
   validate_compose
   docker compose -f "$COMPOSE_FILE" pull --ignore-buildable
-  docker compose -f "$COMPOSE_FILE" build --pull
+  docker compose --parallel "$(compose_build_parallelism)" -f "$COMPOSE_FILE" build --pull
   start_stack
 }
 

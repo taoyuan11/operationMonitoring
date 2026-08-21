@@ -1,11 +1,26 @@
+# syntax=docker/dockerfile:1.7
+
 FROM rust:1.97-trixie AS builder
+
+ARG TARGETPLATFORM
 
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
+
+# Keep Cargo downloads and compiled artifacts across source-only image builds.
+RUN --mount=type=cache,id=operation-monitoring-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=operation-monitoring-cargo-git,target=/usr/local/cargo/git \
+    cargo fetch --locked
+
 COPY src ./src
 
-RUN cargo build --locked --release
+RUN --mount=type=cache,id=operation-monitoring-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=operation-monitoring-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=operation-monitoring-backend-target-${TARGETPLATFORM},target=/build/target,sharing=locked \
+    cargo build --locked --release \
+    && cp target/release/backend /tmp/backend
 
 FROM debian:trixie-slim AS runtime
 
@@ -19,7 +34,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/backend /usr/local/bin/operation-monitoring-backend
+COPY --from=builder /tmp/backend /usr/local/bin/operation-monitoring-backend
 
 USER app
 

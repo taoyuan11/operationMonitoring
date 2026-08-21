@@ -9,10 +9,14 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 
-# Keep Cargo downloads and compiled artifacts across source-only image builds.
+# Cargo requires a discoverable target even when it only fetches dependencies.
+# Use a temporary entry point so this layer remains independent of real source.
 RUN --mount=type=cache,id=operation-monitoring-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=operation-monitoring-cargo-git,target=/usr/local/cargo/git \
-    cargo fetch --locked
+    mkdir src \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && cargo fetch --locked \
+    && rm -rf src
 
 COPY src ./src
 

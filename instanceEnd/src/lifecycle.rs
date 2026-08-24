@@ -18,6 +18,11 @@ const START_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub fn start(config: &AgentConfig) -> Result<()> {
+    #[cfg(windows)]
+    if config.state_dir.is_none() && installed_runtime_paths().is_some() {
+        reject_installed_windows_service_overrides()?;
+        return control_installed_windows_service("start", Duration::from_secs(30));
+    }
     config.server_endpoint()?;
     let paths = RuntimePaths::from_config(config)?;
     paths.prepare()?;
@@ -49,6 +54,11 @@ pub fn start(config: &AgentConfig) -> Result<()> {
 }
 
 pub fn stop(config: &AgentConfig, timeout_seconds: u64) -> Result<()> {
+    #[cfg(windows)]
+    if config.state_dir.is_none() && installed_runtime_paths().is_some() {
+        reject_installed_windows_service_overrides()?;
+        return control_installed_windows_service("stop", Duration::from_secs(timeout_seconds));
+    }
     if !stop_if_running(config, timeout_seconds)? {
         println!("agent is not running");
     }
@@ -668,15 +678,84 @@ enum InstalledServiceState {
     Paused,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InstalledServiceStatus {
     state: InstalledServiceState,
     pid: Option<u32>,
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_SERVICE_CONFIG_OPTIONS: &[&str] = &[
+    "--server",
+    "--identity-file",
+    "--report-interval",
+    "--log-file",
+    "--log-max-bytes",
+    "--log-history",
+    "--update-dir",
+    "--remote-desktop-consent",
+    "--windows-virtual-devices",
+];
+
+#[cfg(any(windows, test))]
+const WINDOWS_SERVICE_CONFIG_ENV: &[&str] = &[
+    "OM_SERVER",
+    "OM_AGENT_ID_FILE",
+    "OM_REPORT_INTERVAL",
+    "OM_AGENT_LOG_FILE",
+    "OM_AGENT_LOG_MAX_BYTES",
+    "OM_AGENT_LOG_HISTORY",
+    "OM_AGENT_UPDATE_DIR",
+    "OM_REMOTE_DESKTOP_CONSENT",
+    "OM_WINDOWS_VIRTUAL_DEVICES",
+];
+
+#[cfg(any(windows, test))]
+fn explicit_windows_service_override<I, S, F>(
+    arguments: I,
+    mut environment_contains: F,
+) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+    F: FnMut(&str) -> bool,
+{
+    for argument in arguments {
+        let Some(argument) = argument.as_ref().to_str() else {
+            continue;
+        };
+        if let Some(option) = WINDOWS_SERVICE_CONFIG_OPTIONS.iter().find(|option| {
+            argument == **option
+                || argument
+                    .strip_prefix(**option)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+        }) {
+            return Some((*option).to_owned());
+        }
+    }
+    WINDOWS_SERVICE_CONFIG_ENV
+        .iter()
+        .find(|name| environment_contains(name))
+        .map(|name| (*name).to_owned())
+}
+
+#[cfg(windows)]
+fn reject_installed_windows_service_overrides() -> Result<()> {
+    if let Some(setting) =
+        explicit_windows_service_override(env::args_os(), |name| env::var_os(name).is_some())
+    {
+        bail!(
+            "{setting} cannot override the installed Windows service configuration; run `om-agent install` again to change service settings, or use --state-dir for a separate agent"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn installed_runtime_paths() -> Option<InstalledRuntimePaths> {
-    let data_dir = PathBuf::from(env::var_os("ProgramData")?).join("OperationMonitoring");
+    let data_dir = crate::windows_security::program_data_directory()
+        .ok()?
+        .join("OperationMonitoring");
     if !data_dir.join("install-type").is_file() {
         return None;
     }
@@ -728,34 +807,250 @@ fn unix_installed_runtime_paths(name: &str, openwrt: bool) -> InstalledRuntimePa
 
 #[cfg(windows)]
 fn installed_service_status() -> Result<Option<InstalledServiceStatus>> {
-    let mut stopped = None;
-    for service_name in ["operation-monitoring-agent", "om-agent"] {
-        let output = Command::new("sc.exe")
-            .args(["queryex", service_name])
-            .output()
-            .with_context(|| format!("failed to query Windows service {service_name}"))?;
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if !output.status.success() {
-            if text.contains("1060") {
-                continue;
+    Ok(preferred_installed_windows_service()?.map(|(_, status)| status))
+}
+
+#[cfg(any(windows, test))]
+fn select_preferred_windows_service(
+    services: &[(&'static str, Option<InstalledServiceStatus>)],
+) -> Option<(&'static str, InstalledServiceStatus)> {
+    services
+        .iter()
+        .filter_map(|(name, status)| status.map(|status| (*name, status)))
+        .find(|(_, status)| status.state != InstalledServiceState::Stopped)
+        .or_else(|| {
+            services
+                .iter()
+                .find_map(|(name, status)| status.map(|status| (*name, status)))
+        })
+}
+
+#[cfg(windows)]
+fn preferred_installed_windows_service() -> Result<Option<(&'static str, InstalledServiceStatus)>> {
+    let services = [
+        (
+            "operation-monitoring-agent",
+            installed_service_status_for_name("operation-monitoring-agent")?,
+        ),
+        ("om-agent", installed_service_status_for_name("om-agent")?),
+    ];
+    Ok(select_preferred_windows_service(&services))
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsServiceControlPlan {
+    Unchanged,
+    Wait(InstalledServiceState),
+    Command {
+        verb: &'static str,
+        expected: InstalledServiceState,
+    },
+    WaitThenCommand {
+        wait_for: InstalledServiceState,
+        verb: &'static str,
+        expected: InstalledServiceState,
+    },
+}
+
+#[cfg(any(windows, test))]
+fn windows_service_control_plan(
+    action: &str,
+    state: InstalledServiceState,
+) -> Option<WindowsServiceControlPlan> {
+    use InstalledServiceState::*;
+    use WindowsServiceControlPlan::*;
+
+    match (action, state) {
+        ("start", Running) | ("stop", Stopped) => Some(Unchanged),
+        ("start", Starting | Resuming) => Some(Wait(Running)),
+        ("start", Stopping) => Some(WaitThenCommand {
+            wait_for: Stopped,
+            verb: "start",
+            expected: Running,
+        }),
+        ("start", Pausing) => Some(WaitThenCommand {
+            wait_for: Paused,
+            verb: "continue",
+            expected: Running,
+        }),
+        ("start", Paused) => Some(Command {
+            verb: "continue",
+            expected: Running,
+        }),
+        ("start", Stopped) => Some(Command {
+            verb: "start",
+            expected: Running,
+        }),
+        ("stop", Stopping) => Some(Wait(Stopped)),
+        ("stop", Starting | Resuming) => Some(WaitThenCommand {
+            wait_for: Running,
+            verb: "stop",
+            expected: Stopped,
+        }),
+        ("stop", Pausing) => Some(WaitThenCommand {
+            wait_for: Paused,
+            verb: "stop",
+            expected: Stopped,
+        }),
+        ("stop", Running | Paused) => Some(Command {
+            verb: "stop",
+            expected: Stopped,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn control_installed_windows_service(action: &str, timeout: Duration) -> Result<()> {
+    let Some(_) = windows_service_control_plan(action, InstalledServiceState::Stopped) else {
+        bail!("unsupported Windows service action: {action}");
+    };
+    if !crate::install::is_elevated_for_service_control() {
+        return crate::install::elevate_service_control(action);
+    }
+
+    let (service_name, status) = preferred_installed_windows_service()?
+        .context("installed agent service was not found; run `om-agent install` again")?;
+    let plan = windows_service_control_plan(action, status.state)
+        .context("unsupported Windows service control transition")?;
+    let started = Instant::now();
+    let remaining = || timeout.saturating_sub(started.elapsed());
+    match plan {
+        WindowsServiceControlPlan::Unchanged => {
+            if action == "start" {
+                println!("agent is already running");
+            } else {
+                println!("agent is not running");
             }
+            return Ok(());
+        }
+        WindowsServiceControlPlan::Wait(expected) => {
+            wait_for_windows_service_state(service_name, expected, remaining())?;
+        }
+        WindowsServiceControlPlan::Command { verb, expected } => {
+            run_windows_service_command(service_name, verb, expected, remaining())?;
+        }
+        WindowsServiceControlPlan::WaitThenCommand {
+            wait_for,
+            verb,
+            expected,
+        } => {
+            let reached = wait_for_windows_service_state_or(
+                service_name,
+                wait_for,
+                Some(expected),
+                remaining(),
+            )?;
+            if reached != expected {
+                run_windows_service_command(service_name, verb, expected, remaining())?;
+            }
+        }
+    }
+    let completed_action = if action == "start" {
+        "started"
+    } else {
+        "stopped"
+    };
+    println!("agent service {completed_action} ({service_name})");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_windows_service_command(
+    service_name: &str,
+    verb: &str,
+    expected: InstalledServiceState,
+    timeout: Duration,
+) -> Result<()> {
+    let status = Command::new("sc.exe")
+        .args([verb, service_name])
+        .status()
+        .with_context(|| format!("failed to {verb} Windows agent service"))?;
+    if !status.success() {
+        let current = installed_service_status_for_name(service_name)?
+            .map(|status| status.state)
+            .context("installed Windows agent service disappeared")?;
+        let progressing = matches!(
+            (current, expected),
+            (
+                InstalledServiceState::Starting | InstalledServiceState::Resuming,
+                InstalledServiceState::Running
+            ) | (
+                InstalledServiceState::Stopping,
+                InstalledServiceState::Stopped
+            )
+        );
+        if current != expected && !progressing {
+            bail!("sc {verb} {service_name} exited with {status}");
+        }
+    }
+    wait_for_windows_service_state(service_name, expected, timeout)
+}
+
+#[cfg(windows)]
+fn wait_for_windows_service_state(
+    service_name: &str,
+    expected: InstalledServiceState,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for_windows_service_state_or(service_name, expected, None, timeout).map(|_| ())
+}
+
+#[cfg(windows)]
+fn wait_for_windows_service_state_or(
+    service_name: &str,
+    expected: InstalledServiceState,
+    alternate: Option<InstalledServiceState>,
+    timeout: Duration,
+) -> Result<InstalledServiceState> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = installed_service_status_for_name(service_name)? {
+            if status.state == expected || alternate == Some(status.state) {
+                return Ok(status.state);
+            }
+            if expected == InstalledServiceState::Running
+                && status.state == InstalledServiceState::Stopped
+            {
+                let log = installed_runtime_paths()
+                    .map(|paths| paths.log_file.display().to_string())
+                    .unwrap_or_else(|| "the installed agent log".to_owned());
+                bail!("Windows agent service stopped during startup; inspect {log}");
+            }
+        }
+        if started.elapsed() >= timeout {
             bail!(
-                "sc queryex {service_name} exited with {}: {}",
-                output.status,
-                text.trim()
+                "Windows agent service {service_name} did not reach the expected state within {} seconds",
+                timeout.as_secs()
             );
         }
-        let status = parse_windows_service_query(&text)?;
-        if status.state != InstalledServiceState::Stopped {
-            return Ok(Some(status));
-        }
-        stopped = Some(status);
+        thread::sleep(POLL_INTERVAL);
     }
-    Ok(stopped)
+}
+
+#[cfg(windows)]
+fn installed_service_status_for_name(service_name: &str) -> Result<Option<InstalledServiceStatus>> {
+    let output = Command::new("sc.exe")
+        .args(["queryex", service_name])
+        .output()
+        .with_context(|| format!("failed to query Windows service {service_name}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        if text.contains("1060") {
+            return Ok(None);
+        }
+        bail!(
+            "sc queryex {service_name} exited with {}: {}",
+            output.status,
+            text.trim()
+        );
+    }
+    Ok(Some(parse_windows_service_query(&text)?))
 }
 
 #[cfg(any(windows, test))]
@@ -1178,6 +1473,179 @@ mod tests {
                 state: InstalledServiceState::Running,
                 pid: Some(1234),
             }
+        );
+    }
+
+    #[test]
+    fn windows_service_selection_prefers_an_active_legacy_service() {
+        let selected = select_preferred_windows_service(&[
+            (
+                "operation-monitoring-agent",
+                Some(InstalledServiceStatus {
+                    state: InstalledServiceState::Stopped,
+                    pid: None,
+                }),
+            ),
+            (
+                "om-agent",
+                Some(InstalledServiceStatus {
+                    state: InstalledServiceState::Running,
+                    pid: Some(42),
+                }),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(selected.0, "om-agent");
+        assert_eq!(selected.1.state, InstalledServiceState::Running);
+    }
+
+    #[test]
+    fn windows_service_selection_prefers_the_current_name_when_both_are_stopped() {
+        let selected = select_preferred_windows_service(&[
+            (
+                "operation-monitoring-agent",
+                Some(InstalledServiceStatus {
+                    state: InstalledServiceState::Stopped,
+                    pid: None,
+                }),
+            ),
+            (
+                "om-agent",
+                Some(InstalledServiceStatus {
+                    state: InstalledServiceState::Stopped,
+                    pid: None,
+                }),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(selected.0, "operation-monitoring-agent");
+    }
+
+    #[test]
+    fn windows_service_start_plans_cover_every_transition_state() {
+        use InstalledServiceState::*;
+        use WindowsServiceControlPlan::*;
+
+        assert_eq!(
+            windows_service_control_plan("start", Running),
+            Some(Unchanged)
+        );
+        assert_eq!(
+            windows_service_control_plan("start", Starting),
+            Some(Wait(Running))
+        );
+        assert_eq!(
+            windows_service_control_plan("start", Resuming),
+            Some(Wait(Running))
+        );
+        assert_eq!(
+            windows_service_control_plan("start", Stopping),
+            Some(WaitThenCommand {
+                wait_for: Stopped,
+                verb: "start",
+                expected: Running,
+            })
+        );
+        assert_eq!(
+            windows_service_control_plan("start", Pausing),
+            Some(WaitThenCommand {
+                wait_for: Paused,
+                verb: "continue",
+                expected: Running,
+            })
+        );
+        assert_eq!(
+            windows_service_control_plan("start", Paused),
+            Some(Command {
+                verb: "continue",
+                expected: Running,
+            })
+        );
+        assert_eq!(
+            windows_service_control_plan("start", Stopped),
+            Some(Command {
+                verb: "start",
+                expected: Running,
+            })
+        );
+    }
+
+    #[test]
+    fn windows_service_stop_plans_wait_for_pending_transitions() {
+        use InstalledServiceState::*;
+        use WindowsServiceControlPlan::*;
+
+        assert_eq!(
+            windows_service_control_plan("stop", Stopped),
+            Some(Unchanged)
+        );
+        assert_eq!(
+            windows_service_control_plan("stop", Stopping),
+            Some(Wait(Stopped))
+        );
+        for state in [Starting, Resuming] {
+            assert_eq!(
+                windows_service_control_plan("stop", state),
+                Some(WaitThenCommand {
+                    wait_for: Running,
+                    verb: "stop",
+                    expected: Stopped,
+                })
+            );
+        }
+        assert_eq!(
+            windows_service_control_plan("stop", Pausing),
+            Some(WaitThenCommand {
+                wait_for: Paused,
+                verb: "stop",
+                expected: Stopped,
+            })
+        );
+        for state in [Running, Paused] {
+            assert_eq!(
+                windows_service_control_plan("stop", state),
+                Some(Command {
+                    verb: "stop",
+                    expected: Stopped,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn installed_windows_service_rejects_explicit_configuration_overrides() {
+        assert_eq!(
+            explicit_windows_service_override(
+                ["om-agent", "start", "--server=https://monitor.example"],
+                |_| false,
+            ),
+            Some("--server".to_owned())
+        );
+        assert_eq!(
+            explicit_windows_service_override(["om-agent", "stop"], |name| {
+                name == "OM_AGENT_LOG_FILE"
+            }),
+            Some("OM_AGENT_LOG_FILE".to_owned())
+        );
+    }
+
+    #[test]
+    fn independent_windows_agent_and_stop_timeout_are_not_service_overrides() {
+        assert_eq!(
+            explicit_windows_service_override(
+                [
+                    "om-agent",
+                    "stop",
+                    "--state-dir",
+                    r"C:\\agent-state",
+                    "--timeout",
+                    "20",
+                ],
+                |_| false,
+            ),
+            None
         );
     }
 

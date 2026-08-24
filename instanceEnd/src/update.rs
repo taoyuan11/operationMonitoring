@@ -47,12 +47,17 @@ const OLD_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVICE_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
+const UPDATE_DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const UPDATE_DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const CHECKSUM_DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const SERVICE_STABILITY_WINDOW: Duration = Duration::from_secs(2);
+#[cfg(any(windows, test))]
+const WINDOWS_UPDATE_HANDOFF_MAX_AGE_SECONDS: i64 = 120;
 const PACKAGE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
-const PARENT_HANDOFF_GRACE: Duration = Duration::from_secs(1);
+const PARENT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const WINDOWS_FILE_REPLACE_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -223,6 +228,25 @@ struct ApplyPlan {
     old_pid: u32,
     #[serde(default)]
     installed_executable: Option<PathBuf>,
+    #[serde(default)]
+    windows_service: Option<WindowsServicePlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WindowsServicePlan {
+    service_name: String,
+    #[serde(default)]
+    services_to_stop: Vec<String>,
+    #[serde(default)]
+    services_to_remove: Vec<String>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WindowsUpdateHandoffReservation {
+    lock_owner: String,
+    process_ids: Vec<u32>,
+    created_at: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -464,17 +488,211 @@ fn installed_standalone_update_dir() -> Result<PathBuf> {
 }
 
 fn installed_standalone_executable() -> Result<PathBuf> {
-    let preferred = if cfg!(windows) {
-        PathBuf::from(std::env::var_os("ProgramFiles").context("ProgramFiles is missing")?)
-            .join("OM Agent/om-agent.exe")
-    } else if cfg!(target_os = "macos") {
-        PathBuf::from("/usr/local/bin/om-agent")
-    } else if Path::new("/etc/openwrt_release").exists() {
-        PathBuf::from("/usr/bin/om-agent")
-    } else {
-        PathBuf::from("/usr/local/bin/om-agent")
+    #[cfg(windows)]
+    {
+        return Ok(resolve_windows_update_service(None)?.0);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(PathBuf::from("/usr/local/bin/om-agent"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if Path::new("/etc/openwrt_release").exists() {
+            Ok(PathBuf::from("/usr/bin/om-agent"))
+        } else {
+            Ok(PathBuf::from("/usr/local/bin/om-agent"))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn resolve_windows_update_service(
+    expected_executable: Option<&Path>,
+) -> Result<(PathBuf, Option<WindowsServicePlan>)> {
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
     };
-    Ok(preferred)
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("failed to open the Windows service manager")?;
+    let mut services = Vec::new();
+    for service_name in [LEGACY_SERVICE_NAME, SERVICE_NAME] {
+        let service = match manager.open_service(
+            service_name,
+            ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS,
+        ) {
+            Ok(service) => service,
+            Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => {
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to open Windows service {service_name}"));
+            }
+        };
+        let status = service
+            .query_status()
+            .with_context(|| format!("failed to query Windows service {service_name}"))?;
+        let config = service
+            .query_config()
+            .with_context(|| format!("failed to query Windows service {service_name}"))?;
+        let executable = first_windows_command_argument(config.executable_path.as_os_str())?;
+        services.push((
+            WindowsServicePlan {
+                service_name: service_name.to_owned(),
+                services_to_stop: Vec::new(),
+                services_to_remove: Vec::new(),
+            },
+            status.current_state != ServiceState::Stopped,
+            executable,
+        ));
+    }
+    let candidates = services
+        .iter()
+        .map(|(_, active, executable)| (*active, executable.clone()))
+        .collect::<Vec<_>>();
+    let selected = select_windows_service_index(&candidates, expected_executable)
+        .context("OM Agent Windows service is not installed")?;
+    let (service, _, executable) = &services[selected];
+    validate_windows_update_target(executable)?;
+    if let Some(expected) = expected_executable
+        && !windows_paths_equal(expected, executable)
+    {
+        crate::logging::info(format_args!(
+            "using executable from Windows SCM instead of process path: scm={} process={}",
+            executable.display(),
+            expected.display()
+        ));
+    }
+    let mut service = service.clone();
+    service.services_to_remove = services
+        .iter()
+        .map(|(service, _, _)| service.service_name.clone())
+        .filter(|name| name != &service.service_name)
+        .collect();
+    service.services_to_stop = services
+        .iter()
+        .filter(|(_, was_active, _)| *was_active)
+        .map(|(service, _, _)| service.service_name.clone())
+        .collect();
+    if !service
+        .services_to_stop
+        .iter()
+        .any(|name| name == &service.service_name)
+    {
+        service.services_to_stop.push(service.service_name.clone());
+    }
+    // Stop duplicate services first so a failure cannot take the selected service offline before
+    // we know the replacement target is writable.
+    service
+        .services_to_stop
+        .sort_by_key(|name| name == &service.service_name);
+    Ok((executable.clone(), Some(service)))
+}
+
+#[cfg(windows)]
+fn first_windows_command_argument(command_line: &std::ffi::OsStr) -> Result<PathBuf> {
+    use std::{
+        os::windows::ffi::{OsStrExt, OsStringExt},
+        slice,
+    };
+    use windows::{
+        Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW},
+        core::PCWSTR,
+    };
+
+    let wide = command_line
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut count = 0_i32;
+    let arguments = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
+    if arguments.is_null() || count <= 0 {
+        bail!("Windows service ImagePath is empty or malformed");
+    }
+    let first = unsafe { slice::from_raw_parts(arguments, count as usize)[0] };
+    let executable = unsafe { std::ffi::OsString::from_wide(first.as_wide()) };
+    unsafe {
+        let _ = LocalFree(Some(windows::Win32::Foundation::HLOCAL(arguments.cast())));
+    }
+    if executable.is_empty() {
+        bail!("Windows service ImagePath has no executable");
+    }
+    Ok(PathBuf::from(executable))
+}
+
+#[cfg(windows)]
+fn validate_windows_update_target(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!(
+            "Windows service executable path must be absolute: {}",
+            path.display()
+        );
+    }
+    let parent = path
+        .parent()
+        .context("Windows service executable has no parent directory")?;
+    if !path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("om-agent.exe"))
+    {
+        bail!(
+            "Windows service executable is not the OM Agent binary: {}",
+            path.display()
+        );
+    }
+    crate::windows_security::validate_agent_install_directory(parent)?;
+    crate::privileged_path::validate_configured_directory(
+        parent,
+        true,
+        "Windows agent installation directory",
+    )?;
+    if path.try_exists()? {
+        crate::privileged_path::validate_regular_file(path, "installed Windows agent")?;
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn select_windows_service_index(
+    candidates: &[(bool, PathBuf)],
+    expected_executable: Option<&Path>,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .position(|(active, executable)| {
+            *active
+                && expected_executable
+                    .is_some_and(|expected| windows_paths_equal(executable, expected))
+        })
+        .or_else(|| candidates.iter().position(|(active, _)| *active))
+        .or_else(|| {
+            expected_executable.and_then(|expected| {
+                candidates
+                    .iter()
+                    .position(|(_, executable)| windows_paths_equal(executable, expected))
+            })
+        })
+        .or_else(|| (!candidates.is_empty()).then_some(0))
+}
+
+#[cfg(any(windows, test))]
+fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+    fn normalize(path: &Path) -> String {
+        #[cfg(windows)]
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        #[cfg(not(windows))]
+        let path = path.to_owned();
+        let path = path
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_ascii_lowercase();
+        let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+        path.trim_end_matches('\\').to_owned()
+    }
+    normalize(left) == normalize(right)
 }
 
 impl UpdateManager {
@@ -1277,6 +1495,7 @@ impl UpdateManager {
         let response = self
             .client
             .get(url)
+            .timeout(UPDATE_DOWNLOAD_TOTAL_TIMEOUT)
             .header(AGENT_ID_HEADER, &self.identity.instance_id)
             .header(AGENT_SECRET_HEADER, &self.identity.secret)
             .send()
@@ -1294,7 +1513,10 @@ impl UpdateManager {
         let mut stream = response.bytes_stream();
         let mut hasher = Sha256::new();
         let mut received = 0_u64;
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = tokio::time::timeout(UPDATE_DOWNLOAD_IDLE_TIMEOUT, stream.next())
+            .await
+            .context("update package download stalled")?
+        {
             let chunk = chunk?;
             received = received
                 .checked_add(chunk.len() as u64)
@@ -1330,6 +1552,7 @@ impl UpdateManager {
         let response = self
             .client
             .get(checksum_url)
+            .timeout(CHECKSUM_DOWNLOAD_TOTAL_TIMEOUT)
             .header(AGENT_ID_HEADER, &self.identity.instance_id)
             .header(AGENT_SECRET_HEADER, &self.identity.secret)
             .send()
@@ -1343,7 +1566,10 @@ impl UpdateManager {
         }
         let mut bytes = Vec::new();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = tokio::time::timeout(UPDATE_DOWNLOAD_IDLE_TIMEOUT, stream.next())
+            .await
+            .context("update checksum download stalled")?
+        {
             let chunk = chunk?;
             if bytes.len() + chunk.len() > MAX_CHECKSUM_FILE_BYTES {
                 bail!("update SHA-256 sidecar size is invalid");
@@ -1498,6 +1724,19 @@ impl UpdateManager {
             self.paths.configured_root,
             "agent update directory",
         )?;
+        let lock_owner = uuid::Uuid::new_v4().to_string();
+        #[cfg(windows)]
+        let (launch_lock, mut handoff_guard) =
+            reserve_windows_update_handoff(&self.paths.root, &self.paths.lock_file, &lock_owner)?;
+        #[cfg(not(windows))]
+        if update_lock_is_held(&self.paths.lock_file)? {
+            bail!("another updater is already running; wait for it to finish");
+        }
+        #[cfg(windows)]
+        let (installed_executable, windows_service) =
+            resolve_windows_update_service(Some(&installed_executable))?;
+        #[cfg(not(windows))]
+        let windows_service = None;
         let mut state = read_update_state(&self.paths.state_file)?;
         let mut previous_package = state
             .attempt
@@ -1547,6 +1786,10 @@ impl UpdateManager {
             .paths
             .root
             .join(format!("updater-{component}{executable_suffix}"));
+        cleanup_detached_update_artifacts(
+            &self.paths.root,
+            &[plan_path.as_path(), updater_path.as_path()],
+        )?;
         let plan = ApplyPlan {
             offer: offer.clone(),
             operation,
@@ -1556,9 +1799,10 @@ impl UpdateManager {
             health_file: self.paths.health_file.clone(),
             lock_file: self.paths.lock_file.clone(),
             lock_owner_file: self.paths.lock_owner_file.clone(),
-            lock_owner: uuid::Uuid::new_v4().to_string(),
+            lock_owner,
             old_pid: std::process::id(),
             installed_executable: Some(installed_executable),
+            windows_service,
         };
         write_json_atomic(&plan_path, &plan)?;
 
@@ -1587,6 +1831,8 @@ impl UpdateManager {
             self.config.log_max_bytes,
             self.config.log_history,
         )?;
+        #[cfg(windows)]
+        let mut detached_worker_pid = None;
         if !spawned_with_systemd {
             let mut command = Command::new(&updater_path);
             command
@@ -1601,9 +1847,31 @@ impl UpdateManager {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             detach(&mut command);
-            command
+            let child = command
                 .spawn()
                 .with_context(|| format!("failed to start updater {}", updater_path.display()))?;
+            #[cfg(windows)]
+            {
+                detached_worker_pid = Some(child.id());
+            }
+            #[cfg(not(windows))]
+            drop(child);
+        }
+        #[cfg(windows)]
+        if let Some(pid) = detached_worker_pid
+            && let Err(error) = handoff_guard.record_worker_process(pid)
+        {
+            // The worker is already detached. Leave the parent reservation in place until that
+            // worker either acquires the ownership lock or exits, so an installer cannot enter
+            // the handoff gap even though this launch must be reported as failed.
+            handoff_guard.leave_for_worker();
+            drop(launch_lock);
+            return Err(error);
+        }
+        #[cfg(windows)]
+        {
+            handoff_guard.leave_for_worker();
+            drop(launch_lock);
         }
         if verify_ownership {
             wait_for_worker_ownership(&plan, WORKER_LOCK_TIMEOUT)?;
@@ -2224,6 +2492,10 @@ fn try_spawn_systemd_updater(
 }
 
 fn open_update_lock(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    if crate::privileged_path::is_process_privileged() && path.try_exists()? {
+        crate::privileged_path::validate_regular_file(path, "agent updater lock")?;
+    }
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
     #[cfg(unix)]
@@ -2231,16 +2503,209 @@ fn open_update_lock(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options
+    let file = options
         .open(path)
-        .with_context(|| format!("failed to open updater ownership lock {}", path.display()))
+        .with_context(|| format!("failed to open updater ownership lock {}", path.display()))?;
+    #[cfg(windows)]
+    if crate::privileged_path::is_process_privileged() {
+        crate::privileged_path::validate_regular_file(path, "agent updater lock")?;
+    }
+    Ok(file)
+}
+
+#[cfg(any(windows, test))]
+fn windows_update_handoff_path(update_dir: &Path) -> PathBuf {
+    update_dir.join("updater-handoff.json")
+}
+
+#[cfg(any(windows, test))]
+fn windows_update_handoff_is_fresh(
+    reservation: &WindowsUpdateHandoffReservation,
+    now: i64,
+) -> bool {
+    reservation.created_at > now
+        || now.saturating_sub(reservation.created_at) <= WINDOWS_UPDATE_HANDOFF_MAX_AGE_SECONDS
+}
+
+#[cfg(windows)]
+fn read_windows_update_handoff(path: &Path) -> Result<Option<WindowsUpdateHandoffReservation>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            crate::privileged_path::validate_regular_file(
+                path,
+                "Windows updater handoff reservation",
+            )?;
+            let contents = fs::read(path).with_context(|| {
+                format!(
+                    "failed to read Windows updater handoff reservation {}",
+                    path.display()
+                )
+            })?;
+            let reservation = serde_json::from_slice(&contents).with_context(|| {
+                format!(
+                    "failed to parse Windows updater handoff reservation {}",
+                    path.display()
+                )
+            })?;
+            Ok(Some(reservation))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect Windows updater handoff reservation {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn remove_matching_windows_update_handoff(path: &Path, lock_owner: &str) -> Result<()> {
+    let Some(reservation) = read_windows_update_handoff(path)? else {
+        return Ok(());
+    };
+    if reservation.lock_owner != lock_owner {
+        return Ok(());
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove Windows updater handoff reservation {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn ensure_no_windows_update_handoff_while_locked(update_dir: &Path) -> Result<()> {
+    let path = windows_update_handoff_path(update_dir);
+    let Some(reservation) = read_windows_update_handoff(&path)? else {
+        return Ok(());
+    };
+    let active = windows_update_handoff_is_fresh(&reservation, now_ts())
+        && reservation
+            .process_ids
+            .iter()
+            .copied()
+            .any(process_is_running);
+    if active {
+        bail!(
+            "an updater is being handed off to a detached worker; wait for it to acquire the update lock"
+        );
+    }
+    fs::remove_file(&path).with_context(|| {
+        format!(
+            "failed to remove stale Windows updater handoff reservation {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+struct WindowsUpdateHandoffGuard {
+    path: PathBuf,
+    reservation: WindowsUpdateHandoffReservation,
+    remove_on_drop: bool,
+}
+
+#[cfg(windows)]
+impl WindowsUpdateHandoffGuard {
+    fn record_worker_process(&mut self, pid: u32) -> Result<()> {
+        if !self.reservation.process_ids.contains(&pid) {
+            self.reservation.process_ids.push(pid);
+            write_json_atomic(&self.path, &self.reservation).with_context(|| {
+                format!(
+                    "failed to record detached updater process in {}",
+                    self.path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn leave_for_worker(&mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsUpdateHandoffGuard {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ =
+                remove_matching_windows_update_handoff(&self.path, &self.reservation.lock_owner);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn reserve_windows_update_handoff(
+    update_dir: &Path,
+    lock_file: &Path,
+    lock_owner: &str,
+) -> Result<(File, WindowsUpdateHandoffGuard)> {
+    let lock = open_update_lock(lock_file)?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if update_lock_is_contended(&error) {
+            anyhow!("another updater is already running; wait for it to finish")
+        } else {
+            anyhow::Error::new(error).context("failed to reserve the Windows updater lock")
+        }
+    })?;
+    ensure_no_windows_update_handoff_while_locked(update_dir)?;
+    let path = windows_update_handoff_path(update_dir);
+    let reservation = WindowsUpdateHandoffReservation {
+        lock_owner: lock_owner.to_owned(),
+        process_ids: vec![std::process::id()],
+        created_at: now_ts(),
+    };
+    write_json_atomic(&path, &reservation).with_context(|| {
+        format!(
+            "failed to create Windows updater handoff reservation {}",
+            path.display()
+        )
+    })?;
+    Ok((
+        lock,
+        WindowsUpdateHandoffGuard {
+            path,
+            reservation,
+            remove_on_drop: true,
+        },
+    ))
 }
 
 fn acquire_worker_ownership(plan: &ApplyPlan) -> Result<File> {
     let lock = open_update_lock(&plan.lock_file)?;
-    lock.try_lock_exclusive()
-        .with_context(|| format!("another updater already owns {}", plan.lock_file.display()))?;
+    let started = Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error)
+                if update_lock_is_contended(&error) && started.elapsed() < WORKER_LOCK_TIMEOUT =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("another updater already owns {}", plan.lock_file.display())
+                });
+            }
+        }
+    }
     write_json_atomic(&plan.lock_owner_file, &plan.lock_owner)?;
+    #[cfg(windows)]
+    remove_matching_windows_update_handoff(
+        &windows_update_handoff_path(
+            plan.lock_file
+                .parent()
+                .context("updater lock has no parent directory")?,
+        ),
+        &plan.lock_owner,
+    )?;
     Ok(lock)
 }
 
@@ -2287,6 +2752,71 @@ fn update_lock_is_contended(error: &io::Error) -> bool {
         || error
             .raw_os_error()
             .is_some_and(|code| fs2::lock_contended_error().raw_os_error() == Some(code))
+}
+
+fn is_detached_update_artifact(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    (name.starts_with("apply-") && name.ends_with(".json"))
+        || (name.starts_with("updater-")
+            && if std::env::consts::EXE_SUFFIX.is_empty() {
+                !name.contains('.')
+            } else {
+                name.ends_with(std::env::consts::EXE_SUFFIX)
+            })
+}
+
+fn cleanup_detached_update_artifacts(root: &Path, keep: &[&Path]) -> Result<()> {
+    let keep = keep
+        .iter()
+        .filter_map(|path| path.file_name())
+        .collect::<Vec<_>>();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if keep.iter().any(|name| Some(*name) == path.file_name())
+            || !is_detached_update_artifact(&path)
+        {
+            continue;
+        }
+        #[cfg(windows)]
+        if std::env::current_exe()
+            .ok()
+            .is_some_and(|current| windows_paths_equal(&current, &path))
+        {
+            crate::windows_security::delete_file_on_reboot(&path).with_context(|| {
+                format!(
+                    "failed to schedule running updater {} for deletion",
+                    path.display()
+                )
+            })?;
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            #[cfg(windows)]
+            Err(error) => {
+                crate::windows_security::delete_file_on_reboot(&path).with_context(|| {
+                    format!(
+                        "failed to clean detached updater artifact {} immediately ({error}) or at reboot",
+                        path.display()
+                    )
+                })?;
+            }
+            #[cfg(not(windows))]
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to clean detached updater artifact {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 impl UpdatePaths {
@@ -2365,9 +2895,8 @@ pub fn apply_update(plan_file: &Path) -> Result<()> {
         update_offer_log_fields(&plan.offer),
         plan.package_path.display()
     ));
-    thread::sleep(PARENT_HANDOFF_GRACE);
-
-    let result = apply_update_inner(&plan);
+    let result = wait_for_plan_handoff(&plan, PARENT_HANDOFF_TIMEOUT)
+        .and_then(|()| apply_update_inner(&plan));
     if let Err(error) = &result {
         let message = format!("updater failed: {error:#}");
         let _ = persist_apply_status(
@@ -2382,13 +2911,14 @@ pub fn apply_update(plan_file: &Path) -> Result<()> {
 
 fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
     ensure_plan_generation_is_current(plan)?;
+    ensure_plan_handoff_is_active(plan)?;
     let package_type: PackageType = plan.offer.package_type.parse()?;
     crate::logging::info(format_args!(
         "updater stopping agent service: old_pid={} {}",
         plan.old_pid,
         update_offer_log_fields(&plan.offer)
     ));
-    stop_standalone_service()?;
+    stop_standalone_service(plan)?;
     wait_for_process_exit(plan.old_pid, OLD_PROCESS_TIMEOUT)?;
     crate::logging::info(format_args!(
         "previous agent process stopped; beginning installation: {}",
@@ -2427,7 +2957,7 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
         AttemptPhase::Target,
         None,
     )?;
-    if let Err(error) = restart_agent_service(package_type) {
+    if let Err(error) = restart_agent_service(plan, package_type) {
         let reason = format!(
             "agent service restart failed after installing {}: {error:#}",
             plan.offer.version
@@ -2448,7 +2978,18 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
         plan.offer.retry_count,
         HEALTH_TIMEOUT,
     ) {
+        #[cfg(windows)]
+        if let Err(error) = cleanup_redundant_windows_services(plan) {
+            crate::logging::error(format_args!(
+                "updated agent is healthy, but redundant Windows service cleanup failed: {error:#}"
+            ));
+        }
         complete_target_update(plan, package_type)?;
+        if let Err(error) = cleanup_completed_update_artifacts(plan) {
+            crate::logging::error(format_args!(
+                "updated agent is healthy, but stale updater cleanup failed: {error:#}"
+            ));
+        }
         crate::logging::info(format_args!(
             "agent update completed and is healthy: {}",
             update_offer_log_fields(&plan.offer)
@@ -2464,6 +3005,32 @@ fn apply_update_inner(plan: &ApplyPlan) -> Result<()> {
             HEALTH_TIMEOUT.as_secs()
         ),
     )
+}
+
+#[cfg(windows)]
+fn cleanup_redundant_windows_services(plan: &ApplyPlan) -> Result<()> {
+    let service = plan
+        .windows_service
+        .as_ref()
+        .context("Windows update plan has no service snapshot")?;
+    let mut errors = Vec::new();
+    for redundant in &service.services_to_remove {
+        if redundant == &service.service_name {
+            continue;
+        }
+        if ![LEGACY_SERVICE_NAME, SERVICE_NAME].contains(&redundant.as_str()) {
+            errors.push(format!("refused unexpected service name {redundant:?}"));
+            continue;
+        }
+        if let Err(error) = crate::install::stop_and_delete_windows_service(redundant) {
+            errors.push(format!("{redundant}: {error:#}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
+    }
 }
 
 fn ensure_plan_generation_is_current(plan: &ApplyPlan) -> Result<()> {
@@ -2502,10 +3069,28 @@ fn ensure_plan_handoff_is_active(plan: &ApplyPlan) -> Result<()> {
     Ok(())
 }
 
+fn wait_for_plan_handoff(plan: &ApplyPlan, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match ensure_plan_handoff_is_active(plan) {
+            Ok(()) => return Ok(()),
+            Err(error) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(50));
+                if started.elapsed() >= timeout {
+                    return Err(error).context("parent did not activate the updater handoff");
+                }
+            }
+            Err(error) => {
+                return Err(error).context("parent did not activate the updater handoff");
+            }
+        }
+    }
+}
+
 fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
     let Some(previous) = &plan.previous_package else {
         let package_type: PackageType = plan.offer.package_type.parse()?;
-        let _ = restart_agent_service(package_type);
+        let _ = restart_agent_service(plan, package_type);
         persist_apply_status(
             plan,
             UpdateStatus::Failed,
@@ -2534,7 +3119,7 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
         &previous.sha256,
     )
     .context("cached rollback package verification failed")?;
-    stop_standalone_service().context("failed to stop service before standalone rollback")?;
+    stop_standalone_service(plan).context("failed to stop service before standalone rollback")?;
     install_standalone(plan, &previous.path).context("standalone rollback failed")?;
     persist_apply_status(
         plan,
@@ -2542,7 +3127,7 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
         AttemptPhase::Rollback,
         Some(reason.clone()),
     )?;
-    if let Err(error) = restart_agent_service(previous.package_type) {
+    if let Err(error) = restart_agent_service(plan, previous.package_type) {
         let message = format!(
             "{reason}; failed to restart restored agent {}: {error:#}",
             previous.version
@@ -2590,6 +3175,11 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
         AttemptPhase::Completed,
         Some(final_message),
     )?;
+    if let Err(error) = cleanup_completed_update_artifacts(plan) {
+        crate::logging::error(format_args!(
+            "restored agent is healthy, but stale updater cleanup failed: {error:#}"
+        ));
+    }
     if matches!(&plan.operation, AttemptOperation::Upgrade) {
         crate::logging::info(format_args!(
             "agent rollback to {} succeeded",
@@ -2602,6 +3192,15 @@ fn attempt_rollback(plan: &ApplyPlan, reason: String) -> Result<()> {
             previous.version
         )
     }
+}
+
+fn cleanup_completed_update_artifacts(plan: &ApplyPlan) -> Result<()> {
+    let root = plan
+        .state_file
+        .parent()
+        .context("update state file has no parent directory")?;
+    let keep = vec![plan.package_path.as_path()];
+    cleanup_detached_update_artifacts(root, &keep)
 }
 
 fn complete_target_update(plan: &ApplyPlan, package_type: PackageType) -> Result<()> {
@@ -2833,17 +3432,14 @@ fn terminate_process_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn restart_agent_service(_package_type: PackageType) -> Result<()> {
+fn restart_agent_service(_plan: &ApplyPlan, _package_type: PackageType) -> Result<()> {
     #[cfg(windows)]
     {
-        let mut errors = Vec::new();
-        for service_name in [LEGACY_SERVICE_NAME, SERVICE_NAME] {
-            match restart_windows_agent_service(service_name) {
-                Ok(()) => return Ok(()),
-                Err(error) => errors.push(format!("{service_name}: {error:#}")),
-            }
-        }
-        bail!("{}", errors.join("; "));
+        let service = _plan
+            .windows_service
+            .as_ref()
+            .context("Windows update plan has no service snapshot")?;
+        return restart_windows_agent_service(&service.service_name);
     }
 
     #[cfg(not(windows))]
@@ -2930,7 +3526,20 @@ fn stop_windows_agent_service(service_name: &str) -> Result<()> {
         program: "sc.exe".into(),
         args: vec!["stop".into(), service_name.into()],
     };
-    let _ = run_command_with_timeout(&stop, SERVICE_RESTART_TIMEOUT, "Windows service stop")?;
+    let stop_command_error = match run_command_output_with_timeout(
+        &stop,
+        SERVICE_RESTART_TIMEOUT,
+        "Windows service stop",
+    ) {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(format!(
+            "sc stop exited with {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(error) => Some(format!("sc stop failed: {error:#}")),
+    };
 
     let started = Instant::now();
     loop {
@@ -2938,9 +3547,16 @@ fn stop_windows_agent_service(service_name: &str) -> Result<()> {
             return Ok(());
         }
         if started.elapsed() >= SERVICE_STOP_TIMEOUT {
+            if query_windows_agent_service(service_name)? == ScServiceState::Stopped {
+                return Ok(());
+            }
             bail!(
-                "Windows agent service did not stop within {} seconds",
-                SERVICE_STOP_TIMEOUT.as_secs()
+                "Windows agent service {service_name} did not stop within {} seconds{}",
+                SERVICE_STOP_TIMEOUT.as_secs(),
+                stop_command_error
+                    .as_deref()
+                    .map(|error| format!("; {error}"))
+                    .unwrap_or_default()
             );
         }
         thread::sleep(POLL_INTERVAL);
@@ -3519,16 +4135,20 @@ fn file_integrity(path: &Path) -> Result<(u64, String)> {
 }
 
 fn standalone_install_marker() -> Option<PathBuf> {
-    let candidates: Vec<PathBuf> = if cfg!(windows) {
-        std::env::var_os("ProgramData")
-            .map(|v| PathBuf::from(v).join("OperationMonitoring/install-type"))
-            .into_iter()
-            .collect()
-    } else if cfg!(target_os = "macos") {
+    #[cfg(windows)]
+    let candidates: Vec<PathBuf> = crate::windows_security::program_data_directory()
+        .ok()
+        .map(|path| path.join("OperationMonitoring/install-type"))
+        .into_iter()
+        .collect();
+    #[cfg(target_os = "macos")]
+    let candidates: Vec<PathBuf> = {
         vec![PathBuf::from(
             "/Library/Application Support/OperationMonitoring/install-type",
         )]
-    } else {
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: Vec<PathBuf> = {
         vec![
             PathBuf::from("/etc/om-agent/install-type"),
             PathBuf::from("/etc/operation-monitoring-agent/install-type"),
@@ -3618,31 +4238,16 @@ fn install_standalone(plan: &ApplyPlan, source: &Path) -> Result<()> {
                 )
             },
         )?;
-        retry_windows_file_operation(WINDOWS_FILE_REPLACE_TIMEOUT, || fs::rename(target, &backup))
-            .with_context(|| {
-                format!(
-                    "failed to release installed executable {} for replacement",
-                    target.display()
-                )
-            })?;
-        if let Err(error) = retry_windows_file_operation(WINDOWS_FILE_REPLACE_TIMEOUT, || {
-            fs::rename(&temporary, target)
-        }) {
-            let restore = retry_windows_file_operation(WINDOWS_FILE_REPLACE_TIMEOUT, || {
-                fs::rename(&backup, target)
-            });
-            return match restore {
-                Ok(()) => Err(error).with_context(|| {
-                    format!("failed to install new executable {}", target.display())
-                }),
-                Err(restore_error) => bail!(
-                    "failed to install new executable {}: {error}; also failed to restore {}: {restore_error}",
-                    target.display(),
-                    backup.display()
-                ),
-            };
-        }
-        let _ = remove_windows_file_if_exists(&backup, WINDOWS_FILE_REPLACE_TIMEOUT);
+        retry_windows_file_operation(WINDOWS_FILE_REPLACE_TIMEOUT, || {
+            crate::windows_security::replace_file_with_backup(&temporary, target, &backup)
+        })
+        .with_context(|| {
+            format!(
+                "failed to atomically install new executable {} with backup {}",
+                target.display(),
+                backup.display()
+            )
+        })?;
         repair_windows_global_command_best_effort(target);
     }
     #[cfg(not(windows))]
@@ -3693,24 +4298,39 @@ fn remove_windows_file_if_exists(path: &Path, timeout: Duration) -> io::Result<(
     })
 }
 
-fn stop_standalone_service() -> Result<()> {
+fn stop_standalone_service(_plan: &ApplyPlan) -> Result<()> {
     #[cfg(windows)]
     {
-        let mut found = false;
-        let mut errors = Vec::new();
-        for service_name in [LEGACY_SERVICE_NAME, SERVICE_NAME] {
-            if query_windows_agent_service(service_name).is_ok() {
-                found = true;
-                if let Err(error) = stop_windows_agent_service(service_name) {
-                    errors.push(format!("{service_name}: {error:#}"));
+        let service = _plan
+            .windows_service
+            .as_ref()
+            .context("Windows update plan has no service snapshot")?;
+        let mut stopped = Vec::new();
+        let services_to_stop = if service.services_to_stop.is_empty() {
+            std::slice::from_ref(&service.service_name)
+        } else {
+            &service.services_to_stop
+        };
+        for service_name in services_to_stop {
+            match stop_windows_agent_service(service_name) {
+                Ok(()) => stopped.push(service_name.as_str()),
+                Err(error) => {
+                    let selected_service_may_be_stopped = service_name == &service.service_name
+                        || stopped
+                            .iter()
+                            .any(|name| *name == service.service_name.as_str());
+                    if selected_service_may_be_stopped
+                        && let Err(restart_error) =
+                            restart_windows_agent_service(&service.service_name)
+                    {
+                        bail!(
+                            "failed to stop Windows service {service_name}: {error:#}; selected service recovery also failed: {restart_error:#}"
+                        );
+                    }
+                    return Err(error)
+                        .with_context(|| format!("failed to stop Windows service {service_name}"));
                 }
             }
-        }
-        if !errors.is_empty() {
-            bail!("{}", errors.join("; "));
-        }
-        if !found {
-            bail!("OM Agent Windows service is not installed");
         }
         return Ok(());
     }
@@ -4589,6 +5209,7 @@ mod tests {
             lock_owner: "manual-owner".to_string(),
             old_pid: 1,
             installed_executable: Some(target.clone()),
+            windows_service: None,
         };
 
         install_standalone(&plan, &source).unwrap();
@@ -4669,6 +5290,7 @@ mod tests {
             lock_owner: "old-owner".to_string(),
             old_pid: 1,
             installed_executable: None,
+            windows_service: None,
         };
 
         let ownership = acquire_worker_ownership(&old_plan).unwrap();
@@ -4718,6 +5340,59 @@ mod tests {
             parse_sc_query_state("        STATE              : 2  START_PENDING\r\n"),
             Some(ScServiceState::Other)
         );
+    }
+
+    #[test]
+    fn windows_update_service_selection_tracks_the_running_expected_binary() {
+        let legacy = PathBuf::from(r"C:\Program Files\Operation Monitoring Agent\om-agent.exe");
+        let current = PathBuf::from(r"C:\Program Files\OM Agent\om-agent.exe");
+        let candidates = vec![(true, legacy.clone()), (true, current.clone())];
+
+        assert_eq!(
+            select_windows_service_index(&candidates, Some(&current)),
+            Some(1)
+        );
+        assert_eq!(
+            select_windows_service_index(&[(false, legacy), (true, current)], None),
+            Some(1)
+        );
+        assert_eq!(
+            select_windows_service_index(
+                &[
+                    (false, PathBuf::from(r"C:\legacy\om-agent.exe")),
+                    (
+                        false,
+                        PathBuf::from(r"C:\Program Files\OM Agent\om-agent.exe")
+                    ),
+                ],
+                Some(Path::new(r"C:\Program Files\OM Agent\om-agent.exe")),
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn windows_update_handoff_reservations_expire() {
+        let reservation = WindowsUpdateHandoffReservation {
+            lock_owner: "owner".to_string(),
+            process_ids: vec![42],
+            created_at: 1_000,
+        };
+
+        assert_eq!(
+            windows_update_handoff_path(Path::new("updates")),
+            PathBuf::from("updates/updater-handoff.json")
+        );
+        assert!(windows_update_handoff_is_fresh(&reservation, 1_000));
+        assert!(windows_update_handoff_is_fresh(
+            &reservation,
+            1_000 + WINDOWS_UPDATE_HANDOFF_MAX_AGE_SECONDS
+        ));
+        assert!(!windows_update_handoff_is_fresh(
+            &reservation,
+            1_001 + WINDOWS_UPDATE_HANDOFF_MAX_AGE_SECONDS
+        ));
+        assert!(windows_update_handoff_is_fresh(&reservation, 999));
     }
 
     #[test]
@@ -4981,6 +5656,7 @@ mod tests {
             lock_owner: "test-owner".to_string(),
             old_pid: 1,
             installed_executable: None,
+            windows_service: None,
         };
         complete_target_update(&plan, PackageType::Standalone).unwrap();
         assert!(!previous_path.exists());
@@ -5159,6 +5835,32 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn detached_updater_cleanup_removes_only_owned_artifacts() {
+        let directory =
+            std::env::temp_dir().join(format!("om-update-cleanup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let stale_plan = directory.join("apply-stale.json");
+        let kept_plan = directory.join("apply-current.json");
+        let updater = directory.join(format!("updater-stale{}", std::env::consts::EXE_SUFFIX));
+        let state = directory.join("state.json");
+        let owner = directory.join("updater-owner.json");
+        let log = directory.join("updater.log");
+        for path in [&stale_plan, &kept_plan, &updater, &state, &owner, &log] {
+            fs::write(path, b"test").unwrap();
+        }
+
+        cleanup_detached_update_artifacts(&directory, &[&kept_plan]).unwrap();
+
+        assert!(!stale_plan.exists());
+        assert!(!updater.exists());
+        assert!(kept_plan.exists());
+        assert!(state.exists());
+        assert!(owner.exists());
+        assert!(log.exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

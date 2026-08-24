@@ -1,9 +1,8 @@
 use std::{
-    env,
-    ffi::OsStr,
+    ffi::OsString,
     fs::File,
     io,
-    os::windows::ffi::OsStrExt,
+    os::windows::ffi::{OsStrExt, OsStringExt},
     os::windows::io::{AsRawHandle, FromRawHandle},
     path::{Path, PathBuf},
 };
@@ -33,21 +32,83 @@ use windows::{
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
             FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle,
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
-            WRITE_DAC, WRITE_OWNER,
+            MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            MoveFileExW, OPEN_EXISTING, REPLACE_FILE_FLAGS, ReplaceFileW, WRITE_DAC, WRITE_OWNER,
+        },
+        System::Com::CoTaskMemFree,
+        UI::Shell::{
+            FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX64,
+            FOLDERID_ProgramFilesX86, FOLDERID_System, FOLDERID_SystemX86, FOLDERID_Windows,
+            KF_FLAG_DEFAULT, SHGetKnownFolderPath,
         },
     },
-    core::{PCWSTR, PWSTR},
+    core::{GUID, PCWSTR, PWSTR},
 };
 
 pub fn repair_legacy_product_tree() -> Result<()> {
-    let Some(root) = legacy_product_root(env::var_os("ProgramData").as_deref()) else {
-        return Ok(());
-    };
+    let root = program_data_directory()?.join("OperationMonitoring");
     repair_existing_product_tree(&root)
 }
 
-fn legacy_product_root(program_data: Option<&OsStr>) -> Option<PathBuf> {
+pub fn program_data_directory() -> Result<PathBuf> {
+    known_folder_path(&FOLDERID_ProgramData)
+        .context("failed to locate the Windows ProgramData directory")
+}
+
+pub fn program_files_directory() -> Result<PathBuf> {
+    known_folder_path(&FOLDERID_ProgramFiles)
+        .context("failed to locate the Windows Program Files directory")
+}
+
+pub fn windows_directory() -> Result<PathBuf> {
+    known_folder_path(&FOLDERID_Windows).context("failed to locate the Windows directory")
+}
+
+pub fn validate_agent_install_directory(path: &Path) -> Result<()> {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let allowed = [
+        &FOLDERID_ProgramFiles,
+        &FOLDERID_ProgramFilesX64,
+        &FOLDERID_ProgramFilesX86,
+    ]
+    .into_iter()
+    .filter_map(|folder_id| known_folder_path(folder_id).ok())
+    .any(|root| {
+        ["OM Agent", "Operation Monitoring Agent"]
+            .into_iter()
+            .any(|name| {
+                let candidate = root.join(name);
+                let candidate = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+                windows_paths_match(&resolved, &candidate)
+            })
+    });
+    if !allowed {
+        bail!(
+            "Windows agent executable must be inside a product installation directory under Program Files: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn known_folder_path(folder_id: &GUID) -> Result<PathBuf> {
+    let value = unsafe { SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, None) }
+        .context("SHGetKnownFolderPath failed")?;
+    if value.is_null() {
+        bail!("SHGetKnownFolderPath returned a null path");
+    }
+    let path = unsafe { OsString::from_wide(value.as_wide()) };
+    unsafe {
+        CoTaskMemFree(Some(value.as_ptr().cast()));
+    }
+    if path.is_empty() {
+        bail!("SHGetKnownFolderPath returned an empty path");
+    }
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(test)]
+fn legacy_product_root(program_data: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     Some(PathBuf::from(program_data?).join("OperationMonitoring"))
 }
 
@@ -83,6 +144,7 @@ fn is_deferred_legacy_entry(relative: &str, error: &anyhow::Error) -> bool {
         relative,
         r"updates\updater.lock"
             | r"updates\updater-owner.json"
+            | r"updates\updater-handoff.json"
             | r"updates\updater.log"
             | r"updates\updater.log.1"
             | r"updates\updater.log.2"
@@ -119,6 +181,7 @@ fn legacy_product_files() -> &'static [&'static str] {
         r"updates\health.json",
         r"updates\updater.lock",
         r"updates\updater-owner.json",
+        r"updates\updater-handoff.json",
         r"updates\updater.log",
         r"updates\updater.log.1",
         r"updates\updater.log.2",
@@ -514,25 +577,37 @@ fn is_trusted_windows_root(path: &Path) -> bool {
     if path.parent().is_none() {
         return true;
     }
-    let normalized = path
-        .to_string_lossy()
-        .trim_end_matches(['\\', '/'])
-        .to_ascii_lowercase();
     [
-        "ProgramData",
-        "ProgramFiles",
-        "ProgramFiles(x86)",
-        "SystemRoot",
+        &FOLDERID_ProgramData,
+        &FOLDERID_ProgramFiles,
+        &FOLDERID_ProgramFilesX64,
+        &FOLDERID_ProgramFilesX86,
+        &FOLDERID_System,
+        &FOLDERID_SystemX86,
+        &FOLDERID_Windows,
     ]
     .into_iter()
-    .filter_map(std::env::var_os)
-    .map(PathBuf::from)
-    .map(|path| {
-        path.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_ascii_lowercase()
-    })
-    .any(|root| root == normalized)
+    .filter_map(|folder_id| known_folder_path(folder_id).ok())
+    .any(|root| windows_paths_match(path, &root))
+}
+
+fn windows_paths_match(left: &Path, right: &Path) -> bool {
+    normalize_windows_path(left) == normalize_windows_path(right)
+}
+
+fn normalize_windows_path(path: &Path) -> String {
+    let normalized = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    let normalized = if let Some(unc) = normalized.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{unc}")
+    } else if let Some(local) = normalized.strip_prefix(r"\\?\") {
+        local.to_owned()
+    } else {
+        normalized
+    };
+    normalized.trim_end_matches('\\').to_owned()
 }
 
 pub fn replace_file(source: &Path, target: &Path) -> Result<()> {
@@ -556,9 +631,55 @@ pub fn replace_file(source: &Path, target: &Path) -> Result<()> {
     }
 }
 
+pub fn replace_file_with_backup(source: &Path, target: &Path, backup: &Path) -> io::Result<()> {
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let backup = backup
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(target.as_ptr()),
+            PCWSTR(source.as_ptr()),
+            PCWSTR(backup.as_ptr()),
+            REPLACE_FILE_FLAGS::default(),
+            None,
+            None,
+        )
+    }
+    .map_err(windows_error)
+}
+
+pub fn delete_file_on_reboot(path: &Path) -> Result<()> {
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(path.as_ptr()),
+            PCWSTR::null(),
+            MOVEFILE_DELAY_UNTIL_REBOOT,
+        )
+    }
+    .context("failed to schedule protected file deletion")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn legacy_product_root_is_always_the_fixed_program_data_child() {
@@ -570,8 +691,28 @@ mod tests {
     }
 
     #[test]
+    fn windows_path_comparison_accepts_canonical_verbatim_paths() {
+        assert!(windows_paths_match(
+            Path::new(r"\\?\C:\ProgramData"),
+            Path::new(r"c:\programdata\")
+        ));
+        assert!(windows_paths_match(
+            Path::new(r"\\?\UNC\server\share\"),
+            Path::new(r"\\server\share")
+        ));
+    }
+
+    #[test]
+    fn windows_path_comparison_does_not_accept_root_descendants() {
+        assert!(!windows_paths_match(
+            Path::new(r"\\?\C:\ProgramData\OperationMonitoring"),
+            Path::new(r"C:\ProgramData")
+        ));
+    }
+
+    #[test]
     fn missing_legacy_product_tree_needs_no_repair() {
-        let root = env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "om-agent-missing-acl-migration-{}",
             uuid::Uuid::new_v4()
         ));
@@ -610,6 +751,7 @@ mod tests {
     fn migration_file_allowlist_excludes_dynamic_update_artifacts() {
         assert!(legacy_product_files().contains(&r"updates\state.json"));
         assert!(legacy_product_files().contains(&r"runtime\agent.lock"));
+        assert!(legacy_product_files().contains(&r"updates\updater-handoff.json"));
         assert!(!legacy_product_files().contains(&r"updates\apply-release.json"));
         assert!(!legacy_product_files().contains(&r"updates\updater-release.exe"));
     }
@@ -623,6 +765,10 @@ mod tests {
 
         assert!(is_deferred_legacy_entry(r"updates\updater.log", &sharing));
         assert!(is_deferred_legacy_entry(r"updates\updater.lock", &missing));
+        assert!(is_deferred_legacy_entry(
+            r"updates\updater-handoff.json",
+            &missing
+        ));
         assert!(!is_deferred_legacy_entry(
             r"updates\updater.lock",
             &access_denied

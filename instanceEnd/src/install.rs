@@ -17,9 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const WINDOWS_SERVICE_NAME: &str = "operation-monitoring-agent";
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const SHORT_WINDOWS_SERVICE_NAME: &str = "om-agent";
 #[cfg(target_os = "macos")]
 const MACOS_SERVICE_LABEL: &str = "com.operation-monitoring.agent";
@@ -29,6 +29,8 @@ const MACOS_SERVICE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const MACOS_SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn install(mut config: AgentConfig, non_interactive: bool, yes: bool) -> Result<()> {
+    #[cfg(windows)]
+    reject_windows_install_path_overrides(&config)?;
     let explicit_server = env::args_os()
         .any(|value| value == "--server" || value.to_string_lossy().starts_with("--server="))
         || env::var_os("OM_SERVER").is_some();
@@ -54,6 +56,34 @@ pub fn install(mut config: AgentConfig, non_interactive: bool, yes: bool) -> Res
     install_elevated(&config)
 }
 
+#[cfg(any(windows, test))]
+fn explicit_windows_install_path_override(config: &AgentConfig) -> Option<&'static str> {
+    [
+        (
+            config.identity_file.is_some(),
+            "--identity-file/OM_AGENT_ID_FILE",
+        ),
+        (config.state_dir.is_some(), "--state-dir/OM_AGENT_STATE_DIR"),
+        (config.log_file.is_some(), "--log-file/OM_AGENT_LOG_FILE"),
+        (
+            config.update_dir.is_some(),
+            "--update-dir/OM_AGENT_UPDATE_DIR",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(configured, setting)| configured.then_some(setting))
+}
+
+#[cfg(windows)]
+fn reject_windows_install_path_overrides(config: &AgentConfig) -> Result<()> {
+    if let Some(setting) = explicit_windows_install_path_override(config) {
+        bail!(
+            "{setting} cannot override Windows system-install paths; the service stores identity, state, logs, and updates under the protected ProgramData directory"
+        );
+    }
+    Ok(())
+}
+
 fn validate_unattended_install_confirmation(
     config: &AgentConfig,
     non_interactive: bool,
@@ -64,6 +94,12 @@ fn validate_unattended_install_confirmation(
         bail!("--yes is required for a non-interactive unattended installation");
     }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn write_service_stop_request(state_dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(state_dir)?;
+    fs::write(state_dir.join("agent.stop"), "stop")
 }
 
 pub fn uninstall(config: AgentConfig, yes: bool) -> Result<()> {
@@ -131,6 +167,16 @@ fn is_elevated() -> bool {
 fn is_elevated() -> bool {
     unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().as_bool() }
 }
+
+#[cfg(windows)]
+pub(crate) fn is_elevated_for_service_control() -> bool {
+    is_elevated()
+}
+
+#[cfg(windows)]
+pub(crate) fn elevate_service_control(action: &str) -> Result<()> {
+    elevate(action, None)
+}
 #[cfg(unix)]
 fn elevate(action: &str, config: Option<&AgentConfig>) -> Result<()> {
     let mut cmd = Command::new("sudo");
@@ -185,6 +231,7 @@ fn uninstall_elevated() -> Result<()> {
         }
     }
 }
+#[cfg(not(windows))]
 fn copy_self(target: &Path) -> Result<()> {
     let source = env::current_exe()?;
     if source == target {
@@ -362,6 +409,7 @@ fn wait_for_macos_service_unloaded(
         thread::sleep(poll_interval.min(timeout.saturating_sub(started.elapsed())));
     }
 }
+#[cfg(not(windows))]
 fn private_file(path: impl AsRef<Path>, contents: &str) -> Result<()> {
     let path = path.as_ref();
     if let Some(p) = path.parent() {
@@ -375,6 +423,7 @@ fn private_file(path: impl AsRef<Path>, contents: &str) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(not(windows))]
 fn remove(paths: &[&str]) {
     for value in paths {
         let p = Path::new(value);
@@ -387,9 +436,11 @@ fn remove(paths: &[&str]) {
         }
     }
 }
+#[cfg(not(windows))]
 fn quoted(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
+#[cfg(not(windows))]
 fn env_file(c: &AgentConfig, mac: bool) -> String {
     let (id, state, log, update) = if mac {
         (
@@ -603,82 +654,767 @@ fn uninstall_macos() -> Result<()> {
 
 #[cfg(windows)]
 fn install_windows(c: &AgentConfig) -> Result<()> {
-    let install =
-        std::path::PathBuf::from(env::var_os("ProgramFiles").context("ProgramFiles missing")?)
-            .join("OM Agent");
-    let legacy_install =
-        std::path::PathBuf::from(env::var_os("ProgramFiles").context("ProgramFiles missing")?)
-            .join("Operation Monitoring Agent");
-    let data = std::path::PathBuf::from(env::var_os("ProgramData").context("ProgramData missing")?)
-        .join("OperationMonitoring");
+    let program_files = crate::windows_security::program_files_directory()?;
+    let program_data = crate::windows_security::program_data_directory()?;
+    let install = crate::privileged_path::prepare_configured_directory(
+        &program_files.join("OM Agent"),
+        true,
+        "Windows agent installation directory",
+    )?;
+    let legacy_install = program_files.join("Operation Monitoring Agent");
+    validate_optional_windows_directory(
+        &legacy_install,
+        "legacy Windows agent installation directory",
+    )?;
+    let data = crate::privileged_path::prepare_configured_directory(
+        &program_data.join("OperationMonitoring"),
+        true,
+        "Windows agent data directory",
+    )?;
+    let runtime = crate::privileged_path::prepare_configured_directory(
+        &data.join("runtime"),
+        true,
+        "Windows agent runtime directory",
+    )?;
+    crate::privileged_path::prepare_configured_directory(
+        &data.join("logs"),
+        true,
+        "Windows agent log directory",
+    )?;
+    let updates = crate::privileged_path::prepare_configured_directory(
+        &data.join("updates"),
+        true,
+        "Windows agent update directory",
+    )?;
+    let _update_lock = acquire_windows_install_update_lock(&updates)?;
     let binary = install.join("om-agent.exe");
-    stop_and_delete_windows_service(WINDOWS_SERVICE_NAME)?;
-    stop_and_delete_windows_service(SHORT_WINDOWS_SERVICE_NAME)?;
-    copy_self(&binary)?;
-    fs::create_dir_all(&data)?;
-    crate::windows_security::restrict_to_system_and_administrators(&data)?;
+    let staged_binary = stage_windows_install_binary(&binary)?;
     let driver_reboot_required = crate::remote_access::stage_bundled_windows_drivers(&data)?;
     let identity_path = data.join("identity.json");
-    if identity_path.exists() {
-        crate::windows_security::restrict_to_system_and_administrators(&identity_path)?;
+    if identity_path.try_exists()? {
+        crate::privileged_path::validate_regular_file(&identity_path, "Windows agent identity")?;
     }
-    private_file(
-        data.join("install.json"),
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "server": c.server,
-            "report_interval": c.report_interval,
-                "remote_desktop_consent": c.remote_desktop_consent.to_string(),
-                "windows_virtual_devices": c.windows_virtual_devices.to_string(),
-                "driver_reboot_required": driver_reboot_required
-        }))?,
-    )?;
-    fs::write(data.join("install-type"), "standalone\n")?;
-    let image = format!(
-        "\"{}\" service-run --server \"{}\" --report-interval {} --identity-file \"{}\" --state-dir \"{}\" --log-file \"{}\" --log-max-bytes {} --log-history {} --update-dir \"{}\" --remote-desktop-consent {} --windows-virtual-devices {}",
-        binary.display(),
-        c.server,
-        c.report_interval,
-        data.join("identity.json").display(),
-        data.join("runtime").display(),
-        data.join("logs/agent.log").display(),
-        c.log_max_bytes,
-        c.log_history,
-        data.join("updates").display(),
-        c.remote_desktop_consent,
-        c.windows_virtual_devices
-    );
-    success(
-        Command::new("sc.exe")
-            .args([
-                "create",
-                WINDOWS_SERVICE_NAME,
-                "start=",
-                "auto",
-                "DisplayName=",
-                "OM Agent",
-                "binPath=",
-                &image,
-            ])
-            .status()?,
-        "sc create",
-    )?;
-    windows_path(&legacy_install, false)?;
-    repair_windows_global_command(&binary)?;
-    run("sc.exe", &["start", WINDOWS_SERVICE_NAME])?;
+    let install_metadata_path = data.join("install.json");
+    let install_type_path = data.join("install-type");
+    let metadata_snapshots = [
+        WindowsPrivateFileSnapshot::capture(
+            &install_metadata_path,
+            "Windows installation metadata",
+        )?,
+        WindowsPrivateFileSnapshot::capture(
+            &install_type_path,
+            "Windows installation type marker",
+        )?,
+    ];
+    let canonical = snapshot_windows_service(WINDOWS_SERVICE_NAME)?;
+    let legacy = snapshot_windows_service(SHORT_WINDOWS_SERVICE_NAME)?;
+    let install_service_name =
+        select_windows_install_service(canonical.is_some(), legacy.is_some());
+    let image = windows_service_image(&binary, c, &data);
+    let install_metadata = serde_json::to_string_pretty(&serde_json::json!({
+        "server": c.server,
+        "report_interval": c.report_interval,
+        "remote_desktop_consent": c.remote_desktop_consent.to_string(),
+        "windows_virtual_devices": c.windows_virtual_devices.to_string(),
+        "driver_reboot_required": driver_reboot_required
+    }))?;
+
+    let mut service_switch_started = false;
+    let switch_result = (|| -> Result<()> {
+        write_windows_private_file(&install_metadata_path, &install_metadata)?;
+        write_windows_private_file(&install_type_path, "standalone\n")?;
+        service_switch_started = true;
+        stop_windows_service(WINDOWS_SERVICE_NAME)?;
+        stop_windows_service(SHORT_WINDOWS_SERVICE_NAME)?;
+        staged_binary.activate(&binary)?;
+        configure_windows_service(
+            install_service_name,
+            &image,
+            canonical.is_some() || legacy.is_some(),
+        )?;
+        remove_windows_runtime_marker(&runtime.join("agent.ready"), "agent ready marker")?;
+        repair_windows_global_command(&binary)?;
+        start_windows_service_and_wait_ready(install_service_name, &data)?;
+        Ok(())
+    })();
+    if let Err(error) = switch_result {
+        let rollback_errors = if service_switch_started {
+            rollback_windows_install(
+                &binary,
+                &staged_binary,
+                canonical.as_ref(),
+                legacy.as_ref(),
+                &metadata_snapshots,
+            )
+        } else {
+            restore_windows_private_files(&metadata_snapshots)
+        };
+        if rollback_errors.is_empty() {
+            return Err(error).context("Windows agent installation was rolled back");
+        }
+        bail!(
+            "Windows agent installation failed: {error:#}; rollback also encountered: {}",
+            rollback_errors.join("; ")
+        );
+    }
+
+    if canonical.is_some()
+        && legacy.is_some()
+        && let Some(redundant_service) = redundant_windows_install_service(install_service_name)
+        && let Err(error) = stop_and_delete_windows_service(redundant_service)
+    {
+        eprintln!(
+            "warning: installed agent is healthy, but redundant Windows service {redundant_service} could not be removed: {error:#}"
+        );
+    }
+    if let Err(error) = windows_path(&legacy_install, false) {
+        eprintln!(
+            "warning: installed agent is healthy, but the legacy installation directory could not be removed from PATH: {error:#}"
+        );
+    }
     println!(
         "agent installed and started; open a new terminal to use om-agent globally ({})",
         binary.display()
     );
-    if env::current_exe()?.starts_with(&legacy_install) {
-        let command = format!(
-            "ping 127.0.0.1 -n 3 >nul & rmdir /S /Q \"{}\"",
-            legacy_install.display()
-        );
-        Command::new("cmd.exe").args(["/C", &command]).spawn()?;
-    } else {
-        let _ = fs::remove_dir_all(legacy_install);
+    match env::current_exe() {
+        Ok(current) if current.starts_with(&legacy_install) => {
+            let command = format!(
+                "ping 127.0.0.1 -n 3 >nul & rmdir /S /Q \"{}\"",
+                legacy_install.display()
+            );
+            if let Err(error) = Command::new("cmd.exe").args(["/C", &command]).spawn() {
+                eprintln!(
+                    "warning: installed agent is healthy, but legacy installation cleanup could not be scheduled: {error}"
+                );
+            }
+        }
+        Ok(_) => match fs::remove_dir_all(&legacy_install) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "warning: installed agent is healthy, but legacy installation directory {} could not be removed: {error}",
+                legacy_install.display()
+            ),
+        },
+        Err(error) => eprintln!(
+            "warning: installed agent is healthy, but the current executable could not be resolved for legacy cleanup: {error}"
+        ),
     }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn select_windows_install_service(canonical_exists: bool, legacy_exists: bool) -> &'static str {
+    if canonical_exists || !legacy_exists {
+        WINDOWS_SERVICE_NAME
+    } else {
+        SHORT_WINDOWS_SERVICE_NAME
+    }
+}
+
+#[cfg(any(windows, test))]
+fn redundant_windows_install_service(selected: &str) -> Option<&'static str> {
+    match selected {
+        WINDOWS_SERVICE_NAME => Some(SHORT_WINDOWS_SERVICE_NAME),
+        SHORT_WINDOWS_SERVICE_NAME => Some(WINDOWS_SERVICE_NAME),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+struct StagedWindowsBinary {
+    temporary: Option<std::path::PathBuf>,
+    backup: Option<std::path::PathBuf>,
+    target_existed: bool,
+}
+
+#[cfg(windows)]
+impl StagedWindowsBinary {
+    fn activate(&self, target: &Path) -> Result<()> {
+        let Some(temporary) = &self.temporary else {
+            return Ok(());
+        };
+        crate::windows_security::replace_file(temporary, target)
+            .with_context(|| format!("failed to activate staged agent {}", target.display()))
+    }
+
+    fn restore(&self, target: &Path) -> Result<()> {
+        if self.temporary.is_none() {
+            return Ok(());
+        }
+        if let Some(backup) = &self.backup {
+            crate::windows_security::replace_file(backup, target).with_context(|| {
+                format!(
+                    "failed to restore previous agent binary {}",
+                    target.display()
+                )
+            })?;
+        } else if self.target_existed {
+            bail!("previous agent binary backup is missing");
+        } else if let Err(error) = fs::remove_file(target)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to remove newly installed agent {}",
+                    target.display()
+                )
+            });
+        }
+        Ok(())
+    }
+
+    fn cleanup(&self) {
+        for path in [&self.temporary, &self.backup].into_iter().flatten() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StagedWindowsBinary {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+#[cfg(windows)]
+fn stage_windows_install_binary(target: &Path) -> Result<StagedWindowsBinary> {
+    let source = env::current_exe()?;
+    let target_existed = target.try_exists()?;
+    if target_existed {
+        crate::privileged_path::validate_regular_file(target, "installed Windows agent")?;
+        if files_equal(&source, target)? {
+            return Ok(StagedWindowsBinary {
+                temporary: None,
+                backup: None,
+                target_existed: true,
+            });
+        }
+    }
+
+    let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
+    let temporary = target.with_file_name(format!("om-agent-install-{unique}.new.exe"));
+    let backup = target_existed
+        .then(|| target.with_file_name(format!("om-agent-install-{unique}.backup.exe")));
+    copy_windows_private_file(&source, &temporary, "staged Windows agent")?;
+    if let Some(backup) = &backup
+        && let Err(error) = copy_windows_private_file(target, backup, "Windows agent backup")
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(StagedWindowsBinary {
+        temporary: Some(temporary),
+        backup,
+        target_existed,
+    })
+}
+
+#[cfg(windows)]
+fn copy_windows_private_file(source: &Path, target: &Path, description: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let result = (|| -> Result<()> {
+        let mut source_file = fs::File::open(source)
+            .with_context(|| format!("failed to open {description} source {}", source.display()))?;
+        if !source_file.metadata()?.is_file() {
+            bail!(
+                "{description} source {} is not a regular file",
+                source.display()
+            );
+        }
+        let mut target_file = crate::windows_security::create_private_file(target)
+            .with_context(|| format!("failed to create {description} {}", target.display()))?;
+        io::copy(&mut source_file, &mut target_file)?;
+        target_file.flush()?;
+        target_file.sync_all()?;
+        drop(target_file);
+        crate::privileged_path::validate_regular_file(target, description)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(target);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn validate_optional_windows_directory(path: &Path, description: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                bail!("{description} {} is not a directory", path.display());
+            }
+            crate::privileged_path::validate_configured_directory(path, true, description)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect {description} {}", path.display())),
+    }
+}
+
+#[cfg(windows)]
+fn write_windows_private_file(path: &Path, contents: &str) -> Result<()> {
+    write_windows_private_bytes(path, contents.as_bytes())
+}
+
+#[cfg(windows)]
+fn write_windows_private_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    if path.try_exists()? {
+        crate::privileged_path::validate_regular_file(path, "Windows installation metadata")?;
+    }
+    let temporary = path.with_file_name(format!(
+        ".om-agent-install-{}-{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = crate::windows_security::create_private_file(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        crate::windows_security::replace_file(&temporary, path)?;
+        crate::privileged_path::validate_regular_file(path, "Windows installation metadata")
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+struct WindowsPrivateFileSnapshot {
+    path: std::path::PathBuf,
+    description: &'static str,
+    contents: Option<Vec<u8>>,
+}
+
+#[cfg(windows)]
+impl WindowsPrivateFileSnapshot {
+    fn capture(path: &Path, description: &'static str) -> Result<Self> {
+        let contents = match fs::symlink_metadata(path) {
+            Ok(_) => {
+                crate::privileged_path::validate_regular_file(path, description)?;
+                Some(fs::read(path).with_context(|| {
+                    format!("failed to snapshot {description} {}", path.display())
+                })?)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect {description} {}", path.display())
+                });
+            }
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            description,
+            contents,
+        })
+    }
+
+    fn restore(&self) -> Result<()> {
+        if let Some(contents) = &self.contents {
+            return write_windows_private_bytes(&self.path, contents).with_context(|| {
+                format!(
+                    "failed to restore {} {}",
+                    self.description,
+                    self.path.display()
+                )
+            });
+        }
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => {
+                crate::privileged_path::validate_regular_file(&self.path, self.description)?;
+                fs::remove_file(&self.path).with_context(|| {
+                    format!(
+                        "failed to remove newly created {} {}",
+                        self.description,
+                        self.path.display()
+                    )
+                })
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to inspect {} {} during rollback",
+                    self.description,
+                    self.path.display()
+                )
+            }),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn restore_windows_private_files(snapshots: &[WindowsPrivateFileSnapshot]) -> Vec<String> {
+    snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            snapshot
+                .restore()
+                .err()
+                .map(|error| format!("could not restore {}: {error:#}", snapshot.description))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn acquire_windows_install_update_lock(update_dir: &Path) -> Result<fs::File> {
+    use fs2::FileExt as _;
+    use std::fs::OpenOptions;
+
+    let path = update_dir.join("updater.lock");
+    let file = match crate::windows_security::create_private_file(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            crate::privileged_path::validate_regular_file(&path, "agent updater lock")?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("failed to open updater lock {}", path.display()))?
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create updater lock {}", path.display()));
+        }
+    };
+    file.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock
+            || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+        {
+            anyhow::anyhow!(
+                "an agent update is currently running; wait for it to finish before installing"
+            )
+        } else {
+            anyhow::Error::new(error).context("failed to acquire the agent update lock")
+        }
+    })?;
+    crate::update::ensure_no_windows_update_handoff_while_locked(update_dir)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+struct WindowsServiceSnapshot {
+    config: windows_service::service::ServiceConfig,
+    was_active: bool,
+}
+
+#[cfg(windows)]
+fn snapshot_windows_service(service_name: &str) -> Result<Option<WindowsServiceSnapshot>> {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let Some(status) = windows_service_status(service_name)? else {
+        return Ok(None);
+    };
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("failed to open the Windows service manager")?;
+    let service = manager
+        .open_service(service_name, ServiceAccess::QUERY_CONFIG)
+        .with_context(|| format!("failed to open Windows service {service_name}"))?;
+    let config = service
+        .query_config()
+        .with_context(|| format!("failed to query Windows service {service_name}"))?;
+    Ok(Some(WindowsServiceSnapshot {
+        config,
+        was_active: status.state != windows_service::service::ServiceState::Stopped,
+    }))
+}
+
+#[cfg(windows)]
+fn windows_service_image(binary: &Path, c: &AgentConfig, data: &Path) -> std::ffi::OsString {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+    let arguments = vec![
+        OsString::from("service-run"),
+        OsString::from("--server"),
+        OsString::from(&c.server),
+        OsString::from("--report-interval"),
+        OsString::from(c.report_interval.to_string()),
+        OsString::from("--identity-file"),
+        data.join("identity.json").into_os_string(),
+        OsString::from("--state-dir"),
+        data.join("runtime").into_os_string(),
+        OsString::from("--log-file"),
+        data.join("logs/agent.log").into_os_string(),
+        OsString::from("--log-max-bytes"),
+        OsString::from(c.log_max_bytes.to_string()),
+        OsString::from("--log-history"),
+        OsString::from(c.log_history.to_string()),
+        OsString::from("--update-dir"),
+        data.join("updates").into_os_string(),
+        OsString::from("--remote-desktop-consent"),
+        OsString::from(c.remote_desktop_consent.to_string()),
+        OsString::from("--windows-virtual-devices"),
+        OsString::from(c.windows_virtual_devices.to_string()),
+    ];
+    let mut encoded = Vec::new();
+    append_quoted_windows_argument(&mut encoded, binary.as_os_str());
+    for argument in &arguments {
+        encoded.push(b' ' as u16);
+        append_quoted_windows_argument(&mut encoded, argument);
+    }
+    OsString::from_wide(&encoded)
+}
+
+#[cfg(windows)]
+fn append_quoted_windows_argument(output: &mut Vec<u16>, value: &std::ffi::OsStr) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    const QUOTE: u16 = b'"' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+    output.push(QUOTE);
+    let mut backslashes = 0;
+    for unit in value.encode_wide() {
+        if unit == BACKSLASH {
+            backslashes += 1;
+            continue;
+        }
+        if unit == QUOTE {
+            output.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2 + 1));
+            output.push(QUOTE);
+        } else {
+            output.extend(std::iter::repeat_n(BACKSLASH, backslashes));
+            output.push(unit);
+        }
+        backslashes = 0;
+    }
+    output.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2));
+    output.push(QUOTE);
+}
+
+#[cfg(windows)]
+fn configure_windows_service(
+    service_name: &str,
+    image: &std::ffi::OsStr,
+    exists: bool,
+) -> Result<()> {
+    let action = if exists { "config" } else { "create" };
+    let output = Command::new("sc.exe")
+        .arg(action)
+        .arg(service_name)
+        .args(["start=", "auto", "DisplayName=", "OM Agent", "binPath="])
+        .arg(image)
+        .output()
+        .with_context(|| format!("failed to {action} Windows service {service_name}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let details = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    bail!(
+        "sc {action} {service_name} exited with {}: {}",
+        output.status,
+        details.trim()
+    )
+}
+
+#[cfg(windows)]
+fn restore_windows_service_config(
+    service_name: &str,
+    snapshot: &WindowsServiceSnapshot,
+) -> Result<()> {
+    use windows_service::service::ServiceStartType;
+
+    let start_type = match snapshot.config.start_type {
+        ServiceStartType::AutoStart => "auto",
+        ServiceStartType::OnDemand => "demand",
+        ServiceStartType::Disabled => "disabled",
+        ServiceStartType::SystemStart => "system",
+        ServiceStartType::BootStart => "boot",
+    };
+    let output = Command::new("sc.exe")
+        .args(["config", service_name, "start=", start_type, "DisplayName="])
+        .arg(&snapshot.config.display_name)
+        .arg("binPath=")
+        .arg(snapshot.config.executable_path.as_os_str())
+        .output()
+        .with_context(|| format!("failed to restore Windows service {service_name}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let details = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    bail!(
+        "sc config {service_name} exited with {} while restoring it: {}",
+        output.status,
+        details.trim()
+    )
+}
+
+#[cfg(windows)]
+fn rollback_windows_install(
+    binary: &Path,
+    staged_binary: &StagedWindowsBinary,
+    canonical: Option<&WindowsServiceSnapshot>,
+    legacy: Option<&WindowsServiceSnapshot>,
+    metadata_snapshots: &[WindowsPrivateFileSnapshot],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for service_name in [WINDOWS_SERVICE_NAME, SHORT_WINDOWS_SERVICE_NAME] {
+        if let Err(error) = stop_windows_service(service_name) {
+            errors.push(format!("could not stop {service_name}: {error:#}"));
+        }
+    }
+    if let Err(error) = staged_binary.restore(binary) {
+        errors.push(format!("could not restore previous binary: {error:#}"));
+    }
+    for (service_name, snapshot) in [
+        (WINDOWS_SERVICE_NAME, canonical),
+        (SHORT_WINDOWS_SERVICE_NAME, legacy),
+    ] {
+        if let Some(snapshot) = snapshot {
+            if let Err(error) = restore_windows_service_config(service_name, snapshot) {
+                errors.push(format!(
+                    "could not restore {service_name} configuration: {error:#}"
+                ));
+            }
+        } else if service_name == WINDOWS_SERVICE_NAME
+            && let Err(error) = stop_and_delete_windows_service(service_name)
+        {
+            errors.push(format!("could not remove replacement service: {error:#}"));
+        }
+    }
+    if binary.try_exists().unwrap_or(false) {
+        if let Err(error) = repair_windows_global_command(binary) {
+            errors.push(format!("could not restore the global command: {error:#}"));
+        }
+    } else {
+        for command in windows_command_paths().unwrap_or_default() {
+            if let Err(error) = fs::remove_file(&command)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                errors.push(format!(
+                    "could not remove global command {}: {error}",
+                    command.display()
+                ));
+            }
+        }
+    }
+    errors.extend(restore_windows_private_files(metadata_snapshots));
+    for (service_name, snapshot) in [
+        (WINDOWS_SERVICE_NAME, canonical),
+        (SHORT_WINDOWS_SERVICE_NAME, legacy),
+    ] {
+        if snapshot.is_some_and(|snapshot| snapshot.was_active)
+            && let Err(error) = start_windows_service_and_wait_running(service_name)
+        {
+            errors.push(format!("could not restart {service_name}: {error:#}"));
+        }
+    }
+    errors
+}
+
+#[cfg(windows)]
+fn remove_windows_runtime_marker(path: &Path, description: &str) -> Result<()> {
+    match path.symlink_metadata() {
+        Ok(_) => {
+            crate::privileged_path::validate_regular_file(path, description)?;
+            fs::remove_file(path)
+                .with_context(|| format!("failed to remove {description} {}", path.display()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect {description} {}", path.display())),
+    }
+}
+
+#[cfg(windows)]
+fn start_windows_service_and_wait_running(service_name: &str) -> Result<()> {
+    use std::{thread, time::Duration};
+
+    let output = Command::new("sc.exe")
+        .args(["start", service_name])
+        .output()
+        .with_context(|| format!("failed to start Windows service {service_name}"))?;
+    if !output.status.success()
+        && !windows_service_status(service_name)?
+            .is_some_and(|status| status.state == windows_service::service::ServiceState::Running)
+    {
+        let details = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        bail!(
+            "sc start {service_name} exited with {}: {}",
+            output.status,
+            details.trim()
+        );
+    }
+    let started = std::time::Instant::now();
+    loop {
+        match windows_service_status(service_name)? {
+            Some(status) if status.state == windows_service::service::ServiceState::Running => {
+                return Ok(());
+            }
+            Some(status) if status.state == windows_service::service::ServiceState::Stopped => {
+                bail!("Windows service {service_name} stopped during startup")
+            }
+            None => bail!("Windows service {service_name} disappeared during startup"),
+            Some(_) if started.elapsed() < Duration::from_secs(30) => {
+                thread::sleep(Duration::from_millis(250));
+            }
+            Some(_) => bail!("Windows service {service_name} did not start within 30 seconds"),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn start_windows_service_and_wait_ready(service_name: &str, data: &Path) -> Result<()> {
+    use std::{thread, time::Duration};
+
+    start_windows_service_and_wait_running(service_name)?;
+    let ready_file = data.join("runtime/agent.ready");
+    let log_file = data.join("logs/agent.log");
+    let started = std::time::Instant::now();
+    let mut stable_since = None;
+    loop {
+        let status = windows_service_status(service_name)?.with_context(|| {
+            format!("Windows service {service_name} disappeared during startup")
+        })?;
+        if status.state == windows_service::service::ServiceState::Stopped {
+            bail!(
+                "Windows service {service_name} stopped during startup; inspect {}",
+                log_file.display()
+            );
+        }
+        let ready_pid = fs::read_to_string(&ready_file)
+            .ok()
+            .and_then(|value| parse_windows_ready_pid(&value));
+        if status.state == windows_service::service::ServiceState::Running
+            && status.pid.is_some()
+            && ready_pid == status.pid
+        {
+            let stable = stable_since.get_or_insert_with(std::time::Instant::now);
+            if stable.elapsed() >= Duration::from_secs(2) {
+                return Ok(());
+            }
+        } else {
+            stable_since = None;
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            bail!(
+                "Windows service {service_name} did not remain RUNNING and ready within 30 seconds; inspect {}",
+                log_file.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 #[cfg(windows)]
@@ -805,8 +1541,7 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool> {
 
 #[cfg(windows)]
 fn windows_command_paths() -> Result<Vec<std::path::PathBuf>> {
-    let system_root =
-        std::path::PathBuf::from(env::var_os("SystemRoot").context("SystemRoot missing")?);
+    let system_root = crate::windows_security::windows_directory()?;
     let is_wow64 = cfg!(target_arch = "x86") && env::var_os("PROCESSOR_ARCHITEW6432").is_some();
     let has_syswow64 = system_root.join("SysWOW64").is_dir();
     Ok(windows_command_paths_from_root(
@@ -834,20 +1569,51 @@ fn windows_command_paths_from_root(
 
 #[cfg(windows)]
 fn uninstall_windows() -> Result<()> {
-    let install =
-        std::path::PathBuf::from(env::var_os("ProgramFiles").context("ProgramFiles missing")?)
-            .join("OM Agent");
-    let legacy_install =
-        std::path::PathBuf::from(env::var_os("ProgramFiles").context("ProgramFiles missing")?)
-            .join("Operation Monitoring Agent");
-    let data = std::path::PathBuf::from(env::var_os("ProgramData").context("ProgramData missing")?)
-        .join("OperationMonitoring");
+    let program_files = crate::windows_security::program_files_directory()?;
+    let program_data = crate::windows_security::program_data_directory()?;
+    let install = program_files.join("OM Agent");
+    let legacy_install = program_files.join("Operation Monitoring Agent");
+    let data = program_data.join("OperationMonitoring");
+    validate_optional_windows_directory(&install, "Windows agent installation directory")?;
+    validate_optional_windows_directory(
+        &legacy_install,
+        "legacy Windows agent installation directory",
+    )?;
+    let data_exists = validate_optional_windows_directory(&data, "Windows agent data directory")?;
+    let update_lock = if data_exists {
+        let updates = crate::privileged_path::prepare_configured_directory(
+            &data.join("updates"),
+            true,
+            "Windows agent update directory",
+        )?;
+        Some(acquire_windows_install_update_lock(&updates)?)
+    } else {
+        None
+    };
     stop_and_delete_windows_service(WINDOWS_SERVICE_NAME)?;
     stop_and_delete_windows_service(SHORT_WINDOWS_SERVICE_NAME)?;
     crate::remote_access::uninstall_product_windows_drivers(&data)?;
     windows_path(&install, false)?;
     windows_path(&legacy_install, false)?;
-    let _ = fs::remove_dir_all(data);
+    drop(update_lock);
+    match fs::remove_dir_all(&data) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to remove Windows agent data {}; identity keys and update state may remain",
+                    data.display()
+                )
+            });
+        }
+    }
+    if data.try_exists()? {
+        bail!(
+            "Windows agent data {} still exists after removal; identity keys and update state may remain",
+            data.display()
+        );
+    }
     let mut cleanup = String::from("ping 127.0.0.1 -n 3 >nul");
     for command in windows_command_paths()? {
         cleanup.push_str(&format!(" & del /F /Q \"{}\" >nul 2>&1", command.display()));
@@ -1003,62 +1769,118 @@ fn update_windows_path(current: &str, target: &str, add: bool) -> String {
     }
     entries.join(";")
 }
-#[cfg(windows)]
-fn windows_service_state(service_name: &str) -> Result<Option<u32>> {
-    let output = Command::new("sc.exe")
-        .args(["query", service_name])
-        .output()
-        .context("failed to query Windows service")?;
-    if !output.status.success() {
-        let message = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if message.contains("1060") {
-            return Ok(None);
-        }
-        bail!("sc query exited with {}: {}", output.status, message.trim());
-    }
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((_, fields)) = line.split_once(':') else {
-            continue;
-        };
-        if let Some(state) = fields
-            .split_whitespace()
-            .next()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|value| (1..=7).contains(value))
-        {
-            return Ok(Some(state));
-        }
-    }
-    bail!("sc query did not report a service state")
+
+#[cfg(any(windows, test))]
+fn parse_windows_ready_pid(value: &str) -> Option<u32> {
+    value.trim().parse::<u32>().ok().filter(|pid| *pid != 0)
 }
 
 #[cfg(windows)]
-fn stop_and_delete_windows_service(service_name: &str) -> Result<()> {
+struct WindowsServiceStatus {
+    state: windows_service::service::ServiceState,
+    pid: Option<u32>,
+}
+
+#[cfg(windows)]
+fn windows_service_error_is_missing(error: &windows_service::Error) -> bool {
+    matches!(
+        error,
+        windows_service::Error::Winapi(error) if error.raw_os_error() == Some(1060)
+    )
+}
+
+#[cfg(windows)]
+fn windows_service_status(service_name: &str) -> Result<Option<WindowsServiceStatus>> {
+    use windows_service::{
+        service::ServiceAccess,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("failed to open the Windows service manager")?;
+    let service = match manager.open_service(service_name, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => service,
+        Err(error) if windows_service_error_is_missing(&error) => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open Windows service {service_name}"));
+        }
+    };
+    let status = service
+        .query_status()
+        .with_context(|| format!("failed to query Windows service {service_name}"))?;
+    Ok(Some(WindowsServiceStatus {
+        state: status.current_state,
+        pid: status.process_id.filter(|pid| *pid != 0),
+    }))
+}
+
+#[cfg(windows)]
+fn stop_windows_service(service_name: &str) -> Result<()> {
+    use std::{thread, time::Duration};
+    use windows_service::service::ServiceState;
+
+    let started = std::time::Instant::now();
+    let mut stop_requested = false;
+    loop {
+        let Some(status) = windows_service_status(service_name)? else {
+            return Ok(());
+        };
+        match status.state {
+            ServiceState::Stopped => return Ok(()),
+            ServiceState::Running | ServiceState::Paused if !stop_requested => {
+                let output = Command::new("sc.exe")
+                    .args(["stop", service_name])
+                    .output()
+                    .with_context(|| format!("failed to stop Windows service {service_name}"))?;
+                stop_requested = true;
+                if !output.status.success() {
+                    let current = windows_service_status(service_name)?;
+                    let progressing = current.as_ref().is_none_or(|status| {
+                        matches!(
+                            status.state,
+                            ServiceState::Stopped | ServiceState::StopPending
+                        )
+                    });
+                    if !progressing {
+                        let details = format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        bail!(
+                            "sc stop {service_name} exited with {}: {}",
+                            output.status,
+                            details.trim()
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            bail!("Windows service {service_name} did not stop within 30 seconds");
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(windows)]
+fn windows_service_state(service_name: &str) -> Result<Option<u32>> {
+    Ok(windows_service_status(service_name)?.map(|status| status.state as u32))
+}
+
+#[cfg(windows)]
+pub(crate) fn stop_and_delete_windows_service(service_name: &str) -> Result<()> {
     use std::{
         thread,
         time::{Duration, Instant},
     };
 
-    let Some(state) = windows_service_state(service_name)? else {
+    let Some(_) = windows_service_state(service_name)? else {
         return Ok(());
     };
-    if state != 1 {
-        let _ = run("sc.exe", &["stop", service_name]);
-        let started = Instant::now();
-        loop {
-            match windows_service_state(service_name)? {
-                None | Some(1) => break,
-                Some(_) if started.elapsed() < Duration::from_secs(30) => {
-                    thread::sleep(Duration::from_millis(250));
-                }
-                Some(_) => bail!("Windows service did not stop within 30 seconds"),
-            }
-        }
-    }
+    stop_windows_service(service_name)?;
     if windows_service_state(service_name)?.is_some() {
         run("sc.exe", &["delete", service_name])?;
         let started = Instant::now();
@@ -1136,7 +1958,10 @@ fn windows_elevation_arguments(action: &str, c: Option<&AgentConfig>) -> String 
             c.windows_virtual_devices
         )
     } else {
-        format!("{action} --yes")
+        match action {
+            "uninstall" => format!("{action} --yes"),
+            _ => action.to_owned(),
+        }
     }
 }
 
@@ -1170,8 +1995,10 @@ mod tests {
     #[cfg(windows)]
     use super::install_windows_command_entry;
     use super::{
-        migrate_path, update_windows_path, validate_unattended_install_confirmation,
-        windows_command_paths_from_root, windows_elevation_arguments,
+        explicit_windows_install_path_override, migrate_path, parse_windows_ready_pid,
+        redundant_windows_install_service, select_windows_install_service, update_windows_path,
+        validate_unattended_install_confirmation, windows_command_paths_from_root,
+        windows_elevation_arguments, write_service_stop_request,
     };
     use crate::config::AgentConfig;
     use std::fs;
@@ -1224,6 +2051,66 @@ mod tests {
     }
 
     #[test]
+    fn windows_service_control_elevation_uses_valid_cli_arguments() {
+        assert_eq!(windows_elevation_arguments("start", None), "start");
+        assert_eq!(windows_elevation_arguments("stop", None), "stop");
+        assert_eq!(
+            windows_elevation_arguments("uninstall", None),
+            "uninstall --yes"
+        );
+    }
+
+    #[test]
+    fn windows_system_install_rejects_custom_runtime_paths() {
+        let mut config = AgentConfig {
+            server: "https://monitor.example".to_string(),
+            identity_file: None,
+            report_interval: 5,
+            state_dir: None,
+            log_file: None,
+            log_max_bytes: 1024,
+            log_history: 1,
+            update_dir: None,
+            remote_desktop_consent: crate::config::RemoteDesktopConsent::Required,
+            windows_virtual_devices: crate::config::WindowsVirtualDevices::Disabled,
+        };
+        assert_eq!(explicit_windows_install_path_override(&config), None);
+        config.state_dir = Some(std::path::PathBuf::from(r"C:\custom-state"));
+        assert_eq!(
+            explicit_windows_install_path_override(&config),
+            Some("--state-dir/OM_AGENT_STATE_DIR")
+        );
+    }
+
+    #[test]
+    fn windows_ready_pid_rejects_zero_and_malformed_values() {
+        assert_eq!(parse_windows_ready_pid(" 42\r\n"), Some(42));
+        assert_eq!(parse_windows_ready_pid("0"), None);
+        assert_eq!(parse_windows_ready_pid("not-a-pid"), None);
+    }
+
+    #[test]
+    fn reinstall_keeps_the_existing_windows_service_name() {
+        assert_eq!(
+            select_windows_install_service(true, false),
+            "operation-monitoring-agent"
+        );
+        assert_eq!(select_windows_install_service(false, true), "om-agent");
+        assert_eq!(
+            select_windows_install_service(false, false),
+            "operation-monitoring-agent"
+        );
+        assert_eq!(
+            redundant_windows_install_service("operation-monitoring-agent"),
+            Some("om-agent")
+        );
+        assert_eq!(
+            redundant_windows_install_service("om-agent"),
+            Some("operation-monitoring-agent")
+        );
+    }
+
+    #[test]
     fn non_interactive_unattended_install_requires_explicit_confirmation() {
         let config = AgentConfig {
             server: "https://monitor.example".to_string(),
@@ -1240,6 +2127,38 @@ mod tests {
         assert!(validate_unattended_install_confirmation(&config, true, false).is_err());
         assert!(validate_unattended_install_confirmation(&config, true, true).is_ok());
         assert!(validate_unattended_install_confirmation(&config, false, false).is_ok());
+    }
+
+    #[test]
+    fn service_stop_request_creates_the_runtime_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "om-agent-service-stop-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = root.join("runtime");
+
+        write_service_stop_request(&state).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(state.join("agent.stop")).unwrap(),
+            "stop"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn service_stop_request_reports_an_unusable_runtime_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "om-agent-service-stop-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let state = root.join("runtime");
+        fs::write(&state, "not a directory").unwrap();
+
+        assert!(write_service_stop_request(&state).is_err());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1427,8 +2346,8 @@ mod windows_service_impl {
     use anyhow::{Context, Result};
     use std::{
         ffi::OsString,
-        fs::{self, OpenOptions},
-        io::Write,
+        fs::OpenOptions,
+        io::{self, Write},
         sync::OnceLock,
         time::Duration,
     };
@@ -1500,12 +2419,14 @@ mod windows_service_impl {
 
     fn write_bootstrap_error(config: &AgentConfig, error: &anyhow::Error) {
         let path = config.log_file.clone().or_else(|| {
-            std::env::var_os("ProgramData").map(|program_data| {
-                std::path::PathBuf::from(program_data)
-                    .join("OperationMonitoring")
-                    .join("logs")
-                    .join("agent.log")
-            })
+            crate::windows_security::program_data_directory()
+                .ok()
+                .map(|program_data| {
+                    program_data
+                        .join("OperationMonitoring")
+                        .join("logs")
+                        .join("agent.log")
+                })
         });
         let Some(path) = path else {
             return;
@@ -1558,6 +2479,14 @@ mod windows_service_impl {
         });
     }
 
+    fn service_control_error_code(error: &io::Error) -> u32 {
+        error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok())
+            .filter(|code| *code != 0)
+            .unwrap_or(windows_sys::Win32::Foundation::ERROR_WRITE_FAULT)
+    }
+
     fn inner() -> Result<()> {
         let c = CONFIG.get().cloned().context("missing service config")?;
         let service_name = ACTIVE_SERVICE_NAME
@@ -1567,9 +2496,16 @@ mod windows_service_impl {
         let state = c.state_dir.clone().context("missing state dir")?;
         let h = service_control_handler::register(service_name, move |control| match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                let _ = fs::create_dir_all(&state);
-                let _ = fs::write(state.join("agent.stop"), "stop");
-                ServiceControlHandlerResult::NoError
+                match super::write_service_stop_request(&state) {
+                    Ok(()) => ServiceControlHandlerResult::NoError,
+                    Err(error) => {
+                        crate::logging::error(format_args!(
+                            "failed to write Windows service stop request {}: {error}",
+                            state.join("agent.stop").display()
+                        ));
+                        ServiceControlHandlerResult::Other(service_control_error_code(&error))
+                    }
+                }
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,

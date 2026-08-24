@@ -1,5 +1,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
+#[cfg(windows)]
+use std::ffi::OsStr;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -60,6 +62,48 @@ pub(super) const DATA_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const INPUT_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_ABORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(any(windows, test))]
+fn push_quoted_windows_arg(output: &mut Vec<u16>, value: impl IntoIterator<Item = u16>) {
+    const BACKSLASH: u16 = b'\\' as u16;
+    const QUOTE: u16 = b'"' as u16;
+
+    output.push(QUOTE);
+    let mut backslashes = 0;
+    for unit in value {
+        if unit == BACKSLASH {
+            backslashes += 1;
+            continue;
+        }
+        if unit == QUOTE {
+            output.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2 + 1));
+            output.push(QUOTE);
+        } else {
+            output.extend(std::iter::repeat_n(BACKSLASH, backslashes));
+            output.push(unit);
+        }
+        backslashes = 0;
+    }
+    output.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2));
+    output.push(QUOTE);
+}
+
+#[cfg(windows)]
+pub(super) fn windows_command_line<'a>(
+    program: &OsStr,
+    arguments: impl IntoIterator<Item = &'a OsStr>,
+) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut command_line = Vec::new();
+    push_quoted_windows_arg(&mut command_line, program.encode_wide());
+    for argument in arguments {
+        command_line.push(b' ' as u16);
+        push_quoted_windows_arg(&mut command_line, argument.encode_wide());
+    }
+    command_line.push(0);
+    command_line
+}
 
 struct DropOldestInner<T> {
     capacity: usize,
@@ -524,6 +568,8 @@ pub struct AudioFrameHeader {
 }
 
 impl AudioFrameHeader {
+    // The 32-bit Windows build can decode protocol frames but has no Opus capture backend.
+    #[cfg_attr(all(windows, target_arch = "x86"), allow(dead_code))]
     pub fn encode(self) -> [u8; AUDIO_FRAME_HEADER_LEN] {
         let mut output = [0_u8; AUDIO_FRAME_HEADER_LEN];
         output[0..4].copy_from_slice(b"OMRA");
@@ -754,6 +800,45 @@ pub(super) fn dom_code_uses_extended_key(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quoted_windows_arg(value: &str) -> String {
+        let mut encoded = Vec::new();
+        push_quoted_windows_arg(&mut encoded, value.encode_utf16());
+        String::from_utf16(&encoded).unwrap()
+    }
+
+    #[test]
+    fn windows_arguments_are_quoted_for_create_process() {
+        assert_eq!(quoted_windows_arg(""), "\"\"");
+        assert_eq!(quoted_windows_arg("plain"), "\"plain\"");
+        assert_eq!(quoted_windows_arg("two words"), "\"two words\"");
+        assert_eq!(quoted_windows_arg("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quoted_windows_arg("C:\\temp\\"), "\"C:\\temp\\\\\"");
+    }
+
+    #[test]
+    fn windows_arguments_double_backslashes_before_quotes_and_preserve_utf16() {
+        let mut quoted = Vec::new();
+        push_quoted_windows_arg(&mut quoted, r#"a\"b"#.encode_utf16());
+        assert_eq!(
+            quoted,
+            vec![
+                b'"' as u16,
+                b'a' as u16,
+                b'\\' as u16,
+                b'\\' as u16,
+                b'\\' as u16,
+                b'"' as u16,
+                b'b' as u16,
+                b'"' as u16
+            ]
+        );
+
+        let unpaired_surrogate = 0xd800;
+        let mut quoted = Vec::new();
+        push_quoted_windows_arg(&mut quoted, [unpaired_surrogate]);
+        assert_eq!(quoted, vec![b'"' as u16, unpaired_surrogate, b'"' as u16]);
+    }
 
     fn test_manager(activity: ActivityTracker) -> DesktopManager {
         let (outbound, _, _failed) = AgentEventSender::channel(8);

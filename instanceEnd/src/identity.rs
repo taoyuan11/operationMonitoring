@@ -131,8 +131,8 @@ fn finish_loaded_identity(path: &Path, identity: Identity) -> Result<Identity> {
 
 #[cfg(windows)]
 fn is_system_identity_path(path: &std::path::Path) -> bool {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
+    crate::windows_security::program_data_directory()
+        .ok()
         .map(|program_data| program_data.join("OperationMonitoring"))
         .is_some_and(|data_dir| path.starts_with(data_dir))
 }

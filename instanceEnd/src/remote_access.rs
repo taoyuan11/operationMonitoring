@@ -895,10 +895,10 @@ fn audio_device_presence() -> anyhow::Result<DevicePresence> {
 
 #[cfg(windows)]
 fn installed_driver_reboot_required() -> bool {
-    let Some(program_data) = std::env::var_os("ProgramData") else {
+    let Ok(program_data) = crate::windows_security::program_data_directory() else {
         return false;
     };
-    let data = std::path::PathBuf::from(program_data).join("OperationMonitoring");
+    let data = program_data.join("OperationMonitoring");
     let state_requires_reboot = std::fs::read(data.join("driver-state.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -922,11 +922,8 @@ fn installed_driver_reboot_required() -> bool {
 
 #[cfg(windows)]
 fn installed_driver_component_version(kind: &str) -> Option<String> {
-    let program_data = std::env::var_os("ProgramData")?;
-    let bytes = std::fs::read(
-        std::path::PathBuf::from(program_data).join("OperationMonitoring/driver-state.json"),
-    )
-    .ok()?;
+    let program_data = crate::windows_security::program_data_directory().ok()?;
+    let bytes = std::fs::read(program_data.join("OperationMonitoring/driver-state.json")).ok()?;
     let state = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
     let version = state
         .get("packages")?
@@ -2264,8 +2261,7 @@ pub fn stage_bundled_after_agent_health(config: &AgentConfig) -> anyhow::Result<
     {
         return Ok(false);
     }
-    let data = std::env::var_os("ProgramData")
-        .map(std::path::PathBuf::from)
+    let data = crate::windows_security::program_data_directory()
         .context("driver_stage_program_data_missing")?
         .join("OperationMonitoring");
     stage_bundled_windows_drivers(&data)

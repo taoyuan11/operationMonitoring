@@ -111,6 +111,7 @@ use super::{
     MAX_AUDIO_FRAME_BYTES, MAX_CONTROL_BYTES, MAX_FRAME_BYTES, MAX_JPEG_QUALITY, MIN_JPEG_QUALITY,
     absolute_pointer_coordinate, dom_code_to_vk, dom_code_uses_extended_key, drop_oldest_channel,
     error_reason, scaled_dimensions, wait_for_input_release_ack, windows_audio,
+    windows_command_line,
 };
 use crate::{
     config::{AgentConfig, RemoteDesktopConsent},
@@ -3142,15 +3143,7 @@ fn spawn_helper_in_active_session(
             let mut command = Command::new(&executable);
             append_helper_args(&mut command, options);
             config.append_cli_args(&mut command);
-            let mut command_line = wide(&format!(
-                "\"{}\" {}",
-                executable.display(),
-                command
-                    .get_args()
-                    .map(|v| quote_arg(v))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ));
+            let mut command_line = windows_command_line(executable.as_os_str(), command.get_args());
             let application = wide(executable.as_os_str());
             let desktop = wide("winsta0\\default");
             let mut environment: *mut c_void = null_mut();
@@ -3205,11 +3198,12 @@ fn spawn_device_probe_in_session(pipe_name: &str, session_id: u32) -> Result<Hel
 
         let result = (|| -> Result<HelperProcess> {
             let executable = std::env::current_exe().context("device_probe_failed")?;
-            let mut command_line = wide(&format!(
-                "\"{}\" \"device-probe\" \"--pipe\" {}",
-                executable.display(),
-                quote_arg(OsStr::new(pipe_name)),
-            ));
+            let arguments = [
+                OsStr::new("device-probe"),
+                OsStr::new("--pipe"),
+                OsStr::new(pipe_name),
+            ];
+            let mut command_line = windows_command_line(executable.as_os_str(), arguments);
             let application = wide(executable.as_os_str());
             let desktop = wide("winsta0\\default");
             let mut environment: *mut c_void = null_mut();
@@ -3247,9 +3241,6 @@ fn spawn_device_probe_in_session(pipe_name: &str, session_id: u32) -> Result<Hel
     }
 }
 
-fn quote_arg(value: &OsStr) -> String {
-    format!("\"{}\"", value.to_string_lossy().replace('"', "\\\""))
-}
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }

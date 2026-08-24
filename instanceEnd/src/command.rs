@@ -12,7 +12,7 @@ use crate::activity::ActivityTracker;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const OUTPUT_TRUNCATION_MARKER: &str = "\n[output truncated]";
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn execute_command_with_timeout(command: &str, command_timeout: Duration) -> (i64, String) {
     execute_command_with_timeout_streaming(command, command_timeout, |_| {}).await
 }

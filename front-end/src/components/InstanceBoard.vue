@@ -136,6 +136,7 @@ function resetFilters() {
 }
 
 function openInstance(instance: Instance) {
+  if (!props.isAdmin) return
   emit('open', instance)
 }
 </script>
@@ -275,10 +276,10 @@ function openInstance(instance: Instance) {
           <article
             v-for="instance in filteredInstances"
             :key="instance.id"
-            :class="['instance-card', { offline: !instance.online, clickable: true }]"
-            role="button"
-            tabindex="0"
-            :aria-label="`查看节点 ${instanceName(instance)} 的详情`"
+            :class="['instance-card', { offline: !instance.online, clickable: isAdmin }]"
+            :role="isAdmin ? 'button' : undefined"
+            :tabindex="isAdmin ? 0 : undefined"
+            :aria-label="isAdmin ? `查看节点 ${instanceName(instance)} 的详情` : undefined"
             @click="openInstance(instance)"
             @keydown.enter="openInstance(instance)"
             @keydown.space.prevent="openInstance(instance)"
@@ -306,14 +307,25 @@ function openInstance(instance: Instance) {
 
             <div class="lifecycle-grid">
               <div class="lifecycle-item">
-                <span><Clock3 :size="14" />运行时长</span>
-                <strong>{{ formatDuration(instance.metrics?.uptime_seconds) }}</strong>
-                <small>{{ instance.online ? '当前主机' : hasKnownRuntime(instance) ? '最后上报' : '尚无数据' }}</small>
+                <span class="lifecycle-label"><Clock3 :size="14" />运行时长</span>
+                <strong class="lifecycle-value" :title="formatDuration(instance.metrics?.uptime_seconds)">
+                  {{ formatDuration(instance.metrics?.uptime_seconds) }}
+                </strong>
+                <small class="lifecycle-detail">
+                  {{ instance.online ? '当前主机' : hasKnownRuntime(instance) ? '最后上报' : '尚无数据' }}
+                </small>
               </div>
               <div :class="['lifecycle-item', 'expiration', { expired: isExpired(instance) }]">
-                <span><CalendarClock :size="14" />到期时间</span>
-                <strong>{{ formatExpirationRelative(instance.expires_at, currentTimestamp()) }}</strong>
-                <small>{{ instance.expires_at ? formatTime(instance.expires_at) : '未设置到期时间' }}</small>
+                <span class="lifecycle-label"><CalendarClock :size="14" />到期时间</span>
+                <strong
+                  class="lifecycle-value"
+                  :title="formatExpirationRelative(instance.expires_at, currentTimestamp())"
+                >
+                  {{ formatExpirationRelative(instance.expires_at, currentTimestamp()) }}
+                </strong>
+                <small class="lifecycle-detail" :title="instance.expires_at ? formatTime(instance.expires_at) : '未设置到期时间'">
+                  {{ instance.expires_at ? formatTime(instance.expires_at) : '未设置到期时间' }}
+                </small>
               </div>
             </div>
 

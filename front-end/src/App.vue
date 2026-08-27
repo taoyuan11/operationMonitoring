@@ -8,6 +8,7 @@ import AuditTrailPanel from './components/AuditTrailPanel.vue'
 import CommandCenterPanel from './components/CommandCenterPanel.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
 import InstanceBoard from './components/InstanceBoard.vue'
+import InstanceDetailModal from './components/InstanceDetailModal.vue'
 import LoginModal from './components/LoginModal.vue'
 import SummaryBand from './components/SummaryBand.vue'
 import TopBar from './components/TopBar.vue'
@@ -31,7 +32,6 @@ import type {
 const TerminalModal = defineAsyncComponent(() => import('./components/TerminalModal.vue'))
 const RemoteDesktopModal = defineAsyncComponent(() => import('./components/RemoteDesktopModal.vue'))
 const EditInstanceModal = defineAsyncComponent(() => import('./components/EditInstanceModal.vue'))
-const InstanceDetailModal = defineAsyncComponent(() => import('./components/InstanceDetailModal.vue'))
 const CommandResultModal = defineAsyncComponent(() => import('./components/CommandResultModal.vue'))
 
 const consoleState = useMonitoringConsole()
@@ -197,6 +197,7 @@ function requestRunCommand(instance: Instance, command: CommandRecord) {
 }
 
 function openInstance(instance: Instance) {
+  if (!consoleState.isAdmin.value) return
   selectedInstanceId.value = instance.id
 }
 
@@ -559,7 +560,7 @@ function confirmAction() {
 
     <Transition name="modal" appear>
       <InstanceDetailModal
-        v-if="selectedInstance"
+        v-if="selectedInstance && consoleState.isAdmin.value"
         :instance="selectedInstance"
         :is-admin="consoleState.isAdmin.value"
         :commands="consoleState.commands.value"

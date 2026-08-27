@@ -107,7 +107,9 @@
   .filter-segmented { width: 100%; }
   .filter-segmented button { flex: 1; min-width: 0; }
   .instance-card { padding: 14px; }
-  .lifecycle-grid { grid-template-columns: 1fr; }
+  .lifecycle-grid { grid-template-columns: 1fr; padding: 0; }
+  .lifecycle-item { min-height: 0; padding: 11px 0; }
+  .lifecycle-item + .lifecycle-item { border-top: 1px solid var(--line); border-left: 0; }
   .metrics { grid-template-columns: 1fr; }
   .title-line h3 { max-width: 145px; }
   .instance-location { max-width: 210px; }

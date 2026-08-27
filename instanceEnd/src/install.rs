@@ -96,12 +96,6 @@ fn validate_unattended_install_confirmation(
     Ok(())
 }
 
-#[cfg(any(windows, test))]
-fn write_service_stop_request(state_dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(state_dir)?;
-    fs::write(state_dir.join("agent.stop"), "stop")
-}
-
 pub fn uninstall(config: AgentConfig, yes: bool) -> Result<()> {
     if !yes {
         if !io::stdin().is_terminal() {
@@ -195,11 +189,11 @@ fn elevate(action: &str, config: Option<&AgentConfig>) -> Result<()> {
 fn install_elevated(config: &AgentConfig) -> Result<()> {
     #[cfg(windows)]
     {
-        return install_windows(config);
+        install_windows(config)
     }
     #[cfg(target_os = "macos")]
     {
-        return install_macos(config);
+        install_macos(config)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -213,11 +207,11 @@ fn install_elevated(config: &AgentConfig) -> Result<()> {
 fn uninstall_elevated() -> Result<()> {
     #[cfg(windows)]
     {
-        return uninstall_windows();
+        uninstall_windows()
     }
     #[cfg(target_os = "macos")]
     {
-        return uninstall_macos();
+        uninstall_macos()
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -708,8 +702,8 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
     ];
     let canonical = snapshot_windows_service(WINDOWS_SERVICE_NAME)?;
     let legacy = snapshot_windows_service(SHORT_WINDOWS_SERVICE_NAME)?;
-    let install_service_name =
-        select_windows_install_service(canonical.is_some(), legacy.is_some());
+    let (install_service_name, redundant_service_name) =
+        windows_install_service_names(canonical.is_some(), legacy.is_some());
     let image = windows_service_image(&binary, c, &data);
     let install_metadata = serde_json::to_string_pretty(&serde_json::json!({
         "server": c.server,
@@ -760,11 +754,10 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
 
     if canonical.is_some()
         && legacy.is_some()
-        && let Some(redundant_service) = redundant_windows_install_service(install_service_name)
-        && let Err(error) = stop_and_delete_windows_service(redundant_service)
+        && let Err(error) = stop_and_delete_windows_service(redundant_service_name)
     {
         eprintln!(
-            "warning: installed agent is healthy, but redundant Windows service {redundant_service} could not be removed: {error:#}"
+            "warning: installed agent is healthy, but redundant Windows service {redundant_service_name} could not be removed: {error:#}"
         );
     }
     if let Err(error) = windows_path(&legacy_install, false) {
@@ -804,20 +797,14 @@ fn install_windows(c: &AgentConfig) -> Result<()> {
 }
 
 #[cfg(any(windows, test))]
-fn select_windows_install_service(canonical_exists: bool, legacy_exists: bool) -> &'static str {
+fn windows_install_service_names(
+    canonical_exists: bool,
+    legacy_exists: bool,
+) -> (&'static str, &'static str) {
     if canonical_exists || !legacy_exists {
-        WINDOWS_SERVICE_NAME
+        (WINDOWS_SERVICE_NAME, SHORT_WINDOWS_SERVICE_NAME)
     } else {
-        SHORT_WINDOWS_SERVICE_NAME
-    }
-}
-
-#[cfg(any(windows, test))]
-fn redundant_windows_install_service(selected: &str) -> Option<&'static str> {
-    match selected {
-        WINDOWS_SERVICE_NAME => Some(SHORT_WINDOWS_SERVICE_NAME),
-        SHORT_WINDOWS_SERVICE_NAME => Some(WINDOWS_SERVICE_NAME),
-        _ => None,
+        (SHORT_WINDOWS_SERVICE_NAME, WINDOWS_SERVICE_NAME)
     }
 }
 
@@ -1996,9 +1983,9 @@ mod tests {
     use super::install_windows_command_entry;
     use super::{
         explicit_windows_install_path_override, migrate_path, parse_windows_ready_pid,
-        redundant_windows_install_service, select_windows_install_service, update_windows_path,
-        validate_unattended_install_confirmation, windows_command_paths_from_root,
-        windows_elevation_arguments, write_service_stop_request,
+        update_windows_path, validate_unattended_install_confirmation,
+        windows_command_paths_from_root, windows_elevation_arguments,
+        windows_install_service_names,
     };
     use crate::config::AgentConfig;
     use std::fs;
@@ -2092,21 +2079,16 @@ mod tests {
     #[test]
     fn reinstall_keeps_the_existing_windows_service_name() {
         assert_eq!(
-            select_windows_install_service(true, false),
-            "operation-monitoring-agent"
-        );
-        assert_eq!(select_windows_install_service(false, true), "om-agent");
-        assert_eq!(
-            select_windows_install_service(false, false),
-            "operation-monitoring-agent"
+            windows_install_service_names(true, false),
+            ("operation-monitoring-agent", "om-agent")
         );
         assert_eq!(
-            redundant_windows_install_service("operation-monitoring-agent"),
-            Some("om-agent")
+            windows_install_service_names(false, true),
+            ("om-agent", "operation-monitoring-agent")
         );
         assert_eq!(
-            redundant_windows_install_service("om-agent"),
-            Some("operation-monitoring-agent")
+            windows_install_service_names(false, false),
+            ("operation-monitoring-agent", "om-agent")
         );
     }
 
@@ -2127,38 +2109,6 @@ mod tests {
         assert!(validate_unattended_install_confirmation(&config, true, false).is_err());
         assert!(validate_unattended_install_confirmation(&config, true, true).is_ok());
         assert!(validate_unattended_install_confirmation(&config, false, false).is_ok());
-    }
-
-    #[test]
-    fn service_stop_request_creates_the_runtime_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "om-agent-service-stop-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let state = root.join("runtime");
-
-        write_service_stop_request(&state).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(state.join("agent.stop")).unwrap(),
-            "stop"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn service_stop_request_reports_an_unusable_runtime_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "om-agent-service-stop-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let state = root.join("runtime");
-        fs::write(&state, "not a directory").unwrap();
-
-        assert!(write_service_stop_request(&state).is_err());
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2346,7 +2296,7 @@ mod windows_service_impl {
     use anyhow::{Context, Result};
     use std::{
         ffi::OsString,
-        fs::OpenOptions,
+        fs::{self, OpenOptions},
         io::{self, Write},
         sync::OnceLock,
         time::Duration,
@@ -2496,7 +2446,9 @@ mod windows_service_impl {
         let state = c.state_dir.clone().context("missing state dir")?;
         let h = service_control_handler::register(service_name, move |control| match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                match super::write_service_stop_request(&state) {
+                let result = fs::create_dir_all(&state)
+                    .and_then(|()| fs::write(state.join("agent.stop"), "stop"));
+                match result {
                     Ok(()) => ServiceControlHandlerResult::NoError,
                     Err(error) => {
                         crate::logging::error(format_args!(

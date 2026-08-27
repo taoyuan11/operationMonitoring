@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Activity,
   Box,
@@ -33,9 +33,7 @@ import {
   Volume2,
 } from '@lucide/vue'
 import CountryFlag from './CountryFlag.vue'
-import DockerManagerPanel from './DockerManagerPanel.vue'
-import FileManagerPanel from './FileManagerPanel.vue'
-import MetricHistoryChart from './MetricHistoryChart.vue'
+import MetricHistoryChartLoading from './MetricHistoryChartLoading.vue'
 import OperatingSystemLogo from './OperatingSystemLogo.vue'
 import { api } from '../api/http'
 import { getDockerStatus } from '../api/docker'
@@ -52,6 +50,14 @@ import type {
 } from '../types/domain'
 import type { DockerStatus } from '../types/docker'
 import { formatBytes, formatDuration, formatTime, metricPercent } from '../utils/format'
+
+const DockerManagerPanel = defineAsyncComponent(() => import('./DockerManagerPanel.vue'))
+const FileManagerPanel = defineAsyncComponent(() => import('./FileManagerPanel.vue'))
+const MetricHistoryChart = defineAsyncComponent({
+  loader: () => import('./MetricHistoryChart.vue'),
+  loadingComponent: MetricHistoryChartLoading,
+  delay: 0,
+})
 
 type DetailTab = 'details' | 'actions' | 'files' | 'docker'
 type HistoryRange = 'day' | 'week' | 'month'

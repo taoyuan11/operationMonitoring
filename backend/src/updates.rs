@@ -248,15 +248,23 @@ async fn delete_agent_release(
     .fetch_optional(&mut *transaction)
     .await?
     .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Agent 版本不存在"))?;
-    let attempt_statuses = sqlx::query_scalar::<_, String>(
-        "SELECT status FROM agent_update_attempts WHERE release_id = $1 FOR UPDATE",
+    let attempt_statuses = sqlx::query_as::<_, (String, bool)>(
+        r#"
+        SELECT u.status, i.id IS NOT NULL AS instance_exists
+        FROM agent_update_attempts AS u
+        LEFT JOIN instances AS i ON i.id = u.instance_id
+        WHERE u.release_id = $1
+        FOR UPDATE OF u
+        "#,
     )
     .bind(release_id)
     .fetch_all(&mut *transaction)
     .await?;
     let active_attempts = attempt_statuses
         .iter()
-        .filter(|status| !TERMINAL_ATTEMPT_STATUSES.contains(&status.as_str()))
+        .filter(|(status, instance_exists)| {
+            *instance_exists && !TERMINAL_ATTEMPT_STATUSES.contains(&status.as_str())
+        })
         .count();
     if active_attempts > 0 {
         return Err(AppError::new(
@@ -268,8 +276,10 @@ async fn delete_agent_release(
         r#"
         SELECT COUNT(*)
         FROM agent_update_attempts AS u
+        JOIN instances AS i ON i.id = u.instance_id
         LEFT JOIN agent_artifacts AS a ON a.id = u.artifact_id
         WHERE u.operation = 'rollback'
+          AND u.status NOT IN ('succeeded', 'rollback_succeeded', 'failed', 'cancelled')
           AND (u.release_id = $1 OR u.target_version = $2 OR a.release_id = $1)
         "#,
     )
@@ -1172,7 +1182,10 @@ pub async fn admin_agent_update_attempts(
             SELECT id, release_id, artifact_id, instance_id, operation, parent_attempt_id,
                    from_version, target_version,
                    status, message, retry_count, created_at, updated_at, completed_at
-            FROM agent_update_attempts WHERE release_id = $1 ORDER BY updated_at DESC
+            FROM agent_update_attempts AS u
+            WHERE u.release_id = $1
+              AND EXISTS (SELECT 1 FROM instances AS i WHERE i.id = u.instance_id)
+            ORDER BY u.updated_at DESC
             "#,
         )
         .bind(release_id)
@@ -1184,7 +1197,9 @@ pub async fn admin_agent_update_attempts(
             SELECT id, release_id, artifact_id, instance_id, operation, parent_attempt_id,
                    from_version, target_version,
                    status, message, retry_count, created_at, updated_at, completed_at
-            FROM agent_update_attempts ORDER BY updated_at DESC LIMIT 1000
+            FROM agent_update_attempts AS u
+            WHERE EXISTS (SELECT 1 FROM instances AS i WHERE i.id = u.instance_id)
+            ORDER BY u.updated_at DESC LIMIT 1000
             "#,
         )
         .fetch_all(&state.db)
@@ -2321,7 +2336,10 @@ async fn load_release_detail(
         SELECT id, release_id, artifact_id, instance_id, operation, parent_attempt_id,
                from_version, target_version,
                status, message, retry_count, created_at, updated_at, completed_at
-        FROM agent_update_attempts WHERE release_id = $1 ORDER BY updated_at DESC
+        FROM agent_update_attempts AS u
+        WHERE u.release_id = $1
+          AND EXISTS (SELECT 1 FROM instances AS i WHERE i.id = u.instance_id)
+        ORDER BY u.updated_at DESC
         "#,
     )
     .bind(&release.id)
@@ -4903,6 +4921,81 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.status, StatusCode::NOT_FOUND);
+        resources.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn terminal_rollback_history_does_not_permanently_block_release_deletion() {
+        let (state, resources) = test_state().await;
+        let fixture = insert_stored_release(&state, "published", Some("succeeded")).await;
+        let parent_attempt_id: String = sqlx::query_scalar(
+            "SELECT id FROM agent_update_attempts WHERE release_id = $1 AND instance_id = $2",
+        )
+        .bind(&fixture.release_id)
+        .bind(&fixture.instance_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("load parent upgrade attempt");
+        sqlx::query(
+            r#"
+            INSERT INTO agent_update_attempts(
+                id, release_id, artifact_id, instance_id, operation, parent_attempt_id,
+                from_version, target_version, status, created_at, updated_at, completed_at
+            ) VALUES($1, $2, NULL, $3, 'rollback', $4, $5, '1.0.0', 'failed', 2, 2, 2)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&fixture.release_id)
+        .bind(&fixture.instance_id)
+        .bind(parent_attempt_id)
+        .bind(&fixture.version)
+        .execute(&state.db)
+        .await
+        .expect("insert failed rollback history");
+
+        delete_agent_release(&state, "test-admin", "test-admin-id", &fixture.release_id)
+            .await
+            .expect("terminal rollback history must not block release deletion");
+        assert!(!fixture.release_dir.exists());
+        resources.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn orphaned_attempt_from_a_deleted_instance_does_not_block_release_deletion() {
+        let (state, resources) = test_state().await;
+        let fixture = insert_stored_release(&state, "published", Some("pending")).await;
+        sqlx::query(
+            "ALTER TABLE agent_update_attempts DROP CONSTRAINT agent_update_attempts_instance_id_fkey",
+        )
+        .execute(&state.db)
+        .await
+        .expect("simulate a legacy database without instance cascade cleanup");
+        sqlx::query("DELETE FROM instances WHERE id = $1")
+            .bind(&fixture.instance_id)
+            .execute(&state.db)
+            .await
+            .expect("delete instance while retaining legacy attempt");
+        let orphaned_attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_update_attempts WHERE release_id = $1")
+                .bind(&fixture.release_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("count orphaned attempts");
+        assert_eq!(orphaned_attempts, 1);
+
+        let release = get_release(&state, &fixture.release_id)
+            .await
+            .expect("load release with orphaned attempt");
+        let detail = load_release_detail(&state, release)
+            .await
+            .expect("load release detail");
+        assert!(detail.attempts.is_empty());
+        delete_agent_release(&state, "test-admin", "test-admin-id", &fixture.release_id)
+            .await
+            .expect("orphaned instance attempt must not block release deletion");
+        assert!(!fixture.release_dir.exists());
         resources.cleanup().await;
     }
 

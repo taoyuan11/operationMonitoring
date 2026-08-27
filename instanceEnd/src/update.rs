@@ -472,10 +472,10 @@ fn installed_standalone_update_dir() -> Result<PathBuf> {
     let marker = standalone_install_marker().context("standalone install marker is missing")?;
     #[cfg(any(windows, target_os = "macos"))]
     {
-        return Ok(marker
+        Ok(marker
             .parent()
             .context("standalone install marker has no parent directory")?
-            .join("updates"));
+            .join("updates"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -490,11 +490,11 @@ fn installed_standalone_update_dir() -> Result<PathBuf> {
 fn installed_standalone_executable() -> Result<PathBuf> {
     #[cfg(windows)]
     {
-        return Ok(resolve_windows_update_service(None)?.0);
+        Ok(resolve_windows_update_service(None)?.0)
     }
     #[cfg(target_os = "macos")]
     {
-        return Ok(PathBuf::from("/usr/local/bin/om-agent"));
+        Ok(PathBuf::from("/usr/local/bin/om-agent"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -4162,11 +4162,11 @@ fn standalone_install_marker() -> Option<PathBuf> {
 fn standalone_native_arch() -> String {
     #[cfg(windows)]
     {
-        return windows_native_arch();
+        windows_native_arch()
     }
     #[cfg(target_os = "macos")]
     {
-        return normalize_macos_arch(std::env::consts::ARCH);
+        normalize_macos_arch(std::env::consts::ARCH)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -4177,11 +4177,11 @@ fn standalone_native_arch() -> String {
 fn standalone_target_os() -> &'static str {
     #[cfg(windows)]
     {
-        return "windows";
+        "windows"
     }
     #[cfg(target_os = "macos")]
     {
-        return "macos";
+        "macos"
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -4332,7 +4332,7 @@ fn stop_standalone_service(_plan: &ApplyPlan) -> Result<()> {
                 }
             }
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     {
@@ -4345,7 +4345,7 @@ fn stop_standalone_service(_plan: &ApplyPlan) -> Result<()> {
             ],
         };
         let _ = run_command_with_timeout(&spec, SERVICE_STOP_TIMEOUT, "standalone service stop")?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -4376,18 +4376,18 @@ fn stop_standalone_service(_plan: &ApplyPlan) -> Result<()> {
 fn standalone_restart_candidates() -> Vec<CommandSpec> {
     #[cfg(target_os = "macos")]
     {
-        return vec![CommandSpec {
+        vec![CommandSpec {
             program: "/bin/launchctl".into(),
             args: vec![
                 "bootstrap".into(),
                 "system".into(),
                 format!("/Library/LaunchDaemons/{MACOS_SERVICE_LABEL}.plist").into(),
             ],
-        }];
+        }]
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        return [SERVICE_NAME, LEGACY_SERVICE_NAME]
+        [SERVICE_NAME, LEGACY_SERVICE_NAME]
             .into_iter()
             .map(|service_name| {
                 if Path::new(&format!("/etc/init.d/{service_name}")).exists() {
@@ -4402,7 +4402,7 @@ fn standalone_restart_candidates() -> Vec<CommandSpec> {
                     }
                 }
             })
-            .collect();
+            .collect()
     }
 }
 

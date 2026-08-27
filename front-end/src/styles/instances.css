@@ -66,14 +66,16 @@
 .more-menu button.danger { color: var(--danger-text); }
 
 .instance-remark { margin: -4px 0 -2px; padding: 9px 10px; color: var(--muted); background: var(--panel-soft); border-left: 2px solid var(--line-strong); font-size: 12px; line-height: 1.5; }
-.lifecycle-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.lifecycle-item { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 10px 11px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; }
-.lifecycle-item > span { display: inline-flex; min-width: 0; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
-.lifecycle-item > span svg { flex: 0 0 auto; color: var(--accent-strong); }
-.lifecycle-item strong { overflow: hidden; color: var(--text-strong); font-size: 12px; font-weight: 650; text-align: right; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.lifecycle-item small { grid-column: 1 / -1; overflow: hidden; color: #77827d; font-size: 10px; text-align: right; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.lifecycle-item.expired { background: color-mix(in srgb, var(--danger) 8%, var(--panel-soft)); border-color: color-mix(in srgb, var(--danger) 34%, var(--line)); }
-.lifecycle-item.expired > span svg, .lifecycle-item.expired strong { color: var(--danger-text); }
+.lifecycle-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; padding: 11px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.lifecycle-item { display: flex; min-width: 0; min-height: 66px; flex-direction: column; gap: 5px; padding: 0 14px; }
+.lifecycle-item:first-child { padding-left: 0; }
+.lifecycle-item:last-child { padding-right: 0; }
+.lifecycle-item + .lifecycle-item { border-left: 1px solid var(--line); }
+.lifecycle-label { display: inline-flex; width: max-content; max-width: 100%; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 550; line-height: 1.3; white-space: nowrap; }
+.lifecycle-label svg { flex: 0 0 auto; color: var(--accent-strong); }
+.lifecycle-value { display: block; max-width: 100%; overflow: hidden; color: var(--text-strong); font-size: 14px; font-weight: 680; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.lifecycle-detail { display: block; max-width: 100%; overflow: hidden; margin-top: auto; color: #77827d; font-size: 10px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.lifecycle-item.expired .lifecycle-label svg, .lifecycle-item.expired .lifecycle-value { color: var(--danger-text); }
 .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 13px; background: var(--surface-inset); border: 1px solid var(--line); border-radius: 6px; }
 .metric { display: flex; min-width: 0; flex-direction: column; gap: 7px; --metric-color: #49c89f; }
 .metric:nth-child(2) { --metric-color: #55b8cf; }

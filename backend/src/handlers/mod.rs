@@ -658,6 +658,14 @@ pub async fn admin_delete_instance(
         .bind(&id)
         .execute(&mut *transaction)
         .await?;
+    sqlx::query("DELETE FROM agent_update_attempts WHERE instance_id = $1")
+        .bind(&id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM agent_release_targets WHERE instance_id = $1")
+        .bind(&id)
+        .execute(&mut *transaction)
+        .await?;
     let deleted = sqlx::query("DELETE FROM instances WHERE id = $1")
         .bind(&id)
         .execute(&mut *transaction)

@@ -723,14 +723,11 @@ function activeAttemptCount(release: AgentRelease) {
 
 function canDeleteRelease(release: AgentRelease) {
   return activeAttemptCount(release) === 0
-    && !attemptsFor(release).some((attempt) => attempt.operation === 'rollback')
 }
 
 function deleteReleaseTitle(release: AgentRelease) {
   const activeCount = activeAttemptCount(release)
   if (activeCount > 0) return `仍有 ${activeCount} 个实例更新未结束，暂不能删除`
-  const rollbackRecords = attemptsFor(release).filter((attempt) => attempt.operation === 'rollback').length
-  if (rollbackRecords > 0) return `仍有 ${rollbackRecords} 条回滚记录依赖此版本，暂不能删除`
   return release.status === 'published' ? '永久删除已发布版本' : '删除草稿'
 }
 

@@ -59,3 +59,25 @@ after the release gates pass, and verify each architecture:
 Formal Agent builds opt in with Cargo feature `bundled-windows-drivers` and
 `OM_WINDOWS_DRIVER_BUNDLE_DIR`. Ordinary builds remain physical-device-only and
 do not need the WDK or a driver bundle.
+
+## Local test Agent package
+
+For a disposable Windows test machine, build locally signed catalogs and an
+Agent that embeds them with the separate test-only feature:
+
+```powershell
+.\scripts\build-windows-test-agent.ps1 -Architecture x64
+```
+
+The script creates a temporary Current User code-signing certificate, signs and
+verifies both catalogs, builds and signs the test-only Agent, exports only the
+public certificate beside the Agent, and removes the temporary certificate from
+the Current User certificate stores. It does not enable Windows test-signing or
+restart the computer. The resulting filenames contain `test-only`, and the
+embedded lock remains `production_ready=false`; the production feature and
+`signtool verify /kp` release gate are unchanged.
+
+Loading these drivers requires a dedicated test machine whose Local Machine
+Root and Trusted Publishers stores trust the exported certificate, plus Windows
+test-signing mode and a restart. Do not make those system-wide changes on a
+production or Secure Boot host.

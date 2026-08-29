@@ -359,7 +359,7 @@ struct LogFollower {
 impl LogFollower {
     fn open(path: PathBuf) -> io::Result<Self> {
         let file = File::open(&path)?;
-        let identity = file_identity(&file.metadata()?);
+        let identity = file_identity(&file)?;
         Ok(Self {
             path,
             file,
@@ -369,8 +369,8 @@ impl LogFollower {
     }
 
     fn copy_available(&mut self, output: &mut impl Write) -> io::Result<()> {
-        match fs::metadata(&self.path) {
-            Ok(metadata) if file_identity(&metadata) != self.identity => self.reopen()?,
+        match path_file_identity(&self.path) {
+            Ok(identity) if identity != self.identity => self.reopen()?,
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
@@ -387,7 +387,7 @@ impl LogFollower {
 
     fn reopen(&mut self) -> io::Result<()> {
         let file = File::open(&self.path)?;
-        self.identity = file_identity(&file.metadata()?);
+        self.identity = file_identity(&file)?;
         self.file = file;
         self.position = 0;
         Ok(())
@@ -402,24 +402,59 @@ struct FileIdentity {
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
 
-    FileIdentity {
+    let metadata = file.metadata()?;
+    Ok(FileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
-    }
+    })
 }
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileIdentity(u64);
+struct FileIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
 
 #[cfg(windows)]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    use std::os::windows::fs::MetadataExt;
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::{
+        Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        },
+        core::Error,
+    };
 
-    FileIdentity(metadata.creation_time())
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }
+        .map_err(|error: Error| io::Error::other(error))?;
+    Ok(FileIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(unix)]
+fn path_file_identity(path: &Path) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path)?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn path_file_identity(path: &Path) -> io::Result<FileIdentity> {
+    let file = File::open(path)?;
+    file_identity(&file)
 }
 
 #[cfg(unix)]

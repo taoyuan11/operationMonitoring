@@ -19,6 +19,7 @@ path = "src/main.rs"
 [features]
 default = []
 bundled-windows-drivers = []
+bundled-windows-test-drivers = []
 
 [dependencies]
 anyhow = "1.0.104"

@@ -22,7 +22,10 @@ function Find-MSBuild {
     if ($null -ne $Command) { return $Command.Source }
     $VsWhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (-not (Test-Path -LiteralPath $VsWhere -PathType Leaf)) { throw 'MSBuild not found; install Visual Studio 2022 with the WDK workload' }
-    $Path = & $VsWhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+    $Path = & $VsWhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $Path = & $VsWhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+    }
     if ([string]::IsNullOrWhiteSpace($Path)) { throw 'MSBuild not found through vswhere' }
     return $Path
 }
@@ -32,11 +35,38 @@ function Find-WdkTool {
     $Command = Get-Command $Name -ErrorAction SilentlyContinue
     if ($null -ne $Command) { return $Command.Source }
     $KitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-    $Candidate = Get-ChildItem -LiteralPath $KitsRoot -Directory -ErrorAction Stop |
-        Sort-Object Name -Descending |
-        ForEach-Object { Join-Path $_.FullName "x64\$Name" } |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-        Select-Object -First 1
+    $ToolsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Tools'
+    $SearchRoots = @($KitsRoot, $ToolsRoot) | Where-Object {
+        Test-Path -LiteralPath $_ -PathType Container
+    }
+    $Candidates = foreach ($SearchRoot in $SearchRoots) {
+        Get-ChildItem -LiteralPath $SearchRoot -Recurse -Filter $Name -File -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $ArchitectureRank = if ($_.FullName -match '\\x64\\') {
+                    0
+                } elseif ($_.FullName -match '\\x86\\') {
+                    1
+                } else {
+                    2
+                }
+                $WdkVersion = [version]'0.0.0.0'
+                if ($_.FullName -match '\\(?<wdkVersion>\d+(?:\.\d+){3})\\') {
+                    $WdkVersion = [version]$Matches['wdkVersion']
+                }
+                [pscustomobject]@{
+                    Path = $_.FullName
+                    ArchitectureRank = $ArchitectureRank
+                    WdkVersion = $WdkVersion
+                }
+            }
+    }
+    $Candidate = $Candidates |
+        Sort-Object `
+            ArchitectureRank, `
+            @{ Expression = { $_.WdkVersion }; Descending = $true }, `
+            Path |
+        Select-Object -First 1 |
+        Select-Object -ExpandProperty Path
     if ([string]::IsNullOrWhiteSpace($Candidate)) { throw "$Name not found in the Windows Driver Kit" }
     return $Candidate
 }
@@ -50,9 +80,9 @@ function Copy-DriverPackage {
     $AudioRoot = Join-Path $ArchRoot 'audio'
     New-Item -ItemType Directory -Force -Path $DisplayRoot, $AudioRoot | Out-Null
 
-    Copy-Item -LiteralPath (Join-Path $DriverRoot 'virtual-display\OmVirtualDisplay.inf') -Destination $DisplayRoot -Force
+    Copy-Item -LiteralPath (Join-Path $BuildRoot 'OmVirtualDisplay\OmVirtualDisplay.inf') -Destination $DisplayRoot -Force
     Copy-Item -LiteralPath (Join-Path $BuildRoot 'OmVirtualDisplay\OmVirtualDisplay.dll') -Destination $DisplayRoot -Force
-    Copy-Item -LiteralPath (Join-Path $DriverRoot 'virtual-audio\OmVirtualAudio.inf') -Destination $AudioRoot -Force
+    Copy-Item -LiteralPath (Join-Path $BuildRoot 'OmVirtualAudio\OmVirtualAudio.inf') -Destination $AudioRoot -Force
     Copy-Item -LiteralPath (Join-Path $BuildRoot 'OmVirtualAudio\OmVirtualAudio.sys') -Destination $AudioRoot -Force
 
     foreach ($PackageRoot in @($DisplayRoot, $AudioRoot)) {
@@ -89,6 +119,12 @@ function New-DraftPackage {
     $TitleKind = (Get-Culture).TextInfo.ToTitleCase($Kind)
     $BaseName = "OmVirtual$TitleKind"
     $HardwareId = if ($Kind -eq 'display') { 'ROOT\OMVIRTUALDISPLAY' } else { 'ROOT\OMVIRTUALAUDIO' }
+    $InfPath = Join-Path $PackageRoot "$BaseName.inf"
+    $InfText = Get-Content -LiteralPath $InfPath -Raw
+    if ($InfText -notmatch '(?im)^\s*DriverVer\s*=\s*[^,]+,\s*([0-9]+(?:\.[0-9]+){3})\s*$') {
+        throw "Unable to read DriverVer from $InfPath"
+    }
+    $DriverVersion = $Matches[1]
     $Files = @("$BaseName.inf", "$BaseName.cat", $PayloadName) | ForEach-Object {
         $FilePath = Join-Path $PackageRoot $_
         [ordered]@{
@@ -98,7 +134,7 @@ function New-DraftPackage {
     }
     return [ordered]@{
         kind = $Kind
-        driver_version = '1.0.0.0'
+        driver_version = $DriverVersion
         hardware_id = $HardwareId
         catalog_path = "$Arch/$Kind/$BaseName.cat"
         files = $Files
@@ -109,10 +145,14 @@ function New-SubmissionCab {
     param([string]$ArchRoot, [string]$OutputRoot, [string]$Arch)
     $DdfPath = Join-Path $OutputRoot "submission-$Arch.ddf"
     $CabName = "om-windows-drivers-$Arch-unsigned.cab"
+    $InfName = Join-Path $OutputRoot "submission-$Arch.inf"
+    $ReportName = Join-Path $OutputRoot "submission-$Arch.rpt"
     $Lines = @(
         '.OPTION EXPLICIT',
         ".Set CabinetNameTemplate=$CabName",
         ".Set DiskDirectoryTemplate=`"$OutputRoot`"",
+        ".Set InfFileName=`"$InfName`"",
+        ".Set RptFileName=`"$ReportName`"",
         '.Set CompressionType=MSZIP',
         '.Set Cabinet=on',
         '.Set Compress=on'
@@ -250,9 +290,11 @@ foreach ($Target in $Platforms) {
     Invoke-CheckedNative -FilePath $MSBuild -Arguments @(
         $Solution,
         '/m',
+        '/nr:false',
         '/t:Build',
         "/p:Configuration=$Configuration",
         "/p:Platform=$($Target.Platform)",
+        '/p:Inf2CatUseLocalTime=true',
         '/p:SignMode=Off'
     )
     Copy-DriverPackage -Platform $Target.Platform -NativeArch $Target.NativeArch -OutputRoot $OutputDirectory

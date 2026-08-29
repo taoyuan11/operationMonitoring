@@ -1,6 +1,7 @@
 param(
     [Parameter(Position = 0)][string]$RustTarget = 'windows',
-    [Parameter(Position = 1)][string]$NativeArchitecture
+    [Parameter(Position = 1)][string]$NativeArchitecture,
+    [switch]$TestWindowsDrivers
 )
 
 $ErrorActionPreference = 'Stop'
@@ -175,6 +176,34 @@ function Invoke-WindowsArtifactSigning {
     }
 }
 
+function Invoke-WindowsTestArtifactSigning {
+    param([Parameter(Mandatory = $true)][string]$Artifact)
+
+    $Thumbprint = "$($env:OM_WINDOWS_TEST_SIGNING_CERTIFICATE_SHA1)".Replace(' ', '')
+    if ($Thumbprint -notmatch '^[0-9A-Fa-f]{40}$') {
+        throw 'OM_WINDOWS_TEST_SIGNING_CERTIFICATE_SHA1 must be a 40-digit SHA-1 certificate thumbprint'
+    }
+    $Signtool = if ([string]::IsNullOrWhiteSpace($env:OM_SIGNTOOL_PATH)) {
+        'signtool.exe'
+    } else {
+        $env:OM_SIGNTOOL_PATH
+    }
+    $SignResult = Invoke-NativeCommand `
+        -FilePath $Signtool `
+        -ArgumentList @('sign', '/sha1', $Thumbprint, '/fd', 'SHA256', $Artifact) `
+        -EchoOutput
+    if ($SignResult.ExitCode -ne 0) {
+        throw "Test-only Authenticode signing failed with status $($SignResult.ExitCode)"
+    }
+    $VerifyResult = Invoke-NativeCommand `
+        -FilePath $Signtool `
+        -ArgumentList @('verify', '/pa', '/all', '/v', '/sha1', $Thumbprint, $Artifact) `
+        -EchoOutput
+    if ($VerifyResult.ExitCode -ne 0) {
+        throw "Test-only Authenticode verification failed with status $($VerifyResult.ExitCode)"
+    }
+}
+
 function Build-StandaloneTarget {
     param(
         [string]$Target,
@@ -182,18 +211,40 @@ function Build-StandaloneTarget {
         [string]$Architecture
     )
 
-    $BundleDrivers =
+    $ProductionBundleDrivers =
         $OS -eq 'windows' -and
         $Architecture -in @('x64', 'arm64') -and
         -not [string]::IsNullOrWhiteSpace($env:OM_WINDOWS_DRIVER_BUNDLE_DIR)
+    $TestBundleDrivers =
+        $OS -eq 'windows' -and
+        $Architecture -in @('x64', 'arm64') -and
+        $TestWindowsDrivers
+    if ($TestWindowsDrivers -and -not $TestBundleDrivers) {
+        throw 'TestWindowsDrivers is only supported for explicit Windows x64 or arm64 targets'
+    }
+    if ($ProductionBundleDrivers -and $TestBundleDrivers) {
+        throw 'Production and test-only Windows driver bundles cannot be selected together'
+    }
+    if ($TestBundleDrivers) {
+        if ([string]::IsNullOrWhiteSpace($env:OM_WINDOWS_TEST_DRIVER_BUNDLE_DIR)) {
+            throw 'OM_WINDOWS_TEST_DRIVER_BUNDLE_DIR is required with -TestWindowsDrivers'
+        }
+        if ("$($env:OM_WINDOWS_TEST_SIGNING_CERTIFICATE_SHA1)".Replace(' ', '') -notmatch '^[0-9A-Fa-f]{40}$') {
+            throw 'OM_WINDOWS_TEST_SIGNING_CERTIFICATE_SHA1 is required with -TestWindowsDrivers'
+        }
+        Write-Warning 'Building a test-only Agent with locally signed drivers. This artifact is not production deployable.'
+    }
+    $BundleDrivers = $ProductionBundleDrivers -or $TestBundleDrivers
     if ($BundleDrivers) {
         if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
-            throw 'Bundled Windows driver releases must be built on Windows so signtool /kp can enforce kernel signing policy'
+            throw 'Bundled Windows driver artifacts must be built on Windows so signtool can enforce the selected signing policy'
         }
-        & $DriverBundleVerifier `
-            -BundleDir $env:OM_WINDOWS_DRIVER_BUNDLE_DIR `
-            -Architecture $Architecture `
-            -SigntoolPath $env:OM_SIGNTOOL_PATH | Format-List | Out-Host
+        if ($ProductionBundleDrivers) {
+            & $DriverBundleVerifier `
+                -BundleDir $env:OM_WINDOWS_DRIVER_BUNDLE_DIR `
+                -Architecture $Architecture `
+                -SigntoolPath $env:OM_SIGNTOOL_PATH | Format-List | Out-Host
+        }
     }
 
     $Builder = $RequestedBuilder
@@ -245,8 +296,10 @@ function Build-StandaloneTarget {
         $Target
     }
     $CargoArguments += @('--locked', '--release', '--target', $CargoTarget, '--bin', 'om-agent')
-    if ($BundleDrivers) {
+    if ($ProductionBundleDrivers) {
         $CargoArguments += @('--features', 'bundled-windows-drivers')
+    } elseif ($TestBundleDrivers) {
+        $CargoArguments += @('--features', 'bundled-windows-test-drivers')
     }
 
     Write-Host "Building $OS/$Architecture ($CargoTarget) with $Builder"
@@ -289,10 +342,15 @@ function Build-StandaloneTarget {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Built executable not found: $Source" }
 
     New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
-    $Artifact = Join-Path $OutputDirectory "om-agent_${Version}_${OS}_${Architecture}.$Extension"
+    $ArtifactMarker = if ($TestBundleDrivers) { '_test-only' } else { '' }
+    $Artifact = Join-Path $OutputDirectory "om-agent_${Version}_${OS}_${Architecture}${ArtifactMarker}.$Extension"
     Copy-Item -LiteralPath $Source -Destination $Artifact -Force
     if ($OS -eq 'windows') {
-        Invoke-WindowsArtifactSigning -Artifact $Artifact -RequireSignature $BundleDrivers
+        if ($TestBundleDrivers) {
+            Invoke-WindowsTestArtifactSigning -Artifact $Artifact
+        } else {
+            Invoke-WindowsArtifactSigning -Artifact $Artifact -RequireSignature $ProductionBundleDrivers
+        }
     }
     $Hash = (Get-FileHash -LiteralPath $Artifact -Algorithm SHA256).Hash.ToLowerInvariant()
     "$Hash  $([IO.Path]::GetFileName($Artifact))" | Set-Content -LiteralPath "$Artifact.sha256" -Encoding ascii
@@ -301,6 +359,9 @@ function Build-StandaloneTarget {
 }
 
 if ($RustTarget -ieq 'all' -or $RustTarget -ieq 'windows') {
+    if ($TestWindowsDrivers) {
+        throw 'Use an explicit x86_64-pc-windows-msvc or aarch64-pc-windows-msvc target with -TestWindowsDrivers'
+    }
     if (-not [string]::IsNullOrWhiteSpace($NativeArchitecture)) {
         throw 'NativeArchitecture must be omitted when RustTarget is all or windows'
     }

@@ -263,7 +263,7 @@ class CAdapterCommon :
         _In_opt_ PCWSTR                                             TemplateReferenceString,
         _In_ ULONG                                                  cPropertyCount,
         _In_reads_opt_(cPropertyCount) const SIMPLEAUDIOSAMPLE_DEVPROPERTY        *pProperties,
-        _Out_ _At_(AudioSymbolicLinkName->Buffer, __drv_allocatesMem(Mem)) PUNICODE_STRING AudioSymbolicLinkName
+        _Out_ PUNICODE_STRING AudioSymbolicLinkName
     );
 
     NTSTATUS MigrateDeviceInterfaceTemplateParameters
@@ -1401,7 +1401,7 @@ CAdapterCommon::CreateAudioInterfaceWithProperties
     _In_opt_ PCWSTR TemplateReferenceString,
     _In_ ULONG cPropertyCount,
     _In_reads_opt_(cPropertyCount) const SIMPLEAUDIOSAMPLE_DEVPROPERTY *pProperties,
-    _Out_ _At_(AudioSymbolicLinkName->Buffer, __drv_allocatesMem(Mem)) PUNICODE_STRING AudioSymbolicLinkName
+    _Out_ PUNICODE_STRING AudioSymbolicLinkName
 )
 /*++
 
@@ -2731,6 +2731,7 @@ Return Value:
         &KSCATEGORY_AUDIO,
         &referenceString,
         &TemplateSymbolicLinkName);
+    IF_FAILED_JUMP(ntStatus, Exit);
 
     // Open the template device interface's registry key path
     ntStatus = IoOpenDeviceInterfaceRegistryKey(&TemplateSymbolicLinkName, GENERIC_READ, &hTemplateDeviceInterfaceParametersKey);

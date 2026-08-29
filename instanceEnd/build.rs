@@ -13,8 +13,16 @@ use std::{
 const PUBLIC_KEY_ENV: &str = "OM_UPDATE_PUBLIC_KEY";
 const KEY_ID_ENV: &str = "OM_UPDATE_PUBLIC_KEY_ID";
 const DRIVER_BUNDLE_ENV: &str = "OM_WINDOWS_DRIVER_BUNDLE_DIR";
+const TEST_DRIVER_BUNDLE_ENV: &str = "OM_WINDOWS_TEST_DRIVER_BUNDLE_DIR";
+const TEST_SIGNING_CERTIFICATE_ENV: &str = "OM_WINDOWS_TEST_SIGNING_CERTIFICATE_SHA1";
 const SIGNTOOL_ENV: &str = "OM_SIGNTOOL_PATH";
 const DRIVER_PROVIDER: &str = "Operation Monitoring";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriverBundleMode {
+    Production,
+    Test,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +78,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed={PUBLIC_KEY_ENV}");
     println!("cargo:rerun-if-env-changed={KEY_ID_ENV}");
     println!("cargo:rerun-if-env-changed={DRIVER_BUNDLE_ENV}");
+    println!("cargo:rerun-if-env-changed={TEST_DRIVER_BUNDLE_ENV}");
+    println!("cargo:rerun-if-env-changed={TEST_SIGNING_CERTIFICATE_ENV}");
     println!("cargo:rerun-if-env-changed={SIGNTOOL_ENV}");
 
     let public_key = std::env::var(PUBLIC_KEY_ENV).ok();
@@ -108,42 +118,72 @@ fn generate_windows_driver_assets() {
     let output_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is not set"));
     let generated_path = output_dir.join("windows_driver_assets.rs");
 
-    if std::env::var_os("CARGO_FEATURE_BUNDLED_WINDOWS_DRIVERS").is_none() {
-        fs::write(generated_path, empty_windows_driver_assets())
-            .expect("failed to generate empty Windows driver assets module");
-        return;
-    }
+    let production_feature = std::env::var_os("CARGO_FEATURE_BUNDLED_WINDOWS_DRIVERS").is_some();
+    let test_feature = std::env::var_os("CARGO_FEATURE_BUNDLED_WINDOWS_TEST_DRIVERS").is_some();
+    assert!(
+        !(production_feature && test_feature),
+        "bundled-windows-drivers and bundled-windows-test-drivers are mutually exclusive"
+    );
+    let mode = match (production_feature, test_feature) {
+        (false, false) => {
+            fs::write(generated_path, empty_windows_driver_assets())
+                .expect("failed to generate empty Windows driver assets module");
+            return;
+        }
+        (true, false) => DriverBundleMode::Production,
+        (false, true) => DriverBundleMode::Test,
+        (true, true) => unreachable!(),
+    };
+    let feature_name = match mode {
+        DriverBundleMode::Production => "bundled-windows-drivers",
+        DriverBundleMode::Test => "bundled-windows-test-drivers",
+    };
+    let bundle_env = match mode {
+        DriverBundleMode::Production => DRIVER_BUNDLE_ENV,
+        DriverBundleMode::Test => TEST_DRIVER_BUNDLE_ENV,
+    };
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     assert_eq!(
         target_os, "windows",
-        "bundled-windows-drivers is only supported for Windows targets"
+        "{feature_name} is only supported for Windows targets"
     );
     let architecture = match target_arch.as_str() {
         "x86_64" => "x64",
         "aarch64" => "arm64",
-        _ => panic!("bundled-windows-drivers only supports Windows x86_64 and aarch64 targets"),
+        _ => panic!("{feature_name} only supports Windows x86_64 and aarch64 targets"),
     };
     assert_eq!(
         std::env::consts::OS,
         "windows",
-        "bundled-windows-drivers must be built on Windows so signtool /kp can verify the Microsoft-signed catalogs"
+        "{feature_name} must be built on Windows so signtool can verify the driver catalogs"
     );
 
-    let bundle_dir =
-        PathBuf::from(std::env::var_os(DRIVER_BUNDLE_ENV).unwrap_or_else(|| {
-            panic!("{DRIVER_BUNDLE_ENV} is required by bundled-windows-drivers")
-        }))
-        .canonicalize()
-        .unwrap_or_else(|error| panic!("failed to resolve {DRIVER_BUNDLE_ENV}: {error}"));
+    let bundle_dir = PathBuf::from(
+        std::env::var_os(bundle_env)
+            .unwrap_or_else(|| panic!("{bundle_env} is required by {feature_name}")),
+    )
+    .canonicalize()
+    .unwrap_or_else(|error| panic!("failed to resolve {bundle_env}: {error}"));
     let lock_path = bundle_dir.join("bundle-lock.json");
     println!("cargo:rerun-if-changed={}", lock_path.display());
     let lock_bytes = fs::read(&lock_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", lock_path.display()));
     let lock: DriverBundleLock = serde_json::from_slice(&lock_bytes)
         .unwrap_or_else(|error| panic!("invalid {}: {error}", lock_path.display()));
-    validate_bundle_metadata(&lock, architecture);
+    validate_bundle_metadata(&lock, architecture, mode);
+
+    let test_signing_certificate = match mode {
+        DriverBundleMode::Production => None,
+        DriverBundleMode::Test => {
+            let thumbprint = std::env::var(TEST_SIGNING_CERTIFICATE_ENV).unwrap_or_else(|_| {
+                panic!("{TEST_SIGNING_CERTIFICATE_ENV} is required by bundled-windows-test-drivers")
+            });
+            validate_certificate_thumbprint(&thumbprint);
+            Some(thumbprint)
+        }
+    };
 
     let selected = lock
         .architectures
@@ -264,9 +304,14 @@ fn generate_windows_driver_assets() {
             expected_driver_payload_name(&package.kind)
         );
         let catalog_path = bundle_dir.join(&package.catalog_path);
-        verify_catalog_signature(&catalog_path);
+        verify_catalog_signature(&catalog_path, mode, test_signing_certificate.as_deref());
         for member_path in catalog_members {
-            verify_catalog_membership(&catalog_path, &member_path);
+            verify_catalog_membership(
+                &catalog_path,
+                &member_path,
+                mode,
+                test_signing_certificate.as_deref(),
+            );
         }
         packages.push(EmbeddedDriverPackage {
             kind: package.kind.clone(),
@@ -301,12 +346,18 @@ fn encode_lower_hex(bytes: impl AsRef<[u8]>) -> String {
     encoded
 }
 
-fn validate_bundle_metadata(lock: &DriverBundleLock, architecture: &str) {
+fn validate_bundle_metadata(lock: &DriverBundleLock, architecture: &str, mode: DriverBundleMode) {
     assert_eq!(lock.schema_version, 1, "unsupported driver bundle schema");
-    assert!(
-        lock.production_ready,
-        "driver bundle is marked production_ready=false; development scaffold packages cannot be embedded"
-    );
+    match mode {
+        DriverBundleMode::Production => assert!(
+            lock.production_ready,
+            "driver bundle is marked production_ready=false; development scaffold packages cannot be embedded by the production feature"
+        ),
+        DriverBundleMode::Test => assert!(
+            !lock.production_ready,
+            "the test-only feature refuses production_ready=true bundles"
+        ),
+    }
     assert_eq!(
         lock.provider, DRIVER_PROVIDER,
         "driver bundle provider must be {DRIVER_PROVIDER}"
@@ -690,36 +741,79 @@ fn driver_file_kind(path: &str) -> &'static str {
     }
 }
 
-fn verify_catalog_signature(catalog_path: &Path) {
+fn validate_certificate_thumbprint(value: &str) {
+    assert!(
+        value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{TEST_SIGNING_CERTIFICATE_ENV} must be a 40-digit SHA-1 certificate thumbprint"
+    );
+}
+
+fn verify_catalog_signature(
+    catalog_path: &Path,
+    mode: DriverBundleMode,
+    test_signing_certificate: Option<&str>,
+) {
     let signtool = std::env::var_os(SIGNTOOL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("signtool.exe"));
-    let output = Command::new(&signtool)
-        .args(["verify", "/kp", "/all", "/v"])
-        .arg(catalog_path)
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to start {} for {}: {error}",
-                signtool.display(),
-                catalog_path.display()
-            )
-        });
+    let mut command = Command::new(&signtool);
+    command.args(["verify"]);
+    match mode {
+        DriverBundleMode::Production => {
+            command.args(["/kp", "/all", "/v"]);
+        }
+        DriverBundleMode::Test => {
+            command.args([
+                "/pa",
+                "/all",
+                "/v",
+                "/sha1",
+                test_signing_certificate.expect("test signing certificate is missing"),
+            ]);
+        }
+    }
+    let output = command.arg(catalog_path).output().unwrap_or_else(|error| {
+        panic!(
+            "failed to start {} for {}: {error}",
+            signtool.display(),
+            catalog_path.display()
+        )
+    });
     assert!(
         output.status.success(),
-        "signtool /kp rejected {}: {}{}",
+        "signtool rejected {} in {mode:?} mode: {}{}",
         catalog_path.display(),
         String::from_utf8_lossy(&output.stdout).trim(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
 }
 
-fn verify_catalog_membership(catalog_path: &Path, member_path: &Path) {
+fn verify_catalog_membership(
+    catalog_path: &Path,
+    member_path: &Path,
+    mode: DriverBundleMode,
+    test_signing_certificate: Option<&str>,
+) {
     let signtool = std::env::var_os(SIGNTOOL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("signtool.exe"));
-    let output = Command::new(&signtool)
-        .args(["verify", "/kp", "/v", "/c"])
+    let mut command = Command::new(&signtool);
+    command.args(["verify"]);
+    match mode {
+        DriverBundleMode::Production => {
+            command.args(["/kp", "/v"]);
+        }
+        DriverBundleMode::Test => {
+            command.args([
+                "/pa",
+                "/v",
+                "/sha1",
+                test_signing_certificate.expect("test signing certificate is missing"),
+            ]);
+        }
+    }
+    let output = command
+        .arg("/c")
         .arg(catalog_path)
         .arg(member_path)
         .output()

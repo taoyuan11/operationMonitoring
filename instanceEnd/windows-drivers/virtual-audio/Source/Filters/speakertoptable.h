@@ -135,14 +135,14 @@ DEFINE_PCAUTOMATION_TABLE_PROP(AutomationSpeakerMute, SpeakerPropertiesMute);
 static
 PCNODE_DESCRIPTOR SpeakerTopologyNodes[] =
 {
-    // KSNODE_TOPO_VOLUME
+    // KSNODE_TOPO_WAVEOUT_VOLUME
     {
       0,                              // Flags
       &AutomationSpeakerVolume,     // AutomationTable
       &KSNODETYPE_VOLUME,             // Type
       &KSAUDFNAME_MASTER_VOLUME         // Name
     },
-    // KSNODE_TOPO_MUTE
+    // KSNODE_TOPO_WAVEOUT_MUTE
     {
       0,                              // Flags
       &AutomationSpeakerMute,       // AutomationTable
@@ -151,16 +151,16 @@ PCNODE_DESCRIPTOR SpeakerTopologyNodes[] =
     }
 };
 
-C_ASSERT(KSNODE_TOPO_VOLUME == 0);
-C_ASSERT(KSNODE_TOPO_MUTE == 1);
+C_ASSERT(KSNODE_TOPO_WAVEOUT_VOLUME == 0);
+C_ASSERT(KSNODE_TOPO_WAVEOUT_MUTE == 1);
 
 static
 PCCONNECTION_DESCRIPTOR SpeakerTopoMiniportConnections[] =
 {
     //  FromNode,                 FromPin,                    ToNode,                 ToPin
-    {   PCFILTER_NODE,            KSPIN_TOPO_WAVEOUT_SOURCE,    KSNODE_TOPO_VOLUME,     1 },
-    {   KSNODE_TOPO_VOLUME,       0,                          KSNODE_TOPO_MUTE,       1 },
-    {   KSNODE_TOPO_MUTE,         0,                          PCFILTER_NODE,          KSPIN_TOPO_LINEOUT_DEST }
+    {   PCFILTER_NODE,               KSPIN_TOPO_WAVEOUT_SOURCE, KSNODE_TOPO_WAVEOUT_VOLUME, 1 },
+    {   KSNODE_TOPO_WAVEOUT_VOLUME,  0,                         KSNODE_TOPO_WAVEOUT_MUTE,   1 },
+    {   KSNODE_TOPO_WAVEOUT_MUTE,    0,                         PCFILTER_NODE,               KSPIN_TOPO_LINEOUT_DEST }
 };
 
 //=============================================================================

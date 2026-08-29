@@ -210,6 +210,7 @@ Arguments:
 --*/
 {
     UNREFERENCED_PARAMETER(PinId);
+    UNREFERENCED_PARAMETER(ResultantFormat);
 
     ULONG                   requiredSize;
 

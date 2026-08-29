@@ -1185,7 +1185,6 @@ VOID CMiniportWaveRTStream::UpdatePosition
     m_ullPresentationPosition += ByteDisplacement;
 
     {
-    {
 
         if (m_bEoSReceived)
         {
@@ -1232,7 +1231,7 @@ VOID CMiniportWaveRTStream::UpdatePosition
 }
 
 //=============================================================================
-#pragma code_seg()
+#pragma code_seg("PAGE")
 STDMETHODIMP_(NTSTATUS) 
 CMiniportWaveRTStream::SetContentId
 (

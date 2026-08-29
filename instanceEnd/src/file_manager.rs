@@ -1013,7 +1013,37 @@ fn rename_without_replacement(source: &Path, destination: &Path) -> io::Result<(
 
 #[cfg(windows)]
 fn rename_without_replacement(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
+        core::PCWSTR,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| {
+        let code = error.code().0 as u32;
+        if code & 0xffff_0000 == 0x8007_0000 {
+            io::Error::from_raw_os_error((code & 0xffff) as i32)
+        } else {
+            io::Error::other(error)
+        }
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

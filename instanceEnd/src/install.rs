@@ -5,6 +5,10 @@ use crate::{
     lifecycle::stop_if_running,
 };
 use anyhow::{Context, Result, bail};
+#[cfg(windows)]
+use base64::Engine;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::{
     env, fs,
     io::{self, IsTerminal, Write},
@@ -106,11 +110,18 @@ pub fn uninstall(config: AgentConfig, yes: bool) -> Result<()> {
             bail!("uninstall cancelled");
         }
     }
-    stop_if_running(&config, 10).context("failed to stop background agent before uninstall")?;
-    if !is_elevated() {
+    let elevated = is_elevated();
+    if should_stop_user_agent_before_uninstall(elevated) {
+        stop_if_running(&config, 10).context("failed to stop background agent before uninstall")?;
+    }
+    if !elevated {
         return elevate("uninstall", None);
     }
     uninstall_elevated()
+}
+
+fn should_stop_user_agent_before_uninstall(elevated: bool) -> bool {
+    !elevated || !cfg!(windows)
 }
 
 pub fn run_service(mut config: AgentConfig) -> Result<()> {
@@ -1601,20 +1612,50 @@ fn uninstall_windows() -> Result<()> {
             data.display()
         );
     }
-    let mut cleanup = String::from("ping 127.0.0.1 -n 3 >nul");
-    for command in windows_command_paths()? {
-        cleanup.push_str(&format!(" & del /F /Q \"{}\" >nul 2>&1", command.display()));
-    }
-    cleanup.push_str(&format!(
-        " & rmdir /S /Q \"{}\" >nul 2>&1 & rmdir /S /Q \"{}\" >nul 2>&1",
-        install.display(),
-        legacy_install.display()
-    ));
-    Command::new("cmd.exe")
-        .args(["/D", "/S", "/C", &cleanup])
+    let cleanup = windows_cleanup_script(
+        std::process::id(),
+        &windows_command_paths()?,
+        &[install, legacy_install],
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(
+        cleanup
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-EncodedCommand",
+            &encoded,
+        ])
         .spawn()
         .context("failed to schedule Windows uninstall cleanup")?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_cleanup_script(parent_pid: u32, files: &[PathBuf], directories: &[PathBuf]) -> String {
+    fn powershell_literal(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+    }
+
+    let files = files
+        .iter()
+        .map(|path| powershell_literal(path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let directories = directories
+        .iter()
+        .map(|path| powershell_literal(path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "$parent = {parent_pid}; while (Get-Process -Id $parent -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }}; $files = @({files}); $directories = @({directories}); for ($attempt = 0; $attempt -lt 30; $attempt++) {{ foreach ($path in $files) {{ Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }}; foreach ($path in $directories) {{ Remove-Item -LiteralPath $path -Force -Recurse -ErrorAction SilentlyContinue }}; if ((@($files + $directories | Where-Object {{ Test-Path -LiteralPath $_ }})).Count -eq 0) {{ break }}; Start-Sleep -Milliseconds 200 }}"
+    )
 }
 #[cfg(windows)]
 fn windows_path(path: &Path, add: bool) -> Result<()> {
@@ -1981,14 +2022,41 @@ const MACOS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUB
 mod tests {
     #[cfg(windows)]
     use super::install_windows_command_entry;
+    #[cfg(windows)]
+    use super::windows_cleanup_script;
     use super::{
         explicit_windows_install_path_override, migrate_path, parse_windows_ready_pid,
-        update_windows_path, validate_unattended_install_confirmation,
-        windows_command_paths_from_root, windows_elevation_arguments,
-        windows_install_service_names,
+        should_stop_user_agent_before_uninstall, update_windows_path,
+        validate_unattended_install_confirmation, windows_command_paths_from_root,
+        windows_elevation_arguments, windows_install_service_names,
     };
     use crate::config::AgentConfig;
     use std::fs;
+
+    #[test]
+    fn elevated_uninstall_does_not_recheck_the_user_runtime_directory() {
+        assert!(should_stop_user_agent_before_uninstall(false));
+        assert_eq!(
+            should_stop_user_agent_before_uninstall(true),
+            !cfg!(windows)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_waits_for_parent_and_retries_path_removal() {
+        let script = windows_cleanup_script(
+            42,
+            &[std::path::PathBuf::from(
+                r"C:\Windows\System32\om-agent.exe",
+            )],
+            &[std::path::PathBuf::from(r"C:\Program Files\OM Agent")],
+        );
+
+        assert!(script.contains("Get-Process -Id $parent"));
+        assert!(script.contains("for ($attempt = 0; $attempt -lt 30; $attempt++)"));
+        assert!(script.contains("C:\\Program Files\\OM Agent"));
+    }
 
     #[test]
     fn migration_merges_legacy_data_without_overwriting_current_files() {

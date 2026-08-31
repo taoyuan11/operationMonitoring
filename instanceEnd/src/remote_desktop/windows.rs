@@ -723,13 +723,13 @@ struct DeviceProbeClient {
 impl DeviceProbeClient {
     fn connect(session_id: u32) -> Result<Self> {
         let pipe_name = format!(r"\\.\pipe\om-device-probe-{}", Uuid::new_v4());
-        let pipe = create_private_pipe(&pipe_name, LOCAL_SYSTEM_SID)?;
-        let mut process = spawn_device_probe_in_session(&pipe_name, session_id)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
             .build()
             .context("device_probe_failed")?;
+        let pipe = create_device_probe_pipe(&runtime, &pipe_name)?;
+        let mut process = spawn_device_probe_in_session(&pipe_name, session_id)?;
         let connected = runtime.block_on(async {
             tokio::time::timeout(DEVICE_PROBE_TIMEOUT, pipe.connect())
                 .await
@@ -773,6 +773,16 @@ impl DeviceProbeClient {
         snapshot.validate(self.session_id)?;
         Ok(snapshot)
     }
+}
+
+fn create_device_probe_pipe(
+    runtime: &tokio::runtime::Runtime,
+    pipe_name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    // Named pipes register with the I/O runtime that is current at creation.
+    // The service coordinator runs on a plain thread, so enter the client-owned runtime.
+    let _runtime_guard = runtime.enter();
+    create_private_pipe(pipe_name, LOCAL_SYSTEM_SID)
 }
 
 pub async fn run_device_probe(pipe_name: &str) -> Result<()> {
@@ -3335,6 +3345,26 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_probe_pipe_creation_enters_client_runtime() {
+        let result = std::thread::spawn(|| -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()?;
+            let pipe_name = format!(r"\\.\pipe\om-device-probe-test-{}", Uuid::new_v4());
+            drop(create_device_probe_pipe(&runtime, &pipe_name)?);
+            Ok(())
+        })
+        .join()
+        .expect("device probe pipe test thread panicked");
+
+        assert!(
+            result.is_ok(),
+            "failed to create device probe pipe: {result:?}"
+        );
+    }
 
     fn test_audio_frame_with_flags(payload_len: usize, flags: u8) -> Vec<u8> {
         let mut frame = AudioFrameHeader {

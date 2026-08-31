@@ -2363,10 +2363,11 @@ mod windows_service_impl {
     use crate::{config::AgentConfig, lifecycle::run_agent};
     use anyhow::{Context, Result};
     use std::{
+        any::Any,
         ffi::OsString,
         fs::{self, OpenOptions},
         io::{self, Write},
-        sync::OnceLock,
+        sync::{Once, OnceLock},
         time::Duration,
     };
     use windows_service::{
@@ -2380,11 +2381,13 @@ mod windows_service_impl {
     };
     static CONFIG: OnceLock<AgentConfig> = OnceLock::new();
     static ACTIVE_SERVICE_NAME: OnceLock<&'static str> = OnceLock::new();
+    static PANIC_HOOK_INSTALLED: Once = Once::new();
     define_windows_service!(ffi_main, service_main);
     pub fn run(c: AgentConfig) -> Result<()> {
         CONFIG
             .set(c)
             .map_err(|_| anyhow::anyhow!("service config already initialized"))?;
+        install_panic_hook();
         match service_dispatcher::start(WINDOWS_SERVICE_NAME, ffi_main) {
             Ok(()) => Ok(()),
             Err(legacy_error) => service_dispatcher::start(SHORT_WINDOWS_SERVICE_NAME, ffi_main)
@@ -2395,6 +2398,40 @@ mod windows_service_impl {
                 }),
         }
     }
+
+    fn install_panic_hook() {
+        PANIC_HOOK_INSTALLED.call_once(|| {
+            let default_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |panic| {
+                default_hook(panic);
+                let Some(config) = CONFIG.get() else {
+                    return;
+                };
+                let location = panic
+                    .location()
+                    .map(|location| format!(" at {}:{}", location.file(), location.line()))
+                    .unwrap_or_default();
+                let error = anyhow::anyhow!(
+                    "Windows service panicked{}: {}\n{}",
+                    location,
+                    panic_payload_message(panic.payload()),
+                    std::backtrace::Backtrace::force_capture()
+                );
+                write_bootstrap_error(config, &error);
+            }));
+        });
+    }
+
+    fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            return (*message).to_owned();
+        }
+        if let Some(message) = payload.downcast_ref::<String>() {
+            return message.clone();
+        }
+        "non-string panic payload".to_owned()
+    }
+
     fn service_main(arguments: Vec<OsString>) {
         let service_name = service_name_from_arguments(&arguments);
         let _ = ACTIVE_SERVICE_NAME.set(service_name);
@@ -2432,6 +2469,18 @@ mod windows_service_impl {
                 SHORT_WINDOWS_SERVICE_NAME
             );
             assert_eq!(service_name_from_arguments(&[]), WINDOWS_SERVICE_NAME);
+        }
+
+        #[test]
+        fn formats_string_panic_payloads() {
+            let string_payload: Box<dyn Any + Send> = Box::new("string panic".to_owned());
+            let str_payload: Box<dyn Any + Send> = Box::new("str panic");
+
+            assert_eq!(
+                panic_payload_message(string_payload.as_ref()),
+                "string panic"
+            );
+            assert_eq!(panic_payload_message(str_payload.as_ref()), "str panic");
         }
     }
 

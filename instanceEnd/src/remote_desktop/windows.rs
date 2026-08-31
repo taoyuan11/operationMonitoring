@@ -96,8 +96,9 @@ use windows::{
             VIRTUAL_KEY,
         },
         UI::WindowsAndMessaging::{
-            GetSystemMetrics, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
-            MB_SYSTEMMODAL, MB_TOPMOST, MB_YESNO, MessageBoxW, SM_CXSCREEN, SM_CYSCREEN,
+            GetSystemMetrics, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL,
+            MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_TOPMOST, MB_YESNO, MessageBoxW, SM_CXSCREEN,
+            SM_CYSCREEN,
         },
     },
     core::{Interface, PCWSTR, PWSTR},
@@ -138,6 +139,13 @@ const DISPLAY_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
 const DESKTOP_BINDING_LOST: &str = "input_desktop_binding_lost";
 const DESKTOP_HANDLE_CLEANUP_FAILED: &str = "desktop_handle_cleanup_failed";
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSessionIndicatorAction {
+    EndSession,
+    Dismiss,
+}
+
 const DEVICE_PROBE_REQUEST: &[u8] = b"probe";
 const DEVICE_PROBE_MAX_RESPONSE: usize = 1024;
 const DEVICE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1304,7 +1312,8 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
             bail!("local_consent_denied")
         }
     }
-    let mut local_stop = spawn_local_session_indicator(audio_negotiated)?;
+    let mut local_indicator = spawn_local_session_indicator(audio_negotiated)?;
+    let mut local_indicator_open = true;
 
     // `read_packet` is not cancellation-safe: if another `select!` branch wins after the length
     // or kind byte has been consumed, dropping the future leaves the next read in the middle of a
@@ -1384,8 +1393,9 @@ pub async fn run_helper(options: DesktopOptions) -> Result<()> {
     loop {
         tokio::select! {
             biased;
-            local_stop = local_stop.recv() => {
-                if local_stop.is_some() {
+            indicator_action = local_indicator.recv(), if local_indicator_open => {
+                local_indicator_open = false;
+                if !matches!(indicator_action, Some(LocalSessionIndicatorAction::Dismiss)) {
                     if let Some(audio) = &audio_runtime {
                         audio.stop();
                     }
@@ -2020,7 +2030,9 @@ fn request_local_control_consent(audio_negotiated: bool) -> bool {
     }
 }
 
-fn spawn_local_session_indicator(audio_negotiated: bool) -> Result<mpsc::Receiver<()>> {
+fn spawn_local_session_indicator(
+    audio_negotiated: bool,
+) -> Result<mpsc::Receiver<LocalSessionIndicatorAction>> {
     let (stop_tx, stop_rx) = mpsc::channel(1);
     std::thread::Builder::new()
         .name("om-desktop-indicator".to_string())
@@ -2028,20 +2040,30 @@ fn spawn_local_session_indicator(audio_negotiated: bool) -> Result<mpsc::Receive
             let title = wide("Operation Monitoring 远程桌面正在进行");
             let message = if audio_negotiated {
                 wide(
-                    "此计算机正在被远程查看和控制，并可能被收听系统声音。\r\n\r\n单击“确定”可立即终止远程桌面会话。",
+                    "此计算机正在被远程查看和控制，并可能被收听系统声音。\r\n\r\n点击“确定”结束远程桌面会话；点击“取消”关闭此提示并继续远程桌面。",
                 )
             } else {
-                wide("此计算机正在被远程查看和控制。\r\n\r\n单击“确定”可立即终止远程桌面会话。")
+                wide("此计算机正在被远程查看和控制。\r\n\r\n点击“确定”结束远程桌面会话；点击“取消”关闭此提示并继续远程桌面。")
             };
-            unsafe {
-                let _ = MessageBoxW(
+            let action = unsafe {
+                match MessageBoxW(
                     None,
                     PCWSTR(message.as_ptr()),
                     PCWSTR(title.as_ptr()),
-                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST | MB_SYSTEMMODAL,
-                );
-            }
-            let _ = stop_tx.blocking_send(());
+                    MB_OKCANCEL
+                        | MB_ICONWARNING
+                        | MB_DEFBUTTON2
+                        | MB_SETFOREGROUND
+                        | MB_TOPMOST
+                        | MB_SYSTEMMODAL,
+                ) {
+                    IDOK => LocalSessionIndicatorAction::EndSession,
+                    IDCANCEL => LocalSessionIndicatorAction::Dismiss,
+                    // A failed MessageBox call should fail closed and end the session.
+                    _ => LocalSessionIndicatorAction::EndSession,
+                }
+            };
+            let _ = stop_tx.blocking_send(action);
         })?;
     Ok(stop_rx)
 }

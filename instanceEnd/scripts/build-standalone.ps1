@@ -197,7 +197,7 @@ function Invoke-WindowsTestArtifactSigning {
     }
     $VerifyResult = Invoke-NativeCommand `
         -FilePath $Signtool `
-        -ArgumentList @('verify', '/pa', '/all', '/v', $Artifact) `
+        -ArgumentList @('verify', '/pa', '/all', '/v', '/sha1', $Thumbprint, $Artifact) `
         -EchoOutput
     if ($VerifyResult.ExitCode -ne 0) {
         throw "Test-only Authenticode verification failed with status $($VerifyResult.ExitCode)"

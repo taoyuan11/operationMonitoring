@@ -174,12 +174,16 @@ fn generate_windows_driver_assets() {
         .unwrap_or_else(|error| panic!("invalid {}: {error}", lock_path.display()));
     validate_bundle_metadata(&lock, architecture, mode);
 
-    if mode == DriverBundleMode::Test {
-        let thumbprint = std::env::var(TEST_SIGNING_CERTIFICATE_ENV).unwrap_or_else(|_| {
-            panic!("{TEST_SIGNING_CERTIFICATE_ENV} is required by bundled-windows-test-drivers")
-        });
-        validate_certificate_thumbprint(&thumbprint);
-    }
+    let test_signing_certificate = match mode {
+        DriverBundleMode::Production => None,
+        DriverBundleMode::Test => {
+            let thumbprint = std::env::var(TEST_SIGNING_CERTIFICATE_ENV).unwrap_or_else(|_| {
+                panic!("{TEST_SIGNING_CERTIFICATE_ENV} is required by bundled-windows-test-drivers")
+            });
+            validate_certificate_thumbprint(&thumbprint);
+            Some(thumbprint)
+        }
+    };
 
     let selected = lock
         .architectures
@@ -300,9 +304,14 @@ fn generate_windows_driver_assets() {
             expected_driver_payload_name(&package.kind)
         );
         let catalog_path = bundle_dir.join(&package.catalog_path);
-        verify_catalog_signature(&catalog_path, mode);
+        verify_catalog_signature(&catalog_path, mode, test_signing_certificate.as_deref());
         for member_path in catalog_members {
-            verify_catalog_membership(&catalog_path, &member_path, mode);
+            verify_catalog_membership(
+                &catalog_path,
+                &member_path,
+                mode,
+                test_signing_certificate.as_deref(),
+            );
         }
         packages.push(EmbeddedDriverPackage {
             kind: package.kind.clone(),
@@ -739,7 +748,11 @@ fn validate_certificate_thumbprint(value: &str) {
     );
 }
 
-fn verify_catalog_signature(catalog_path: &Path, mode: DriverBundleMode) {
+fn verify_catalog_signature(
+    catalog_path: &Path,
+    mode: DriverBundleMode,
+    test_signing_certificate: Option<&str>,
+) {
     let signtool = std::env::var_os(SIGNTOOL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("signtool.exe"));
@@ -750,7 +763,13 @@ fn verify_catalog_signature(catalog_path: &Path, mode: DriverBundleMode) {
             command.args(["/kp", "/all", "/v"]);
         }
         DriverBundleMode::Test => {
-            command.args(["/pa", "/all", "/v"]);
+            command.args([
+                "/pa",
+                "/all",
+                "/v",
+                "/sha1",
+                test_signing_certificate.expect("test signing certificate is missing"),
+            ]);
         }
     }
     let output = command.arg(catalog_path).output().unwrap_or_else(|error| {
@@ -769,7 +788,12 @@ fn verify_catalog_signature(catalog_path: &Path, mode: DriverBundleMode) {
     );
 }
 
-fn verify_catalog_membership(catalog_path: &Path, member_path: &Path, mode: DriverBundleMode) {
+fn verify_catalog_membership(
+    catalog_path: &Path,
+    member_path: &Path,
+    mode: DriverBundleMode,
+    test_signing_certificate: Option<&str>,
+) {
     let signtool = std::env::var_os(SIGNTOOL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("signtool.exe"));
@@ -780,7 +804,12 @@ fn verify_catalog_membership(catalog_path: &Path, member_path: &Path, mode: Driv
             command.args(["/kp", "/v"]);
         }
         DriverBundleMode::Test => {
-            command.args(["/pa", "/v"]);
+            command.args([
+                "/pa",
+                "/v",
+                "/sha1",
+                test_signing_certificate.expect("test signing certificate is missing"),
+            ]);
         }
     }
     let output = command

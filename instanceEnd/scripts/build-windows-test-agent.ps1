@@ -228,7 +228,7 @@ try {
             'sign', '/sha1', $Thumbprint, '/fd', 'SHA256', '/v', $Catalog.FullName
         )
         Invoke-CheckedNative -FilePath $SignTool -Arguments @(
-            'verify', '/pa', '/all', '/v', '/sha1', $Thumbprint, $Catalog.FullName
+            'verify', '/pa', '/all', '/v', $Catalog.FullName
         )
     }
 

@@ -293,26 +293,38 @@ async fn delete_agent_release(
             format!("该版本仍被 {rollback_dependencies} 条回滚记录依赖"),
         ));
     }
-    let installed_or_required: i64 = sqlx::query_scalar(
+    // Instances already running this version keep the executable they installed, so retiring the
+    // distribution artifact cannot disturb them and must not block deletion. The one destructive
+    // case is an instance that upgraded away from this version, still sits on that upgrade result,
+    // and holds no local rollback baseline for it: the published artifact is then its only way
+    // back, and `queue_rollback_for_upgrade` would fail once the artifact is gone. Mirror that
+    // function's preconditions so the guard only counts instances that could really roll back.
+    let sole_rollback_path: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(DISTINCT i.id)
         FROM instances i
-        WHERE i.agent_version = $1
-           OR EXISTS (
-               SELECT 1 FROM agent_update_attempts u
-               WHERE u.instance_id = i.id AND u.operation = 'upgrade'
-                 AND u.status = 'succeeded' AND u.from_version = $1
-                 AND i.agent_version = u.target_version
-           )
+        WHERE i.rollback_supported = 1
+          AND i.update_privileged = 1
+          AND i.approved = 1
+          AND i.disabled = 0
+          AND i.rollback_version <> $1
+          AND EXISTS (
+              SELECT 1 FROM agent_update_attempts u
+              WHERE u.instance_id = i.id AND u.operation = 'upgrade'
+                AND u.status = 'succeeded' AND u.from_version = $1
+                AND i.agent_version = u.target_version
+          )
         "#,
     )
     .bind(&release.version)
     .fetch_one(&mut *transaction)
     .await?;
-    if release.status == "published" && installed_or_required > 0 {
+    if release.status == "published" && sole_rollback_path > 0 {
         return Err(AppError::new(
             StatusCode::CONFLICT,
-            format!("仍有 {installed_or_required} 个实例正在运行或依赖该版本作为回滚目标"),
+            format!(
+                "仍有 {sole_rollback_path} 个实例只能回滚到该版本且本地没有回滚基线，删除后将无法回退"
+            ),
         ));
     }
     let artifact_count: i64 =
@@ -4760,6 +4772,79 @@ mod tests {
             .expect_err("target-version rollback dependency blocks deletion");
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert!(error.message.contains("回滚记录依赖"));
+        resources.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn instances_running_a_published_version_do_not_block_its_deletion() {
+        let (state, resources) = test_state().await;
+        insert_instance(&state, "running-agent", "linux", "standalone", "x86_64").await;
+        insert_release(&state, "1.0.0", "standalone", "x86_64").await;
+        set_instance_version_and_rollback(&state, "running-agent", "1.0.0", true, "0.9.0").await;
+
+        delete_agent_release(&state, "test-admin", "test-admin-id", "release-1.0.0")
+            .await
+            .expect("a version that instances merely run must stay deletable");
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_releases WHERE id = 'release-1.0.0'")
+                .fetch_one(&state.db)
+                .await
+                .expect("count deleted release");
+        assert_eq!(remaining, 0);
+        resources.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn deletion_is_blocked_when_a_published_version_is_the_only_rollback_path() {
+        let (state, resources) = test_state().await;
+        insert_instance(&state, "upgraded-agent", "linux", "standalone", "x86_64").await;
+        insert_release(&state, "1.0.0", "standalone", "x86_64").await;
+        insert_release(&state, "2.0.0", "standalone", "x86_64").await;
+        // No local baseline for 1.0.0, so only the published artifact can bring the agent back.
+        set_instance_version_and_rollback(&state, "upgraded-agent", "2.0.0", true, "").await;
+        insert_upgrade_attempt(
+            &state,
+            "release-2.0.0",
+            "artifact-2.0.0-x86_64",
+            "upgraded-agent",
+            "1.0.0",
+            "2.0.0",
+            "succeeded",
+        )
+        .await;
+
+        let error = delete_agent_release(&state, "test-admin", "test-admin-id", "release-1.0.0")
+            .await
+            .expect_err("removing the only rollback path must be refused");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("1 个实例只能回滚到该版本"));
+        resources.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    async fn a_local_rollback_baseline_keeps_the_superseded_version_deletable() {
+        let (state, resources) = test_state().await;
+        insert_instance(&state, "baselined-agent", "linux", "standalone", "x86_64").await;
+        insert_release(&state, "1.0.0", "standalone", "x86_64").await;
+        insert_release(&state, "2.0.0", "standalone", "x86_64").await;
+        set_instance_version_and_rollback(&state, "baselined-agent", "2.0.0", true, "1.0.0").await;
+        insert_upgrade_attempt(
+            &state,
+            "release-2.0.0",
+            "artifact-2.0.0-x86_64",
+            "baselined-agent",
+            "1.0.0",
+            "2.0.0",
+            "succeeded",
+        )
+        .await;
+
+        delete_agent_release(&state, "test-admin", "test-admin-id", "release-1.0.0")
+            .await
+            .expect("a local baseline makes the published artifact redundant");
         resources.cleanup().await;
     }
 

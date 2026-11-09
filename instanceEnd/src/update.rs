@@ -833,18 +833,6 @@ impl UpdateManager {
             _ => (attempt.status, None, attempt.message.clone(), false),
         };
 
-        if let Some((artifact_id, version, retry_count)) = &health {
-            write_json_atomic(
-                &self.paths.health_file,
-                &HealthMarker {
-                    artifact_id: artifact_id.clone(),
-                    version: version.clone(),
-                    retry_count: *retry_count,
-                    connected_at: now_ts(),
-                },
-            )?;
-        }
-
         let mut stale_package = None;
         let mut finalized_log = None;
         if finalize {
@@ -871,6 +859,20 @@ impl UpdateManager {
         }
         if let Some(path) = stale_package {
             let _ = fs::remove_file(path);
+        }
+
+        // Health releases the detached worker, which may immediately remove the old package.
+        // Preserve the rollback baseline and commit state before acknowledging the new agent.
+        if let Some((artifact_id, version, retry_count)) = &health {
+            write_json_atomic(
+                &self.paths.health_file,
+                &HealthMarker {
+                    artifact_id: artifact_id.clone(),
+                    version: version.clone(),
+                    retry_count: *retry_count,
+                    connected_at: now_ts(),
+                },
+            )?;
         }
 
         if attempt.manual {
@@ -930,7 +932,13 @@ impl UpdateManager {
                 UpdateStatus::Installing | UpdateStatus::AwaitingRestart
             );
         if active_handoff {
-            return Ok(false);
+            // A crashed worker leaves its handoff state behind. Once it has released the
+            // ownership lock, an explicit administrator retry must be able to recover it.
+            return Ok(matches!(
+                &attempt.operation,
+                AttemptOperation::Rollback { attempt_id, retry_count, .. }
+                    if attempt_id == &offer.attempt_id && offer.retry_count > *retry_count
+            ));
         }
         let terminal = matches!(
             attempt.status,
@@ -1738,45 +1746,25 @@ impl UpdateManager {
         #[cfg(not(windows))]
         let windows_service = None;
         let mut state = read_update_state(&self.paths.state_file)?;
-        let mut previous_package = state
+        let attempt = state
             .attempt
             .as_ref()
             .filter(|attempt| offer_generation_matches(&attempt.offer, offer))
-            .and_then(|attempt| attempt.previous_package.clone());
-        let operation = state
-            .attempt
-            .as_ref()
-            .filter(|attempt| offer_generation_matches(&attempt.offer, offer))
-            .map(|attempt| attempt.operation.clone())
             .ok_or_else(|| anyhow!("prepared update attempt is missing from update state"))?;
-        if previous_package.is_none()
-            && offer.package_type == PackageType::Standalone.as_str()
-            && installed_executable.is_file()
-        {
-            let rollback_path = self.paths.packages.join(format!(
-                "standalone-rollback-{}{}",
-                env!("CARGO_PKG_VERSION"),
-                std::env::consts::EXE_SUFFIX
-            ));
-            fs::copy(&installed_executable, &rollback_path)?;
-            set_owner_only_executable(&rollback_path)?;
-            let (size_bytes, sha256) = file_integrity(&rollback_path)?;
-            previous_package = Some(CachedPackage {
-                artifact_id: format!("standalone-installed-{}", env!("CARGO_PKG_VERSION")),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                package_type: PackageType::Standalone,
-                native_arch: standalone_native_arch(),
-                path: rollback_path,
-                retry_count: 0,
-                size_bytes,
-                sha256,
-            });
-        }
+        let operation = attempt.operation.clone();
+        let previous_package = snapshot_installed_package(
+            &installed_executable,
+            &self.paths.packages,
+            state.current_package.as_ref(),
+            attempt.manual,
+            inspect_agent_package_version,
+        )
+        .context("failed to prepare installed agent rollback baseline")?;
         if let Some(attempt) = &mut state.attempt
             && offer_generation_matches(&attempt.offer, offer)
-            && attempt.previous_package.is_none()
         {
             attempt.previous_package = previous_package.clone();
+            state.current_package = previous_package.clone();
             write_update_state(&self.paths.state_file, &state)?;
         }
         let component = safe_component(&offer_storage_component(offer));
@@ -2363,6 +2351,82 @@ fn copy_private_executable(source: &Path, target: &Path) -> Result<()> {
     target_file.sync_all()?;
     drop(target_file);
     set_owner_only_executable(target)
+}
+
+fn snapshot_installed_package(
+    installed_executable: &Path,
+    packages: &Path,
+    cached: Option<&CachedPackage>,
+    allow_unusable: bool,
+    inspect_version: impl FnOnce(&Path) -> Result<String>,
+) -> Result<Option<CachedPackage>> {
+    if !installed_executable.try_exists()? {
+        return Ok(None);
+    }
+    let (installed_size, installed_sha256) = file_integrity(installed_executable)?;
+    let native_arch = standalone_native_arch();
+    let inspect = |path: &Path| {
+        match validate_package_magic(PackageType::Standalone, path)
+            .and_then(|()| inspect_version(path))
+        {
+            Ok(version) => Ok(Some(version)),
+            Err(error) if allow_unusable => {
+                // Forced updates can repair an unstartable binary, but must still propagate
+                // I/O failures when copying or persisting an otherwise usable baseline.
+                crate::logging::error(format_args!(
+                    "installed agent cannot provide a rollback baseline; continuing forced update: {error:#}"
+                ));
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    };
+    if let Some(cached) = cached
+        && cached.native_arch == native_arch
+        && cached.size_bytes == installed_size
+        && cached.sha256.eq_ignore_ascii_case(&installed_sha256)
+        && verify_package_at_rest(
+            &cached.path,
+            cached.package_type,
+            cached.size_bytes,
+            &cached.sha256,
+        )
+        .is_ok()
+    {
+        // Reuse an intact copy of the installed bytes without requiring another binary's
+        // worth of free space. Still inspect it to repair older, incorrectly labelled caches.
+        let Some(version) = inspect(&cached.path)? else {
+            return Ok(None);
+        };
+        let mut baseline = cached.clone();
+        baseline.version = version;
+        return Ok(Some(baseline));
+    }
+    let artifact_id = format!("standalone-installed-{}", uuid::Uuid::new_v4());
+    let snapshot = packages.join(format!("{artifact_id}{}", std::env::consts::EXE_SUFFIX));
+    let result = (|| {
+        copy_private_executable(installed_executable, &snapshot)?;
+        // Inspect the snapshot itself: a forced updater may be a different version, and an
+        // intervening manual install may have made current_package stale or removed it.
+        let Some(version) = inspect(&snapshot)? else {
+            return Ok(None);
+        };
+        let (size_bytes, sha256) = file_integrity(&snapshot)?;
+        Ok(Some(CachedPackage {
+            artifact_id,
+            version,
+            package_type: PackageType::Standalone,
+            native_arch,
+            path: snapshot.clone(),
+            retry_count: 0,
+            size_bytes,
+            sha256,
+        }))
+    })();
+    if !matches!(&result, Ok(Some(_))) {
+        let _ = fs::remove_file(&snapshot);
+    }
+    result
 }
 
 fn create_new_executable(path: &Path) -> io::Result<File> {
@@ -4170,7 +4234,11 @@ fn standalone_native_arch() -> String {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        linux_standalone_native_arch(std::env::consts::ARCH, Path::new("/etc/openwrt_release"))
+        linux_standalone_native_arch(
+            std::env::consts::ARCH,
+            cfg!(target_env = "musl"),
+            Path::new("/etc/openwrt_release"),
+        )
     }
 }
 
@@ -4189,9 +4257,9 @@ fn standalone_target_os() -> &'static str {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn linux_standalone_native_arch(arch: &str, openwrt_release: &Path) -> String {
-    if arch == "x86_64" && openwrt_release.exists() {
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn linux_standalone_native_arch(arch: &str, musl: bool, openwrt_release: &Path) -> String {
+    if arch == "x86_64" && (musl || openwrt_release.exists()) {
         "x86_64-musl".to_string()
     } else {
         arch.to_string()
@@ -4523,20 +4591,33 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
-    fn distinguishes_openwrt_x86_64_musl_updates() {
+    fn distinguishes_linux_musl_and_openwrt_updates_from_glibc() {
         let directory = std::env::temp_dir().join(format!("om-openwrt-{}", uuid::Uuid::new_v4()));
         let marker = directory.join("openwrt_release");
 
-        assert_eq!(linux_standalone_native_arch("x86_64", &marker), "x86_64");
+        assert_eq!(
+            linux_standalone_native_arch("x86_64", false, &marker),
+            "x86_64"
+        );
+        assert_eq!(
+            linux_standalone_native_arch("x86_64", true, &marker),
+            "x86_64-musl"
+        );
+        assert_eq!(
+            linux_standalone_native_arch("aarch64", true, &marker),
+            "aarch64"
+        );
         fs::create_dir_all(&directory).unwrap();
         fs::write(&marker, "DISTRIB_ID='OpenWrt'\n").unwrap();
         assert_eq!(
-            linux_standalone_native_arch("x86_64", &marker),
+            linux_standalone_native_arch("x86_64", false, &marker),
             "x86_64-musl"
         );
-        assert_eq!(linux_standalone_native_arch("aarch64", &marker), "aarch64");
+        assert_eq!(
+            linux_standalone_native_arch("aarch64", false, &marker),
+            "aarch64"
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -5108,6 +5189,183 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
+    #[test]
+    fn crashed_rollback_handoff_allows_only_an_explicit_retry_without_a_live_worker() {
+        let directory =
+            std::env::temp_dir().join(format!("om-rollback-gate-{}", uuid::Uuid::new_v4()));
+        let config = AgentConfig {
+            server: "https://example.test".to_string(),
+            identity_file: None,
+            report_interval: 5,
+            state_dir: None,
+            log_file: None,
+            log_max_bytes: 10 * 1024 * 1024,
+            log_history: 3,
+            update_dir: Some(directory.clone()),
+            remote_desktop_consent: crate::config::RemoteDesktopConsent::Required,
+            windows_virtual_devices: crate::config::WindowsVirtualDevices::Disabled,
+        };
+        let manager = UpdateManager::new(
+            config,
+            Identity {
+                instance_id: "instance-gate".to_string(),
+                secret: "secret-gate".to_string(),
+                credential_version: 1,
+                previous_secret: None,
+            },
+            crate::tls::http_client(),
+            ActivityTracker::default(),
+        )
+        .unwrap();
+        let (rollback, _) = signed_test_rollback_offer();
+        let effective =
+            rollback_effective_offer(&rollback, rollback.package.as_ref(), None).unwrap();
+        manager
+            .begin_attempt(
+                &effective,
+                AttemptOperation::Rollback {
+                    attempt_id: rollback.attempt_id.clone(),
+                    release_id: rollback.release_id.clone(),
+                    from_version: rollback.from_version.clone(),
+                    target_version: rollback.target_version.clone(),
+                    retry_count: rollback.retry_count,
+                },
+            )
+            .unwrap();
+        let mut retry = rollback.clone();
+        retry.retry_count += 1;
+        let mut unrelated = retry.clone();
+        unrelated.attempt_id = "other-rollback".to_string();
+        let mut stale = rollback.clone();
+        stale.retry_count -= 1;
+
+        for phase in [AttemptPhase::Target, AttemptPhase::Rollback] {
+            for status in [UpdateStatus::Installing, UpdateStatus::AwaitingRestart] {
+                mutate_attempt(&manager.paths.state_file, &effective, |attempt| {
+                    attempt.phase = phase;
+                    attempt.status = status;
+                })
+                .unwrap();
+                assert!(!manager.can_start_rollback(&rollback).unwrap());
+                assert!(!manager.can_start_rollback(&stale).unwrap());
+                assert!(!manager.can_start_rollback(&unrelated).unwrap());
+                assert!(manager.can_start_rollback(&retry).unwrap());
+
+                let ownership = open_update_lock(&manager.paths.lock_file).unwrap();
+                ownership.try_lock_exclusive().unwrap();
+                assert!(!manager.can_start_rollback(&retry).unwrap());
+                FileExt::unlock(&ownership).unwrap();
+            }
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollback_baseline_uses_the_installed_version_and_rejects_stale_or_damaged_cache() {
+        let directory = std::env::temp_dir().join(format!("om-baseline-{}", uuid::Uuid::new_v4()));
+        let packages = directory.join("packages");
+        fs::create_dir_all(&packages).unwrap();
+        let installed = directory.join("installed-agent");
+        let mut executable_header = [0_u8; 32];
+        File::open(std::env::current_exe().unwrap())
+            .unwrap()
+            .read_exact(&mut executable_header)
+            .unwrap();
+        fs::write(&installed, executable_header).unwrap();
+        let installed_integrity = file_integrity(&installed).unwrap();
+        let inspect = |snapshot: &Path| {
+            assert_ne!(snapshot, installed);
+            assert_eq!(file_integrity(snapshot).unwrap(), installed_integrity);
+            Ok("0.1.24".to_string())
+        };
+        let baseline = snapshot_installed_package(&installed, &packages, None, false, inspect)
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.version, "0.1.24");
+        assert_eq!(
+            (baseline.size_bytes, baseline.sha256.clone()),
+            installed_integrity
+        );
+
+        let reused =
+            snapshot_installed_package(&installed, &packages, Some(&baseline), false, inspect)
+                .unwrap()
+                .unwrap();
+        assert_eq!(reused.path, baseline.path);
+        assert_eq!(fs::read_dir(&packages).unwrap().count(), 1);
+
+        let mut stale = baseline.clone();
+        stale.version = "0.1.23".to_string();
+        let replaced =
+            snapshot_installed_package(&installed, &packages, Some(&stale), false, inspect)
+                .unwrap()
+                .unwrap();
+        assert_eq!(replaced.version, "0.1.24");
+        assert_eq!(replaced.path, stale.path);
+        assert_eq!(fs::read_dir(&packages).unwrap().count(), 1);
+
+        stale.path = packages.join("older-agent");
+        fs::write(&stale.path, b"previously installed version").unwrap();
+        (stale.size_bytes, stale.sha256) = file_integrity(&stale.path).unwrap();
+        let replaced =
+            snapshot_installed_package(&installed, &packages, Some(&stale), false, inspect)
+                .unwrap()
+                .unwrap();
+        assert_eq!(replaced.version, "0.1.24");
+        assert_ne!(replaced.path, stale.path);
+
+        fs::write(&baseline.path, b"corrupt cache").unwrap();
+        let repaired =
+            snapshot_installed_package(&installed, &packages, Some(&baseline), false, inspect)
+                .unwrap()
+                .unwrap();
+        assert_ne!(repaired.path, baseline.path);
+        verify_package_at_rest(
+            &repaired.path,
+            repaired.package_type,
+            repaired.size_bytes,
+            &repaired.sha256,
+        )
+        .unwrap();
+
+        fs::remove_file(&repaired.path).unwrap();
+        let recovered =
+            snapshot_installed_package(&installed, &packages, Some(&repaired), false, inspect)
+                .unwrap()
+                .unwrap();
+        assert!(recovered.path.is_file());
+        let count = fs::read_dir(&packages).unwrap().count();
+        assert!(
+            snapshot_installed_package(&installed, &packages, None, false, |_| bail!(
+                "broken installation"
+            ))
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(&packages).unwrap().count(), count);
+        assert!(
+            snapshot_installed_package(&installed, &packages, None, true, |_| bail!(
+                "broken installation"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(fs::read_dir(&packages).unwrap().count(), count);
+        assert!(
+            snapshot_installed_package(&installed, &directory.join("missing"), None, true, inspect)
+                .is_err(),
+            "a forced update must not ignore failures to copy a usable baseline"
+        );
+        fs::remove_file(&installed).unwrap();
+        assert!(
+            snapshot_installed_package(&installed, &packages, Some(&recovered), true, |_| panic!(
+                "missing executable must not be inspected"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn service_command_timeout_terminates_the_process_group() {
@@ -5572,6 +5830,15 @@ mod tests {
             },
         )
         .unwrap();
+
+        let unavailable_previous = previous_path.with_extension("unavailable");
+        fs::rename(&previous_path, &unavailable_previous).unwrap();
+        assert!(manager.connected_status().is_err());
+        assert!(
+            !paths.health_file.exists(),
+            "the old updater must not receive health confirmation before its baseline is preserved"
+        );
+        fs::rename(&unavailable_previous, &previous_path).unwrap();
 
         let status = manager.connected_status().unwrap().unwrap();
         assert!(matches!(

@@ -444,7 +444,7 @@ fn inspect_agent_package_version(path: &Path) -> Result<String> {
     let output = run_command_output_with_timeout(
         &spec,
         PACKAGE_INSPECTION_TIMEOUT,
-        "forced update package inspection",
+        "agent package version inspection",
     )?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2395,6 +2395,14 @@ fn snapshot_installed_package(
     {
         // Reuse an intact copy of the installed bytes without requiring another binary's
         // worth of free space. Still inspect it to repair older, incorrectly labelled caches.
+        // Downloaded packages are stored as 0600 data files. Restore executable permissions
+        // only after integrity verification, including for caches written by older agents.
+        set_owner_only_executable(&cached.path).with_context(|| {
+            format!(
+                "failed to prepare cached rollback package for inspection {}",
+                cached.path.display()
+            )
+        })?;
         let Some(version) = inspect(&cached.path)? else {
             return Ok(None);
         };
@@ -5364,6 +5372,62 @@ mod tests {
             .is_none()
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_baseline_makes_downloaded_cache_executable_before_inspection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("om-baseline-permissions-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let installed = std::env::current_exe().unwrap();
+        let cached_path = directory.join("artifact-retry-0.bin");
+        fs::copy(&installed, &cached_path).unwrap();
+        // Downloads are stored as owner-only data files, including caches from older agents.
+        fs::set_permissions(&cached_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (size_bytes, sha256) = file_integrity(&cached_path).unwrap();
+        let cached = CachedPackage {
+            artifact_id: "artifact".to_string(),
+            version: "0.1.23".to_string(),
+            package_type: PackageType::Standalone,
+            native_arch: standalone_native_arch(),
+            path: cached_path.clone(),
+            retry_count: 0,
+            size_bytes,
+            sha256,
+        };
+        let result =
+            snapshot_installed_package(&installed, &directory, Some(&cached), false, |path| {
+                // Execute the native test binary's help command without starting an agent.
+                let spec = CommandSpec {
+                    program: path.as_os_str().to_owned(),
+                    args: vec!["--help".into()],
+                };
+                let output = run_command_output_with_timeout(
+                    &spec,
+                    PACKAGE_INSPECTION_TIMEOUT,
+                    "cached baseline inspection",
+                )?;
+                if !output.status.success() {
+                    bail!("cached baseline inspection failed: {}", output.status);
+                }
+                Ok("0.1.24".to_string())
+            });
+        let permissions = fs::metadata(&cached_path).unwrap().permissions().mode() & 0o777;
+        let package_count = fs::read_dir(&directory).unwrap().count();
+        fs::remove_dir_all(&directory).unwrap();
+
+        let baseline = result.unwrap().unwrap();
+        assert_eq!(baseline.path, cached_path);
+        assert_eq!(baseline.version, "0.1.24");
+        assert_eq!(baseline.sha256, cached.sha256);
+        assert_eq!(permissions, 0o700);
+        assert_eq!(
+            package_count, 1,
+            "reuse the verified cache without copying it"
+        );
     }
 
     #[cfg(unix)]

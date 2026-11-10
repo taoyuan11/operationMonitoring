@@ -466,6 +466,8 @@ om-agent update /path/to/new/om-agent
 
 Windows 路径含空格时需要加引号，例如 `om-agent update "C:\Temp\om-agent new.exe"`。`update` 只接受本地 standalone 可执行文件，要求 Agent 以 root/管理员权限安装运行；它会先复制并执行 `--version` 预检，再交给独立 updater。命令显示 `has been handed off` 后会退出，服务随后重启。强制更新不受管理端版本策略限制，允许重装、升级或降级；存在旧程序时仍会保留回滚基线，并在新版本未能通过健康检查时自动恢复。此命令是自动更新失效后的恢复手段，不应与另一个正在运行的 updater 并发执行。
 
+若旧版 Agent 在 macOS、Linux 或 iStoreOS 上报 `failed to prepare installed agent rollback baseline`，且内部错误是缓存包预检的 `Permission denied (os error 13)`，检查报错中缓存包的权限。历史下载缓存以 `0600` 保存，缺少执行权限；可先以 root 权限对报错中的那个文件执行 `chmod 700`，再从控制台重试更新。请使用每台实例报错中的完整路径，路径含空格时加引号。修复后的 Agent 会在验证缓存完整性后、执行版本预检前自动恢复仅所有者可执行的权限，兼容已有缓存。
+
 生产分发应使用 HTTPS/WSS，并对 standalone 产物执行平台代码签名：Windows 对 `.exe` 使用 Authenticode，macOS 对二进制进行 Developer ID 签名和公证。后端的 SHA-256 校验用于传输完整性，不能替代平台代码签名。
 
 ### 从旧原生安装迁移

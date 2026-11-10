@@ -65,7 +65,7 @@
 label { display: flex; flex-direction: column; gap: 7px; color: var(--muted-strong); font-size: 12px; font-weight: 550; }
 label > span { display: flex; align-items: center; justify-content: space-between; }
 label > span i { color: var(--muted-soft); font-size: 11px; font-style: normal; font-weight: 450; }
-input, textarea, select {
+input, textarea, .ui-select-trigger {
   width: 100%;
   min-height: 42px;
   padding: 9px 11px;
@@ -78,8 +78,8 @@ input, textarea, select {
   transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
 }
 input::placeholder, textarea::placeholder { color: var(--muted-faint); }
-input:hover, textarea:hover, select:hover { border-color: var(--input-line-hover); }
-input:focus, textarea:focus, select:focus { background: var(--surface-input-focus); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-focus); }
+input:hover, textarea:hover, .ui-select-trigger:hover { border-color: var(--input-line-hover); }
+input:focus, textarea:focus, .ui-select-trigger:focus { background: var(--surface-input-focus); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-focus); }
 textarea { min-height: 104px; resize: vertical; line-height: 1.55; }
 .input-shell { display: flex; align-items: center; gap: 9px; min-height: 44px; padding: 0 12px; color: var(--muted-soft); background: var(--surface-input); border: 1px solid var(--input-line); border-radius: 6px; transition: color .16s ease, background .16s ease, border-color .16s ease, box-shadow .16s ease; }
 .input-shell:focus-within { color: var(--accent-strong); background: var(--surface-input-focus); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-focus); }

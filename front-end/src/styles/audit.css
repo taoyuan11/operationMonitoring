@@ -120,7 +120,7 @@
 .audit-workspace-input-clear:hover { color: var(--text); background: var(--surface-hover); }
 
 .audit-workspace-status-filter { width: 142px; flex: 0 0 142px; }
-.audit-workspace-status-filter select { min-height: 34px; height: 34px; padding: 5px 28px 5px 9px; font-size: 11px; }
+.audit-workspace-status-filter .ui-select-trigger { min-height: 34px; height: 34px; padding: 5px 9px; font-size: 11px; }
 
 .audit-workspace-toolbar-actions {
   display: flex;

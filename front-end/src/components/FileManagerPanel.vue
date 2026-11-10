@@ -1,4 +1,10 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiFileInput from './ui/UiFileInput.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
+import UiProgress from './ui/UiProgress.vue'
+import UiSelect from './ui/UiSelect.vue'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   AlertTriangle,
@@ -76,7 +82,7 @@ const loading = ref(false)
 const operationBusy = ref(false)
 const errorMessage = ref('')
 const dragActive = ref(false)
-const fileInput = ref<HTMLInputElement | null>(null)
+const fileInput = ref<InstanceType<typeof UiFileInput> | null>(null)
 const dialog = ref<FileDialog | null>(null)
 const uploadQueue = ref<UploadQueueItem[]>([])
 const processingUploads = ref(false)
@@ -520,63 +526,59 @@ function buildBreadcrumbs(path: string) {
     <div class="file-toolbar">
       <label class="file-root-select">
         <HardDrive :size="15" aria-hidden="true" />
-        <select v-model="selectedRoot" aria-label="文件系统根目录" @change="changeRoot">
-          <option v-for="root in roots" :key="root.path" :value="root.path">
-            {{ root.label }}
-          </option>
-        </select>
+        <UiSelect v-model="selectedRoot" aria-label="文件系统根目录" @change="changeRoot" :options="[...roots.map((root) => ({ value: root.path, label: (root.label) }))]" />
       </label>
 
-      <button
+      <UiButton
         class="icon-button subtle"
         type="button"
-        title="返回上级目录"
+        v-tooltip="'返回上级目录'"
         aria-label="返回上级目录"
         :disabled="!listing?.parent || loading"
         @click="listing?.parent && openPath(listing.parent)"
       >
         <ArrowUp :size="16" />
-      </button>
-      <button
+      </UiButton>
+      <UiButton
         class="icon-button subtle"
         type="button"
-        title="刷新目录"
+        v-tooltip="'刷新目录'"
         aria-label="刷新当前目录"
         :disabled="loading"
         @click="refresh"
       >
         <RefreshCw :class="{ spin: loading }" :size="16" />
-      </button>
+      </UiButton>
 
       <nav class="file-breadcrumbs" aria-label="当前文件路径">
         <template v-for="(crumb, index) in breadcrumbs" :key="crumb.path">
           <ChevronRight v-if="index" :size="13" aria-hidden="true" />
-          <button type="button" :title="crumb.path" @click="openPath(crumb.path)">
+          <UiButton type="button" v-tooltip="crumb.path" @click="openPath(crumb.path)">
             {{ crumb.label }}
-          </button>
+          </UiButton>
         </template>
       </nav>
 
       <div class="file-toolbar-actions">
-        <button
+        <UiButton
           class="text-button"
           type="button"
-          title="新建目录"
+          v-tooltip="'新建目录'"
           :disabled="!currentPath || operationBusy"
           @click="showCreateDialog"
         >
           <FolderPlus :size="15" />新建目录
-        </button>
-        <button
+        </UiButton>
+        <UiButton
           class="primary-button file-upload-trigger"
           type="button"
-          title="上传文件"
+          v-tooltip="'上传文件'"
           :disabled="!currentPath"
           @click="chooseFiles"
         >
           <Upload :size="15" />上传
-        </button>
-        <input ref="fileInput" type="file" multiple tabindex="-1" @change="selectFiles" />
+        </UiButton>
+        <UiFileInput ref="fileInput" multiple tabindex="-1" @change="selectFiles" />
       </div>
     </div>
 
@@ -587,35 +589,35 @@ function buildBreadcrumbs(path: string) {
     <div v-if="uploadQueue.length" class="upload-queue">
       <header>
         <strong>上传队列</strong>
-        <button class="text-button" type="button" @click="clearFinishedUploads">
+        <UiButton class="text-button" type="button" @click="clearFinishedUploads">
           清理已完成
-        </button>
+        </UiButton>
       </header>
       <div v-for="item in uploadQueue" :key="item.id" class="upload-item">
         <FileIcon :size="15" aria-hidden="true" />
         <div>
-          <strong :title="item.file.name">{{ item.file.name }}</strong>
+          <strong v-tooltip="item.file.name">{{ item.file.name }}</strong>
           <span>
             {{ formatBytes(item.file.size) }}
             <i v-if="item.error">{{ item.error }}</i>
           </span>
-          <progress v-if="item.status === 'uploading'" :value="item.progress" max="100"></progress>
+          <UiProgress v-if="item.status === 'uploading'" :value="item.progress" max="100"></UiProgress>
         </div>
         <span :class="['upload-status', item.status]">
           <LoaderCircle v-if="item.status === 'uploading'" class="spin" :size="14" />
           <CheckCircle2 v-else-if="item.status === 'completed'" :size="14" />
           {{ item.status === 'queued' ? '等待' : item.status === 'uploading' ? `${item.progress.toFixed(0)}%` : item.status === 'completed' ? '完成' : item.status === 'cancelled' ? '已取消' : '失败' }}
         </span>
-        <button
+        <UiButton
           v-if="item.status === 'queued' || item.status === 'uploading'"
           class="icon-button subtle"
           type="button"
-          title="取消上传"
+          v-tooltip="'取消上传'"
           aria-label="取消上传"
           @click="cancelUpload(item)"
         >
           <X :size="14" />
-        </button>
+        </UiButton>
       </div>
     </div>
 
@@ -638,10 +640,10 @@ function buildBreadcrumbs(path: string) {
           role="listitem"
           @dblclick="openEntry(entry)"
         >
-          <button
+          <UiButton
             class="file-name"
             type="button"
-            :title="entry.path"
+            v-tooltip="entry.path"
             :disabled="entry.kind !== 'directory' && entry.kind !== 'symlink'"
             @click="openEntry(entry)"
           >
@@ -649,42 +651,42 @@ function buildBreadcrumbs(path: string) {
             <span class="file-entry-label">{{ entry.name }}</span>
             <span class="file-lock"><LockKeyhole v-if="entry.readonly" :size="12" aria-label="只读" /></span>
             <small>{{ entryKindLabel(entry) }}</small>
-          </button>
+          </UiButton>
           <span class="file-size">{{ entry.kind === 'file' ? formatBytes(entry.size_bytes) : '—' }}</span>
           <time>{{ formatTime(entry.modified_at) }}</time>
           <div class="file-row-actions">
-            <button
+            <UiButton
               v-if="entry.kind !== 'directory'"
               class="icon-button subtle"
               type="button"
-              title="下载"
+              v-tooltip="'下载'"
               :aria-label="`下载 ${entry.name}`"
               @click="downloadEntry(entry)"
             >
               <Download :size="15" />
-            </button>
-            <button
+            </UiButton>
+            <UiButton
               class="icon-button subtle"
               type="button"
-              title="重命名或移动"
+              v-tooltip="'重命名或移动'"
               :aria-label="`重命名或移动 ${entry.name}`"
               @click="showMoveDialog(entry)"
             >
               <Move :size="15" />
-            </button>
-            <button
+            </UiButton>
+            <UiButton
               class="icon-button subtle danger"
               type="button"
-              title="永久删除"
+              v-tooltip="'永久删除'"
               :aria-label="`永久删除 ${entry.name}`"
               @click="showDeleteDialog(entry)"
             >
               <Trash2 :size="15" />
-            </button>
+            </UiButton>
           </div>
         </div>
       </div>
-      <button
+      <UiButton
         v-if="hasMore"
         class="file-load-more"
         type="button"
@@ -692,7 +694,7 @@ function buildBreadcrumbs(path: string) {
         @click="openPath(currentPath, true)"
       >
         {{ loading ? '正在读取…' : `加载更多（${listing?.entries.length} / ${listing?.total}）` }}
-      </button>
+      </UiButton>
     </div>
 
     <div v-if="dragActive" class="file-drop-overlay" aria-hidden="true">
@@ -706,16 +708,16 @@ function buildBreadcrumbs(path: string) {
       @wheel.self.prevent
       @touchmove.self.prevent
     >
-      <form class="file-dialog" @submit.prevent="submitDialog(false)">
-        <button class="icon-button subtle file-dialog-close" type="button" title="关闭" @click="dialog = null">
+      <UiForm class="file-dialog" @submit.prevent="submitDialog(false)">
+        <UiButton class="icon-button subtle file-dialog-close" type="button" v-tooltip="'关闭'" @click="dialog = null">
           <X :size="15" />
-        </button>
+        </UiButton>
         <template v-if="dialog.type === 'create'">
           <span class="file-dialog-icon"><FolderPlus :size="22" /></span>
           <h3>新建目录</h3>
           <label>
             <span>目录名称</span>
-            <input v-model="dialog.name" required maxlength="255" autocomplete="off" />
+            <UiInput v-model="dialog.name" required maxlength="255" autocomplete="off" />
           </label>
         </template>
         <template v-else-if="dialog.type === 'move'">
@@ -723,11 +725,11 @@ function buildBreadcrumbs(path: string) {
           <h3>重命名或移动</h3>
           <label>
             <span>目标目录</span>
-            <input v-model="dialog.destinationParent" required autocomplete="off" />
+            <UiInput v-model="dialog.destinationParent" required autocomplete="off" />
           </label>
           <label>
             <span>名称</span>
-            <input v-model="dialog.name" required maxlength="255" autocomplete="off" />
+            <UiInput v-model="dialog.name" required maxlength="255" autocomplete="off" />
           </label>
           <p v-if="dialog.conflict" class="file-dialog-warning">
             <AlertTriangle :size="14" />目标已存在。仅普通文件可以确认覆盖，目录不会被覆盖。
@@ -743,8 +745,8 @@ function buildBreadcrumbs(path: string) {
         </template>
         <p v-if="dialog.error" class="file-notice error">{{ dialog.error }}</p>
         <div class="file-dialog-actions">
-          <button class="text-button" type="button" @click="dialog = null">取消</button>
-          <button
+          <UiButton class="text-button" type="button" @click="dialog = null">取消</UiButton>
+          <UiButton
             v-if="dialog.type === 'move' && dialog.conflict"
             class="confirm-button danger"
             type="button"
@@ -752,17 +754,17 @@ function buildBreadcrumbs(path: string) {
             @click="submitDialog(true)"
           >
             确认覆盖
-          </button>
-          <button
+          </UiButton>
+          <UiButton
             v-else
             :class="dialog.type === 'delete' ? 'confirm-button danger' : 'primary-button'"
             type="submit"
             :disabled="operationBusy"
           >
             {{ operationBusy ? '处理中…' : dialog.type === 'delete' ? '永久删除' : dialog.type === 'create' ? '创建目录' : '确认移动' }}
-          </button>
+          </UiButton>
         </div>
-      </form>
+      </UiForm>
     </div>
 
     <div
@@ -777,8 +779,8 @@ function buildBreadcrumbs(path: string) {
         <p class="file-delete-path">{{ uploadConflict.targetPath }}</p>
         <p class="file-dialog-warning">覆盖只会在新文件完整上传后执行。</p>
         <div class="file-dialog-actions">
-          <button class="text-button" type="button" @click="resolveUploadOverwrite(false)">跳过</button>
-          <button class="confirm-button danger" type="button" @click="resolveUploadOverwrite(true)">确认覆盖</button>
+          <UiButton class="text-button" type="button" @click="resolveUploadOverwrite(false)">跳过</UiButton>
+          <UiButton class="confirm-button danger" type="button" @click="resolveUploadOverwrite(true)">确认覆盖</UiButton>
         </div>
       </section>
     </div>

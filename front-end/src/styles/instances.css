@@ -23,10 +23,11 @@
 .clear-search { display: inline-flex; width: 26px; height: 26px; flex: 0 0 26px; align-items: center; justify-content: center; color: #86918c; background: transparent; border: 0; border-radius: 4px; }
 .clear-search:hover { color: var(--text); background: var(--surface-hover); }
 .toolbar-group { display: flex; align-items: center; gap: 8px; }
-.toolbar-label, .sort-control > span { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.toolbar-label, .sort-control > span:not(.ui-control) { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; white-space: nowrap; }
 .filter-segmented button { width: auto; min-width: 54px; padding: 0 9px; font-size: 12px; }
 .sort-control { display: flex; flex-direction: row; align-items: center; gap: 8px; }
-.sort-control select { width: 112px; min-height: 38px; padding: 0 28px 0 9px; font-size: 12px; }
+.sort-control .ui-select { width: 120px; }
+.sort-control .ui-select-trigger { width: 100%; min-height: 38px; padding: 0 9px; font-size: 12px; }
 .result-count { color: var(--muted); font-size: 11px; white-space: nowrap; }
 
 .instance-list.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 14px; }

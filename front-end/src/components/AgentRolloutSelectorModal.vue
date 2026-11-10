@@ -1,4 +1,9 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiCheckbox from './ui/UiCheckbox.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
+import UiSelect from './ui/UiSelect.vue'
 import { computed, ref, watch } from 'vue'
 import { Check, LoaderCircle, Search, Server, ShieldAlert, Wifi, WifiOff, X } from '@lucide/vue'
 import type { AgentRelease, AgentRolloutCandidate } from '../types/domain'
@@ -103,37 +108,29 @@ function submit() {
             <p>Agent {{ release.version }}</p>
           </div>
         </div>
-        <button class="icon-button subtle" type="button" title="关闭" aria-label="关闭实例选择" @click="$emit('close')">
+        <UiButton class="icon-button subtle" type="button" v-tooltip="'关闭'" aria-label="关闭实例选择" @click="$emit('close')">
           <X :size="17" />
-        </button>
+        </UiButton>
       </header>
 
       <div class="rollout-selector-filters">
         <label class="rollout-search">
           <Search :size="15" />
-          <input v-model="search" type="search" placeholder="搜索名称、主机名或实例 ID" autocomplete="off" />
+          <UiInput v-model="search" type="search" placeholder="搜索名称、主机名或实例 ID" autocomplete="off" />
         </label>
         <label>
           <span>状态</span>
-          <select v-model="statusFilter">
-            <option value="all">全部状态</option>
-            <option value="online">在线</option>
-            <option value="offline">离线</option>
-          </select>
+          <UiSelect v-model="statusFilter" :options="[{ value: 'all', label: '全部状态' }, { value: 'online', label: '在线' }, { value: 'offline', label: '离线' }]" />
         </label>
         <label>
           <span>平台</span>
-          <select v-model="platformFilter">
-            <option value="all">全部平台</option>
-            <option v-for="platform in platforms" :key="platform" :value="platform">{{ platform }}</option>
-          </select>
+          <UiSelect v-model="platformFilter" :options="[{ value: 'all', label: '全部平台' }, ...platforms.map((platform) => ({ value: platform, label: (platform) }))]" />
         </label>
       </div>
 
       <div class="rollout-selection-summary">
         <label>
-          <input
-            type="checkbox"
+          <UiCheckbox
             :checked="allVisibleSelected"
             :indeterminate="someVisibleSelected"
             :disabled="!selectableCandidates.length"
@@ -152,7 +149,7 @@ function submit() {
           没有符合筛选条件的实例
         </div>
         <template v-else>
-          <button
+          <UiButton
             v-for="candidate in filteredCandidates"
             :key="candidate.instance_id"
             class="rollout-candidate-row"
@@ -191,16 +188,16 @@ function submit() {
             <span v-else class="rollout-candidate-reason ready">
               {{ candidate.online ? '可立即下发' : '上线后下发' }}
             </span>
-          </button>
+          </UiButton>
         </template>
       </div>
 
-      <form class="modal-actions" @submit.prevent="submit">
-        <button class="text-button" type="button" @click="$emit('close')">取消</button>
-        <button class="primary-button" type="submit" :disabled="loading || !selectedIds.length">
+      <UiForm class="modal-actions" @submit.prevent="submit">
+        <UiButton class="text-button" type="button" @click="$emit('close')">取消</UiButton>
+        <UiButton class="primary-button" type="submit" :disabled="loading || !selectedIds.length">
           {{ mode === 'publish' ? `发布到 ${selectedIds.length} 个实例` : `添加 ${selectedIds.length} 个实例` }}
-        </button>
-      </form>
+        </UiButton>
+      </UiForm>
     </section>
   </div>
 </template>

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiSelect from './ui/UiSelect.vue'
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Download, Pause, Play, ScrollText, Trash2, X } from '@lucide/vue'
 import { dockerWebSocketUrl } from '../api/docker'
@@ -332,25 +334,20 @@ function decodeBase64(value: string) {
         <div class="docker-stream-actions">
           <label class="docker-tail-select">
             <span>尾部行数</span>
-            <select v-model.number="tail">
-              <option :value="200">200</option>
-              <option :value="500">500</option>
-              <option :value="1000">1000</option>
-              <option :value="2000">2000</option>
-            </select>
+            <UiSelect v-model="tail" :options="[{ value: 200, label: '200' }, { value: 500, label: '500' }, { value: 1000, label: '1000' }, { value: 2000, label: '2000' }]" />
           </label>
-          <button class="icon-button subtle" type="button" :title="following ? '暂停日志' : '继续日志'" @click="toggleFollowing">
+          <UiButton class="icon-button subtle" type="button" v-tooltip="following ? '暂停日志' : '继续日志'" @click="toggleFollowing">
             <Pause v-if="following" :size="15" /><Play v-else :size="15" />
-          </button>
-          <button class="icon-button subtle" type="button" title="下载日志" :disabled="!lines.length && !partialLine" @click="downloadLogs">
+          </UiButton>
+          <UiButton class="icon-button subtle" type="button" v-tooltip="'下载日志'" :disabled="!lines.length && !partialLine" @click="downloadLogs">
             <Download :size="15" />
-          </button>
-          <button class="icon-button subtle" type="button" title="清空显示" :disabled="!lines.length && !partialLine" @click="clearLogs">
+          </UiButton>
+          <UiButton class="icon-button subtle" type="button" v-tooltip="'清空显示'" :disabled="!lines.length && !partialLine" @click="clearLogs">
             <Trash2 :size="15" />
-          </button>
-          <button class="icon-button subtle" type="button" title="关闭日志" @click="emit('close')">
+          </UiButton>
+          <UiButton class="icon-button subtle" type="button" v-tooltip="'关闭日志'" @click="emit('close')">
             <X :size="16" />
-          </button>
+          </UiButton>
         </div>
       </header>
       <pre ref="logElement" class="docker-log-output" aria-live="polite">{{ displayText() || '等待日志输出…' }}</pre>

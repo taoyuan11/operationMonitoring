@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
 import { computed, nextTick, ref, watch } from 'vue'
 import {
   CircleCheck,
@@ -67,15 +68,15 @@ watch(
             <p>{{ execution.instanceName }} · {{ execution.commandName }}</p>
           </div>
         </div>
-        <button
+        <UiButton
           class="icon-button subtle"
           type="button"
-          title="关闭"
+          v-tooltip="'关闭'"
           aria-label="关闭命令执行结果"
           @click="$emit('close')"
         >
           <X :size="17" />
-        </button>
+        </UiButton>
       </header>
 
       <div :class="['command-result-status', execution.job.status]" role="status">
@@ -103,7 +104,7 @@ watch(
       </div>
 
       <footer class="modal-actions">
-        <button class="text-button" type="button" @click="$emit('close')">关闭</button>
+        <UiButton class="text-button" type="button" @click="$emit('close')">关闭</UiButton>
       </footer>
     </section>
   </div>

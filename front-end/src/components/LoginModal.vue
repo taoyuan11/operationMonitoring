@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
 import { KeyRound, LoaderCircle, LockKeyhole, LogIn, RotateCcw, ShieldCheck, User, X } from '@lucide/vue'
 import QrcodeVue from 'qrcode.vue'
 import type { AuthEnrollment, AuthMode } from '../types/domain'
@@ -30,10 +33,10 @@ function canSubmit() {
 
 <template>
   <div class="modal-backdrop login-backdrop" @click.self="$emit('close')" @keydown.esc="$emit('close')">
-    <form class="modal login-modal" role="dialog" aria-modal="true" aria-labelledby="login-title" @submit.prevent="$emit('login')">
-      <button class="icon-button subtle modal-close" type="button" title="关闭" @click="$emit('close')">
+    <UiForm class="modal login-modal" role="dialog" aria-modal="true" aria-labelledby="login-title" @submit.prevent="$emit('login')">
+      <UiButton class="icon-button subtle modal-close" type="button" v-tooltip="'关闭'" @click="$emit('close')">
         <X :size="17" />
-      </button>
+      </UiButton>
       <div class="login-icon"><ShieldCheck :size="25" /></div>
       <div class="login-copy centered">
         <span class="section-kicker">Authenticator access</span>
@@ -56,7 +59,7 @@ function canSubmit() {
           <span>Authenticator 代码</span>
           <div class="input-shell">
             <KeyRound :size="16" />
-            <input
+            <UiInput
               v-model="form.code"
               inputmode="numeric"
               autocomplete="one-time-code"
@@ -73,7 +76,7 @@ function canSubmit() {
           <span>用户名</span>
           <div class="input-shell">
             <User :size="16" />
-            <input
+            <UiInput
               v-model="form.username"
               autocomplete="username"
               autofocus
@@ -85,7 +88,7 @@ function canSubmit() {
           <span>默认管理密码</span>
           <div class="input-shell">
             <LockKeyhole :size="16" />
-            <input
+            <UiInput
               v-model="form.password"
               type="password"
               autocomplete="current-password"
@@ -97,7 +100,7 @@ function canSubmit() {
           <span>Authenticator 代码</span>
           <div class="input-shell">
             <KeyRound :size="16" />
-            <input
+            <UiInput
               v-model="form.code"
               inputmode="numeric"
               autocomplete="one-time-code"
@@ -108,15 +111,15 @@ function canSubmit() {
         </label>
       </template>
 
-      <button class="primary-button login-button" type="submit" :disabled="loading || !canSubmit()">
+      <UiButton class="primary-button login-button" type="submit" :disabled="loading || !canSubmit()">
         <LoaderCircle v-if="loading" class="spin" :size="17" />
         <LogIn v-else :size="17" />
         {{ loading ? '正在验证' : enrollment ? '确认并进入管理台' : mode === 'bootstrap' ? '生成绑定二维码' : '登录管理台' }}
-      </button>
-      <button v-if="enrollment && mode === 'bootstrap'" class="text-button auth-restart" type="button" @click="$emit('restart')">
+      </UiButton>
+      <UiButton v-if="enrollment && mode === 'bootstrap'" class="text-button auth-restart" type="button" @click="$emit('restart')">
         <RotateCcw :size="14" />重新输入用户名和密码
-      </button>
+      </UiButton>
       <small class="login-hint"><ShieldCheck :size="13" />初始化完成后，默认密码将永久失效</small>
-    </form>
+    </UiForm>
   </div>
 </template>

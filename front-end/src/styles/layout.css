@@ -241,6 +241,7 @@
   border-bottom: 1px solid var(--line);
 }
 .admin-navigation button {
+  border-radius: 0;
   position: relative;
   display: inline-flex;
   min-height: 46px;

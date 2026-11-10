@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiInput from './ui/UiInput.vue'
+import UiSelect from './ui/UiSelect.vue'
 import { computed, ref } from 'vue'
 import {
   ArrowDownWideNarrow,
@@ -150,26 +153,26 @@ function openInstance(instance: Instance) {
         <p>节点状态与资源指标每 5 秒自动刷新</p>
       </div>
       <div class="segmented" aria-label="切换视图">
-        <button
+        <UiButton
           :class="{ active: viewMode === 'grid' }"
           type="button"
-          title="卡片视图"
+          v-tooltip="'卡片视图'"
           aria-label="切换到卡片视图"
           :aria-pressed="viewMode === 'grid'"
           @click="$emit('update:viewMode', 'grid')"
         >
           <Grid3X3 :size="16" />
-        </button>
-        <button
+        </UiButton>
+        <UiButton
           :class="{ active: viewMode === 'rows' }"
           type="button"
-          title="列表视图"
+          v-tooltip="'列表视图'"
           aria-label="切换到列表视图"
           :aria-pressed="viewMode === 'rows'"
           @click="$emit('update:viewMode', 'rows')"
         >
           <Rows3 :size="16" />
-        </button>
+        </UiButton>
       </div>
     </div>
 
@@ -177,70 +180,65 @@ function openInstance(instance: Instance) {
       <div v-if="instances.length" class="board-toolbar">
         <div class="instance-search" role="search">
           <Search :size="16" aria-hidden="true" />
-          <input
+          <UiInput
             v-model="searchQuery"
             type="search"
             aria-label="搜索节点名称、主机名、地区或备注"
             placeholder="搜索名称、主机名、地区或备注"
           />
           <Transition name="fade-scale">
-            <button
+            <UiButton
               v-if="searchQuery"
               class="clear-search"
               type="button"
-              title="清除搜索"
+              v-tooltip="'清除搜索'"
               aria-label="清除节点搜索"
               @click="searchQuery = ''"
             >
               <X :size="14" />
-            </button>
+            </UiButton>
           </Transition>
         </div>
 
         <div class="toolbar-group status-filter">
           <span class="toolbar-label"><ListFilter :size="14" aria-hidden="true" />状态</span>
           <div class="segmented filter-segmented" aria-label="按节点状态筛选">
-            <button
+            <UiButton
               :class="{ active: statusFilter === 'all' }"
               type="button"
-              title="显示全部节点"
+              v-tooltip="'显示全部节点'"
               aria-label="显示全部节点"
               :aria-pressed="statusFilter === 'all'"
               @click="statusFilter = 'all'"
             >
               全部
-            </button>
-            <button
+            </UiButton>
+            <UiButton
               :class="{ active: statusFilter === 'online' }"
               type="button"
-              title="只显示在线节点"
+              v-tooltip="'只显示在线节点'"
               aria-label="只显示在线节点"
               :aria-pressed="statusFilter === 'online'"
               @click="statusFilter = 'online'"
             >
               <Wifi :size="13" aria-hidden="true" />在线
-            </button>
-            <button
+            </UiButton>
+            <UiButton
               :class="{ active: statusFilter === 'offline' }"
               type="button"
-              title="只显示离线节点"
+              v-tooltip="'只显示离线节点'"
               aria-label="只显示离线节点"
               :aria-pressed="statusFilter === 'offline'"
               @click="statusFilter = 'offline'"
             >
               <WifiOff :size="13" aria-hidden="true" />离线
-            </button>
+            </UiButton>
           </div>
         </div>
 
         <label class="sort-control">
           <span><ArrowDownWideNarrow :size="14" aria-hidden="true" />排序</span>
-          <select v-model="sortMode" aria-label="节点排序方式">
-            <option value="default">默认顺序</option>
-            <option value="cpu">CPU 占用</option>
-            <option value="memory">内存占用</option>
-            <option value="name">节点名称</option>
-          </select>
+          <UiSelect v-model="sortMode" aria-label="节点排序方式" :options="[{ value: 'default', label: '默认顺序' }, { value: 'cpu', label: 'CPU 占用' }, { value: 'memory', label: '内存占用' }, { value: 'name', label: '节点名称' }]" />
         </label>
 
         <output class="result-count" aria-live="polite">
@@ -261,15 +259,15 @@ function openInstance(instance: Instance) {
           <span class="empty-icon"><Search :size="28" /></span>
           <strong>没有符合条件的节点</strong>
           <span>尝试更换关键词或状态筛选条件。</span>
-          <button
+          <UiButton
             class="text-button"
             type="button"
-            title="重置筛选条件"
+            v-tooltip="'重置筛选条件'"
             aria-label="重置节点筛选条件"
             @click="resetFilters"
           >
             <RotateCcw :size="14" />重置筛选
-          </button>
+          </UiButton>
         </div>
 
         <TransitionGroup v-else key="instances" name="instance" tag="div" :class="['instance-list', viewMode]">
@@ -289,7 +287,7 @@ function openInstance(instance: Instance) {
                 <OperatingSystemLogo class="server-icon" :os="instance.os" />
                 <div>
                   <div class="title-line">
-                    <h3 :title="instanceName(instance)">{{ instanceName(instance) }}</h3>
+                    <h3 v-tooltip="instanceName(instance)">{{ instanceName(instance) }}</h3>
                     <span :class="['status-badge', { online: instance.online }]">
                       <i></i>{{ instance.online ? '在线' : '离线' }}
                     </span>
@@ -308,7 +306,7 @@ function openInstance(instance: Instance) {
             <div class="lifecycle-grid">
               <div class="lifecycle-item">
                 <span class="lifecycle-label"><Clock3 :size="14" />运行时长</span>
-                <strong class="lifecycle-value" :title="formatDuration(instance.metrics?.uptime_seconds)">
+                <strong class="lifecycle-value" v-tooltip="formatDuration(instance.metrics?.uptime_seconds)">
                   {{ formatDuration(instance.metrics?.uptime_seconds) }}
                 </strong>
                 <small class="lifecycle-detail">
@@ -319,11 +317,11 @@ function openInstance(instance: Instance) {
                 <span class="lifecycle-label"><CalendarClock :size="14" />到期时间</span>
                 <strong
                   class="lifecycle-value"
-                  :title="formatExpirationRelative(instance.expires_at, currentTimestamp())"
+                  v-tooltip="formatExpirationRelative(instance.expires_at, currentTimestamp())"
                 >
                   {{ formatExpirationRelative(instance.expires_at, currentTimestamp()) }}
                 </strong>
-                <small class="lifecycle-detail" :title="instance.expires_at ? formatTime(instance.expires_at) : '未设置到期时间'">
+                <small class="lifecycle-detail" v-tooltip="instance.expires_at ? formatTime(instance.expires_at) : '未设置到期时间'">
                   {{ instance.expires_at ? formatTime(instance.expires_at) : '未设置到期时间' }}
                 </small>
               </div>

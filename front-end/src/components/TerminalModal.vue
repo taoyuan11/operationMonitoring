@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiInput from './ui/UiInput.vue'
+import UiSelect from './ui/UiSelect.vue'
 import { computed, ref, watch } from 'vue'
 import {
   LoaderCircle,
@@ -247,12 +250,12 @@ function statusText(status: TerminalSessionStatus) {
           </div>
         </div>
         <div class="terminal-head-actions">
-          <button class="icon-button" type="button" title="新建终端" aria-label="新建终端" @click="openCreator">
+          <UiButton class="icon-button" type="button" v-tooltip="'新建终端'" aria-label="新建终端" @click="openCreator">
             <Plus :size="17" />
-          </button>
-          <button class="icon-button" type="button" title="关闭工作区" aria-label="关闭终端工作区" @click="requestWorkspaceClose">
+          </UiButton>
+          <UiButton class="icon-button" type="button" v-tooltip="'关闭工作区'" aria-label="关闭终端工作区" @click="requestWorkspaceClose">
             <X :size="17" />
-          </button>
+          </UiButton>
         </div>
       </header>
 
@@ -264,7 +267,7 @@ function statusText(status: TerminalSessionStatus) {
           role="tab"
           tabindex="0"
           :aria-selected="session.id === activeSessionId && !creatorOpen"
-          :title="session.title"
+          v-tooltip="session.title"
           @click="activateSession(session.id)"
           @keydown.enter="activateSession(session.id)"
           @keydown.space.prevent="activateSession(session.id)"
@@ -272,24 +275,24 @@ function statusText(status: TerminalSessionStatus) {
           <span :class="['terminal-tab-status', session.status]"></span>
           <span class="terminal-tab-label">{{ session.title }}</span>
           <span class="terminal-tab-state">{{ statusText(session.status) }}</span>
-          <button
+          <UiButton
             class="terminal-tab-close"
             type="button"
-            title="关闭会话"
+            v-tooltip="'关闭会话'"
             :aria-label="`关闭 ${session.title}`"
             @click.stop="closeSession(session.id)"
             @keydown.enter.stop="closeSession(session.id)"
             @keydown.space.prevent.stop="closeSession(session.id)"
-          ><X :size="13" /></button>
+          ><X :size="13" /></UiButton>
         </div>
-        <button
+        <UiButton
           :class="['terminal-new-tab', { active: creatorOpen }]"
           type="button"
           role="tab"
           :aria-selected="creatorOpen"
-          title="新建终端"
+          v-tooltip="'新建终端'"
           @click="openCreator"
-        ><Plus :size="15" /></button>
+        ><Plus :size="15" /></UiButton>
       </div>
 
       <div v-if="creatorOpen" class="terminal-creator">
@@ -301,44 +304,36 @@ function statusText(status: TerminalSessionStatus) {
         <div class="terminal-creator-fields">
           <label>
             <span>实例</span>
-            <select v-model="selectedInstanceId">
-              <option v-for="item in onlineInstances" :key="item.id" :value="item.id">
-                {{ item.name || item.hostname }} · {{ item.os }}
-              </option>
-            </select>
+            <UiSelect v-model="selectedInstanceId" :options="[...onlineInstances.map((item) => ({ value: item.id, label: (item.name || item.hostname) + ' · ' + (item.os) }))]" />
           </label>
 
           <div class="terminal-shell-field">
             <span class="terminal-field-label">Shell</span>
             <div class="segmented terminal-shell-modes">
-              <button type="button" :class="{ active: shellMode === 'auto' }" @click="shellMode = 'auto'">自动</button>
-              <button
+              <UiButton type="button" :class="{ active: shellMode === 'auto' }" @click="shellMode = 'auto'">自动</UiButton>
+              <UiButton
                 v-if="supportsShellSelection"
                 type="button"
                 :class="{ active: shellMode === 'detected' }"
                 @click="shellMode = 'detected'"
-              >已检测</button>
-              <button
+              >已检测</UiButton>
+              <UiButton
                 v-if="supportsShellSelection"
                 type="button"
                 :class="{ active: shellMode === 'custom' }"
                 @click="shellMode = 'custom'"
-              >自定义</button>
+              >自定义</UiButton>
             </div>
           </div>
 
           <label v-if="shellMode === 'detected'" class="terminal-shell-input">
             <span>可用 Shell</span>
-            <select v-model="detectedProgram" :disabled="shellsLoading || shellOptions.length === 0">
-              <option v-for="shell in shellOptions" :key="shell.program" :value="shell.program">
-                {{ shell.label }} · {{ shell.program }}
-              </option>
-            </select>
+            <UiSelect v-model="detectedProgram" :disabled="shellsLoading || shellOptions.length === 0" :options="[...shellOptions.map((shell) => ({ value: shell.program, label: (shell.label) + ' · ' + (shell.program) }))]" />
           </label>
 
           <label v-else-if="shellMode === 'custom'" class="terminal-shell-input">
             <span>可执行文件</span>
-            <input
+            <UiInput
               v-model="customProgram"
               type="text"
               autocomplete="off"
@@ -357,19 +352,19 @@ function statusText(status: TerminalSessionStatus) {
         </div>
         <div v-else-if="shellsError" class="terminal-creator-notice error" role="alert">
           <span>{{ shellsError }}</span>
-          <button class="icon-button subtle" type="button" title="重试" aria-label="重新读取 Shell 列表" @click="loadShellOptions">
+          <UiButton class="icon-button subtle" type="button" v-tooltip="'重试'" aria-label="重新读取 Shell 列表" @click="loadShellOptions">
             <RefreshCw :size="14" />
-          </button>
+          </UiButton>
         </div>
         <div v-else-if="selectedInstanceSessionCount >= maxSessions" class="terminal-creator-notice error">
           该实例已达到 {{ maxSessions }} 个活动终端的上限。
         </div>
 
         <div class="terminal-creator-actions">
-          <button v-if="sessions.length" class="text-button" type="button" @click="cancelCreator">取消</button>
-          <button class="primary-button" type="button" :disabled="createDisabled" @click="createSession">
+          <UiButton v-if="sessions.length" class="text-button" type="button" @click="cancelCreator">取消</UiButton>
+          <UiButton class="primary-button" type="button" :disabled="createDisabled" @click="createSession">
             <TerminalSquare :size="16" />创建终端
-          </button>
+          </UiButton>
         </div>
       </div>
 

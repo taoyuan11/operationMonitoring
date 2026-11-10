@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
 import { ref } from 'vue'
 import { CircleAlert, X } from '@lucide/vue'
 
@@ -25,9 +28,9 @@ const enteredConfirmation = ref('')
 <template>
   <div class="modal-backdrop">
     <section class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
-      <button class="icon-button subtle modal-close" type="button" title="关闭" aria-label="关闭确认弹窗" @click="$emit('close')">
+      <UiButton class="icon-button subtle modal-close" type="button" v-tooltip="'关闭'" aria-label="关闭确认弹窗" @click="$emit('close')">
         <X :size="17" />
-      </button>
+      </UiButton>
       <span :class="['confirm-icon', tone]"><CircleAlert :size="24" /></span>
       <div class="confirm-copy">
         <h2 id="confirm-title">{{ title }}</h2>
@@ -35,7 +38,7 @@ const enteredConfirmation = ref('')
       </div>
       <label v-if="confirmationText" class="confirm-target-field">
         <span>输入 <strong>{{ confirmationText }}</strong> 以确认目标</span>
-        <input
+        <UiInput
           v-model="enteredConfirmation"
           type="text"
           autocomplete="off"
@@ -43,14 +46,14 @@ const enteredConfirmation = ref('')
           autofocus
         />
       </label>
-      <form class="modal-actions" @submit.prevent="$emit('confirm')">
-        <button class="text-button" type="button" :autofocus="!confirmationText" @click="$emit('close')">取消</button>
-        <button
+      <UiForm class="modal-actions" @submit.prevent="$emit('confirm')">
+        <UiButton class="text-button" type="button" :autofocus="!confirmationText" @click="$emit('close')">取消</UiButton>
+        <UiButton
           :class="['confirm-button', tone]"
           type="submit"
           :disabled="Boolean(props.confirmationText) && enteredConfirmation !== props.confirmationText"
-        >{{ confirmLabel }}</button>
-      </form>
+        >{{ confirmLabel }}</UiButton>
+      </UiForm>
     </section>
   </div>
 </template>

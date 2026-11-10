@@ -1,4 +1,12 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiCheckbox from './ui/UiCheckbox.vue'
+import UiDateTimePicker from './ui/UiDateTimePicker.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
+import UiNumberInput from './ui/UiNumberInput.vue'
+import UiSelect from './ui/UiSelect.vue'
+import UiTextarea from './ui/UiTextarea.vue'
 import { computed } from 'vue'
 import {
   Activity,
@@ -348,19 +356,18 @@ function dateInputValue(timestamp: number) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-function setMaintenanceTime(key: 'starts_at' | 'ends_at', event: Event) {
-  const value = Date.parse((event.target as HTMLInputElement).value)
+function setMaintenanceTime(key: 'starts_at' | 'ends_at', raw: string) {
+  const value = Date.parse(raw)
   if (!Number.isNaN(value)) maintenanceForm[key] = Math.floor(value / 1000)
 }
 
-function setEventTime(key: 'from' | 'to', event: Event) {
-  const raw = (event.target as HTMLInputElement).value
+function setEventTime(key: 'from' | 'to', raw: string) {
   const value = Date.parse(raw)
   eventQuery[key] = raw && !Number.isNaN(value) ? Math.floor(value / 1000) : null
 }
 
-function changeRuleMetric(event: Event) {
-  const metric = (event.target as HTMLSelectElement).value as AlertMetric
+function changeRuleMetric(value: string) {
+  const metric = value as AlertMetric
   const preset = ALERT_RULE_PRESETS.find((item) => item.metric === metric)
   ruleForm.metric = metric
   ruleForm.threshold = preset?.threshold ?? null
@@ -411,16 +418,16 @@ function jsonValue(value: unknown) {
         <h2>告警中心</h2>
         <p>处理监控异常、静默计划和通知投递。</p>
       </div>
-      <button
+      <UiButton
         class="icon-button"
         type="button"
-        title="刷新当前页"
+        v-tooltip="'刷新当前页'"
         :disabled="loading"
         @click="refreshCurrentTab"
       >
         <LoaderCircle v-if="loading" class="spin" :size="16" />
         <RefreshCw v-else :size="16" />
-      </button>
+      </UiButton>
     </header>
 
     <div class="alert-summary-strip" aria-label="告警摘要">
@@ -443,7 +450,7 @@ function jsonValue(value: unknown) {
     </div>
 
     <nav class="alert-tabs" aria-label="告警中心视图">
-      <button
+      <UiButton
         v-for="tab in tabs"
         :key="tab.id"
         :class="{ active: activeTab === tab.id }"
@@ -453,7 +460,7 @@ function jsonValue(value: unknown) {
         <component :is="tab.icon" :size="15" />
         <span>{{ tab.label }}</span>
         <em v-if="tab.id === 'events' && summary.firing">{{ summary.firing }}</em>
-      </button>
+      </UiButton>
     </nav>
 
     <Transition name="notice">
@@ -462,63 +469,44 @@ function jsonValue(value: unknown) {
     </Transition>
 
     <div v-if="activeTab === 'events'" class="alert-tab-content">
-      <form class="alert-filter-bar" @submit.prevent="updateEventQuery({})">
+      <UiForm class="alert-filter-bar" @submit.prevent="updateEventQuery({})">
         <label>
           <span>状态</span>
-          <select v-model="eventQuery.status">
-            <option value="">全部状态</option>
-            <option value="firing">告警中</option>
-            <option value="acknowledged">已确认</option>
-            <option value="resolved">已恢复</option>
-          </select>
+          <UiSelect v-model="eventQuery.status" :options="[{ value: '', label: '全部状态' }, { value: 'firing', label: '告警中' }, { value: 'acknowledged', label: '已确认' }, { value: 'resolved', label: '已恢复' }]" />
         </label>
         <label>
           <span>级别</span>
-          <select v-model="eventQuery.severity">
-            <option value="">全部级别</option>
-            <option value="critical">严重</option>
-            <option value="warning">警告</option>
-          </select>
+          <UiSelect v-model="eventQuery.severity" :options="[{ value: '', label: '全部级别' }, { value: 'critical', label: '严重' }, { value: 'warning', label: '警告' }]" />
         </label>
         <label>
           <span>指标</span>
-          <select v-model="eventQuery.metric">
-            <option value="">全部指标</option>
-            <option v-for="option in metricOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
-          </select>
+          <UiSelect v-model="eventQuery.metric" :options="[{ value: '', label: '全部指标' }, ...metricOptions.map((option) => ({ value: option.value, label: (option.label) }))]" />
         </label>
         <label>
           <span>节点</span>
-          <select v-model="eventQuery.instance_id">
-            <option value="">全部节点</option>
-            <option v-for="instance in instances" :key="instance.id" :value="instance.id">{{ instance.name || instance.hostname }}</option>
-          </select>
+          <UiSelect v-model="eventQuery.instance_id" :options="[{ value: '', label: '全部节点' }, ...instances.map((instance) => ({ value: instance.id, label: (instance.name || instance.hostname) }))]" />
         </label>
         <label>
           <span>抑制</span>
-          <select v-model="eventQuery.suppressed">
-            <option value="">全部</option>
-            <option value="true">仅已抑制</option>
-            <option value="false">仅未抑制</option>
-          </select>
+          <UiSelect v-model="eventQuery.suppressed" :options="[{ value: '', label: '全部' }, { value: 'true', label: '仅已抑制' }, { value: 'false', label: '仅未抑制' }]" />
         </label>
         <label>
           <span>开始时间</span>
-          <input type="datetime-local" :value="eventQuery.from ? dateInputValue(eventQuery.from) : ''" @change="setEventTime('from', $event)" />
+          <UiDateTimePicker :model-value="eventQuery.from ? dateInputValue(eventQuery.from) : ''" @change="setEventTime('from', $event)" />
         </label>
         <label>
           <span>结束时间</span>
-          <input type="datetime-local" :value="eventQuery.to ? dateInputValue(eventQuery.to) : ''" @change="setEventTime('to', $event)" />
+          <UiDateTimePicker :model-value="eventQuery.to ? dateInputValue(eventQuery.to) : ''" @change="setEventTime('to', $event)" />
         </label>
         <label class="alert-search-filter">
           <span>关键词</span>
-          <span class="input-shell"><Search :size="14" /><input v-model="eventQuery.search" placeholder="规则、节点或事件 ID" /></span>
+          <span class="input-shell"><Search :size="14" /><UiInput v-model="eventQuery.search" placeholder="规则、节点或事件 ID" /></span>
         </label>
         <div class="alert-filter-actions">
-          <button class="text-button" type="button" @click="resetEventQuery"><RotateCcw :size="14" />重置</button>
-          <button class="primary-button" type="submit"><Search :size="14" />查询</button>
+          <UiButton class="text-button" type="button" @click="resetEventQuery"><RotateCcw :size="14" />重置</UiButton>
+          <UiButton class="primary-button" type="submit"><Search :size="14" />查询</UiButton>
         </div>
-      </form>
+      </UiForm>
 
       <div class="alert-data-surface event-surface">
         <div class="alert-event-head">
@@ -550,13 +538,13 @@ function jsonValue(value: unknown) {
               <strong>{{ formatTime(event.fired_at) }}</strong>
               <small>更新 {{ formatTime(event.last_observed_at) }}</small>
             </div>
-            <button
+            <UiButton
               class="icon-button"
               type="button"
-              title="查看事件详情"
+              v-tooltip="'查看事件详情'"
               :aria-expanded="expandedEventId === event.id"
               @click="toggleEventDetail(event)"
-            ><ChevronDown :size="15" /></button>
+            ><ChevronDown :size="15" /></UiButton>
 
             <div v-if="expandedEventId === event.id" class="alert-event-detail">
               <div v-if="!eventDetail || eventDetail.id !== event.id" class="alert-detail-loading"><LoaderCircle class="spin" :size="18" />加载事件详情</div>
@@ -570,13 +558,13 @@ function jsonValue(value: unknown) {
                   <div><dt>抑制原因</dt><dd>{{ eventDetail.suppression_reason || '未抑制' }}</dd></div>
                 </dl>
 
-                <form v-if="eventDetail.status === 'firing'" class="acknowledge-form" @submit.prevent="acknowledgeEvent(eventDetail)">
-                  <label><span>确认备注 <i>可选</i></span><input v-model="acknowledgeNote" maxlength="2000" placeholder="记录负责人、处置动作或关联工单" /></label>
-                  <button class="primary-button" type="submit" :disabled="isBusy(`event:${event.id}:acknowledge`)">
+                <UiForm v-if="eventDetail.status === 'firing'" class="acknowledge-form" @submit.prevent="acknowledgeEvent(eventDetail)">
+                  <label><span>确认备注 <i>可选</i></span><UiInput v-model="acknowledgeNote" maxlength="2000" placeholder="记录负责人、处置动作或关联工单" /></label>
+                  <UiButton class="primary-button" type="submit" :disabled="isBusy(`event:${event.id}:acknowledge`)">
                     <LoaderCircle v-if="isBusy(`event:${event.id}:acknowledge`)" class="spin" :size="14" />
                     <Check v-else :size="14" />确认事件
-                  </button>
-                </form>
+                  </UiButton>
+                </UiForm>
 
                 <div class="alert-detail-columns">
                   <section>
@@ -607,9 +595,9 @@ function jsonValue(value: unknown) {
         <div class="alert-pagination">
           <span>{{ eventRangeLabel() }}</span>
           <div>
-            <button class="icon-button" type="button" title="上一页" :disabled="events.page <= 1" @click="setEventPage(events.page - 1)"><ChevronLeft :size="15" /></button>
+            <UiButton class="icon-button" type="button" v-tooltip="'上一页'" :disabled="events.page <= 1" @click="setEventPage(events.page - 1)"><ChevronLeft :size="15" /></UiButton>
             <strong>{{ events.page }} / {{ events.pages || 1 }}</strong>
-            <button class="icon-button" type="button" title="下一页" :disabled="events.page >= (events.pages || 1)" @click="setEventPage(events.page + 1)"><ChevronRight :size="15" /></button>
+            <UiButton class="icon-button" type="button" v-tooltip="'下一页'" :disabled="events.page >= (events.pages || 1)" @click="setEventPage(events.page + 1)"><ChevronRight :size="15" /></UiButton>
           </div>
         </div>
       </div>
@@ -619,50 +607,50 @@ function jsonValue(value: unknown) {
       <section class="alert-form-panel">
         <div class="alert-panel-heading">
           <div><h3>{{ editingRuleId ? '编辑规则' : '创建规则' }}</h3><p>{{ ruleForm.metric === 'instance_expiring' ? '进入设定的到期提醒周期后立即生成事件。' : '异常持续达到设定时间后生成事件。' }}</p></div>
-          <button v-if="editingRuleId" class="icon-button" type="button" title="取消编辑" @click="resetRuleForm"><X :size="15" /></button>
+          <UiButton v-if="editingRuleId" class="icon-button" type="button" v-tooltip="'取消编辑'" @click="resetRuleForm"><X :size="15" /></UiButton>
         </div>
         <div class="alert-presets" aria-label="快速规则预设">
-          <button v-for="preset in ALERT_RULE_PRESETS" :key="preset.metric" type="button" :class="{ active: !editingRuleId && ruleForm.metric === preset.metric }" @click="selectRulePreset(preset.metric)">
+          <UiButton v-for="preset in ALERT_RULE_PRESETS" :key="preset.metric" type="button" :class="{ active: !editingRuleId && ruleForm.metric === preset.metric }" @click="selectRulePreset(preset.metric)">
             <component :is="metricIcon(preset.metric)" :size="14" /><span>{{ metricLabel(preset.metric) }}</span>
-          </button>
+          </UiButton>
         </div>
-        <form class="stack-form alert-editor-form" @submit.prevent="saveRule">
-          <label><span>规则名称</span><input v-model="ruleForm.name" required maxlength="120" placeholder="例如：核心节点 CPU 持续过高" /></label>
+        <UiForm class="stack-form alert-editor-form" @submit.prevent="saveRule">
+          <label><span>规则名称</span><UiInput v-model="ruleForm.name" required maxlength="120" placeholder="例如：核心节点 CPU 持续过高" /></label>
           <div class="alert-form-grid">
-            <label><span>监控指标</span><select :value="ruleForm.metric" @change="changeRuleMetric"><option v-for="option in metricOptions" :key="option.value" :value="option.value">{{ option.label }}</option></select></label>
-            <label v-if="ruleForm.metric !== 'node_offline'"><span>阈值 {{ ruleForm.metric === 'latency_ms' ? '(ms)' : ruleForm.metric === 'instance_expiring' ? '(天)' : '(%)' }}</span><input v-model.number="ruleForm.threshold" required type="number" min="0" :max="['cpu_percent', 'memory_percent', 'disk_percent'].includes(ruleForm.metric) ? 100 : undefined" :step="ruleForm.metric === 'instance_expiring' ? 1 : 0.1" /></label>
-            <label v-if="ruleForm.metric !== 'instance_expiring'"><span>持续时间（秒）</span><input v-model.number="ruleForm.duration_seconds" required type="number" min="0" max="31536000" /></label>
+            <label><span>监控指标</span><UiSelect :model-value="ruleForm.metric" @change="changeRuleMetric" :options="[...metricOptions.map((option) => ({ value: option.value, label: (option.label) }))]" /></label>
+            <label v-if="ruleForm.metric !== 'node_offline'"><span>阈值 {{ ruleForm.metric === 'latency_ms' ? '(ms)' : ruleForm.metric === 'instance_expiring' ? '(天)' : '(%)' }}</span><UiNumberInput v-model="ruleForm.threshold" required min="0" :max="['cpu_percent', 'memory_percent', 'disk_percent'].includes(ruleForm.metric) ? 100 : undefined" :step="ruleForm.metric === 'instance_expiring' ? 1 : 0.1" /></label>
+            <label v-if="ruleForm.metric !== 'instance_expiring'"><span>持续时间（秒）</span><UiNumberInput v-model="ruleForm.duration_seconds" required min="0" max="31536000" /></label>
           </div>
           <fieldset class="alert-choice-fieldset">
             <legend>严重级别</legend>
             <div class="alert-segmented">
-              <button type="button" :class="{ active: ruleForm.severity === 'warning' }" @click="ruleForm.severity = 'warning'">警告</button>
-              <button type="button" :class="{ active: ruleForm.severity === 'critical' }" @click="ruleForm.severity = 'critical'">严重</button>
+              <UiButton type="button" :class="{ active: ruleForm.severity === 'warning' }" @click="ruleForm.severity = 'warning'">警告</UiButton>
+              <UiButton type="button" :class="{ active: ruleForm.severity === 'critical' }" @click="ruleForm.severity = 'critical'">严重</UiButton>
             </div>
           </fieldset>
           <fieldset class="alert-choice-fieldset">
             <legend>作用范围</legend>
             <div class="alert-segmented">
-              <button type="button" :class="{ active: ruleForm.scope === 'all' }" @click="ruleForm.scope = 'all'; ruleForm.target_instance_ids = []">全部节点</button>
-              <button type="button" :class="{ active: ruleForm.scope === 'specific' }" @click="ruleForm.scope = 'specific'">指定节点</button>
+              <UiButton type="button" :class="{ active: ruleForm.scope === 'all' }" @click="ruleForm.scope = 'all'; ruleForm.target_instance_ids = []">全部节点</UiButton>
+              <UiButton type="button" :class="{ active: ruleForm.scope === 'specific' }" @click="ruleForm.scope = 'specific'">指定节点</UiButton>
             </div>
           </fieldset>
           <fieldset v-if="ruleForm.scope === 'specific'" class="alert-check-fieldset">
             <legend>目标节点</legend>
             <div class="alert-checkbox-list">
-              <label v-for="instance in instances" :key="instance.id"><input v-model="ruleForm.target_instance_ids" type="checkbox" :value="instance.id" /><span>{{ instance.name || instance.hostname }}<small>{{ instance.online ? '在线' : '离线' }}</small></span></label>
+              <label v-for="instance in instances" :key="instance.id"><UiCheckbox v-model="ruleForm.target_instance_ids" :value="instance.id" /><span>{{ instance.name || instance.hostname }}<small>{{ instance.online ? '在线' : '离线' }}</small></span></label>
             </div>
           </fieldset>
           <fieldset class="alert-check-fieldset">
             <legend>通知渠道 <i>可选</i></legend>
             <div v-if="!channels.items.length" class="alert-compact-empty">未配置通知渠道，事件仍会出现在控制台</div>
             <div v-else class="alert-checkbox-list">
-              <label v-for="channel in channels.items" :key="channel.id"><input v-model="ruleForm.channel_ids" type="checkbox" :value="channel.id" /><span>{{ channel.name }}<small>{{ channel.enabled ? '已启用' : '已停用' }}</small></span></label>
+              <label v-for="channel in channels.items" :key="channel.id"><UiCheckbox v-model="ruleForm.channel_ids" :value="channel.id" /><span>{{ channel.name }}<small>{{ channel.enabled ? '已启用' : '已停用' }}</small></span></label>
             </div>
           </fieldset>
-          <label class="alert-toggle-row"><input v-model="ruleForm.enabled" type="checkbox" /><span><strong>创建后启用</strong><small>停用规则会自动恢复其活动事件</small></span></label>
-          <button class="primary-button" type="submit" :disabled="isBusy(editingRuleId ? `rule:${editingRuleId}:save` : 'rule:create')"><Check :size="15" />{{ editingRuleId ? '保存规则' : '创建规则' }}</button>
-        </form>
+          <label class="alert-toggle-row"><UiCheckbox v-model="ruleForm.enabled" /><span><strong>创建后启用</strong><small>停用规则会自动恢复其活动事件</small></span></label>
+          <UiButton class="primary-button" type="submit" :disabled="isBusy(editingRuleId ? `rule:${editingRuleId}:save` : 'rule:create')"><Check :size="15" />{{ editingRuleId ? '保存规则' : '创建规则' }}</UiButton>
+        </UiForm>
       </section>
 
       <section class="alert-list-panel">
@@ -672,10 +660,10 @@ function jsonValue(value: unknown) {
           <article v-for="rule in rules.items" :key="rule.id" :class="{ disabled: !rule.enabled, editing: editingRuleId === rule.id }">
             <span :class="['alert-severity-mark', rule.severity]"><component :is="metricIcon(rule.metric)" :size="16" /></span>
             <div class="alert-rule-main"><strong>{{ rule.name }}</strong><small>{{ metricLabel(rule.metric) }} {{ formatThreshold(rule) }}<template v-if="rule.metric !== 'instance_expiring'"> · 持续 {{ formatDuration(rule.duration_seconds) }}</template></small><p>{{ rule.scope === 'all' ? '全部节点' : `${rule.target_instance_ids.length} 个指定节点` }} · {{ rule.channel_ids.length ? `${rule.channel_ids.length} 个通知渠道` : '仅控制台事件' }}</p></div>
-            <label class="switch-control" :title="rule.enabled ? '停用规则' : '启用规则'"><input type="checkbox" :checked="rule.enabled" :disabled="isBusy(`rule:${rule.id}:enabled`)" @change="toggleRule(rule, ($event.target as HTMLInputElement).checked)" /><span></span></label>
+            <label class="switch-control" v-tooltip="rule.enabled ? '停用规则' : '启用规则'"><UiCheckbox :checked="rule.enabled" :disabled="isBusy(`rule:${rule.id}:enabled`)" @change="toggleRule(rule, ($event.target as HTMLInputElement).checked)" /><span></span></label>
             <div class="row-actions">
-              <button class="icon-button" type="button" title="编辑规则" @click="editRule(rule)"><Edit3 :size="14" /></button>
-              <button class="icon-button danger" type="button" title="删除规则" @click="emit('deleteRule', rule)"><Trash2 :size="14" /></button>
+              <UiButton class="icon-button" type="button" v-tooltip="'编辑规则'" @click="editRule(rule)"><Edit3 :size="14" /></UiButton>
+              <UiButton class="icon-button danger" type="button" v-tooltip="'删除规则'" @click="emit('deleteRule', rule)"><Trash2 :size="14" /></UiButton>
             </div>
           </article>
         </div>
@@ -684,24 +672,24 @@ function jsonValue(value: unknown) {
 
     <div v-else-if="activeTab === 'maintenance'" class="alert-tab-content alert-config-layout">
       <section class="alert-form-panel">
-        <div class="alert-panel-heading"><div><h3>{{ editingMaintenanceId ? '编辑维护窗口' : '创建维护窗口' }}</h3><p>窗口采用开始时间包含、结束时间不包含的区间。</p></div><button v-if="editingMaintenanceId" class="icon-button" type="button" title="取消编辑" @click="resetMaintenanceForm"><X :size="15" /></button></div>
-        <form class="stack-form alert-editor-form" @submit.prevent="saveMaintenance">
-          <label><span>窗口名称</span><input v-model="maintenanceForm.name" required maxlength="120" placeholder="例如：数据库计划升级" /></label>
-          <label><span>维护原因 <i>可选</i></span><textarea v-model="maintenanceForm.reason" maxlength="2000" placeholder="变更内容、负责人或工单编号"></textarea></label>
-          <fieldset class="alert-choice-fieldset"><legend>作用范围</legend><div class="alert-segmented"><button type="button" :class="{ active: maintenanceForm.scope === 'global' }" @click="maintenanceForm.scope = 'global'; maintenanceForm.target_ids = []">全局</button><button type="button" :class="{ active: maintenanceForm.scope === 'rule' }" @click="maintenanceForm.scope = 'rule'; maintenanceForm.target_ids = []">指定规则</button><button type="button" :class="{ active: maintenanceForm.scope === 'node' }" @click="maintenanceForm.scope = 'node'; maintenanceForm.target_ids = []">指定节点</button></div></fieldset>
+        <div class="alert-panel-heading"><div><h3>{{ editingMaintenanceId ? '编辑维护窗口' : '创建维护窗口' }}</h3><p>窗口采用开始时间包含、结束时间不包含的区间。</p></div><UiButton v-if="editingMaintenanceId" class="icon-button" type="button" v-tooltip="'取消编辑'" @click="resetMaintenanceForm"><X :size="15" /></UiButton></div>
+        <UiForm class="stack-form alert-editor-form" @submit.prevent="saveMaintenance">
+          <label><span>窗口名称</span><UiInput v-model="maintenanceForm.name" required maxlength="120" placeholder="例如：数据库计划升级" /></label>
+          <label><span>维护原因 <i>可选</i></span><UiTextarea v-model="maintenanceForm.reason" maxlength="2000" placeholder="变更内容、负责人或工单编号"></UiTextarea></label>
+          <fieldset class="alert-choice-fieldset"><legend>作用范围</legend><div class="alert-segmented"><UiButton type="button" :class="{ active: maintenanceForm.scope === 'global' }" @click="maintenanceForm.scope = 'global'; maintenanceForm.target_ids = []">全局</UiButton><UiButton type="button" :class="{ active: maintenanceForm.scope === 'rule' }" @click="maintenanceForm.scope = 'rule'; maintenanceForm.target_ids = []">指定规则</UiButton><UiButton type="button" :class="{ active: maintenanceForm.scope === 'node' }" @click="maintenanceForm.scope = 'node'; maintenanceForm.target_ids = []">指定节点</UiButton></div></fieldset>
           <fieldset v-if="maintenanceForm.scope !== 'global'" class="alert-check-fieldset">
             <legend>{{ maintenanceForm.scope === 'rule' ? '目标规则' : '目标节点' }}</legend>
             <div class="alert-checkbox-list">
-              <label v-for="item in maintenanceForm.scope === 'rule' ? rules.items : instances" :key="item.id"><input v-model="maintenanceForm.target_ids" type="checkbox" :value="item.id" /><span>{{ 'metric' in item ? item.name : (item.name || item.hostname) }}</span></label>
+              <label v-for="item in maintenanceForm.scope === 'rule' ? rules.items : instances" :key="item.id"><UiCheckbox v-model="maintenanceForm.target_ids" :value="item.id" /><span>{{ 'metric' in item ? item.name : (item.name || item.hostname) }}</span></label>
             </div>
           </fieldset>
           <div class="alert-form-grid">
-            <label><span>开始时间</span><input required type="datetime-local" :value="dateInputValue(maintenanceForm.starts_at)" @change="setMaintenanceTime('starts_at', $event)" /></label>
-            <label><span>结束时间</span><input required type="datetime-local" :value="dateInputValue(maintenanceForm.ends_at)" @change="setMaintenanceTime('ends_at', $event)" /></label>
+            <label><span>开始时间</span><UiDateTimePicker required :model-value="dateInputValue(maintenanceForm.starts_at)" @change="setMaintenanceTime('starts_at', $event)" /></label>
+            <label><span>结束时间</span><UiDateTimePicker required :model-value="dateInputValue(maintenanceForm.ends_at)" @change="setMaintenanceTime('ends_at', $event)" /></label>
           </div>
-          <label class="alert-toggle-row"><input v-model="maintenanceForm.enabled" type="checkbox" /><span><strong>启用窗口</strong><small>窗口内仍生成事件，只抑制首次触发通知</small></span></label>
-          <button class="primary-button" type="submit"><Check :size="15" />{{ editingMaintenanceId ? '保存窗口' : '创建窗口' }}</button>
-        </form>
+          <label class="alert-toggle-row"><UiCheckbox v-model="maintenanceForm.enabled" /><span><strong>启用窗口</strong><small>窗口内仍生成事件，只抑制首次触发通知</small></span></label>
+          <UiButton class="primary-button" type="submit"><Check :size="15" />{{ editingMaintenanceId ? '保存窗口' : '创建窗口' }}</UiButton>
+        </UiForm>
       </section>
       <section class="alert-list-panel">
         <div class="alert-panel-heading"><div><h3>维护计划</h3><p>{{ maintenance.total }} 个一次性维护窗口。</p></div></div>
@@ -710,7 +698,7 @@ function jsonValue(value: unknown) {
           <article v-for="window in maintenance.items" :key="window.id" :class="maintenanceState(window)">
             <div class="maintenance-status"><Clock3 :size="16" /><span :class="['alert-status', maintenanceState(window)]">{{ maintenanceStateLabel(window) }}</span></div>
             <div><strong>{{ window.name }}</strong><small>{{ formatTime(window.starts_at) }} - {{ formatTime(window.ends_at) }}</small><p>{{ window.scope === 'global' ? '全局' : window.scope === 'rule' ? `${window.target_ids.length} 条规则` : `${window.target_ids.length} 个节点` }}<template v-if="window.reason"> · {{ window.reason }}</template></p></div>
-            <div class="row-actions"><button class="icon-button" type="button" title="编辑维护窗口" @click="editMaintenance(window)"><Edit3 :size="14" /></button><button class="icon-button danger" type="button" title="删除维护窗口" @click="emit('deleteMaintenance', window)"><Trash2 :size="14" /></button></div>
+            <div class="row-actions"><UiButton class="icon-button" type="button" v-tooltip="'编辑维护窗口'" @click="editMaintenance(window)"><Edit3 :size="14" /></UiButton><UiButton class="icon-button danger" type="button" v-tooltip="'删除维护窗口'" @click="emit('deleteMaintenance', window)"><Trash2 :size="14" /></UiButton></div>
           </article>
         </div>
       </section>
@@ -718,53 +706,53 @@ function jsonValue(value: unknown) {
 
     <div v-else-if="activeTab === 'webhooks'" class="alert-tab-content alert-config-layout">
       <section class="alert-form-panel">
-        <div class="alert-panel-heading"><div><h3>{{ editingChannelId ? '编辑通知渠道' : '创建通知渠道' }}</h3><p>{{ channelTypeLabel(channelForm.channel_type) }} 渠道配置</p></div><button v-if="editingChannelId" class="icon-button" type="button" title="取消编辑" @click="resetChannelForm"><X :size="15" /></button></div>
-        <form class="stack-form alert-editor-form" @submit.prevent="saveChannel">
-          <label><span>渠道名称</span><input v-model="channelForm.name" required maxlength="120" placeholder="例如：值班系统" /></label>
+        <div class="alert-panel-heading"><div><h3>{{ editingChannelId ? '编辑通知渠道' : '创建通知渠道' }}</h3><p>{{ channelTypeLabel(channelForm.channel_type) }} 渠道配置</p></div><UiButton v-if="editingChannelId" class="icon-button" type="button" v-tooltip="'取消编辑'" @click="resetChannelForm"><X :size="15" /></UiButton></div>
+        <UiForm class="stack-form alert-editor-form" @submit.prevent="saveChannel">
+          <label><span>渠道名称</span><UiInput v-model="channelForm.name" required maxlength="120" placeholder="例如：值班系统" /></label>
           <fieldset class="alert-choice-fieldset">
             <legend>渠道类型 <i v-if="editingChannelId">创建后不可更改</i></legend>
             <div class="alert-segmented alert-channel-type-segmented">
-              <button v-for="type in channelTypes" :key="type.value" type="button" :class="{ active: channelForm.channel_type === type.value }" :disabled="Boolean(editingChannelId)" @click="selectChannelType(type.value)"><component :is="type.icon" :size="14" /><span>{{ type.label }}</span></button>
+              <UiButton v-for="type in channelTypes" :key="type.value" type="button" :class="{ active: channelForm.channel_type === type.value }" :disabled="Boolean(editingChannelId)" @click="selectChannelType(type.value)"><component :is="type.icon" :size="14" /><span>{{ type.label }}</span></UiButton>
             </div>
           </fieldset>
 
           <template v-if="channelForm.channel_type === 'email'">
             <div class="alert-form-grid">
-              <label><span>SMTP 服务器</span><input v-model="channelForm.smtp_host" required maxlength="255" placeholder="smtp.example.com" /></label>
-              <label><span>SMTP 端口</span><input v-model.number="channelForm.smtp_port" required type="number" min="1" max="65535" step="1" /></label>
+              <label><span>SMTP 服务器</span><UiInput v-model="channelForm.smtp_host" required maxlength="255" placeholder="smtp.example.com" /></label>
+              <label><span>SMTP 端口</span><UiNumberInput v-model="channelForm.smtp_port" required min="1" max="65535" step="1" /></label>
             </div>
             <div class="alert-form-grid">
-              <label><span>传输安全</span><select v-model="channelForm.security"><option value="starttls">STARTTLS</option><option value="smtps">SMTPS</option></select></label>
-              <label><span>用户名 <i>可选</i></span><input v-model="channelForm.username" maxlength="255" autocomplete="username" placeholder="alerts@example.com" :disabled="channelForm.clear_password" /></label>
+              <label><span>传输安全</span><UiSelect v-model="channelForm.security" :options="[{ value: 'starttls', label: 'STARTTLS' }, { value: 'smtps', label: 'SMTPS' }]" /></label>
+              <label><span>用户名 <i>可选</i></span><UiInput v-model="channelForm.username" maxlength="255" autocomplete="username" placeholder="alerts@example.com" :disabled="channelForm.clear_password" /></label>
             </div>
-            <label><span>SMTP 密码 <i>{{ editingChannelId ? '留空保留现有值' : '可选' }}</i></span><input v-model="channelForm.password" type="password" maxlength="512" autocomplete="new-password" :disabled="channelForm.clear_password" /></label>
-            <label v-if="editingChannelId && channelForm.has_password" class="alert-check-line"><input v-model="channelForm.clear_password" type="checkbox" :disabled="Boolean(channelForm.password)" /><span>清除现有 SMTP 认证信息</span></label>
+            <label><span>SMTP 密码 <i>{{ editingChannelId ? '留空保留现有值' : '可选' }}</i></span><UiInput v-model="channelForm.password" type="password" maxlength="512" autocomplete="new-password" :disabled="channelForm.clear_password" /></label>
+            <label v-if="editingChannelId && channelForm.has_password" class="alert-check-line"><UiCheckbox v-model="channelForm.clear_password" :disabled="Boolean(channelForm.password)" /><span>清除现有 SMTP 认证信息</span></label>
             <div class="alert-form-grid">
-              <label><span>发件邮箱</span><input v-model="channelForm.from_address" required type="email" maxlength="320" placeholder="alerts@example.com" /></label>
-              <label><span>发件人名称 <i>可选</i></span><input v-model="channelForm.from_name" maxlength="120" placeholder="运维告警" /></label>
+              <label><span>发件邮箱</span><UiInput v-model="channelForm.from_address" required type="email" maxlength="320" placeholder="alerts@example.com" /></label>
+              <label><span>发件人名称 <i>可选</i></span><UiInput v-model="channelForm.from_name" maxlength="120" placeholder="运维告警" /></label>
             </div>
-            <label><span>收件人</span><textarea v-model="channelForm.recipients" required maxlength="8000" placeholder="oncall@example.com&#10;ops@example.com"></textarea></label>
+            <label><span>收件人</span><UiTextarea v-model="channelForm.recipients" required maxlength="8000" placeholder="oncall@example.com&#10;ops@example.com"></UiTextarea></label>
           </template>
 
           <template v-else>
-            <label><span>{{ channelUrlLabel(channelForm.channel_type) }} <i v-if="editingChannelId">留空保留现有值</i></span><input v-model="channelForm.url" :required="!editingChannelId" type="url" maxlength="4096" :placeholder="channelUrlPlaceholder(channelForm.channel_type)" /></label>
-            <label v-if="channelForm.channel_type === 'telegram'"><span>Telegram Chat ID</span><input v-model="channelForm.chat_id" required maxlength="255" placeholder="例如：-1001234567890" /></label>
+            <label><span>{{ channelUrlLabel(channelForm.channel_type) }} <i v-if="editingChannelId">留空保留现有值</i></span><UiInput v-model="channelForm.url" :required="!editingChannelId" type="url" maxlength="4096" :placeholder="channelUrlPlaceholder(channelForm.channel_type)" /></label>
+            <label v-if="channelForm.channel_type === 'telegram'"><span>Telegram Chat ID</span><UiInput v-model="channelForm.chat_id" required maxlength="255" placeholder="例如：-1001234567890" /></label>
             <template v-if="channelUsesSecret(channelForm.channel_type)">
-              <label><span>{{ channelSecretLabel(channelForm.channel_type) }} <i>{{ editingChannelId ? '留空保留现有值' : '可选' }}</i></span><input v-model="channelForm.secret" type="password" maxlength="4096" autocomplete="new-password" :placeholder="channelForm.channel_type === 'generic_webhook' ? '用于校验 X-OM-Signature' : ''" /></label>
-              <label v-if="editingChannelId" class="alert-check-line"><input v-model="channelForm.clear_secret" type="checkbox" :disabled="Boolean(channelForm.secret)" /><span>清除现有{{ channelSecretLabel(channelForm.channel_type) }}</span></label>
+              <label><span>{{ channelSecretLabel(channelForm.channel_type) }} <i>{{ editingChannelId ? '留空保留现有值' : '可选' }}</i></span><UiInput v-model="channelForm.secret" type="password" maxlength="4096" autocomplete="new-password" :placeholder="channelForm.channel_type === 'generic_webhook' ? '用于校验 X-OM-Signature' : ''" /></label>
+              <label v-if="editingChannelId" class="alert-check-line"><UiCheckbox v-model="channelForm.clear_secret" :disabled="Boolean(channelForm.secret)" /><span>清除现有{{ channelSecretLabel(channelForm.channel_type) }}</span></label>
             </template>
           </template>
           <fieldset v-if="channelForm.channel_type === 'generic_webhook'" class="alert-check-fieldset webhook-header-fieldset">
             <legend>自定义请求头 <i>最多 32 个</i></legend>
-            <label v-if="editingChannelId" class="alert-check-line"><input v-model="channelForm.replace_headers" type="checkbox" /><span>替换现有请求头（关闭时保留）</span></label>
+            <label v-if="editingChannelId" class="alert-check-line"><UiCheckbox v-model="channelForm.replace_headers" /><span>替换现有请求头（关闭时保留）</span></label>
             <div v-if="channelForm.replace_headers || !editingChannelId" class="webhook-header-editor">
-              <div v-for="header in channelForm.headers" :key="header.id" class="webhook-header-row"><input v-model="header.name" maxlength="128" placeholder="Header-Name" /><input v-model="header.value" maxlength="4096" placeholder="值" /><button class="icon-button danger" type="button" title="移除请求头" @click="removeHeader(header.id)"><X :size="14" /></button></div>
-              <button class="text-button" type="button" :disabled="channelForm.headers.length >= 32" @click="addHeader"><Plus :size="14" />添加请求头</button>
+              <div v-for="header in channelForm.headers" :key="header.id" class="webhook-header-row"><UiInput v-model="header.name" maxlength="128" placeholder="Header-Name" /><UiInput v-model="header.value" maxlength="4096" placeholder="值" /><UiButton class="icon-button danger" type="button" v-tooltip="'移除请求头'" @click="removeHeader(header.id)"><X :size="14" /></UiButton></div>
+              <UiButton class="text-button" type="button" :disabled="channelForm.headers.length >= 32" @click="addHeader"><Plus :size="14" />添加请求头</UiButton>
             </div>
           </fieldset>
-          <label class="alert-toggle-row"><input v-model="channelForm.enabled" type="checkbox" /><span><strong>启用渠道</strong><small>停用后不会接收新的告警投递</small></span></label>
-          <button class="primary-button" type="submit" :disabled="isBusy(editingChannelId ? `channel:${editingChannelId}:save` : 'channel:create')"><Check :size="15" />{{ editingChannelId ? '保存渠道' : '创建渠道' }}</button>
-        </form>
+          <label class="alert-toggle-row"><UiCheckbox v-model="channelForm.enabled" /><span><strong>启用渠道</strong><small>停用后不会接收新的告警投递</small></span></label>
+          <UiButton class="primary-button" type="submit" :disabled="isBusy(editingChannelId ? `channel:${editingChannelId}:save` : 'channel:create')"><Check :size="15" />{{ editingChannelId ? '保存渠道' : '创建渠道' }}</UiButton>
+        </UiForm>
       </section>
       <section class="alert-list-panel">
         <div class="alert-panel-heading"><div><h3>通知渠道</h3><p>密码、签名密钥和完整机器人 URL 不会回显。</p></div></div>
@@ -774,20 +762,20 @@ function jsonValue(value: unknown) {
             <span :class="['webhook-channel-icon', channel.channel_type]"><component :is="channelTypeIcon(channel.channel_type)" :size="17" /></span>
             <div><span class="channel-title"><strong>{{ channel.name }}</strong><i>{{ channelTypeLabel(channel.channel_type) }}</i></span><code>{{ channelPrimarySummary(channel) }}</code><small>{{ channelSecondarySummary(channel) }}</small></div>
             <span :class="['alert-status', channel.enabled ? 'succeeded' : 'disabled']">{{ channel.enabled ? '已启用' : '已停用' }}</span>
-            <div class="row-actions"><button class="text-button" type="button" :disabled="!channel.enabled || isBusy(`channel:${channel.id}:test`)" @click="testChannel(channel)"><Send :size="13" />测试</button><button class="icon-button" type="button" title="编辑通知渠道" @click="editChannel(channel)"><Edit3 :size="14" /></button><button class="icon-button danger" type="button" title="删除通知渠道" @click="emit('deleteChannel', channel)"><Trash2 :size="14" /></button></div>
+            <div class="row-actions"><UiButton class="text-button" type="button" :disabled="!channel.enabled || isBusy(`channel:${channel.id}:test`)" @click="testChannel(channel)"><Send :size="13" />测试</UiButton><UiButton class="icon-button" type="button" v-tooltip="'编辑通知渠道'" @click="editChannel(channel)"><Edit3 :size="14" /></UiButton><UiButton class="icon-button danger" type="button" v-tooltip="'删除通知渠道'" @click="emit('deleteChannel', channel)"><Trash2 :size="14" /></UiButton></div>
           </article>
         </div>
       </section>
     </div>
 
     <div v-else class="alert-tab-content">
-      <form class="alert-filter-bar delivery-filter-bar" @submit.prevent="updateDeliveryQuery({})">
-        <label><span>状态</span><select v-model="deliveryQuery.status"><option value="">全部状态</option><option value="pending">待投递</option><option value="processing">投递中</option><option value="succeeded">成功</option><option value="failed">失败</option><option value="suppressed">已抑制</option></select></label>
-        <label><span>类型</span><select v-model="deliveryQuery.kind"><option value="">全部类型</option><option value="alert.firing">触发通知</option><option value="alert.acknowledged">确认通知</option><option value="alert.resolved">恢复通知</option><option value="webhook.test">测试通知</option></select></label>
-        <label><span>渠道</span><select v-model="deliveryQuery.channel_id"><option value="">全部渠道</option><option v-for="channel in deliveryChannelOptions" :key="channel.id" :value="channel.id">{{ channel.name }}</option></select></label>
-        <label class="alert-search-filter"><span>事件 ID</span><input v-model="deliveryQuery.event_id" placeholder="精确筛选关联事件" /></label>
-        <div class="alert-filter-actions"><button class="text-button" type="button" @click="resetDeliveryQuery"><RotateCcw :size="14" />重置</button><button class="primary-button" type="submit"><Search :size="14" />查询</button></div>
-      </form>
+      <UiForm class="alert-filter-bar delivery-filter-bar" @submit.prevent="updateDeliveryQuery({})">
+        <label><span>状态</span><UiSelect v-model="deliveryQuery.status" :options="[{ value: '', label: '全部状态' }, { value: 'pending', label: '待投递' }, { value: 'processing', label: '投递中' }, { value: 'succeeded', label: '成功' }, { value: 'failed', label: '失败' }, { value: 'suppressed', label: '已抑制' }]" /></label>
+        <label><span>类型</span><UiSelect v-model="deliveryQuery.kind" :options="[{ value: '', label: '全部类型' }, { value: 'alert.firing', label: '触发通知' }, { value: 'alert.acknowledged', label: '确认通知' }, { value: 'alert.resolved', label: '恢复通知' }, { value: 'webhook.test', label: '测试通知' }]" /></label>
+        <label><span>渠道</span><UiSelect v-model="deliveryQuery.channel_id" :options="[{ value: '', label: '全部渠道' }, ...deliveryChannelOptions.map((channel) => ({ value: channel.id, label: (channel.name) }))]" /></label>
+        <label class="alert-search-filter"><span>事件 ID</span><UiInput v-model="deliveryQuery.event_id" placeholder="精确筛选关联事件" /></label>
+        <div class="alert-filter-actions"><UiButton class="text-button" type="button" @click="resetDeliveryQuery"><RotateCcw :size="14" />重置</UiButton><UiButton class="primary-button" type="submit"><Search :size="14" />查询</UiButton></div>
+      </UiForm>
       <div class="alert-data-surface delivery-surface">
         <div class="alert-delivery-head"><span>投递</span><span>渠道</span><span>尝试</span><span>更新时间</span><span></span></div>
         <div v-if="!deliveries.items.length && !isBusy('deliveries:load')" class="alert-empty"><Send :size="24" /><strong>没有匹配投递</strong><span>测试通知渠道或触发绑定渠道的事件后会显示记录。</span></div>
@@ -797,7 +785,7 @@ function jsonValue(value: unknown) {
             <div><strong>{{ deliveryChannelLabel(delivery) }}</strong><small>{{ delivery.channel_id.slice(0, 12) }}</small></div>
             <div><strong>{{ delivery.attempts_count }} 次</strong><small v-if="delivery.status === 'failed'">{{ delivery.last_error || '等待手动重试' }}</small><small v-else-if="delivery.next_attempt_at">下次 {{ formatTime(delivery.next_attempt_at) }}</small><small v-else>{{ delivery.manual_retry_count }} 次手动重试</small></div>
             <div><strong>{{ formatTime(delivery.updated_at) }}</strong><small v-if="delivery.completed_at">完成 {{ formatTime(delivery.completed_at) }}</small></div>
-            <div class="row-actions"><button v-if="delivery.status === 'failed'" class="icon-button" type="button" :title="retryUnavailableReason(delivery) || '重新投递'" :disabled="Boolean(retryUnavailableReason(delivery)) || isBusy(`delivery:${delivery.id}:retry`)" @click="retryDelivery(delivery)"><RefreshCw :size="14" /></button><button class="icon-button" type="button" title="查看投递详情" :aria-expanded="expandedDeliveryId === delivery.id" @click="toggleDeliveryDetail(delivery)"><ChevronDown :size="15" /></button></div>
+            <div class="row-actions"><UiButton v-if="delivery.status === 'failed'" class="icon-button" type="button" v-tooltip="retryUnavailableReason(delivery) || '重新投递'" :disabled="Boolean(retryUnavailableReason(delivery)) || isBusy(`delivery:${delivery.id}:retry`)" @click="retryDelivery(delivery)"><RefreshCw :size="14" /></UiButton><UiButton class="icon-button" type="button" v-tooltip="'查看投递详情'" :aria-expanded="expandedDeliveryId === delivery.id" @click="toggleDeliveryDetail(delivery)"><ChevronDown :size="15" /></UiButton></div>
             <div v-if="expandedDeliveryId === delivery.id" class="alert-delivery-detail">
               <div v-if="!deliveryDetail || deliveryDetail.id !== delivery.id" class="alert-detail-loading"><LoaderCircle class="spin" :size="18" />加载投递详情</div>
               <template v-else>
@@ -810,7 +798,7 @@ function jsonValue(value: unknown) {
             </div>
           </article>
         </div>
-        <div class="alert-pagination"><span>{{ deliveryRangeLabel() }}</span><div><button class="icon-button" type="button" title="上一页" :disabled="deliveries.page <= 1" @click="setDeliveryPage(deliveries.page - 1)"><ChevronLeft :size="15" /></button><strong>{{ deliveries.page }} / {{ deliveries.pages || 1 }}</strong><button class="icon-button" type="button" title="下一页" :disabled="deliveries.page >= (deliveries.pages || 1)" @click="setDeliveryPage(deliveries.page + 1)"><ChevronRight :size="15" /></button></div></div>
+        <div class="alert-pagination"><span>{{ deliveryRangeLabel() }}</span><div><UiButton class="icon-button" type="button" v-tooltip="'上一页'" :disabled="deliveries.page <= 1" @click="setDeliveryPage(deliveries.page - 1)"><ChevronLeft :size="15" /></UiButton><strong>{{ deliveries.page }} / {{ deliveries.pages || 1 }}</strong><UiButton class="icon-button" type="button" v-tooltip="'下一页'" :disabled="deliveries.page >= (deliveries.pages || 1)" @click="setDeliveryPage(deliveries.page + 1)"><ChevronRight :size="15" /></UiButton></div></div>
       </div>
     </div>
   </section>

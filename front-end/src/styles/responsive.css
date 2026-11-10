@@ -62,7 +62,7 @@
   .instance-search, .status-filter, .sort-control, .result-count { grid-column: auto; }
   .status-filter { align-items: flex-start; flex-direction: column; }
   .sort-control { justify-self: stretch; justify-content: space-between; }
-  .sort-control select { width: min(180px, 55%); }
+  .sort-control .ui-select { width: min(180px, 55%); }
   .result-count { padding-top: 4px; }
 
   .instance-list.grid { grid-template-columns: 1fr; }

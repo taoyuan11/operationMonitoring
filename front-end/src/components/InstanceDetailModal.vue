@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Activity,
@@ -477,13 +478,13 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
             </p>
           </div>
         </div>
-        <button class="icon-button subtle" type="button" title="关闭" aria-label="关闭实例详情" @click="emit('close')">
+        <UiButton class="icon-button subtle" type="button" v-tooltip="'关闭'" aria-label="关闭实例详情" @click="emit('close')">
           <X :size="17" />
-        </button>
+        </UiButton>
       </header>
 
       <nav class="instance-detail-tabs" role="tablist" aria-label="实例面板">
-        <button
+        <UiButton
           :class="{ active: activeTab === 'details' }"
           type="button"
           role="tab"
@@ -491,8 +492,8 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
           @click="activeTab = 'details'"
         >
           <Info :size="15" />详情
-        </button>
-        <button
+        </UiButton>
+        <UiButton
           v-if="isAdmin"
           :class="{ active: activeTab === 'actions' }"
           type="button"
@@ -501,8 +502,8 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
           @click="activeTab = 'actions'"
         >
           <FileCog :size="15" />操作
-        </button>
-        <button
+        </UiButton>
+        <UiButton
           v-if="isAdmin && supportsFiles"
           :class="{ active: activeTab === 'files' }"
           type="button"
@@ -511,8 +512,8 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
           @click="activeTab = 'files'"
         >
           <UploadCloud :size="15" />文件
-        </button>
-        <button
+        </UiButton>
+        <UiButton
           v-if="isAdmin && supportsDocker"
           :class="{ active: activeTab === 'docker' }"
           type="button"
@@ -521,7 +522,7 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
           @click="activeTab = 'docker'"
         >
           <Box :size="15" />容器
-        </button>
+        </UiButton>
       </nav>
 
       <div :class="['instance-detail-content', { 'files-active': activeTab === 'files' || activeTab === 'docker' }]">
@@ -533,7 +534,7 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
                 <div><h3>资源趋势</h3><p>悬停折线可查看对应时间点</p></div>
               </div>
               <div class="metric-history-ranges" role="group" aria-label="历史指标时间范围">
-                <button
+                <UiButton
                   v-for="option in historyRanges"
                   :key="option.value"
                   :class="{ active: historyRange === option.value }"
@@ -542,13 +543,13 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
                   @click="historyRange = option.value"
                 >
                   {{ option.label }}
-                </button>
+                </UiButton>
               </div>
             </header>
 
             <div v-if="historyError" class="metric-history-error" role="alert">
               <span>{{ historyError }}</span>
-              <button type="button" @click="loadMetricHistory">重试</button>
+              <UiButton type="button" @click="loadMetricHistory">重试</UiButton>
             </div>
 
             <div class="detail-metrics">
@@ -610,7 +611,7 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
           <div class="detail-section">
             <header><Server :size="16" /><h3>实例资料</h3></header>
             <dl class="detail-grid">
-              <div><dt>实例 ID</dt><dd :title="instance.id">{{ instance.id }}</dd></div>
+              <div><dt>实例 ID</dt><dd v-tooltip="instance.id">{{ instance.id }}</dd></div>
               <div><dt>主机名</dt><dd>{{ instance.hostname || '未知' }}</dd></div>
               <div><dt>操作系统</dt><dd>{{ instance.os || '未知' }}</dd></div>
               <div><dt>架构</dt><dd>{{ instance.arch || '未知' }}</dd></div>
@@ -635,20 +636,20 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
             </div>
             <div v-else-if="deviceProfileError" class="device-profile-state error" role="alert">
               <span>{{ deviceProfileError }}</span>
-              <button class="text-button" type="button" @click="loadDeviceProfile">
+              <UiButton class="text-button" type="button" @click="loadDeviceProfile">
                 <RefreshCw :size="13" />重试
-              </button>
+              </UiButton>
             </div>
             <div v-else-if="!publicDeviceProfile?.profile" class="device-profile-state">
               <span>当前 Agent 尚未上报设备配置</span>
-              <button class="text-button" type="button" @click="loadDeviceProfile">
+              <UiButton class="text-button" type="button" @click="loadDeviceProfile">
                 <RefreshCw :size="13" />刷新
-              </button>
+              </UiButton>
             </div>
             <dl v-else class="detail-grid device-summary-grid">
               <div>
                 <dt><Cpu :size="13" />CPU</dt>
-                <dd :title="publicDeviceProfile.profile.cpu_model">{{ publicDeviceProfile.profile.cpu_model || '未知' }}</dd>
+                <dd v-tooltip="publicDeviceProfile.profile.cpu_model">{{ publicDeviceProfile.profile.cpu_model || '未知' }}</dd>
                 <small>{{ cpuCoreSummary(publicDeviceProfile.profile.physical_cores, publicDeviceProfile.profile.logical_cores) }}</small>
               </div>
               <div>
@@ -681,13 +682,13 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
             <header><Network :size="16" /><h3>设备与网络详情</h3></header>
             <div v-if="adminDeviceProfileError" class="device-profile-state error" role="alert">
               <span>{{ adminDeviceProfileError }}</span>
-              <button class="text-button" type="button" @click="loadDeviceProfile">
+              <UiButton class="text-button" type="button" @click="loadDeviceProfile">
                 <RefreshCw :size="13" />重试
-              </button>
+              </UiButton>
             </div>
             <template v-else-if="adminDeviceProfile?.profile">
               <dl class="detail-grid device-admin-grid">
-                <div><dt>内核版本</dt><dd :title="adminDeviceProfile.profile.system.kernel_version">{{ adminDeviceProfile.profile.system.kernel_version || '未知' }}</dd></div>
+                <div><dt>内核版本</dt><dd v-tooltip="adminDeviceProfile.profile.system.kernel_version">{{ adminDeviceProfile.profile.system.kernel_version || '未知' }}</dd></div>
                 <div><dt>CPU 厂商</dt><dd>{{ adminDeviceProfile.profile.cpu.vendor || '未知' }}</dd></div>
                 <div><dt>CPU 频率</dt><dd>{{ formatFrequency(adminDeviceProfile.profile.cpu.frequency_mhz) }}</dd></div>
                 <div><dt>连接来源 IP</dt><dd>{{ adminDeviceProfile.observed_ip || '未知' }}</dd></div>
@@ -698,8 +699,8 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
                   <h4><HardDrive :size="14" />磁盘</h4>
                   <div v-if="adminDeviceProfile.profile.disks.length" class="device-inventory-list">
                     <div v-for="disk in adminDeviceProfile.profile.disks" :key="`${disk.name}-${disk.mount_point}`" class="device-inventory-row">
-                      <strong :title="disk.name">{{ disk.name || '未命名磁盘' }}</strong>
-                      <span :title="disk.mount_point">{{ disk.mount_point || '无挂载点' }}</span>
+                      <strong v-tooltip="disk.name">{{ disk.name || '未命名磁盘' }}</strong>
+                      <span v-tooltip="disk.mount_point">{{ disk.mount_point || '无挂载点' }}</span>
                       <span>{{ disk.file_system || disk.kind || '未知类型' }}</span>
                       <span>{{ formatBytes(disk.total_bytes) }}</span>
                     </div>
@@ -754,27 +755,27 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
               </span>
             </header>
             <div class="operation-command-grid">
-              <button type="button" :disabled="loading" @click="emit('edit', instance)">
+              <UiButton type="button" :disabled="loading" @click="emit('edit', instance)">
                 <span><Pencil :size="18" /></span>
                 <strong>编辑资料</strong>
                 <small>名称、地区与备注</small>
-              </button>
-              <button type="button" :disabled="!instance.online || loading" @click="emit('terminal', instance)">
+              </UiButton>
+              <UiButton type="button" :disabled="!instance.online || loading" @click="emit('terminal', instance)">
                 <span><Terminal :size="18" /></span>
                 <strong>Web 终端</strong>
                 <small>打开交互式 Shell</small>
-              </button>
-              <button
+              </UiButton>
+              <UiButton
                 v-if="supportsRemoteDesktop"
                 type="button"
                 :disabled="Boolean(remoteDesktopUnavailableReason) || loading"
-                :title="remoteDesktopUnavailableReason || '在浏览器中控制 Windows 桌面'"
+                v-tooltip="remoteDesktopUnavailableReason || '在浏览器中控制 Windows 桌面'"
                 @click="emit('remoteDesktop', instance)"
               >
                 <span><Monitor :size="18" /></span>
                 <strong>远程桌面</strong>
                 <small>{{ remoteDesktopUnavailableReason || '浏览器内操作 Windows' }}</small>
-              </button>
+              </UiButton>
             </div>
           </div>
 
@@ -785,16 +786,16 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
                 <p v-if="remoteAccessStatus?.checked_at">检查于 {{ formatTime(remoteAccessStatus.checked_at) }}</p>
                 <p v-else>显示、音频与虚拟设备状态</p>
               </div>
-              <button
+              <UiButton
                 class="icon-button subtle"
                 type="button"
-                title="刷新远程访问状态"
+                v-tooltip="'刷新远程访问状态'"
                 aria-label="刷新远程访问状态"
                 :disabled="remoteAccessLoading"
                 @click="loadRemoteAccessStatus"
               >
                 <RefreshCw :class="{ spin: remoteAccessLoading }" :size="15" />
-              </button>
+              </UiButton>
             </header>
 
             <div v-if="remoteAccessLoading && !remoteAccessStatus" class="remote-access-loading">
@@ -863,16 +864,16 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
           <div class="operation-section">
             <header><div><h3>快捷命令</h3><p>执行管理员配置的白名单命令</p></div></header>
             <div v-if="commands.length" class="detail-command-list">
-              <button
+              <UiButton
                 v-for="command in commands"
                 :key="command.id"
                 type="button"
                 :disabled="!instance.online || loading"
-                :title="command.command"
+                v-tooltip="command.command"
                 @click="emit('runCommand', instance, command)"
               >
                 <Play :size="14" />{{ command.name }}
-              </button>
+              </UiButton>
             </div>
             <p v-else class="operation-empty">暂无启用的快捷命令</p>
           </div>
@@ -880,12 +881,12 @@ function remoteFallbackLabel(status: RemoteAccessStatus) {
           <div class="operation-section danger-zone">
             <header><div><h3>危险操作</h3><p>停用或永久移除当前实例</p></div><ShieldAlert :size="18" /></header>
             <div class="danger-actions">
-              <button type="button" :disabled="loading" @click="emit('disable', instance)">
+              <UiButton type="button" :disabled="loading" @click="emit('disable', instance)">
                 <Pause :size="15" />停用实例
-              </button>
-              <button type="button" :disabled="loading" @click="emit('delete', instance)">
+              </UiButton>
+              <UiButton type="button" :disabled="loading" @click="emit('delete', instance)">
                 <Trash2 :size="15" />永久删除
-              </button>
+              </UiButton>
             </div>
           </div>
         </section>

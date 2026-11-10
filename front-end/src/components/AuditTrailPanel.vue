@@ -1,4 +1,9 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiDateTimePicker from './ui/UiDateTimePicker.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
+import UiSelect from './ui/UiSelect.vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   ChevronDown,
@@ -69,7 +74,7 @@ type AdvancedFilterChip = {
 }
 
 const exportMenuElement = ref<HTMLElement | null>(null)
-const exportMenuButton = ref<HTMLButtonElement | null>(null)
+const exportMenuButton = ref<InstanceType<typeof UiButton> | null>(null)
 const keywordDraft = ref(props.auditQuery.keyword)
 const filtersOpen = ref(false)
 const exportMenuOpen = ref(false)
@@ -207,9 +212,9 @@ function clearKeyword() {
   applyKeyword()
 }
 
-function updateStatus(event: Event) {
+function updateStatus(value: string) {
   emit('auditQueryChanged', {
-    status: (event.target as HTMLSelectElement).value as AuditQuery['status'],
+    status: value as AuditQuery['status'],
   })
 }
 
@@ -391,40 +396,33 @@ function handleDocumentKeydown(event: KeyboardEvent) {
 
     <div class="audit-workspace-panel" :aria-busy="auditLoading">
       <div class="audit-workspace-toolbar">
-        <form class="audit-workspace-search" role="search" @submit.prevent="applyKeyword">
+        <UiForm class="audit-workspace-search" role="search" @submit.prevent="applyKeyword">
           <Search :size="15" aria-hidden="true" />
           <label class="audit-workspace-sr-only" for="audit-keyword">搜索审计记录</label>
-          <input
+          <UiInput
             id="audit-keyword"
             v-model="keywordDraft"
             type="search"
             placeholder="搜索动作、目标或详情"
             @change="applyKeyword"
           />
-          <button
+          <UiButton
             v-if="keywordDraft"
             class="audit-workspace-input-clear"
             type="button"
-            title="清除关键字"
+            v-tooltip="'清除关键字'"
             aria-label="清除关键字"
             @click="clearKeyword"
-          ><X :size="14" /></button>
-        </form>
+          ><X :size="14" /></UiButton>
+        </UiForm>
 
         <label class="audit-workspace-status-filter">
           <span class="audit-workspace-sr-only">状态</span>
-          <select :value="auditQuery.status" title="按状态筛选" @change="updateStatus">
-            <option value="">全部状态</option>
-            <option value="running">进行中</option>
-            <option value="success">成功</option>
-            <option value="partial_success">部分成功</option>
-            <option value="failed">失败</option>
-            <option value="cancelled">已取消</option>
-          </select>
+          <UiSelect :model-value="auditQuery.status" v-tooltip="'按状态筛选'" @change="updateStatus" :options="[{ value: '', label: '全部状态' }, { value: 'running', label: '进行中' }, { value: 'success', label: '成功' }, { value: 'partial_success', label: '部分成功' }, { value: 'failed', label: '失败' }, { value: 'cancelled', label: '已取消' }]" />
         </label>
 
         <div class="audit-workspace-toolbar-actions">
-          <button
+          <UiButton
             class="text-button audit-workspace-filter-button"
             type="button"
             :aria-label="advancedFilterChips.length ? `高级筛选，已应用 ${advancedFilterChips.length} 项` : '高级筛选'"
@@ -433,17 +431,17 @@ function handleDocumentKeydown(event: KeyboardEvent) {
             <Filter :size="15" />
             <span>筛选</span>
             <em v-if="advancedFilterChips.length">{{ advancedFilterChips.length }}</em>
-          </button>
-          <button
+          </UiButton>
+          <UiButton
             class="icon-button subtle"
             type="button"
-            title="刷新审计记录"
+            v-tooltip="'刷新审计记录'"
             aria-label="刷新审计记录"
             :disabled="auditLoading"
             @click="$emit('refreshAudit')"
-          ><RefreshCw :class="{ spin: auditLoading }" :size="16" /></button>
+          ><RefreshCw :class="{ spin: auditLoading }" :size="16" /></UiButton>
           <div ref="exportMenuElement" class="audit-workspace-export" @focusout="handleExportMenuFocusout">
-            <button
+            <UiButton
               ref="exportMenuButton"
               class="text-button audit-workspace-export-trigger"
               type="button"
@@ -457,14 +455,14 @@ function handleDocumentKeydown(event: KeyboardEvent) {
               <Download v-else :size="15" />
               <span>导出</span>
               <ChevronDown :size="13" />
-            </button>
+            </UiButton>
             <div v-if="exportMenuOpen" class="audit-workspace-export-menu" role="menu" @keydown="handleExportMenuKeydown">
-              <button type="button" role="menuitem" @click="exportAudit('csv')">
+              <UiButton type="button" role="menuitem" @click="exportAudit('csv')">
                 <span>CSV 表格</span><small>.csv</small>
-              </button>
-              <button type="button" role="menuitem" @click="exportAudit('json')">
+              </UiButton>
+              <UiButton type="button" role="menuitem" @click="exportAudit('json')">
                 <span>JSON 数据</span><small>.json</small>
-              </button>
+              </UiButton>
             </div>
           </div>
         </div>
@@ -472,19 +470,19 @@ function handleDocumentKeydown(event: KeyboardEvent) {
 
       <div v-if="advancedFilterChips.length" class="audit-workspace-chips" aria-label="已应用的高级筛选">
         <div class="audit-workspace-chip-list">
-          <button
+          <UiButton
             v-for="chip in advancedFilterChips"
             :key="chip.key"
             type="button"
-            :title="`移除${chip.label}筛选`"
+            v-tooltip="`移除${chip.label}筛选`"
             @click="removeAdvancedFilter(chip.key)"
           >
             <span>{{ chip.label }}</span>
             <strong>{{ chip.value }}</strong>
             <X :size="12" />
-          </button>
+          </UiButton>
         </div>
-        <button class="audit-workspace-clear-filters" type="button" @click="clearAdvancedFilters">清除全部</button>
+        <UiButton class="audit-workspace-clear-filters" type="button" @click="clearAdvancedFilters">清除全部</UiButton>
       </div>
 
       <p v-if="auditError" class="audit-workspace-error" role="alert">{{ auditError }}</p>
@@ -534,19 +532,19 @@ function handleDocumentKeydown(event: KeyboardEvent) {
                 </div>
               </div>
               <div class="audit-workspace-action" role="cell">
-                <strong :title="eventTitle(event)">{{ eventTitle(event) }}</strong>
-                <p :title="event.detail || event.target">{{ event.detail || event.target || '无详情' }}</p>
-                <small :title="event.target">{{ event.target || '全局操作' }}</small>
+                <strong v-tooltip="eventTitle(event)">{{ eventTitle(event) }}</strong>
+                <p v-tooltip="event.detail || event.target">{{ event.detail || event.target || '无详情' }}</p>
+                <small v-tooltip="event.target">{{ event.target || '全局操作' }}</small>
               </div>
               <div class="audit-workspace-context" role="cell">
-                <strong :title="nodeLabel(event)">{{ nodeLabel(event) }}</strong>
+                <strong v-tooltip="nodeLabel(event)">{{ nodeLabel(event) }}</strong>
                 <small v-if="event.actor">操作者 {{ event.actor }}</small>
-                <small v-if="event.user_id" :title="event.user_id">用户 {{ event.user_id }}</small>
+                <small v-if="event.user_id" v-tooltip="event.user_id">用户 {{ event.user_id }}</small>
               </div>
               <div class="audit-workspace-request" role="cell">
-                <code v-if="event.request_id" :title="event.request_id">{{ event.request_id }}</code>
+                <code v-if="event.request_id" v-tooltip="event.request_id">{{ event.request_id }}</code>
                 <small v-if="event.source_ip">{{ event.source_ip }}</small>
-                <small v-if="event.operation_id" :title="event.operation_id">操作 {{ event.operation_id }}</small>
+                <small v-if="event.operation_id" v-tooltip="event.operation_id">操作 {{ event.operation_id }}</small>
               </div>
               <PanelRightOpen class="audit-workspace-row-arrow" :size="16" role="cell" aria-hidden="true" />
             </article>
@@ -557,23 +555,23 @@ function handleDocumentKeydown(event: KeyboardEvent) {
       <footer class="audit-workspace-pagination">
         <span>{{ auditRange }}</span>
         <div>
-          <button
+          <UiButton
             class="icon-button subtle"
             type="button"
-            title="上一页"
+            v-tooltip="'上一页'"
             aria-label="上一页"
             :disabled="audit.page <= 1 || auditLoading"
             @click="$emit('auditPageChanged', audit.page - 1)"
-          ><ChevronLeft :size="16" /></button>
+          ><ChevronLeft :size="16" /></UiButton>
           <strong>第 {{ audit.page }} / {{ Math.max(audit.pages, 1) }} 页</strong>
-          <button
+          <UiButton
             class="icon-button subtle"
             type="button"
-            title="下一页"
+            v-tooltip="'下一页'"
             aria-label="下一页"
             :disabled="audit.page >= audit.pages || auditLoading"
             @click="$emit('auditPageChanged', audit.page + 1)"
-          ><ChevronRight :size="16" /></button>
+          ><ChevronRight :size="16" /></UiButton>
         </div>
       </footer>
     </div>
@@ -586,22 +584,22 @@ function handleDocumentKeydown(event: KeyboardEvent) {
       :modal="true"
       @close="closeAdvancedFilters"
     >
-      <form class="audit-workspace-filter-form" @submit.prevent="applyAdvancedFilters">
+      <UiForm class="audit-workspace-filter-form" @submit.prevent="applyAdvancedFilters">
         <div class="audit-workspace-filter-grid">
-          <label><span>开始时间</span><input v-model="advancedDraft.from" type="datetime-local" /></label>
-          <label><span>结束时间</span><input v-model="advancedDraft.to" type="datetime-local" /></label>
-          <label><span>类别</span><input v-model="advancedDraft.category" placeholder="admin / session" /></label>
-          <label><span>动作</span><input v-model="advancedDraft.action" placeholder="操作名称" /></label>
-          <label><span>用户 ID</span><input v-model="advancedDraft.user_id" placeholder="用户 ID" /></label>
-          <label><span>操作者</span><input v-model="advancedDraft.actor" placeholder="用户名" /></label>
-          <label><span>节点 ID</span><input v-model="advancedDraft.instance_id" placeholder="节点 ID" /></label>
-          <label><span>来源 IP</span><input v-model="advancedDraft.source_ip" placeholder="例如 10.0.0.1" /></label>
-          <label class="audit-workspace-filter-wide"><span>请求 ID</span><input v-model="advancedDraft.request_id" placeholder="UUID request ID" /></label>
+          <label><span>开始时间</span><UiDateTimePicker v-model="advancedDraft.from" /></label>
+          <label><span>结束时间</span><UiDateTimePicker v-model="advancedDraft.to" /></label>
+          <label><span>类别</span><UiInput v-model="advancedDraft.category" placeholder="admin / session" /></label>
+          <label><span>动作</span><UiInput v-model="advancedDraft.action" placeholder="操作名称" /></label>
+          <label><span>用户 ID</span><UiInput v-model="advancedDraft.user_id" placeholder="用户 ID" /></label>
+          <label><span>操作者</span><UiInput v-model="advancedDraft.actor" placeholder="用户名" /></label>
+          <label><span>节点 ID</span><UiInput v-model="advancedDraft.instance_id" placeholder="节点 ID" /></label>
+          <label><span>来源 IP</span><UiInput v-model="advancedDraft.source_ip" placeholder="例如 10.0.0.1" /></label>
+          <label class="audit-workspace-filter-wide"><span>请求 ID</span><UiInput v-model="advancedDraft.request_id" placeholder="UUID request ID" /></label>
         </div>
-      </form>
+      </UiForm>
       <template #footer>
-        <button class="text-button" type="button" @click="closeAdvancedFilters">取消</button>
-        <button class="primary-button" type="button" @click="applyAdvancedFilters">应用筛选</button>
+        <UiButton class="text-button" type="button" @click="closeAdvancedFilters">取消</UiButton>
+        <UiButton class="primary-button" type="button" @click="applyAdvancedFilters">应用筛选</UiButton>
       </template>
     </WorkspaceDrawer>
 

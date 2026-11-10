@@ -1,4 +1,10 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiFileInput from './ui/UiFileInput.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
+import UiSelect from './ui/UiSelect.vue'
+import UiTextarea from './ui/UiTextarea.vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   ArrowUpCircle,
@@ -89,7 +95,7 @@ const activeTab = ref<'attempts' | 'overview' | 'artifacts'>('attempts')
 const operationDrawer = ref<'create' | 'edit' | 'upload' | null>(null)
 const moreMenuOpen = ref(false)
 const moreMenuElement = ref<HTMLElement | null>(null)
-const moreMenuButton = ref<HTMLButtonElement | null>(null)
+const moreMenuButton = ref<InstanceType<typeof UiButton> | null>(null)
 const createReleaseFiles = ref<File[]>([])
 const createReleaseFileError = ref('')
 const createReleaseVersionSource = ref('')
@@ -928,9 +934,9 @@ function handleMenuKeydown(event: KeyboardEvent) {
       </div>
       <div class="updates-header-actions">
         <span class="page-count">{{ publishedCount }} 个已发布</span>
-        <button class="primary-button" type="button" :disabled="Boolean(operation)" @click="openCreateDrawer">
+        <UiButton class="primary-button" type="button" :disabled="Boolean(operation)" @click="openCreateDrawer">
           <Plus :size="16" />新建版本
-        </button>
+        </UiButton>
       </div>
     </header>
 
@@ -951,7 +957,7 @@ function handleMenuKeydown(event: KeyboardEvent) {
         </div>
 
         <div v-if="releases.length" class="release-rail-list">
-          <button
+          <UiButton
             v-for="release in releases"
             :key="release.id"
             type="button"
@@ -974,16 +980,16 @@ function handleMenuKeydown(event: KeyboardEvent) {
               <span class="active">处理中 {{ attemptStats(release).active }}</span>
               <span :class="{ danger: attemptStats(release).failed > 0 }">失败 {{ attemptStats(release).failed }}</span>
             </span>
-          </button>
+          </UiButton>
         </div>
 
         <div v-else class="page-empty update-empty">
           <span><PackageCheck :size="24" /></span>
           <strong>暂无更新版本</strong>
           <p>创建草稿后即可上传更新包。</p>
-          <button class="primary-button" type="button" @click="openCreateDrawer">
+          <UiButton class="primary-button" type="button" @click="openCreateDrawer">
             <Plus :size="15" />新建版本
-          </button>
+          </UiButton>
         </div>
       </aside>
 
@@ -1004,7 +1010,7 @@ function handleMenuKeydown(event: KeyboardEvent) {
           </div>
 
           <div class="release-detail-actions">
-            <button
+            <UiButton
               v-if="draftArtifactCount(selectedRelease) > 0"
               class="primary-button release-publish-button"
               type="button"
@@ -1013,8 +1019,8 @@ function handleMenuKeydown(event: KeyboardEvent) {
             >
               <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'publishing'" class="spin" :size="15" />
               <Send v-else :size="15" />{{ selectedRelease.status === 'published' ? '发布新增包' : '发布' }}
-            </button>
-            <button
+            </UiButton>
+            <UiButton
               v-else-if="isRolloutActive(selectedRelease)"
               class="primary-button"
               type="button"
@@ -1023,8 +1029,8 @@ function handleMenuKeydown(event: KeyboardEvent) {
             >
               <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'pausing'" class="spin" :size="15" />
               <Pause v-else :size="15" />暂停发布
-            </button>
-            <button
+            </UiButton>
+            <UiButton
               v-else-if="isRolloutPaused(selectedRelease)"
               class="primary-button"
               type="button"
@@ -1033,84 +1039,84 @@ function handleMenuKeydown(event: KeyboardEvent) {
             >
               <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'resuming'" class="spin" :size="15" />
               <Play v-else :size="15" />恢复发布
-            </button>
+            </UiButton>
 
             <div ref="moreMenuElement" class="release-more" @focusout="handleMoreMenuFocusout">
-              <button
+              <UiButton
                 ref="moreMenuButton"
                 class="icon-button"
                 type="button"
-                title="更多版本操作"
+                v-tooltip="'更多版本操作'"
                 aria-label="更多版本操作"
                 aria-haspopup="menu"
                 :aria-expanded="moreMenuOpen"
                 @click="toggleMoreMenu"
               >
                 <EllipsisVertical :size="17" />
-              </button>
+              </UiButton>
               <div v-if="moreMenuOpen" class="release-more-menu" role="menu" @keydown="handleMoreMenuKeydown">
-                <button
+                <UiButton
                   v-if="selectedRelease.status === 'draft'"
                   type="button"
                   role="menuitem"
                   :disabled="Boolean(operation)"
                   @click="editRelease(selectedRelease)"
-                ><Pencil :size="15" />编辑草稿</button>
-                <button
+                ><Pencil :size="15" />编辑草稿</UiButton>
+                <UiButton
                   v-if="draftArtifactCount(selectedRelease) > 0 && isRolloutActive(selectedRelease)"
                   type="button"
                   role="menuitem"
                   :disabled="Boolean(operation)"
                   @click="moreMenuOpen = false; $emit('pauseRollout', selectedRelease)"
-                ><Pause :size="15" />暂停发布</button>
-                <button
+                ><Pause :size="15" />暂停发布</UiButton>
+                <UiButton
                   v-if="draftArtifactCount(selectedRelease) > 0 && isRolloutPaused(selectedRelease)"
                   type="button"
                   role="menuitem"
                   :disabled="Boolean(operation)"
                   @click="moreMenuOpen = false; $emit('resumeRollout', selectedRelease)"
-                ><Play :size="15" />恢复发布</button>
-                <button
+                ><Play :size="15" />恢复发布</UiButton>
+                <UiButton
                   v-if="isCanaryRollout(selectedRelease)"
                   type="button"
                   role="menuitem"
                   :disabled="Boolean(operation)"
                   @click="moreMenuOpen = false; openRolloutSelector(selectedRelease, 'add')"
-                ><UserPlus :size="15" />添加灰度批次</button>
-                <button
+                ><UserPlus :size="15" />添加灰度批次</UiButton>
+                <UiButton
                   v-if="isCanaryRollout(selectedRelease)"
                   type="button"
                   role="menuitem"
                   :disabled="Boolean(operation)"
                   @click="moreMenuOpen = false; $emit('promoteRollout', selectedRelease)"
-                ><ArrowUpCircle :size="15" />晋级全量</button>
-                <button
+                ><ArrowUpCircle :size="15" />晋级全量</UiButton>
+                <UiButton
                   v-if="canRollbackRelease(selectedRelease)"
                   class="danger"
                   type="button"
                   role="menuitem"
                   :disabled="Boolean(operation)"
                   @click="moreMenuOpen = false; $emit('rollbackRelease', selectedRelease)"
-                ><Undo2 :size="15" />批量回滚</button>
-                <button
+                ><Undo2 :size="15" />批量回滚</UiButton>
+                <UiButton
                   class="danger"
                   type="button"
                   role="menuitem"
-                  :title="deleteReleaseTitle(selectedRelease)"
+                  v-tooltip="deleteReleaseTitle(selectedRelease)"
                   :aria-label="deleteReleaseLabel(selectedRelease)"
                   :disabled="Boolean(operation) || !canDeleteRelease(selectedRelease)"
                   @click="moreMenuOpen = false; $emit('deleteRelease', selectedRelease)"
                 >
                   <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'deleting'" class="spin" :size="15" />
                   <Trash2 v-else :size="15" />删除版本
-                </button>
+                </UiButton>
               </div>
             </div>
           </div>
         </header>
 
         <div class="release-tabs" role="tablist" aria-label="版本详情视图" @keydown="handleTabKeydown">
-          <button
+          <UiButton
             id="release-tab-attempts"
             type="button"
             role="tab"
@@ -1119,8 +1125,8 @@ function handleMenuKeydown(event: KeyboardEvent) {
             :tabindex="activeTab === 'attempts' ? 0 : -1"
             :class="{ active: activeTab === 'attempts' }"
             @click="activeTab = 'attempts'"
-          >实例更新 <span>{{ attemptsFor(selectedRelease).length }}</span></button>
-          <button
+          >实例更新 <span>{{ attemptsFor(selectedRelease).length }}</span></UiButton>
+          <UiButton
             id="release-tab-overview"
             type="button"
             role="tab"
@@ -1129,8 +1135,8 @@ function handleMenuKeydown(event: KeyboardEvent) {
             :tabindex="activeTab === 'overview' ? 0 : -1"
             :class="{ active: activeTab === 'overview' }"
             @click="activeTab = 'overview'"
-          >版本概览</button>
-          <button
+          >版本概览</UiButton>
+          <UiButton
             id="release-tab-artifacts"
             type="button"
             role="tab"
@@ -1139,7 +1145,7 @@ function handleMenuKeydown(event: KeyboardEvent) {
             :tabindex="activeTab === 'artifacts' ? 0 : -1"
             :class="{ active: activeTab === 'artifacts' }"
             @click="activeTab = 'artifacts'"
-          >更新包 <span>{{ selectedRelease.artifacts.length }}</span></button>
+          >更新包 <span>{{ selectedRelease.artifacts.length }}</span></UiButton>
         </div>
 
         <section
@@ -1159,8 +1165,8 @@ function handleMenuKeydown(event: KeyboardEvent) {
             <div class="update-attempts-body">
               <article v-for="attempt in attemptsFor(selectedRelease)" :key="attempt.id" class="update-attempt-row">
                 <div class="attempt-instance">
-                  <strong :title="attemptInstanceName(attempt)">{{ attemptInstanceName(attempt) }}</strong>
-                  <small :title="attempt.instance_id">{{ attempt.instance_id.slice(0, 12) }}</small>
+                  <strong v-tooltip="attemptInstanceName(attempt)">{{ attemptInstanceName(attempt) }}</strong>
+                  <small v-tooltip="attempt.instance_id">{{ attempt.instance_id.slice(0, 12) }}</small>
                 </div>
                 <span :class="['attempt-operation', attempt.operation]">
                   <ArrowUpCircle v-if="attempt.operation === 'upgrade'" :size="13" />
@@ -1169,45 +1175,45 @@ function handleMenuKeydown(event: KeyboardEvent) {
                 </span>
                 <span class="attempt-versions">{{ attempt.from_version }} -&gt; {{ attempt.target_version }}</span>
                 <span :class="['attempt-status', attempt.status]">{{ attemptStatusText[attempt.status] }}</span>
-                <span class="attempt-message" :title="attempt.message || '暂无补充说明'">{{ attempt.message || '—' }}</span>
+                <span class="attempt-message" v-tooltip="attempt.message || '暂无补充说明'">{{ attempt.message || '—' }}</span>
                 <time>{{ formatTime(attempt.updated_at) }}</time>
                 <div class="attempt-actions">
-                  <button
+                  <UiButton
                     v-if="canRetryAttempt(selectedRelease, attempt)"
                     class="icon-button"
                     type="button"
-                    title="重试此任务"
+                    v-tooltip="'重试此任务'"
                     :aria-label="`重试实例 ${attempt.instance_id} 的${attempt.operation === 'upgrade' ? '升级' : '回滚'}任务`"
                     :disabled="Boolean(operation)"
                     @click="$emit('retryAttempt', attempt)"
                   >
                     <LoaderCircle v-if="isBusy(attempt.id) && operation === 'retrying'" class="spin" :size="15" />
                     <RotateCcw v-else :size="15" />
-                  </button>
-                  <button
+                  </UiButton>
+                  <UiButton
                     v-else-if="canRollbackInstance(selectedRelease, attempt)"
                     class="icon-button danger"
                     type="button"
-                    title="回滚此实例"
+                    v-tooltip="'回滚此实例'"
                     :aria-label="`将实例 ${attempt.instance_id} 回滚到 ${attempt.from_version}`"
                     :disabled="Boolean(operation)"
                     @click="$emit('rollbackInstance', selectedRelease, attempt)"
                   >
                     <LoaderCircle v-if="isBusy(attempt.id) && operation === 'rolling_back'" class="spin" :size="15" />
                     <Undo2 v-else :size="15" />
-                  </button>
-                  <button
+                  </UiButton>
+                  <UiButton
                     v-else-if="canReupgradeInstance(selectedRelease, attempt)"
                     class="icon-button"
                     type="button"
-                    title="重新升级此实例"
+                    v-tooltip="'重新升级此实例'"
                     :aria-label="`将实例 ${attempt.instance_id} 重新升级到 ${selectedRelease.version}`"
                     :disabled="Boolean(operation)"
                     @click="$emit('reupgradeInstance', selectedRelease, attempt)"
                   >
                     <LoaderCircle v-if="isBusy(attempt.id) && operation === 'reupgrading'" class="spin" :size="15" />
                     <RefreshCw v-else :size="15" />
-                  </button>
+                  </UiButton>
                 </div>
               </article>
             </div>
@@ -1283,12 +1289,12 @@ function handleMenuKeydown(event: KeyboardEvent) {
               <h4>更新包</h4>
               <span>{{ selectedRelease.artifacts.length }} 个目标</span>
             </div>
-            <button
+            <UiButton
               class="text-button"
               type="button"
               :disabled="Boolean(operation) || !canPublishArtifacts(selectedRelease)"
               @click="openUploadDrawer(selectedRelease)"
-            ><Plus :size="15" />添加更新包</button>
+            ><Plus :size="15" />添加更新包</UiButton>
           </div>
 
           <div v-if="selectedRelease.artifacts.length === 0" class="release-empty-row release-tab-empty">
@@ -1298,7 +1304,7 @@ function handleMenuKeydown(event: KeyboardEvent) {
             <article v-for="artifact in selectedRelease.artifacts" :key="artifact.id" class="artifact-row">
               <span class="artifact-icon"><FileArchive :size="17" /></span>
               <div class="artifact-name">
-                <strong :title="artifact.file_name">{{ artifact.file_name }}</strong>
+                <strong v-tooltip="artifact.file_name">{{ artifact.file_name }}</strong>
                 <span>{{ artifact.os }} / {{ artifact.native_arch }} / {{ artifact.package_type }}</span>
               </div>
               <span :class="['artifact-status', artifact.status]">
@@ -1306,28 +1312,28 @@ function handleMenuKeydown(event: KeyboardEvent) {
               </span>
               <div class="artifact-integrity">
                 <span>{{ formatBytes(artifact.size_bytes) }}</span>
-                <code :title="artifact.sha256">{{ artifact.sha256.slice(0, 12) }}</code>
+                <code v-tooltip="artifact.sha256">{{ artifact.sha256.slice(0, 12) }}</code>
               </div>
               <div class="artifact-row-actions">
-                <button
+                <UiButton
                   class="icon-button subtle"
                   type="button"
-                  title="下载更新包"
+                  v-tooltip="'下载更新包'"
                   :aria-label="`下载 ${artifact.file_name}`"
                   @click="downloadArtifact(selectedRelease.id, artifact)"
-                ><Download :size="15" /></button>
-                <button
+                ><Download :size="15" /></UiButton>
+                <UiButton
                   v-if="artifact.status === 'draft'"
                   class="icon-button danger"
                   type="button"
-                  title="移除更新包"
+                  v-tooltip="'移除更新包'"
                   :aria-label="`移除 ${artifact.file_name}`"
                   :disabled="Boolean(operation)"
                   @click="$emit('deleteArtifact', selectedRelease.id, artifact.id)"
                 >
                   <LoaderCircle v-if="isBusy(artifact.id) && operation === 'deleting'" class="spin" :size="15" />
                   <Trash2 v-else :size="15" />
-                </button>
+                </UiButton>
               </div>
             </article>
           </div>
@@ -1344,13 +1350,13 @@ function handleMenuKeydown(event: KeyboardEvent) {
       :busy="Boolean(operation)"
       @close="closeOperationDrawer"
     >
-      <form v-if="operationDrawer === 'create'" id="create-agent-release-form" class="drawer-form" @submit.prevent="submitCreateRelease">
+      <UiForm v-if="operationDrawer === 'create'" id="create-agent-release-form" class="drawer-form" @submit.prevent="submitCreateRelease">
         <label class="release-create-file-picker">
           <span>更新文件 <i>可选，用于识别版本</i></span>
           <span
             class="file-button"
             :class="{ dragging: isFileDragActive(createReleaseDropKey), disabled: operation }"
-            :title="createReleaseFiles.map((file) => file.name).join('\n')"
+            v-tooltip="createReleaseFiles.map((file) => file.name).join('\n')"
             @dragenter="fileDragEnter(createReleaseDropKey, $event)"
             @dragleave="fileDragLeave(createReleaseDropKey)"
             @dragover="fileDragOver"
@@ -1361,9 +1367,8 @@ function handleMenuKeydown(event: KeyboardEvent) {
               <strong>{{ isFileDragActive(createReleaseDropKey) ? '松开即可添加文件' : createReleaseFileSummary }}</strong>
               <small>可同时选择 .bin/.exe 及同名 .sha256</small>
             </span>
-            <input
+            <UiFileInput
               :key="createReleaseInputKey"
-              type="file"
               accept=".bin,.exe,.sha256"
               multiple
               :disabled="Boolean(operation)"
@@ -1374,7 +1379,7 @@ function handleMenuKeydown(event: KeyboardEvent) {
         </label>
         <label>
           <span>版本号</span>
-          <input
+          <UiInput
             v-model.trim="form.version"
             required
             autofocus
@@ -1388,11 +1393,11 @@ function handleMenuKeydown(event: KeyboardEvent) {
         </label>
         <label>
           <span>发布说明 <i>可选</i></span>
-          <textarea v-model.trim="form.notes" rows="6" placeholder="本次更新内容"></textarea>
+          <UiTextarea v-model.trim="form.notes" rows="6" placeholder="本次更新内容"></UiTextarea>
         </label>
-      </form>
+      </UiForm>
 
-      <form
+      <UiForm
         v-else-if="operationDrawer === 'edit' && selectedRelease"
         id="edit-agent-release-form"
         class="drawer-form"
@@ -1400,15 +1405,15 @@ function handleMenuKeydown(event: KeyboardEvent) {
       >
         <label>
           <span>版本号</span>
-          <input v-model.trim="draftEdits[selectedRelease.id].version" required autofocus autocomplete="off" />
+          <UiInput v-model.trim="draftEdits[selectedRelease.id].version" required autofocus autocomplete="off" />
         </label>
         <label>
           <span>发布说明 <i>可选</i></span>
-          <textarea v-model.trim="draftEdits[selectedRelease.id].notes" rows="8"></textarea>
+          <UiTextarea v-model.trim="draftEdits[selectedRelease.id].notes" rows="8"></UiTextarea>
         </label>
-      </form>
+      </UiForm>
 
-      <form
+      <UiForm
         v-else-if="operationDrawer === 'upload' && selectedRelease"
         id="upload-agent-artifact-form"
         class="artifact-upload-form"
@@ -1426,9 +1431,8 @@ function handleMenuKeydown(event: KeyboardEvent) {
             <strong>{{ batchDragActive[selectedRelease.id] ? '松开即可添加多个文件' : '批量添加更新包' }}</strong>
             <small>同时选择更新包及其同名 .sha256 文件</small>
           </span>
-          <input
+          <UiFileInput
             :key="batchInputKeys[selectedRelease.id]"
-            type="file"
             accept=".bin,.exe,.sha256"
             multiple
             :disabled="Boolean(operation)"
@@ -1444,30 +1448,20 @@ function handleMenuKeydown(event: KeyboardEvent) {
             <div class="artifact-upload-target">
               <label>
                 <span>目标系统</span>
-                <select v-model="row.os" @change="changeArtifactOs(row)">
-                  <option v-if="!row.os" value="" disabled>请选择系统</option>
-                  <option value="linux">Linux</option>
-                  <option value="windows">Windows</option>
-                  <option value="macos">macOS</option>
-                </select>
+                <UiSelect v-model="row.os" @change="changeArtifactOs(row)" :options="[{ value: '', label: '请选择系统', disabled: true }, { value: 'linux', label: 'Linux' }, { value: 'windows', label: 'Windows' }, { value: 'macos', label: 'macOS' }]" />
               </label>
               <label>
                 <span>原生架构</span>
-                <select v-model="row.native_arch" required @change="changeArtifactArchitecture(row)">
-                  <option v-if="!row.native_arch" value="" disabled>请选择架构</option>
-                  <option v-for="architecture in nativeArchitectures(row.os)" :key="architecture" :value="architecture">
-                    {{ architecture }}
-                  </option>
-                </select>
+                <UiSelect v-model="row.native_arch" required @change="changeArtifactArchitecture(row)" :options="[{ value: '', label: '请选择架构', disabled: true }, ...nativeArchitectures(row.os).map((architecture) => ({ value: architecture, label: (architecture) }))]" />
               </label>
-              <button
+              <UiButton
                 class="icon-button danger"
                 type="button"
-                title="移除上传目标"
+                v-tooltip="'移除上传目标'"
                 :aria-label="`移除上传目标 ${row.file?.name || row.os}`"
                 :disabled="Boolean(operation)"
                 @click="removeUploadRow(selectedRelease.id, row.id)"
-              ><Trash2 :size="15" /></button>
+              ><Trash2 :size="15" /></UiButton>
             </div>
 
             <label
@@ -1478,15 +1472,14 @@ function handleMenuKeydown(event: KeyboardEvent) {
               @drop.prevent="dropArtifactFile(row, $event)"
             >
               <span>可执行文件</span>
-              <span class="file-button" :title="row.file?.name">
+              <span class="file-button" v-tooltip="row.file?.name">
                 <Upload :size="17" />
                 <span>
                   <strong>{{ row.file?.name || '选择单个文件' }}</strong>
                   <small>{{ row.inference === 'needs_target' ? '请确认系统和架构' : row.inference === 'needs_architecture' ? '请确认架构' : `仅支持 ${artifactAccept(row)} 文件` }}</small>
                 </span>
-                <input
+                <UiFileInput
                   :key="fileInputKeys[row.id] || 0"
-                  type="file"
                   :accept="artifactAccept(row)"
                   :disabled="Boolean(operation)"
                   @change="chooseArtifactFile(row, $event)"
@@ -1502,15 +1495,14 @@ function handleMenuKeydown(event: KeyboardEvent) {
               @drop.prevent="dropChecksumFile(row, $event)"
             >
               <span>SHA-256 文件</span>
-              <span class="file-button" :title="row.checksum_file?.name">
+              <span class="file-button" v-tooltip="row.checksum_file?.name">
                 <FileArchive :size="17" />
                 <span>
                   <strong>{{ row.checksum_file?.name || '选择同名 .sha256' }}</strong>
                   <small>{{ row.file ? `${row.file.name}.sha256` : '需与可执行文件同名' }}</small>
                 </span>
-                <input
+                <UiFileInput
                   :key="checksumInputKeys[row.id] || 0"
-                  type="file"
                   accept=".sha256"
                   :disabled="Boolean(operation)"
                   @change="chooseChecksumFile(row, $event)"
@@ -1520,14 +1512,14 @@ function handleMenuKeydown(event: KeyboardEvent) {
             <small v-if="row.error" class="artifact-file-error" role="alert">{{ row.error }}</small>
           </div>
         </div>
-      </form>
+      </UiForm>
 
       <template #footer>
         <template v-if="operationDrawer === 'create'">
-          <button class="text-button" type="button" :disabled="Boolean(operation)" @click="closeOperationDrawer">
+          <UiButton class="text-button" type="button" :disabled="Boolean(operation)" @click="closeOperationDrawer">
             <X :size="15" />取消
-          </button>
-          <button
+          </UiButton>
+          <UiButton
             class="primary-button"
             type="submit"
             form="create-agent-release-form"
@@ -1535,22 +1527,22 @@ function handleMenuKeydown(event: KeyboardEvent) {
           >
             <LoaderCircle v-if="operation === 'creating'" class="spin" :size="16" />
             <Plus v-else :size="16" />{{ operation === 'creating' ? '正在创建' : '创建草稿' }}
-          </button>
+          </UiButton>
         </template>
         <template v-else-if="operationDrawer === 'edit' && selectedRelease">
-          <button class="text-button" type="button" :disabled="Boolean(operation)" @click="cancelEdit(selectedRelease.id)">
+          <UiButton class="text-button" type="button" :disabled="Boolean(operation)" @click="cancelEdit(selectedRelease.id)">
             <X :size="15" />取消
-          </button>
-          <button class="primary-button" type="submit" form="edit-agent-release-form" :disabled="Boolean(operation)">
+          </UiButton>
+          <UiButton class="primary-button" type="submit" form="edit-agent-release-form" :disabled="Boolean(operation)">
             <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'saving'" class="spin" :size="15" />
             <Save v-else :size="15" />保存草稿
-          </button>
+          </UiButton>
         </template>
         <template v-else-if="operationDrawer === 'upload' && selectedRelease">
-          <button class="text-button" type="button" :disabled="Boolean(operation)" @click="addUploadRow(selectedRelease.id)">
+          <UiButton class="text-button" type="button" :disabled="Boolean(operation)" @click="addUploadRow(selectedRelease.id)">
             <Plus :size="15" />添加目标
-          </button>
-          <button
+          </UiButton>
+          <UiButton
             class="primary-button"
             type="submit"
             form="upload-agent-artifact-form"
@@ -1558,7 +1550,7 @@ function handleMenuKeydown(event: KeyboardEvent) {
           >
             <LoaderCircle v-if="isBusy(selectedRelease.id) && operation === 'uploading'" class="spin" :size="15" />
             <Upload v-else :size="15" />上传 {{ uploadableRowsFor(selectedRelease.id).length }} 个
-          </button>
+          </UiButton>
         </template>
       </template>
     </WorkspaceDrawer>

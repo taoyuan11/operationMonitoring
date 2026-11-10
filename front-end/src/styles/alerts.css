@@ -28,7 +28,7 @@
 .alert-filter-bar { display: grid; grid-template-columns: repeat(5, minmax(125px, 1fr)); gap: 9px; margin-bottom: 12px; padding: 13px; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; box-shadow: var(--shadow); }
 .alert-filter-bar label { gap: 4px; }
 .alert-filter-bar label > span:first-child { color: var(--muted); font-size: 9px; }
-.alert-filter-bar input, .alert-filter-bar select, .alert-filter-bar .input-shell { min-height: 34px; height: 34px; padding-top: 5px; padding-bottom: 5px; font-size: 11px; }
+.alert-filter-bar input, .alert-filter-bar .ui-select-trigger, .alert-filter-bar .ui-date-trigger, .alert-filter-bar .input-shell { min-height: 34px; height: 34px; padding-top: 5px; padding-bottom: 5px; font-size: 11px; }
 .alert-filter-bar .input-shell { padding: 0 8px; }
 .alert-filter-bar .input-shell input { min-height: 32px; height: 32px; padding: 0; }
 .alert-search-filter { grid-column: span 2; }
@@ -103,7 +103,7 @@
 .alert-presets button span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .alert-presets button:hover, .alert-presets button.active { color: var(--accent-strong); background: var(--accent-soft); border-color: var(--accent-border); }
 .alert-editor-form { gap: 12px; }
-.alert-editor-form input, .alert-editor-form select { min-height: 38px; }
+.alert-editor-form input, .alert-editor-form .ui-select-trigger { min-height: 38px; }
 .alert-editor-form textarea { min-height: 76px; }
 .alert-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
 .alert-choice-fieldset, .alert-check-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }

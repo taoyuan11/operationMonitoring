@@ -1,4 +1,9 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiColorPicker from './ui/UiColorPicker.vue'
+import UiFileInput from './ui/UiFileInput.vue'
+import UiForm from './ui/UiForm.vue'
+import UiNumberInput from './ui/UiNumberInput.vue'
 import { computed } from 'vue'
 import {
   Check,
@@ -105,12 +110,12 @@ const emit = defineEmits<{
                 <strong>{{ formatTime(item.last_seen) }}</strong>
               </div>
               <div class="row-actions">
-                <button class="approve-button" type="button" @click="$emit('approve', item.id)">
+                <UiButton class="approve-button" type="button" @click="$emit('approve', item.id)">
                   <Check :size="15" />批准
-                </button>
-                <button class="reject-button" type="button" @click="$emit('reject', item.id)">
+                </UiButton>
+                <UiButton class="reject-button" type="button" @click="$emit('reject', item.id)">
                   <X :size="15" />拒绝
-                </button>
+                </UiButton>
               </div>
             </article>
           </TransitionGroup>
@@ -140,7 +145,7 @@ const emit = defineEmits<{
               <fieldset class="theme-mode-fieldset">
                 <legend>主题模式</legend>
                 <div class="theme-mode-options">
-                  <button
+                  <UiButton
                     v-for="option in themeOptions"
                     :key="option.value"
                     :class="['theme-mode-option', { active: settingsForm.theme_mode === option.value }]"
@@ -151,37 +156,37 @@ const emit = defineEmits<{
                     <component :is="option.icon" :size="18" />
                     <span><strong>{{ option.label }}</strong><small>{{ option.description }}</small></span>
                     <i aria-hidden="true"></i>
-                  </button>
+                  </UiButton>
                 </div>
               </fieldset>
 
               <fieldset class="accent-fieldset">
                 <legend>主题色</legend>
                 <div class="accent-presets">
-                  <button
+                  <UiButton
                     v-for="preset in accentPresets"
                     :key="preset.value"
                     :class="['accent-swatch', { active: settingsForm.accent_color === preset.value }]"
                     :style="{ '--swatch-color': preset.value }"
                     type="button"
-                    :title="preset.label"
+                    v-tooltip="preset.label"
                     :aria-label="`使用${preset.label}主题色`"
                     :aria-pressed="settingsForm.accent_color === preset.value"
                     @click="settingsForm.accent_color = preset.value; $emit('appearanceChanged')"
-                  ><Check v-if="settingsForm.accent_color === preset.value" :size="14" /></button>
+                  ><Check v-if="settingsForm.accent_color === preset.value" :size="14" /></UiButton>
                   <label class="custom-color-picker">
                     <Palette :size="16" />
                     <span>自定义</span>
-                    <input v-model="settingsForm.accent_color" type="color" aria-label="选择自定义主题色" @input="$emit('appearanceChanged')" />
+                    <UiColorPicker v-model="settingsForm.accent_color" aria-label="选择自定义主题色" @input="$emit('appearanceChanged')" />
                     <code>{{ settingsForm.accent_color }}</code>
                   </label>
                 </div>
               </fieldset>
 
               <div class="appearance-save-row">
-                <button class="primary-button" type="button" @click="$emit('saveAppearance')">
+                <UiButton class="primary-button" type="button" @click="$emit('saveAppearance')">
                   <Palette :size="16" />保存外观
-                </button>
+                </UiButton>
                 <small :class="{ success: appearanceMessage }">{{ appearanceMessage || '保存后将作为全站默认外观' }}</small>
               </div>
             </div>
@@ -197,7 +202,7 @@ const emit = defineEmits<{
                   <div class="preview-sidebar"><span></span><span class="active"></span><span></span></div>
                   <div class="preview-content">
                     <div class="preview-summary"><i></i><i></i><i></i></div>
-                    <div class="preview-card"><strong>运行监控</strong><span></span><button type="button">主要操作</button></div>
+                    <div class="preview-card"><strong>运行监控</strong><span></span><UiButton type="button">主要操作</UiButton></div>
                   </div>
                 </section>
               </div>
@@ -224,15 +229,14 @@ const emit = defineEmits<{
               <LoaderCircle v-if="backgroundOperation === 'uploading'" class="spin" :size="15" />
               <Image v-else :size="15" />
               {{ backgroundOperation === 'uploading' ? '正在上传' : '选择图片' }}
-              <input
-                type="file"
+              <UiFileInput
                 accept="image/png,image/jpeg,image/webp"
                 :disabled="Boolean(backgroundOperation)"
                 @change="$emit('selectBackgroundImage', $event)"
               />
             </label>
             <Transition name="fade-scale">
-              <button
+              <UiButton
                 v-if="settingsForm.background_image_url"
                 class="text-button danger"
                 type="button"
@@ -242,7 +246,7 @@ const emit = defineEmits<{
                 <LoaderCircle v-if="backgroundOperation === 'removing'" class="spin" :size="14" />
                 <Trash2 v-else :size="14" />
                 {{ backgroundOperation === 'removing' ? '正在移除' : '移除背景' }}
-              </button>
+              </UiButton>
             </Transition>
             <small :class="{ success: backgroundMessage }">{{ backgroundMessage || backgroundFileName || '支持 PNG、JPEG、WebP，最大 5MB' }}</small>
           </div>
@@ -250,24 +254,24 @@ const emit = defineEmits<{
 
         <div class="admin-content-card retention-card">
           <div class="card-heading"><div><h3>数据保留</h3><p>分别设置历史指标、审计事件和已恢复告警的自动清理期限。</p></div></div>
-          <form class="stack-form page-form" @submit.prevent="$emit('saveSettings')">
+          <UiForm class="stack-form page-form" @submit.prevent="$emit('saveSettings')">
             <label>
               <span>指标保留天数</span>
-              <input v-model.number="settingsForm.retention_days" min="1" max="365" type="number" />
+              <UiNumberInput v-model="settingsForm.retention_days" min="1" max="365" />
             </label>
             <small class="form-help">可设置 1 至 365 天，不影响节点基础信息。</small>
             <label>
               <span>审计保留天数</span>
-              <input v-model.number="settingsForm.audit_retention_days" min="1" max="3650" type="number" />
+              <UiNumberInput v-model="settingsForm.audit_retention_days" min="1" max="3650" />
             </label>
             <small class="form-help">可设置 1 至 3650 天，运行中的会话不会被清理。</small>
             <label>
               <span>告警保留天数</span>
-              <input v-model.number="settingsForm.alert_retention_days" min="1" max="3650" type="number" />
+              <UiNumberInput v-model="settingsForm.alert_retention_days" min="1" max="3650" />
             </label>
             <small class="form-help">仅清理过期的已恢复事件及投递记录，活动事件不会被清理。</small>
-            <button class="primary-button" type="submit"><Settings :size="16" />保存设置</button>
-          </form>
+            <UiButton class="primary-button" type="submit"><Settings :size="16" />保存设置</UiButton>
+          </UiForm>
         </div>
       </div>
     </template>

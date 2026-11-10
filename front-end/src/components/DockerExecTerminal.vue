@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
@@ -149,9 +150,9 @@ function decodeBase64(value: string) {
           <TerminalSquare :size="17" />
           <div><strong>{{ containerName }}</strong><span>{{ shell }} · {{ status }}</span></div>
         </div>
-        <button class="icon-button subtle" type="button" title="关闭终端" @click="emit('close')">
+        <UiButton class="icon-button subtle" type="button" v-tooltip="'关闭终端'" @click="emit('close')">
           <X :size="16" />
-        </button>
+        </UiButton>
       </header>
       <div class="terminal-screen docker-terminal-screen" aria-label="容器交互式终端">
         <div ref="terminalElement" class="terminal-screen-content"></div>

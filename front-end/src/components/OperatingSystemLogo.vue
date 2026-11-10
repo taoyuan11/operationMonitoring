@@ -141,7 +141,7 @@ function brandColor(hex: string | undefined) {
     :style="logoStyle"
     role="img"
     :aria-label="`${logoLabel} 系统`"
-    :title="logoLabel"
+    v-tooltip="logoLabel"
   >
     <svg v-if="logo" class="brand-logo" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
       <path :d="logo.icon.path" />

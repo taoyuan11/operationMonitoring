@@ -1,4 +1,9 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
+import UiSelect from './ui/UiSelect.vue'
+import UiTextarea from './ui/UiTextarea.vue'
 import { computed, nextTick, ref, watch } from 'vue'
 import {
   CircleAlert,
@@ -192,15 +197,15 @@ function handleTabKeydown(event: KeyboardEvent) {
       </div>
       <div class="command-workspace-header-actions">
         <span class="page-count">{{ commands.length }} 个命令</span>
-        <button class="primary-button" type="button" :disabled="loading" @click="openCreateDrawer">
+        <UiButton class="primary-button" type="button" :disabled="loading" @click="openCreateDrawer">
           <Plus :size="16" />新建命令
-        </button>
+        </UiButton>
       </div>
     </header>
 
     <div class="command-workspace-panel">
       <div class="command-workspace-tabs" role="tablist" aria-label="快捷命令视图" @keydown="handleTabKeydown">
-        <button
+        <UiButton
           id="command-tab-library"
           type="button"
           role="tab"
@@ -211,8 +216,8 @@ function handleTabKeydown(event: KeyboardEvent) {
           @click="activeTab = 'library'"
         >
           <Terminal :size="15" />命令库 <span>{{ commands.length }}</span>
-        </button>
-        <button
+        </UiButton>
+        <UiButton
           id="command-tab-history"
           type="button"
           role="tab"
@@ -224,7 +229,7 @@ function handleTabKeydown(event: KeyboardEvent) {
         >
           <History :size="15" />执行记录 <span>{{ jobs.length }}</span>
           <em v-if="activeJobCount">{{ activeJobCount }} 进行中</em>
-        </button>
+        </UiButton>
       </div>
 
       <section
@@ -238,14 +243,14 @@ function handleTabKeydown(event: KeyboardEvent) {
           <div class="command-workspace-search">
             <Search :size="15" aria-hidden="true" />
             <label class="command-workspace-sr-only" for="command-library-search">搜索命令库</label>
-            <input id="command-library-search" v-model="commandSearch" type="search" placeholder="搜索名称、命令或确认提示" />
-            <button
+            <UiInput id="command-library-search" v-model="commandSearch" type="search" placeholder="搜索名称、命令或确认提示" />
+            <UiButton
               v-if="commandSearch"
               type="button"
-              title="清除搜索"
+              v-tooltip="'清除搜索'"
               aria-label="清除命令搜索"
               @click="clearCommandSearch"
-            ><X :size="14" /></button>
+            ><X :size="14" /></UiButton>
           </div>
           <span>{{ filteredCommands.length }} / {{ commands.length }}</span>
         </div>
@@ -255,9 +260,9 @@ function handleTabKeydown(event: KeyboardEvent) {
             <span><Terminal :size="22" /></span>
             <strong>{{ commands.length ? '没有匹配的命令' : '暂无快捷命令' }}</strong>
             <p>{{ commands.length ? '调整搜索条件后重试。' : '创建后即可在节点操作面板中执行。' }}</p>
-            <button v-if="commands.length === 0" class="primary-button" type="button" @click="openCreateDrawer">
+            <UiButton v-if="commands.length === 0" class="primary-button" type="button" @click="openCreateDrawer">
               <Plus :size="15" />新建命令
-            </button>
+            </UiButton>
           </div>
           <div v-else class="command-library-table" role="table" aria-label="快捷命令库">
             <div class="command-library-head" role="row">
@@ -272,17 +277,17 @@ function handleTabKeydown(event: KeyboardEvent) {
               <article v-for="command in filteredCommands" :key="command.id" class="command-library-row" role="row">
                 <div class="command-library-name" role="cell">
                   <span><Terminal :size="15" /></span>
-                  <div><strong :title="command.name">{{ command.name }}</strong><small>最近记录 {{ commandRunCount(command.id) }} 次</small></div>
+                  <div><strong v-tooltip="command.name">{{ command.name }}</strong><small>最近记录 {{ commandRunCount(command.id) }} 次</small></div>
                 </div>
                 <div class="command-library-code" role="cell">
                   <small class="command-mobile-label">执行内容</small>
-                  <code :title="command.command">{{ command.command }}</code>
+                  <code v-tooltip="command.command">{{ command.command }}</code>
                 </div>
                 <div class="command-library-confirm" role="cell">
                   <small class="command-mobile-label">确认策略</small>
                   <ShieldCheck v-if="command.confirm_text" :size="14" />
                   <CircleAlert v-else :size="14" />
-                  <span :title="command.confirm_text || '使用默认命令内容确认'">
+                  <span v-tooltip="command.confirm_text || '使用默认命令内容确认'">
                     {{ command.confirm_text || '默认确认' }}
                   </span>
                 </div>
@@ -301,14 +306,14 @@ function handleTabKeydown(event: KeyboardEvent) {
                   <time>{{ formatTime(command.created_at) }}</time>
                 </div>
                 <div class="command-library-action" role="cell">
-                  <button
+                  <UiButton
                     class="icon-button danger"
                     type="button"
-                    title="停用快捷命令"
+                    v-tooltip="'停用快捷命令'"
                     :aria-label="`停用快捷命令：${command.name}`"
                     :disabled="loading"
                     @click="$emit('removeCommand', command)"
-                  ><Trash2 :size="15" /></button>
+                  ><Trash2 :size="15" /></UiButton>
                 </div>
               </article>
             </div>
@@ -327,24 +332,18 @@ function handleTabKeydown(event: KeyboardEvent) {
           <div class="command-workspace-search">
             <Search :size="15" aria-hidden="true" />
             <label class="command-workspace-sr-only" for="command-history-search">搜索执行记录</label>
-            <input id="command-history-search" v-model="jobSearch" type="search" placeholder="搜索命令、节点、操作者或任务 ID" />
-            <button
+            <UiInput id="command-history-search" v-model="jobSearch" type="search" placeholder="搜索命令、节点、操作者或任务 ID" />
+            <UiButton
               v-if="jobSearch"
               type="button"
-              title="清除搜索"
+              v-tooltip="'清除搜索'"
               aria-label="清除执行记录搜索"
               @click="clearJobSearch"
-            ><X :size="14" /></button>
+            ><X :size="14" /></UiButton>
           </div>
           <label class="command-history-status">
             <span class="command-workspace-sr-only">执行状态</span>
-            <select v-model="jobStatus" title="按执行状态筛选">
-              <option value="">全部状态</option>
-              <option value="queued">排队中</option>
-              <option value="running">执行中</option>
-              <option value="completed">已完成</option>
-              <option value="failed">失败</option>
-            </select>
+            <UiSelect v-model="jobStatus" v-tooltip="'按执行状态筛选'" :options="[{ value: '', label: '全部状态' }, { value: 'queued', label: '排队中' }, { value: 'running', label: '执行中' }, { value: 'completed', label: '已完成' }, { value: 'failed', label: '失败' }]" />
           </label>
           <span>{{ filteredJobs.length }} / {{ jobs.length }}</span>
         </div>
@@ -381,8 +380,8 @@ function handleTabKeydown(event: KeyboardEvent) {
                 @keydown.space.prevent="selectJob(job)"
               >
                 <span :class="['command-job-status', jobStatusClass(job.status)]">{{ jobStatusLabel(job.status) }}</span>
-                <div class="command-history-command"><strong :title="job.command">{{ job.command }}</strong><small :title="job.id">{{ job.id }}</small></div>
-                <div class="command-history-instance"><small class="command-mobile-label">节点</small><code :title="job.instance_id">{{ job.instance_id }}</code></div>
+                <div class="command-history-command"><strong v-tooltip="job.command">{{ job.command }}</strong><small v-tooltip="job.id">{{ job.id }}</small></div>
+                <div class="command-history-instance"><small class="command-mobile-label">节点</small><code v-tooltip="job.instance_id">{{ job.instance_id }}</code></div>
                 <div class="command-history-actor"><small class="command-mobile-label">操作者</small><span>{{ job.requested_by || '未知' }}</span></div>
                 <div class="command-history-time"><small class="command-mobile-label">发起时间 / 总用时</small><time>{{ formatTime(job.created_at) }}</time><small>{{ jobDuration(job) }}</small></div>
                 <div class="command-history-result"><strong>{{ job.exit_code ?? '-' }}</strong><small>退出码</small></div>
@@ -403,33 +402,33 @@ function handleTabKeydown(event: KeyboardEvent) {
       :busy="createSubmitted && loading"
       @close="closeCreateDrawer"
     >
-      <form id="command-create-form" class="command-create-form" @submit.prevent="submitCreateCommand">
+      <UiForm id="command-create-form" class="command-create-form" @submit.prevent="submitCreateCommand">
         <fieldset :disabled="createSubmitted && loading">
           <label>
             <span>显示名称</span>
-            <input v-model.trim="commandForm.name" required autofocus autocomplete="off" placeholder="例如：重启 Nginx" />
+            <UiInput v-model.trim="commandForm.name" required autofocus autocomplete="off" placeholder="例如：重启 Nginx" />
           </label>
           <label>
             <span>执行命令</span>
-            <textarea v-model.trim="commandForm.command" required rows="5" placeholder="systemctl restart nginx"></textarea>
+            <UiTextarea v-model.trim="commandForm.command" required rows="5" placeholder="systemctl restart nginx"></UiTextarea>
           </label>
           <label>
             <span>确认提示 <i>可选</i></span>
-            <textarea v-model.trim="commandForm.confirm_text" rows="4" placeholder="执行前显示的二次确认提示"></textarea>
+            <UiTextarea v-model.trim="commandForm.confirm_text" rows="4" placeholder="执行前显示的二次确认提示"></UiTextarea>
           </label>
         </fieldset>
         <p v-if="createSubmitted && errorMessage && !loading" class="command-create-error" role="alert">
           <CircleAlert :size="15" />{{ errorMessage }}
         </p>
-      </form>
+      </UiForm>
       <template #footer>
-        <button class="text-button" type="button" :disabled="createSubmitted && loading" @click="closeCreateDrawer">
+        <UiButton class="text-button" type="button" :disabled="createSubmitted && loading" @click="closeCreateDrawer">
           <X :size="15" />取消
-        </button>
-        <button class="primary-button" type="submit" form="command-create-form" :disabled="loading">
+        </UiButton>
+        <UiButton class="primary-button" type="submit" form="command-create-form" :disabled="loading">
           <LoaderCircle v-if="createSubmitted && loading" class="spin" :size="16" />
           <Plus v-else :size="16" />{{ createSubmitted && loading ? '正在创建' : '创建命令' }}
-        </button>
+        </UiButton>
       </template>
     </WorkspaceDrawer>
 

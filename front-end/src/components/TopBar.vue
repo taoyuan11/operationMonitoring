@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
 import { Activity, ArrowDown, ArrowUp, Clock3, LockKeyhole, LogOut, RefreshCw, ShieldCheck, Wifi } from '@lucide/vue'
 import { computed } from 'vue'
 import { formatBytes } from '../utils/format'
@@ -76,18 +77,18 @@ const healthText = computed(() => {
     </div>
 
     <div class="top-actions">
-      <button class="icon-button" type="button" title="刷新数据" aria-label="刷新监控数据" :disabled="refreshing" @click="$emit('refresh')">
+      <UiButton class="icon-button" type="button" v-tooltip="'刷新数据'" aria-label="刷新监控数据" :disabled="refreshing" @click="$emit('refresh')">
         <RefreshCw :class="{ spin: refreshing }" :size="17" />
-      </button>
+      </UiButton>
       <template v-if="isAdmin">
         <span class="session"><ShieldCheck :size="15" />管理模式</span>
-        <button class="text-button" type="button" @click="$emit('logout')">
+        <UiButton class="text-button" type="button" @click="$emit('logout')">
           <LogOut :size="16" />退出
-        </button>
+        </UiButton>
       </template>
-      <button v-else class="admin-login-button" type="button" @click="$emit('login')">
+      <UiButton v-else class="admin-login-button" type="button" @click="$emit('login')">
         <LockKeyhole :size="15" />管理员登录
-      </button>
+      </UiButton>
     </div>
   </header>
 </template>

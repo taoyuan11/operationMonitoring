@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiSelect from './ui/UiSelect.vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   Expand,
@@ -973,54 +975,50 @@ function isDesktopQuality(value: string | null): value is DesktopQuality {
         </div>
 
         <div class="remote-desktop-tools">
-          <label class="desktop-quality-control" title="切换远程桌面画质">
+          <label class="desktop-quality-control" v-tooltip="'切换远程桌面画质'">
             <Gauge :size="15" aria-hidden="true" />
-            <select
+            <UiSelect
               v-model="desktopQuality"
               aria-label="远程桌面画质"
               @change="changeDesktopQuality"
-            >
-              <option v-for="option in desktopQualityOptions" :key="option.value" :value="option.value">
-                {{ option.label }}
-              </option>
-            </select>
+             :options="[...desktopQualityOptions.map((option) => ({ value: option.value, label: (option.label) }))]" />
           </label>
           <div class="desktop-view-toggle" role="group" aria-label="远程桌面缩放模式">
-            <button
+            <UiButton
               :class="{ active: viewMode === 'fit' }"
               type="button"
-              title="使桌面画面适应窗口"
+              v-tooltip="'使桌面画面适应窗口'"
               :aria-pressed="viewMode === 'fit'"
               @click="setViewMode('fit')"
             >
               <Shrink :size="15" />适应窗口
-            </button>
-            <button
+            </UiButton>
+            <UiButton
               :class="{ active: viewMode === 'actual' }"
               type="button"
-              title="按原始像素显示桌面"
+              v-tooltip="'按原始像素显示桌面'"
               :aria-pressed="viewMode === 'actual'"
               @click="setViewMode('actual')"
             >
               <Maximize2 :size="15" />1:1
-            </button>
+            </UiButton>
           </div>
-          <button
+          <UiButton
             v-if="instance.capabilities?.includes('remote_desktop_unattended_v1')"
             class="desktop-tool-button"
             type="button"
-            :title="secureAttentionTitle"
+            v-tooltip="secureAttentionTitle"
             aria-label="发送 Ctrl+Alt+Del"
             :disabled="!canSendSecureAttention"
             @click="sendSecureAttention"
           >
             <Keyboard :size="15" />
             <span>Ctrl+Alt+Del</span>
-          </button>
-          <button
+          </UiButton>
+          <UiButton
             :class="['desktop-tool-button', { active: audioEnabled }]"
             type="button"
-            :title="audioTitle"
+            v-tooltip="audioTitle"
             :aria-label="audioTitle"
             :aria-pressed="audioEnabled"
             :disabled="!canToggleAudio"
@@ -1029,18 +1027,18 @@ function isDesktopQuality(value: string | null): value is DesktopQuality {
             <Volume2 v-if="audioEnabled" :size="15" />
             <VolumeX v-else :size="15" />
             <span>{{ audioEnabled ? '静音' : '声音' }}</span>
-          </button>
-          <button class="desktop-tool-button" type="button" title="重新连接" @click="connect">
+          </UiButton>
+          <UiButton class="desktop-tool-button" type="button" v-tooltip="'重新连接'" @click="connect">
             <RefreshCw :size="15" /><span>重连</span>
-          </button>
-          <button class="desktop-tool-button" type="button" title="切换浏览器全屏" @click="toggleFullscreen">
+          </UiButton>
+          <UiButton class="desktop-tool-button" type="button" v-tooltip="'切换浏览器全屏'" @click="toggleFullscreen">
             <Fullscreen v-if="!isFullscreen" :size="15" />
             <Expand v-else :size="15" />
             <span>{{ isFullscreen ? '退出全屏' : '全屏' }}</span>
-          </button>
-          <button class="desktop-close-button" type="button" title="关闭远程桌面" aria-label="关闭远程桌面" @click="emit('close')">
+          </UiButton>
+          <UiButton class="desktop-close-button" type="button" v-tooltip="'关闭远程桌面'" aria-label="关闭远程桌面" @click="emit('close')">
             <X :size="18" />
-          </button>
+          </UiButton>
         </div>
       </header>
 
@@ -1069,13 +1067,13 @@ function isDesktopQuality(value: string | null): value is DesktopQuality {
             </span>
             <strong>{{ statusLabel }}</strong>
             <p>{{ statusDetail }}</p>
-            <button
+            <UiButton
               v-if="connectionState === 'error' || connectionState === 'closed' || connectionState === 'disconnected'"
               type="button"
               @click="connect"
             >
               <RefreshCw :size="14" />重新连接
-            </button>
+            </UiButton>
           </div>
         </Transition>
 

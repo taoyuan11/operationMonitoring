@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
 import {
   Ban,
   Check,
@@ -65,14 +68,14 @@ function hasStepUpCode() {
     <div class="admin-page-grid user-management-layout">
       <div class="admin-content-card auth-create-card">
         <div class="card-heading"><div><h3>添加管理员</h3><p>新用户需现场扫码并输入首个验证码后才会生效。</p></div></div>
-        <form class="stack-form page-form" @submit.prevent="$emit('createUser')">
+        <UiForm class="stack-form page-form" @submit.prevent="$emit('createUser')">
           <label>
             <span>新用户名</span>
-            <input v-model="form.username" required minlength="3" maxlength="32" placeholder="字母、数字、点、下划线或连字符" />
+            <UiInput v-model="form.username" required minlength="3" maxlength="32" placeholder="字母、数字、点、下划线或连字符" />
           </label>
           <label>
             <span>当前管理员验证码</span>
-            <input
+            <UiInput
               v-model="form.current_code"
               required
               inputmode="numeric"
@@ -82,11 +85,11 @@ function hasStepUpCode() {
             />
           </label>
           <small class="form-help">添加、停用、删除或撤销设备时均需重新输入你自己的 6 位代码。</small>
-          <button class="primary-button" type="submit" :disabled="loading || !form.username.trim() || !hasStepUpCode()">
+          <UiButton class="primary-button" type="submit" :disabled="loading || !form.username.trim() || !hasStepUpCode()">
             <LoaderCircle v-if="loading" class="spin" :size="16" />
             <UserPlus v-else :size="16" />生成二维码
-          </button>
-        </form>
+          </UiButton>
+        </UiForm>
       </div>
 
       <div v-if="activeEnrollment" class="admin-content-card active-enrollment-card">
@@ -96,10 +99,10 @@ function hasStepUpCode() {
           <strong>{{ activeEnrollment.username }} · {{ activeEnrollment.device_name }}</strong>
           <small>请在 {{ formatTime(activeEnrollment.expires_at) }} 前完成确认</small>
         </div>
-        <form class="stack-form page-form enrollment-confirm-form" @submit.prevent="$emit('confirmEnrollment')">
+        <UiForm class="stack-form page-form enrollment-confirm-form" @submit.prevent="$emit('confirmEnrollment')">
           <label>
             <span>新设备生成的验证码</span>
-            <input
+            <UiInput
               v-model="form.confirmation_code"
               required
               inputmode="numeric"
@@ -108,18 +111,18 @@ function hasStepUpCode() {
               placeholder="000000"
             />
           </label>
-          <button class="primary-button" type="submit" :disabled="loading || !/^\d{6}$/.test(form.confirmation_code.trim())">
+          <UiButton class="primary-button" type="submit" :disabled="loading || !/^\d{6}$/.test(form.confirmation_code.trim())">
             <Check :size="16" />确认并激活
-          </button>
-          <button
+          </UiButton>
+          <UiButton
             class="text-button danger"
             type="button"
             :disabled="loading || !hasStepUpCode()"
             @click="$emit('cancelEnrollment', activeEnrollment.id)"
           >
             <X :size="14" />取消注册
-          </button>
-        </form>
+          </UiButton>
+        </UiForm>
       </div>
 
       <div class="admin-content-card wide-card administrator-list-card">
@@ -134,40 +137,40 @@ function hasStepUpCode() {
               </div>
               <span :class="['user-status', { disabled: !user.enabled }]">{{ user.enabled ? '已启用' : '已停用' }}</span>
               <div class="row-actions">
-                <button
+                <UiButton
                   class="text-button"
                   type="button"
                   :disabled="loading || !hasStepUpCode()"
                   @click="$emit('addDevice', user)"
-                ><Plus :size="14" />添加设备</button>
-                <button
+                ><Plus :size="14" />添加设备</UiButton>
+                <UiButton
                   v-if="user.id !== currentUser?.id"
                   :class="['text-button', { danger: user.enabled }]"
                   type="button"
                   :disabled="loading || !hasStepUpCode()"
                   @click="$emit('setEnabled', user, !user.enabled)"
-                ><Ban :size="14" />{{ user.enabled ? '停用' : '启用' }}</button>
-                <button
+                ><Ban :size="14" />{{ user.enabled ? '停用' : '启用' }}</UiButton>
+                <UiButton
                   v-if="user.id !== currentUser?.id"
                   class="icon-button danger"
                   type="button"
-                  title="删除用户"
+                  v-tooltip="'删除用户'"
                   :disabled="loading || !hasStepUpCode()"
                   @click="$emit('deleteUser', user)"
-                ><Trash2 :size="14" /></button>
+                ><Trash2 :size="14" /></UiButton>
               </div>
             </div>
             <div v-if="user.devices.length" class="auth-device-list">
               <div v-for="device in user.devices" :key="device.id" class="auth-device-row">
                 <Smartphone :size="15" />
                 <div><strong>{{ device.name }}</strong><small>最后使用：{{ device.last_used_at ? formatTime(device.last_used_at) : '尚未使用' }}</small></div>
-                <button
+                <UiButton
                   class="icon-button danger"
                   type="button"
-                  title="撤销设备"
+                  v-tooltip="'撤销设备'"
                   :disabled="loading || !hasStepUpCode()"
                   @click="$emit('revokeDevice', device)"
-                ><Trash2 :size="14" /></button>
+                ><Trash2 :size="14" /></UiButton>
               </div>
             </div>
             <p v-else class="compact-empty">该用户当前没有认证设备</p>
@@ -181,12 +184,12 @@ function hasStepUpCode() {
           <div v-for="enrollment in enrollments" :key="enrollment.id" class="auth-device-row">
             <KeyRound :size="15" />
             <div><strong>{{ enrollment.username }} · {{ enrollment.device_name }}</strong><small>{{ formatTime(enrollment.expires_at) }} 过期</small></div>
-            <button
+            <UiButton
               class="text-button danger"
               type="button"
               :disabled="loading || !hasStepUpCode()"
               @click="$emit('cancelEnrollment', enrollment.id)"
-            ><X :size="14" />取消</button>
+            ><X :size="14" />取消</UiButton>
           </div>
         </div>
       </div>

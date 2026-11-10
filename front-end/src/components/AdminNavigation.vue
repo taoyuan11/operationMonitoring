@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
 import { BellRing, ClipboardList, Home, ListChecks, PackageCheck, Settings, Terminal, Users } from '@lucide/vue'
 import type { AppPage } from '../types/domain'
 
@@ -26,7 +27,7 @@ const items: Array<{ page: AppPage; label: string; icon: typeof Home }> = [
 
 <template>
   <nav class="admin-navigation" aria-label="管理员导航">
-    <button
+    <UiButton
       v-for="item in items"
       :key="item.page"
       :class="{ active: currentPage === item.page }"
@@ -39,6 +40,6 @@ const items: Array<{ page: AppPage; label: string; icon: typeof Home }> = [
       <span>{{ item.label }}</span>
       <em v-if="item.page === 'pending' && pendingCount">{{ pendingCount }}</em>
       <em v-else-if="item.page === 'alerts' && alertCount">{{ alertCount }}</em>
-    </button>
+    </UiButton>
   </nav>
 </template>

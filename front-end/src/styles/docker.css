@@ -101,7 +101,7 @@
 .docker-dialog > header > div { display: flex; align-items: center; gap: 8px; color: var(--accent-strong); }
 .docker-dialog h3 { color: var(--text-strong); font-size: 14px; }
 .docker-dialog label { gap: 5px; font-size: 10px; }
-.docker-dialog input, .docker-dialog select { min-height: 38px; font-size: 11px; }
+.docker-dialog input, .docker-dialog .ui-select-trigger { min-height: 38px; font-size: 11px; }
 .docker-dialog textarea { min-height: 66px; font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .docker-dialog footer { display: flex; justify-content: flex-end; gap: 8px; padding-top: 4px; }
 .docker-dialog-target { padding: 9px 10px; color: var(--cyan-text); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; overflow-wrap: anywhere; }
@@ -145,8 +145,8 @@
 .docker-stream-title span { color: var(--muted); font-size: 9px; }
 .docker-stream-actions { display: flex; align-items: center; gap: 3px; }
 .docker-tail-select { display: flex; height: 34px; flex-direction: row; align-items: center; gap: 6px; padding-left: 8px; border: 1px solid var(--line); border-radius: 5px; }
-.docker-tail-select span { font-size: 9px; white-space: nowrap; }
-.docker-tail-select select { width: 70px; min-height: 32px; padding: 0 22px 0 4px; background: transparent; border: 0; box-shadow: none; font-size: 10px; }
+.docker-tail-select > span:not(.ui-control) { font-size: 9px; white-space: nowrap; }
+.docker-tail-select .ui-select-trigger { width: 70px; min-height: 32px; padding: 0 6px 0 4px; background: transparent; border: 0; box-shadow: none; font-size: 10px; }
 .docker-log-output { min-height: 0; flex: 1; margin: 0; padding: 12px; overflow: auto; color: #d5dce2; background: #080b0d; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; scrollbar-width: thin; }
 .docker-terminal-window { height: min(680px, calc(100% - 20px)); }
 .docker-terminal-screen { min-height: 0; height: auto; flex: 1; border: 0; border-radius: 0; }
@@ -206,7 +206,7 @@
   .docker-prune-zone .text-button { justify-content: center; }
   .docker-stream-head { align-items: flex-start; }
   .docker-stream-actions { flex-wrap: wrap; justify-content: flex-end; }
-  .docker-tail-select span { display: none; }
+  .docker-tail-select > span:not(.ui-control) { display: none; }
   .docker-tail-select { padding-left: 0; }
   .docker-log-output { font-size: 10px; }
 }

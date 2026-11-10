@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
 import { nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, useId } from 'vue'
 import { X } from '@lucide/vue'
 
@@ -120,16 +121,16 @@ function getFocusableElements() {
           <h2 :id="titleId">{{ title }}</h2>
           <p v-if="description" :id="descriptionId">{{ description }}</p>
         </div>
-        <button
+        <UiButton
           class="icon-button subtle workspace-drawer-close"
           type="button"
           :disabled="busy"
-          :title="closeLabel"
+          v-tooltip="closeLabel"
           :aria-label="closeLabel"
           @click="requestClose"
         >
           <X :size="18" />
-        </button>
+        </UiButton>
       </header>
 
       <div class="workspace-drawer-body">

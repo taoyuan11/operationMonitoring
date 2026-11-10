@@ -210,7 +210,7 @@
 .command-workspace-search button:hover { color: var(--text); background: var(--surface-hover); }
 
 .command-history-status { width: 140px; flex: 0 0 140px; }
-.command-history-status select { min-height: 34px; height: 34px; padding: 5px 28px 5px 9px; font-size: 11px; }
+.command-history-status .ui-select-trigger { min-height: 34px; height: 34px; padding: 5px 9px; font-size: 11px; }
 
 .command-workspace-records {
   min-width: 0;

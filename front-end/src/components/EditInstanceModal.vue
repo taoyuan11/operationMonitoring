@@ -1,4 +1,9 @@
 <script setup lang="ts">
+import UiButton from './ui/UiButton.vue'
+import UiDateTimePicker from './ui/UiDateTimePicker.vue'
+import UiForm from './ui/UiForm.vue'
+import UiInput from './ui/UiInput.vue'
+import UiTextarea from './ui/UiTextarea.vue'
 import { computed, nextTick, onBeforeUnmount, ref } from 'vue'
 import { CalendarClock, Check, ChevronDown, Globe2, MapPin, Pencil, Search, X } from '@lucide/vue'
 import {
@@ -25,8 +30,8 @@ const emit = defineEmits<{
 
 const countryPickerOpen = ref(false)
 const countrySearch = ref('')
-const countrySelectTrigger = ref<HTMLButtonElement | null>(null)
-const countrySearchInput = ref<HTMLInputElement | null>(null)
+const countrySelectTrigger = ref<InstanceType<typeof UiButton> | null>(null)
+const countrySearchInput = ref<InstanceType<typeof UiInput> | null>(null)
 const countryPickerMenu = ref<HTMLElement | null>(null)
 const countryPickerMenuStyle = ref<Record<string, string>>({})
 const countryError = ref(false)
@@ -144,18 +149,18 @@ function submit() {
 
 <template>
   <div class="modal-backdrop">
-    <form class="modal" role="dialog" aria-modal="true" aria-labelledby="edit-instance-title" @submit.prevent="submit">
+    <UiForm class="modal" role="dialog" aria-modal="true" aria-labelledby="edit-instance-title" @submit.prevent="submit">
       <header class="modal-header">
         <div class="modal-title"><span><Pencil :size="18" /></span><div><h2 id="edit-instance-title">编辑节点</h2><p>更新公开显示的节点信息</p></div></div>
-        <button class="icon-button subtle" type="button" title="关闭" @click="$emit('close')"><X :size="17" /></button>
+        <UiButton class="icon-button subtle" type="button" v-tooltip="'关闭'" @click="$emit('close')"><X :size="17" /></UiButton>
       </header>
-      <label><span>节点名称</span><input v-model="form.name" required placeholder="节点名称" /></label>
+      <label><span>节点名称</span><UiInput v-model="form.name" required placeholder="节点名称" /></label>
       <fieldset class="location-fieldset">
         <legend><MapPin :size="13" />所在地区</legend>
         <div class="country-field">
           <span class="field-label">国家</span>
           <div class="country-picker" @focusout="closeCountryPicker">
-            <button
+            <UiButton
               ref="countrySelectTrigger"
               :class="['country-select-trigger', { invalid: countryError }]"
               type="button"
@@ -178,7 +183,7 @@ function submit() {
                 <small v-if="selectedCountry">{{ selectedCountry.code }}</small>
               </span>
               <ChevronDown :class="{ open: countryPickerOpen }" :size="16" aria-hidden="true" />
-            </button>
+            </UiButton>
 
             <Teleport to="body">
               <Transition name="menu">
@@ -190,7 +195,7 @@ function submit() {
                 >
                     <div class="country-search-box">
                       <Search :size="15" aria-hidden="true" />
-                      <input
+                      <UiInput
                         ref="countrySearchInput"
                         v-model="countrySearch"
                         type="search"
@@ -201,7 +206,7 @@ function submit() {
                       />
                     </div>
                     <div id="country-option-list" class="country-option-list" role="listbox" aria-label="国家">
-                      <button
+                      <UiButton
                         v-for="country in filteredCountries"
                         :key="country.code"
                         :class="['country-option', { selected: country.code === form.country_code }]"
@@ -221,7 +226,7 @@ function submit() {
                         <span>{{ country.name }}</span>
                         <small>{{ country.code }}</small>
                         <Check v-if="country.code === form.country_code" :size="15" aria-hidden="true" />
-                      </button>
+                      </UiButton>
                       <p v-if="filteredCountries.length === 0" class="country-empty">没有匹配的国家</p>
                     </div>
                 </div>
@@ -236,15 +241,15 @@ function submit() {
       <label class="expiration-field">
         <span><CalendarClock :size="13" />到期时间</span>
         <div class="expiration-input-row">
-          <input v-model="form.expires_at" type="datetime-local" step="60" />
-          <button class="text-button" type="button" @click="form.expires_at = ''">长期有效</button>
+          <UiDateTimePicker v-model="form.expires_at" />
+          <UiButton class="text-button" type="button" @click="form.expires_at = ''">长期有效</UiButton>
         </div>
       </label>
-      <label><span>节点备注</span><textarea v-model="form.remark" placeholder="补充说明"></textarea></label>
+      <label><span>节点备注</span><UiTextarea v-model="form.remark" placeholder="补充说明"></UiTextarea></label>
       <div class="modal-actions">
-        <button class="text-button" type="button" @click="$emit('close')">取消</button>
-        <button class="primary-button" type="submit">保存更改</button>
+        <UiButton class="text-button" type="button" @click="$emit('close')">取消</UiButton>
+        <UiButton class="primary-button" type="submit">保存更改</UiButton>
       </div>
-    </form>
+    </UiForm>
   </div>
 </template>

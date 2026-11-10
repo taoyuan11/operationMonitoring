@@ -80,11 +80,11 @@
 
 .desktop-quality-control:focus-within { color: #edf4f1; border-color: #4b5c56; }
 .desktop-quality-control > svg { flex: 0 0 auto; }
-.desktop-quality-control select {
+.desktop-quality-control .ui-select-trigger {
   width: 100%;
   min-width: 0;
   min-height: 32px;
-  padding: 0 20px 0 2px;
+  padding: 0 6px 0 2px;
   color: inherit;
   background: transparent;
   border: 0;
@@ -226,7 +226,7 @@
   .remote-desktop-title h2 { max-width: 180px; font-size: 12px; }
   .remote-desktop-title p span:last-child { display: none; }
   .desktop-quality-control { width: 96px; padding-left: 6px; }
-  .desktop-quality-control select { padding-right: 16px; }
+  .desktop-quality-control .ui-select-trigger { padding-right: 6px; }
   .desktop-view-toggle button { width: 34px; padding: 0; font-size: 0; }
   .desktop-close-button, .desktop-tool-button { min-height: 32px; width: 32px; }
   .remote-desktop-input-hint { right: 8px; bottom: 8px; max-width: calc(100% - 16px); }

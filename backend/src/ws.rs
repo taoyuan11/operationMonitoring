@@ -65,7 +65,14 @@ const MAX_TERMINAL_SHELL_LABEL_BYTES: usize = 128;
 const MAX_TERMINAL_SHELL_PROGRAM_BYTES: usize = 1024;
 const TERMINAL_SHELLS_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-const TERMINAL_SESSION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
+pub(crate) fn terminal_keepalive() -> tokio::time::Interval {
+    // Native WebSocket pings keep idle proxies alive and are answered by the
+    // browser even when background tabs throttle JavaScript timers.
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
 
 #[derive(Debug)]
 struct PendingHeartbeat {
@@ -202,7 +209,6 @@ pub async fn agent_socket(
                 };
                 match incoming {
                     Ok(Message::Text(text)) => {
-                        last_inbound = Instant::now();
                         if text.len() > MAX_AGENT_MESSAGE_BYTES {
                             warn!(%instance_id, message_bytes = text.len(), "agent websocket text frame exceeded limit");
                             break;
@@ -240,16 +246,19 @@ pub async fn agent_socket(
                             }
                             Err(error) => warn!(?error, message_bytes = text.len(), "invalid agent websocket message"),
                         }
+                        // Do not count time spent in database work or browser
+                        // backpressure on this task as agent heartbeat silence.
+                        last_inbound = Instant::now();
                     }
                     Ok(Message::Pong(_)) => last_inbound = Instant::now(),
                     Ok(Message::Binary(data)) => {
-                        last_inbound = Instant::now();
                         handle_agent_file_binary(
                             &state,
                             &instance_id,
                             connection_id,
                             &data,
                         ).await;
+                        last_inbound = Instant::now();
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => {}
@@ -395,9 +404,11 @@ fn validate_agent_inbound(message: &AgentInbound) -> Result<(), &'static str> {
                 return Err("terminal shell response is invalid");
             }
         }
-        AgentInbound::TerminalOpened { session_id }
+        AgentInbound::TerminalOpened { session_id, .. }
         | AgentInbound::DesktopOpened { session_id }
-        | AgentInbound::DockerExecOpened { session_id } => {
+        | AgentInbound::DockerExecOpened { session_id, .. }
+        | AgentInbound::TerminalInputAck { session_id, .. }
+        | AgentInbound::DockerExecInputAck { session_id, .. } => {
             if !id(session_id) {
                 return Err("session identifier too large");
             }
@@ -567,12 +578,13 @@ pub(crate) async fn request_terminal_shells(
             tx,
         },
     );
-    if agent
-        .tx
-        .send(AgentOutbound::TerminalShellsRequest {
+    if !send_terminal_agent_message(
+        &agent,
+        AgentOutbound::TerminalShellsRequest {
             request_id: request_id.clone(),
-        })
-        .is_err()
+        },
+    )
+    .await
     {
         state
             .terminal_shell_requests
@@ -695,13 +707,30 @@ async fn handle_agent_message(
             handle_terminal_shells_response(state, instance_id, connection_id, &request_id, shells)
                 .await;
         }
-        AgentInbound::TerminalOpened { session_id } => {
+        AgentInbound::TerminalOpened {
+            session_id,
+            input_ack,
+        } => {
             send_terminal_event(
                 state,
                 instance_id,
                 connection_id,
                 &session_id,
-                TerminalServerMessage::Ready,
+                TerminalServerMessage::Ready { input_ack },
+                false,
+            )
+            .await;
+        }
+        AgentInbound::TerminalInputAck {
+            session_id,
+            input_id,
+        } => {
+            send_terminal_event(
+                state,
+                instance_id,
+                connection_id,
+                &session_id,
+                TerminalServerMessage::InputAck { input_id },
                 false,
             )
             .await;
@@ -771,13 +800,30 @@ async fn handle_agent_message(
         AgentInbound::DockerLogClosed { request_id, error } => {
             handle_docker_log_closed(state, instance_id, connection_id, &request_id, error).await;
         }
-        AgentInbound::DockerExecOpened { session_id } => {
+        AgentInbound::DockerExecOpened {
+            session_id,
+            input_ack,
+        } => {
             handle_docker_exec_event(
                 state,
                 instance_id,
                 connection_id,
                 &session_id,
-                TerminalServerMessage::Ready,
+                TerminalServerMessage::Ready { input_ack },
+                false,
+            )
+            .await;
+        }
+        AgentInbound::DockerExecInputAck {
+            session_id,
+            input_id,
+        } => {
+            handle_docker_exec_event(
+                state,
+                instance_id,
+                connection_id,
+                &session_id,
+                TerminalServerMessage::InputAck { input_id },
                 false,
             )
             .await;
@@ -1011,6 +1057,220 @@ fn retain_recent_heartbeats(pending: &mut VecDeque<PendingHeartbeat>, now: Insta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    fn terminal_test_state() -> AppState {
+        AppState::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgresql://localhost/unused")
+                .unwrap(),
+            crate::config::Cli::parse_from(["backend"]),
+            crate::auth::AuthCipher::from_key(&[7; 32]).unwrap(),
+            None,
+        )
+    }
+
+    #[test]
+    fn terminal_input_acknowledgements_are_backward_compatible() {
+        let old_input = serde_json::from_str::<AgentOutbound>(
+            r#"{"type":"terminal_input","session_id":"s","data":"YQ=="}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old_input,
+            AgentOutbound::TerminalInput { input_id: None, .. }
+        ));
+        let old_opened =
+            serde_json::from_str::<AgentInbound>(r#"{"type":"terminal_opened","session_id":"s"}"#)
+                .unwrap();
+        assert!(matches!(
+            old_opened,
+            AgentInbound::TerminalOpened {
+                input_ack: false,
+                ..
+            }
+        ));
+        let old_ready =
+            serde_json::from_str::<TerminalServerMessage>(r#"{"type":"ready"}"#).unwrap();
+        assert!(matches!(
+            old_ready,
+            TerminalServerMessage::Ready { input_ack: false }
+        ));
+        assert_eq!(
+            serde_json::to_value(TerminalServerMessage::InputAck { input_id: 7 }).unwrap(),
+            json!({"type":"input_ack", "input_id":7})
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_input_waits_for_agent_capacity_without_disconnecting_other_sessions() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (tx, mut rx) = AgentOutboundSender::channel(1, shutdown_tx.clone());
+        tx.send(AgentOutbound::Ping { now: 1 }).unwrap();
+        let (binary_tx, _binary_rx) = mpsc::channel(1);
+        let agent = AgentHandle {
+            connection_id: Uuid::new_v4(),
+            tx,
+            binary_tx,
+            shutdown_tx,
+            capabilities: Vec::new(),
+            docker_status: Default::default(),
+            remote_access_status: Default::default(),
+        };
+        let send = send_terminal_agent_message(
+            &agent,
+            AgentOutbound::TerminalInput {
+                session_id: "s".to_string(),
+                data: "YQ==".to_string(),
+                input_id: Some(7),
+            },
+        );
+        tokio::pin!(send);
+        assert!(futures_util::poll!(&mut send).is_pending());
+        assert!(!*shutdown_rx.borrow());
+        assert!(matches!(rx.recv().await, Some(AgentOutbound::Ping { .. })));
+        assert!(send.await);
+        assert!(matches!(
+            rx.recv().await,
+            Some(AgentOutbound::TerminalInput {
+                input_id: Some(7),
+                ..
+            })
+        ));
+        assert!(!*shutdown_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn input_ack_is_forwarded_only_to_the_matching_session_connection() {
+        let state = terminal_test_state();
+        let connection_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(2);
+        state.terminal_sessions.write().await.insert(
+            "s".to_string(),
+            TerminalSessionHandle {
+                instance_id: "node".to_string(),
+                agent_connection_id: connection_id,
+                tx,
+            },
+        );
+        for source_connection in [Uuid::new_v4(), connection_id] {
+            handle_agent_message(
+                &state,
+                "node",
+                source_connection,
+                AgentInbound::TerminalInputAck {
+                    session_id: "s".to_string(),
+                    input_id: 7,
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TerminalServerMessage::InputAck { input_id: 7 })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_output_bursts_wait_for_browser_capacity_without_closing_session() {
+        let state = terminal_test_state();
+        let connection_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(TerminalServerMessage::Ready { input_ack: false })
+            .await
+            .unwrap();
+        state.terminal_sessions.write().await.insert(
+            "terminal-1".to_string(),
+            TerminalSessionHandle {
+                instance_id: "node-1".to_string(),
+                agent_connection_id: connection_id,
+                tx,
+            },
+        );
+        let send = send_terminal_event(
+            &state,
+            "node-1",
+            connection_id,
+            "terminal-1",
+            TerminalServerMessage::Output {
+                data: "aGVsbG8=".to_string(),
+            },
+            false,
+        );
+        tokio::pin!(send);
+        assert!(futures_util::poll!(&mut send).is_pending());
+        assert!(matches!(
+            rx.recv().await,
+            Some(TerminalServerMessage::Ready { input_ack: false })
+        ));
+        send.await;
+        assert!(
+            matches!(rx.recv().await, Some(TerminalServerMessage::Output { data }) if data == "aGVsbG8=")
+        );
+        assert!(
+            state
+                .terminal_sessions
+                .read()
+                .await
+                .contains_key("terminal-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_exit_is_delivered_after_queued_output() {
+        let state = terminal_test_state();
+        let connection_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(TerminalServerMessage::Output {
+            data: "ZmluYWw=".to_string(),
+        })
+        .await
+        .unwrap();
+        state.terminal_sessions.write().await.insert(
+            "terminal-1".to_string(),
+            TerminalSessionHandle {
+                instance_id: "node-1".to_string(),
+                agent_connection_id: connection_id,
+                tx,
+            },
+        );
+        let send = send_terminal_event(
+            &state,
+            "node-1",
+            connection_id,
+            "terminal-1",
+            TerminalServerMessage::Closed {
+                exit_code: Some(0),
+                reason: None,
+            },
+            true,
+        );
+        tokio::pin!(send);
+        assert!(futures_util::poll!(&mut send).is_pending());
+        assert!(matches!(
+            rx.recv().await,
+            Some(TerminalServerMessage::Output { .. })
+        ));
+        send.await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(TerminalServerMessage::Closed {
+                exit_code: Some(0),
+                ..
+            })
+        ));
+        assert!(
+            !state
+                .terminal_sessions
+                .read()
+                .await
+                .contains_key("terminal-1")
+        );
+    }
 
     #[test]
     fn explicit_shutdown_survives_active_agent_handle_clones() {
@@ -1280,7 +1540,14 @@ async fn send_terminal_event(
     let Some(handle) = handle else {
         return;
     };
-    if handle.tx.try_send(event).is_err() && !remove {
+    // Brief output bursts must apply backpressure, not kill the shell as soon
+    // as the browser queue fills. Bound the wait so a stalled browser cannot
+    // hold up the shared agent connection indefinitely.
+    if send_with_timeout(SOCKET_SEND_TIMEOUT, handle.tx.send(event))
+        .await
+        .is_err()
+        && !remove
+    {
         let removed = {
             let mut sessions = state.terminal_sessions.write().await;
             if sessions.get(session_id).is_some_and(|current| {
@@ -1292,7 +1559,7 @@ async fn send_terminal_event(
             }
         };
         if removed {
-            warn!(%instance_id, %connection_id, %session_id, "terminal browser event queue overflowed");
+            warn!(%instance_id, %connection_id, %session_id, "terminal browser event queue stalled or closed");
             close_agent_terminal(state, instance_id, connection_id, session_id).await;
         }
     }
@@ -1317,17 +1584,32 @@ async fn close_agent_terminal(
             AgentOutbound::TerminalClose {
                 session_id: session_id.to_string(),
             },
-        );
+        )
+        .await;
     }
 }
 
-fn send_terminal_agent_message(agent: &AgentHandle, message: AgentOutbound) -> bool {
-    if agent.tx.send(message).is_ok() {
+pub(crate) async fn send_terminal_agent_message(
+    agent: &AgentHandle,
+    message: AgentOutbound,
+) -> bool {
+    let closing = matches!(
+        message,
+        AgentOutbound::TerminalClose { .. } | AgentOutbound::DockerExecClose { .. }
+    );
+    if send_with_timeout(SOCKET_SEND_TIMEOUT, agent.tx.send_async(message))
+        .await
+        .is_ok()
+    {
         return true;
     }
 
     warn!(connection_id = %agent.connection_id, "agent control queue unavailable during terminal operation");
-    agent.shutdown_tx.send_replace(true);
+    // A brief full queue must not disconnect every terminal on the instance.
+    // If even cleanup cannot be delivered, disconnect to avoid an orphan shell.
+    if closing {
+        agent.shutdown_tx.send_replace(true);
+    }
     false
 }
 
@@ -1492,7 +1774,9 @@ pub async fn terminal_socket(
             cols: 80,
             rows: 24,
         },
-    ) {
+    )
+    .await
+    {
         finish_terminal_session(
             &state,
             &agent,
@@ -1530,26 +1814,23 @@ pub async fn terminal_socket(
     }
     let authorization = session_guard.wait_until_invalid(state.clone());
     tokio::pin!(authorization);
-    let session_timeout = tokio::time::sleep(TERMINAL_SESSION_TIMEOUT);
-    tokio::pin!(session_timeout);
+    let mut keepalive = terminal_keepalive();
     let mut end_status = "success";
     let mut end_code = None;
     let mut end_reason = String::new();
 
     loop {
         tokio::select! {
-            _ = &mut session_timeout => {
-                let _ = send_terminal_message(
-                    &mut sender,
-                    &TerminalServerMessage::Error {
-                        message: "终端会话已超时".to_string(),
-                    },
-                )
-                .await;
-                end_status = "failed";
-                end_code = Some("session_timeout");
-                end_reason = "终端会话已超时".to_string();
-                break;
+            _ = keepalive.tick() => {
+                if socket_send_with_timeout(sender.send(Message::Ping(Vec::new().into())))
+                    .await
+                    .is_err()
+                {
+                    end_status = "failed";
+                    end_code = Some("client_disconnected");
+                    end_reason = "客户端连接已断开".to_string();
+                    break;
+                }
             }
             _ = &mut authorization => {
                 let _ = send_terminal_message(
@@ -1574,15 +1855,16 @@ pub async fn terminal_socket(
                 match browser_message {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<TerminalClientMessage>(&text) {
-                            Ok(TerminalClientMessage::Input { data })
+                            Ok(TerminalClientMessage::Input { data, input_id })
                                 if data.len() <= MAX_STREAM_CHUNK_BYTES => {
                                 if !send_terminal_agent_message(
                                     &agent,
                                     AgentOutbound::TerminalInput {
                                         session_id: session_id.clone(),
                                         data,
+                                        input_id,
                                     },
-                                ) {
+                                ).await {
                                     end_status = "failed";
                                     end_code = Some("agent_disconnected");
                                     end_reason = "实例连接已断开".to_string();
@@ -1604,7 +1886,7 @@ pub async fn terminal_socket(
                                         cols: cols.clamp(2, 500),
                                         rows: rows.clamp(1, 300),
                                     },
-                                ) {
+                                ).await {
                                     end_status = "failed";
                                     end_code = Some("agent_disconnected");
                                     end_reason = "实例连接已断开".to_string();
@@ -1685,7 +1967,8 @@ async fn finish_terminal_session(
         AgentOutbound::TerminalClose {
             session_id: session_id.to_string(),
         },
-    );
+    )
+    .await;
     mark_terminal_session_ended(state, session_id, status, error_code, error_reason).await;
 }
 

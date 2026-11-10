@@ -368,14 +368,14 @@ function statusText(status: TerminalSessionStatus) {
         </div>
       </div>
 
-      <div v-else class="terminal-session-stack">
+      <div v-show="!creatorOpen" class="terminal-session-stack">
         <TerminalSession
           v-for="session in sessions"
           v-show="session.id === activeSessionId"
           :key="session.id"
           :instance-id="session.instanceId"
           :shell-program="session.shellProgram"
-          :active="session.id === activeSessionId"
+          :active="!creatorOpen && session.id === activeSessionId"
           @status="updateSessionStatus(session.id, $event)"
         />
       </div>

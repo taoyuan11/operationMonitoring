@@ -141,6 +141,13 @@ impl AgentOutboundSender {
             }
         })
     }
+
+    pub async fn send_async(&self, message: AgentOutbound) -> Result<(), AgentOutboundSendError> {
+        self.tx.send(message).await.map_err(|_| {
+            self.shutdown_tx.send_replace(true);
+            AgentOutboundSendError::Closed
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

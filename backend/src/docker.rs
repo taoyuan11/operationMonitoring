@@ -44,6 +44,7 @@ use crate::{
         DockerRequestFailure, PendingDockerRequest,
     },
     utils::now_ts,
+    ws::{send_terminal_agent_message, terminal_keepalive},
 };
 
 pub(crate) const CAPABILITY: &str = "docker_manager_v1";
@@ -2716,7 +2717,7 @@ pub async fn handle_docker_exec_event(
         warn!(%instance_id, %connection_id, %session_id, "ignored unmatched Docker exec event");
         return;
     };
-    if matches!(event, TerminalServerMessage::Ready) {
+    if matches!(event, TerminalServerMessage::Ready { .. }) {
         handle.opened.store(true, Ordering::SeqCst);
     }
     if remove {
@@ -2735,7 +2736,10 @@ pub async fn handle_docker_exec_event(
         }
         return;
     }
-    if handle.tx.try_send(event).is_err() {
+    if socket_send_with_timeout(handle.tx.send(event))
+        .await
+        .is_err()
+    {
         let removed = state.docker_exec_sessions.write().await.remove(session_id);
         if let Some(removed) = removed {
             removed
@@ -2761,9 +2765,13 @@ pub async fn handle_docker_exec_event(
             .filter(|agent| agent.connection_id == connection_id)
             .cloned()
         {
-            let _ = agent.tx.send(AgentOutbound::DockerExecClose {
-                session_id: session_id.to_string(),
-            });
+            let _ = send_terminal_agent_message(
+                &agent,
+                AgentOutbound::DockerExecClose {
+                    session_id: session_id.to_string(),
+                },
+            )
+            .await;
         }
     }
 }
@@ -2906,9 +2914,13 @@ pub async fn cancel_instance_docker(
             });
         }
         for session_id in &session_ids {
-            let _ = agent.tx.send(AgentOutbound::DockerExecClose {
-                session_id: session_id.clone(),
-            });
+            let _ = send_terminal_agent_message(
+                &agent,
+                AgentOutbound::DockerExecClose {
+                    session_id: session_id.clone(),
+                },
+            )
+            .await;
         }
     }
 
@@ -3502,16 +3514,17 @@ async fn docker_exec_socket(
                 audit_id: audit_id.clone(),
             },
         );
-        current
-            .tx
-            .send(AgentOutbound::DockerExecOpen {
+        !send_terminal_agent_message(
+            &current,
+            AgentOutbound::DockerExecOpen {
                 session_id: session_id.clone(),
                 container,
                 shell: query.shell,
                 cols: query.cols.clamp(20, 500),
                 rows: query.rows.clamp(5, 300),
-            })
-            .is_err()
+            },
+        )
+        .await
     };
     if send_failed {
         state.docker_exec_sessions.write().await.remove(&session_id);
@@ -3521,22 +3534,18 @@ async fn docker_exec_socket(
     }
     let authorization = session_guard.wait_until_invalid(state.clone());
     tokio::pin!(authorization);
-    let session_timeout = tokio::time::sleep(STREAM_SESSION_TIMEOUT);
-    tokio::pin!(session_timeout);
+    let mut keepalive = terminal_keepalive();
     let mut failure_code = "client_disconnected";
 
     loop {
         tokio::select! {
-            _ = &mut session_timeout => {
-                failure_code = "session_timeout";
-                let _ = send_split_terminal_event(
-                    &mut sender,
-                    &TerminalServerMessage::Error {
-                        message: "容器终端会话已超时".to_string(),
-                    },
-                )
-                .await;
-                break;
+            _ = keepalive.tick() => {
+                if socket_send_with_timeout(sender.send(Message::Ping(Vec::new().into())))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
             _ = &mut authorization => {
                 failure_code = "authorization_revoked";
@@ -3582,20 +3591,21 @@ async fn docker_exec_socket(
                 match incoming {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<TerminalClientMessage>(&text) {
-                            Ok(TerminalClientMessage::Input { data }) if data.len() <= 64 * 1024 => {
-                                if agent.tx.send(AgentOutbound::DockerExecInput {
+                            Ok(TerminalClientMessage::Input { data, input_id }) if data.len() <= 64 * 1024 => {
+                                if !send_terminal_agent_message(&agent, AgentOutbound::DockerExecInput {
                                     session_id: session_id.clone(),
                                     data,
-                                }).is_err() {
+                                    input_id,
+                                }).await {
                                     break;
                                 }
                             }
                             Ok(TerminalClientMessage::Resize { cols, rows }) => {
-                                let _ = agent.tx.send(AgentOutbound::DockerExecResize {
+                                let _ = send_terminal_agent_message(&agent, AgentOutbound::DockerExecResize {
                                     session_id: session_id.clone(),
                                     cols: cols.clamp(20, 500),
                                     rows: rows.clamp(5, 300),
-                                });
+                                }).await;
                             }
                             _ => {}
                         }
@@ -3616,9 +3626,13 @@ async fn docker_exec_socket(
             .filter(|current| current.connection_id == agent.connection_id)
             .cloned()
         {
-            let _ = current.tx.send(AgentOutbound::DockerExecClose {
-                session_id: session_id.clone(),
-            });
+            let _ = send_terminal_agent_message(
+                &current,
+                AgentOutbound::DockerExecClose {
+                    session_id: session_id.clone(),
+                },
+            )
+            .await;
         }
         finish_audit_best_effort(
             &state,
@@ -3676,8 +3690,10 @@ mod tests {
     use std::{net::SocketAddr, path::PathBuf};
 
     use axum::http::header;
+    use clap::Parser;
 
     use super::*;
+
     use crate::{
         auth::AuthCipher,
         config::Cli,
@@ -3688,6 +3704,71 @@ mod tests {
         },
         request_security::RequestScheme,
     };
+
+    #[tokio::test]
+    async fn exec_output_bursts_wait_for_browser_capacity_without_closing_session() {
+        let state = AppState::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgresql://localhost/unused")
+                .unwrap(),
+            Cli::parse_from(["backend"]),
+            AuthCipher::from_key(&[7; 32]).unwrap(),
+            None,
+        );
+        let connection_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (close_tx, close_rx) = watch::channel(None);
+        tx.send(TerminalServerMessage::Ready { input_ack: false })
+            .await
+            .unwrap();
+        state.docker_exec_sessions.write().await.insert(
+            "exec-1".to_string(),
+            DockerExecSessionHandle {
+                instance_id: "node-1".to_string(),
+                agent_connection_id: connection_id,
+                tx,
+                close_tx,
+                opened: Arc::new(AtomicBool::new(true)),
+                audit_id: "unused-audit".to_string(),
+            },
+        );
+        let send = handle_docker_exec_event(
+            &state,
+            "node-1",
+            connection_id,
+            "exec-1",
+            TerminalServerMessage::Output {
+                data: "aGVsbG8=".to_string(),
+            },
+            false,
+        );
+        tokio::pin!(send);
+        assert!(futures_util::poll!(&mut send).is_pending());
+        assert!(
+            state
+                .docker_exec_sessions
+                .read()
+                .await
+                .contains_key("exec-1")
+        );
+        assert!(close_rx.borrow().is_none());
+        assert!(matches!(
+            rx.recv().await,
+            Some(TerminalServerMessage::Ready { input_ack: false })
+        ));
+        send.await;
+        assert!(
+            matches!(rx.recv().await, Some(TerminalServerMessage::Output { data }) if data == "aGVsbG8=")
+        );
+        assert!(
+            state
+                .docker_exec_sessions
+                .read()
+                .await
+                .contains_key("exec-1")
+        );
+        assert!(close_rx.borrow().is_none());
+    }
 
     fn origin_headers(host: &str, origin: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();

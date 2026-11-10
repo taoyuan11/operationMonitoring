@@ -479,6 +479,8 @@ Windows 路径含空格时需要加引号，例如 `om-agent update "C:\Temp\om-
 - 后端以内存中的 WebSocket 连接状态判断实例在线；连接关闭或心跳超时后立即判定离线，不再依赖“最后上报时间 + 固定阈值”。
 - Web 终端使用系统 PTY/ConPTY，支持持续 Shell 上下文、`cd`、环境变量、交互程序、方向键、Tab、`Ctrl+C` 和窗口尺寸变化。
 - 终端工作区支持跨实例标签页；每个实例最多同时运行 8 个相互隔离的会话。关闭单个标签仅结束对应会话，关闭工作区会结束其中全部活动会话。
+- 打开新建面板或切换标签会保留已有 Shell 上下文。主机和容器终端每 15 秒通过 WebSocket Ping 保活，不再因会话达到两小时而强制关闭；退出登录、授权失效或连接实际中断时仍会结束会话。
+- 主机和容器终端输入按 UTF-8 字节分块传输。新版 Agent 在 `terminal_opened` / `docker_exec_opened` 中声明 `input_ack`，后端将它传给浏览器的 `ready`；每块输入携带可选的 `input_id`，实际写入 PTY 后才返回对应的 `terminal_input_ack` / `docker_exec_input_ack`，后端转发为 `input_ack`。浏览器等待确认再发下一块，避免粘贴超限或输入拥塞误断开；本地待发送输入最多 4 MiB，超限时整次新输入会被拒绝并提示。旧版 Agent 仍可使用限速分块模式，完整输入流控需要前端、后端和 Agent 同步更新。
 - 新版 Agent 支持自动 Shell、实时检测到的 Shell 和自定义 Shell 可执行文件。自定义值只能是可执行文件名或绝对路径，不接受命令参数，并始终以 Agent 服务账户的权限运行。
 - 浏览器与 Agent 之间的终端数据按原始字节进行 Base64 封装，Shell 统一按 UTF-8 工作；Windows `cmd.exe` 会切换到代码页 65001，避免中文经 JSON 转发时损坏。
 

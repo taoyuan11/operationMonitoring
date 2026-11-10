@@ -1,30 +1,81 @@
 use std::{
     fmt,
     io::{self, Write},
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    },
     thread,
 };
 
+#[derive(Debug)]
+pub(crate) struct PtyInput {
+    pub data: Vec<u8>,
+    pub input_id: Option<u32>,
+}
+
+// Resizes are replaceable state and closing must take priority over queued
+// input, including when the PTY writer is blocked in a system call.
+#[derive(Clone, Default)]
+pub(crate) struct PtyControl(Arc<Mutex<PtyControlState>>);
+
+#[derive(Default)]
+struct PtyControlState {
+    resize: Option<(u16, u16)>,
+    close: Option<Option<String>>,
+}
+
+impl PtyControl {
+    pub(crate) fn resize(&self, cols: u16, rows: u16) {
+        self.0.lock().unwrap().resize = Some((cols.clamp(2, 500), rows.clamp(1, 300)));
+    }
+
+    pub(crate) fn take_resize(&self) -> Option<(u16, u16)> {
+        self.0.lock().unwrap().resize.take()
+    }
+
+    pub(crate) fn close(&self, reason: Option<String>) {
+        self.0.lock().unwrap().close.get_or_insert(reason);
+    }
+
+    pub(crate) fn take_close(&self) -> Option<Option<String>> {
+        self.0.lock().unwrap().close.take()
+    }
+}
+
 pub(crate) struct PtyInputWriter {
-    input: SyncSender<Vec<u8>>,
+    input: SyncSender<PtyInput>,
     failures: Receiver<io::Error>,
 }
 
 impl PtyInputWriter {
+    #[cfg(test)]
     pub(crate) fn spawn(
-        mut writer: Box<dyn Write + Send>,
+        writer: Box<dyn Write + Send>,
         queue_capacity: usize,
         thread_name: &str,
     ) -> io::Result<Self> {
-        let (input, inputs) = mpsc::sync_channel::<Vec<u8>>(queue_capacity);
+        Self::spawn_with_ack(writer, queue_capacity, thread_name, |_| {})
+    }
+
+    pub(crate) fn spawn_with_ack(
+        mut writer: Box<dyn Write + Send>,
+        queue_capacity: usize,
+        thread_name: &str,
+        acknowledge: impl Fn(u32) + Send + 'static,
+    ) -> io::Result<Self> {
+        let (input, inputs) = mpsc::sync_channel::<PtyInput>(queue_capacity);
         let (failure_tx, failures) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
-                while let Ok(data) = inputs.recv() {
-                    if let Err(error) = writer.write_all(&data).and_then(|_| writer.flush()) {
+                while let Ok(input) = inputs.recv() {
+                    if let Err(error) = writer.write_all(&input.data).and_then(|_| writer.flush()) {
                         let _ = failure_tx.try_send(error);
                         break;
+                    }
+                    if let Some(input_id) = input.input_id {
+                        acknowledge(input_id);
                     }
                 }
             })?;
@@ -32,7 +83,14 @@ impl PtyInputWriter {
     }
 
     pub(crate) fn try_write(&self, data: Vec<u8>) -> Result<(), PtyInputSendError> {
-        self.input.try_send(data).map_err(|error| match error {
+        self.try_write_input(PtyInput {
+            data,
+            input_id: None,
+        })
+    }
+
+    pub(crate) fn try_write_input(&self, input: PtyInput) -> Result<(), PtyInputSendError> {
+        self.input.try_send(input).map_err(|error| match error {
             TrySendError::Full(_) => PtyInputSendError::Full,
             TrySendError::Disconnected(_) => PtyInputSendError::Closed,
         })
@@ -89,6 +147,38 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn input_is_acknowledged_only_after_the_pty_write_completes() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let writer = PtyInputWriter::spawn_with_ack(
+            Box::new(BlockingOnceWriter {
+                started: Some(started_tx),
+                release: release_rx,
+            }),
+            1,
+            "test-pty-ack",
+            move |id| {
+                let _ = ack_tx.send(id);
+            },
+        )
+        .unwrap();
+        writer
+            .try_write_input(PtyInput {
+                data: vec![1],
+                input_id: Some(42),
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(ack_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 42);
+        writer.try_write(vec![2]).unwrap();
+        drop(writer);
+        assert!(ack_rx.recv_timeout(Duration::from_secs(1)).is_err());
     }
 
     #[test]

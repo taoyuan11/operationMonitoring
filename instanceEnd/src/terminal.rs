@@ -35,7 +35,7 @@ use crate::{
     activity::ActivityTracker,
     models::{AgentInbound, TerminalShellInfo},
     outbound::AgentEventSender,
-    pty_io::PtyInputWriter,
+    pty_io::{PtyControl, PtyInput, PtyInputWriter},
 };
 
 pub const CAPABILITY: &str = "terminal_shells_v1";
@@ -396,14 +396,13 @@ fn try_shell_candidates<T>(
     )
 }
 
-enum TerminalControl {
-    Input(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
-    Close,
+struct ActiveTerminal {
+    input: mpsc::SyncSender<PtyInput>,
+    control: PtyControl,
 }
 
 pub struct TerminalManager {
-    sessions: HashMap<String, mpsc::SyncSender<TerminalControl>>,
+    sessions: HashMap<String, ActiveTerminal>,
     session_slots: Arc<Semaphore>,
     outbound: AgentEventSender,
     stream_outbound: AgentEventSender,
@@ -450,7 +449,9 @@ impl TerminalManager {
             });
             return;
         };
-        let (control_tx, control_rx) = mpsc::sync_channel(TERMINAL_CONTROL_QUEUE_CAPACITY);
+        let (input_tx, input_rx) = mpsc::sync_channel(TERMINAL_CONTROL_QUEUE_CAPACITY);
+        let control = PtyControl::default();
+        let worker_control = control.clone();
         let stream_outbound = self.stream_outbound.clone();
         let worker_session_id = session_id.clone();
         let worker = thread::Builder::new().spawn(move || {
@@ -461,13 +462,20 @@ impl TerminalManager {
                 shell,
                 cols,
                 rows,
-                control_rx,
+                input_rx,
+                worker_control,
                 stream_outbound,
             );
         });
         match worker {
             Ok(_) => {
-                self.sessions.insert(session_id, control_tx);
+                self.sessions.insert(
+                    session_id,
+                    ActiveTerminal {
+                        input: input_tx,
+                        control,
+                    },
+                );
             }
             Err(error) => {
                 let _ = self.outbound.send(AgentInbound::TerminalClosed {
@@ -479,7 +487,7 @@ impl TerminalManager {
         }
     }
 
-    pub fn input(&mut self, session_id: &str, encoded_data: &str) {
+    pub fn input(&mut self, session_id: &str, encoded_data: &str, input_id: Option<u32>) {
         let Some(session) = self.sessions.get(session_id) else {
             return;
         };
@@ -489,7 +497,7 @@ impl TerminalManager {
         }
         match STANDARD.decode(encoded_data) {
             Ok(data) => {
-                if session.try_send(TerminalControl::Input(data)).is_err() {
+                if session.input.try_send(PtyInput { data, input_id }).is_err() {
                     self.fail_session(session_id, "终端输入队列拥塞");
                 }
             }
@@ -500,34 +508,27 @@ impl TerminalManager {
     }
 
     pub fn resize(&mut self, session_id: &str, cols: u16, rows: u16) {
-        let Some(session) = self.sessions.get(session_id) else {
-            return;
-        };
-        if session
-            .try_send(TerminalControl::Resize {
-                cols: cols.clamp(2, 500),
-                rows: rows.clamp(1, 300),
-            })
-            .is_err()
-        {
-            self.fail_session(session_id, "终端控制队列拥塞");
+        if let Some(session) = self.sessions.get(session_id) {
+            session.control.resize(cols, rows);
         }
     }
 
     pub fn close(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
-            let _ = session.try_send(TerminalControl::Close);
+            session.control.close(None);
         }
     }
 
     pub fn close_all(&mut self) {
         for (_, session) in self.sessions.drain() {
-            let _ = session.try_send(TerminalControl::Close);
+            session.control.close(None);
         }
     }
 
     fn fail_session(&mut self, session_id: &str, reason: &str) {
-        self.sessions.remove(session_id);
+        if let Some(session) = self.sessions.remove(session_id) {
+            session.control.close(Some(reason.to_string()));
+        }
         let _ = self.outbound.send(AgentInbound::TerminalClosed {
             session_id: session_id.to_string(),
             exit_code: None,
@@ -541,7 +542,8 @@ fn run_terminal(
     shell: Option<String>,
     cols: u16,
     rows: u16,
-    control_rx: mpsc::Receiver<TerminalControl>,
+    input_rx: mpsc::Receiver<PtyInput>,
+    control: PtyControl,
     stream_outbound: AgentEventSender,
 ) {
     if let Err(error) = run_terminal_inner(
@@ -549,7 +551,8 @@ fn run_terminal(
         shell.as_deref(),
         cols.clamp(2, 500),
         rows.clamp(1, 300),
-        control_rx,
+        input_rx,
+        control,
         stream_outbound.clone(),
     ) {
         crate::logging::error(format_args!(
@@ -568,7 +571,8 @@ fn run_terminal_inner(
     shell: Option<&str>,
     cols: u16,
     rows: u16,
-    control_rx: mpsc::Receiver<TerminalControl>,
+    input_rx: mpsc::Receiver<PtyInput>,
+    control: PtyControl,
     stream_outbound: AgentEventSender,
 ) -> anyhow::Result<()> {
     let RunningTerminal {
@@ -577,17 +581,29 @@ fn run_terminal_inner(
         mut reader,
         writer,
     } = open_terminal(shell, cols, rows)?;
-    let input_writer =
-        match PtyInputWriter::spawn(writer, TERMINAL_WRITE_QUEUE_CAPACITY, "om-terminal-input") {
-            Ok(writer) => writer,
-            Err(error) => {
-                let _ = process.terminate();
-                return Err(error.into());
-            }
-        };
+    let ack_session_id = session_id.to_string();
+    let ack_outbound = stream_outbound.clone();
+    let input_writer = match PtyInputWriter::spawn_with_ack(
+        writer,
+        TERMINAL_WRITE_QUEUE_CAPACITY,
+        "om-terminal-input",
+        move |input_id| {
+            let _ = ack_outbound.blocking_send(AgentInbound::TerminalInputAck {
+                session_id: ack_session_id.clone(),
+                input_id,
+            });
+        },
+    ) {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = process.terminate();
+            return Err(error.into());
+        }
+    };
 
     if let Err(error) = stream_outbound.blocking_send(AgentInbound::TerminalOpened {
         session_id: session_id.to_string(),
+        input_ack: true,
     }) {
         let _ = process.terminate();
         return Err(error.into());
@@ -600,28 +616,27 @@ fn run_terminal_inner(
     });
 
     let (exit_code, reason) = loop {
+        if let Some(reason) = control.take_close() {
+            break (process.terminate(), reason);
+        }
+        if let Some((cols, rows)) = control.take_resize()
+            && let Err(error) = master.resize(cols, rows)
+        {
+            crate::logging::error(format_args!(
+                "terminal session {session_id} resize failed: {error}"
+            ));
+        }
         if let Some(error) = input_writer.take_failure() {
             break (process.terminate(), Some(format!("写入终端失败: {error}")));
         }
-        match control_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(TerminalControl::Input(data)) => {
-                if let Err(error) = input_writer.try_write(data) {
+        match input_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(input) => {
+                if let Err(error) = input_writer.try_write_input(input) {
                     break (
                         process.terminate(),
                         Some(format!("终端输入写入失败: {error}")),
                     );
                 }
-            }
-            Ok(TerminalControl::Resize { cols, rows }) => {
-                if let Err(error) = master.resize(cols, rows) {
-                    break (
-                        process.terminate(),
-                        Some(format!("调整终端大小失败: {error}")),
-                    );
-                }
-            }
-            Ok(TerminalControl::Close) => {
-                break (process.terminate(), None);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(exit_code) = process.try_wait_code()? {
@@ -629,7 +644,10 @@ fn run_terminal_inner(
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                break (process.terminate(), Some("终端控制通道已关闭".to_string()));
+                let reason = control
+                    .take_close()
+                    .unwrap_or_else(|| Some("终端控制通道已关闭".to_string()));
+                break (process.terminate(), reason);
             }
         }
     };
@@ -1157,7 +1175,7 @@ mod tests {
             match inbound.try_recv() {
                 Ok(AgentInbound::TerminalOpened { .. }) if !opened => {
                     opened = true;
-                    manager.input(&session_id, &STANDARD.encode(input.as_bytes()));
+                    manager.input(&session_id, &STANDARD.encode(input.as_bytes()), None);
                 }
                 Ok(AgentInbound::TerminalOutput { data, .. }) => {
                     output.extend(STANDARD.decode(data).unwrap());
@@ -1183,6 +1201,56 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_input_and_resize_bursts_keep_the_shell_alive_until_explicit_close() {
+        let (outbound, mut control_events, _failed) = AgentEventSender::channel(32);
+        let (stream_outbound, mut inbound, _stream_failed) = AgentEventSender::channel(128);
+        let mut manager =
+            TerminalManager::new(outbound, stream_outbound, ActivityTracker::default());
+        let session_id = "acknowledged-input".to_string();
+        manager.open(session_id.clone(), None, 80, 24);
+        let mut acknowledged = 0;
+        let mut closed = false;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            match inbound.try_recv() {
+                Ok(AgentInbound::TerminalOpened { input_ack, .. }) => {
+                    assert!(input_ack);
+                    manager.input(&session_id, &STANDARD.encode(b"# input\n"), Some(1));
+                }
+                Ok(AgentInbound::TerminalInputAck { input_id, .. }) => {
+                    assert_eq!(input_id, acknowledged + 1);
+                    acknowledged = input_id;
+                    for cols in 80..200 {
+                        manager.resize(&session_id, cols, 40);
+                    }
+                    if acknowledged < 64 {
+                        manager.input(
+                            &session_id,
+                            &STANDARD.encode(b"# input\n"),
+                            Some(acknowledged + 1),
+                        );
+                    } else {
+                        manager.close(&session_id);
+                    }
+                }
+                Ok(AgentInbound::TerminalClosed { reason, .. }) => {
+                    assert!(reason.is_none(), "unexpected terminal close: {reason:?}");
+                    closed = true;
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        manager.close_all();
+        assert_eq!(acknowledged, 64);
+        assert!(closed);
+        assert!(control_events.try_recv().is_err());
+    }
+
+    #[test]
     fn concurrent_terminals_keep_working_directories_and_environments_isolated() {
         let (outbound, _control_events, _failed) = AgentEventSender::channel(64);
         let (stream_outbound, mut inbound, _stream_failed) = AgentEventSender::channel(128);
@@ -1198,20 +1266,22 @@ mod tests {
         let mut output = HashMap::<String, Vec<u8>>::new();
         while Instant::now() < deadline && closed.len() < 2 {
             match inbound.try_recv() {
-                Ok(AgentInbound::TerminalOpened { session_id }) if session_id == first => {
+                Ok(AgentInbound::TerminalOpened { session_id, .. }) if session_id == first => {
                     manager.input(
                         &first,
                         &STANDARD.encode(
                             b"cd /; export OM_TERMINAL_ISOLATION=first; printf '__OM_FIRST__%s:%s\\n' \"$PWD\" \"$OM_TERMINAL_ISOLATION\"; exit\n",
                         ),
+                        None,
                     );
                 }
-                Ok(AgentInbound::TerminalOpened { session_id }) if session_id == second => {
+                Ok(AgentInbound::TerminalOpened { session_id, .. }) if session_id == second => {
                     manager.input(
                         &second,
                         &STANDARD.encode(
                             b"cd /tmp; printf '__OM_SECOND__%s:%s\\n' \"$PWD\" \"${OM_TERMINAL_ISOLATION:-unset}\"; exit\n",
                         ),
+                        None,
                     );
                 }
                 Ok(AgentInbound::TerminalOutput { session_id, data }) => {
@@ -1315,11 +1385,11 @@ mod tests {
             }
         }
 
-        manager.input(&session_id, &STANDARD.encode(b"sleep 60\n"));
+        manager.input(&session_id, &STANDARD.encode(b"sleep 60\n"), None);
         thread::sleep(Duration::from_millis(100));
         let input = STANDARD.encode(vec![b'x'; 32 * 1024]);
         for _ in 0..64 {
-            manager.input(&session_id, &input);
+            manager.input(&session_id, &input, None);
         }
         manager.close_all();
 
@@ -1378,24 +1448,34 @@ mod tests {
     }
 
     #[test]
-    fn terminal_manager_closes_a_session_when_its_control_queue_is_full() {
+    fn resize_and_close_remain_available_when_terminal_input_queue_is_full() {
         let (outbound, mut inbound, _failed) = AgentEventSender::channel(32);
         let mut manager =
             TerminalManager::new(outbound.clone(), outbound, ActivityTracker::default());
-        let (control, _receiver) = mpsc::sync_channel(1);
-        control.try_send(TerminalControl::Close).unwrap();
-        manager.sessions.insert("congested".to_string(), control);
+        let (input, _receiver) = mpsc::sync_channel(1);
+        input
+            .try_send(PtyInput {
+                data: vec![1],
+                input_id: None,
+            })
+            .unwrap();
+        let control = PtyControl::default();
+        manager.sessions.insert(
+            "congested".to_string(),
+            ActiveTerminal {
+                input,
+                control: control.clone(),
+            },
+        );
 
-        manager.resize("congested", 100, 40);
-
+        for cols in 2..500 {
+            manager.resize("congested", cols, 40);
+        }
+        assert!(manager.sessions.contains_key("congested"));
+        assert_eq!(control.take_resize(), Some((499, 40)));
+        assert!(inbound.try_recv().is_err());
+        manager.close("congested");
         assert!(!manager.sessions.contains_key("congested"));
-        assert!(matches!(
-            inbound.try_recv(),
-            Ok(AgentInbound::TerminalClosed {
-                session_id,
-                exit_code: None,
-                reason: Some(reason),
-            }) if session_id == "congested" && reason.contains("拥塞")
-        ));
+        assert_eq!(control.take_close(), Some(None));
     }
 }

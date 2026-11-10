@@ -6,7 +6,8 @@ import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { TerminalSquare, X } from '@lucide/vue'
 import { dockerWebSocketUrl } from '../api/docker'
-import type { DockerTerminalClientMessage, DockerTerminalServerMessage } from '../types/docker'
+import { createTerminalInput } from '../utils/terminalInput'
+import type { DockerTerminalServerMessage } from '../types/docker'
 
 const props = defineProps<{
   instanceId: string
@@ -24,6 +25,7 @@ let terminal: Terminal | null = null
 let fitAddon: FitAddon | null = null
 let resizeObserver: ResizeObserver | null = null
 let closedByUser = false
+const input = createTerminalInput(() => socket)
 
 onMounted(() => {
   terminal = new Terminal({
@@ -43,8 +45,10 @@ onMounted(() => {
   fitAddon = new FitAddon()
   terminal.loadAddon(fitAddon)
   terminal.open(terminalElement.value!)
-  terminal.onData((data) => send({ type: 'input', data: encodeUtf8(data) }))
-  terminal.onResize(({ cols, rows }) => send({ type: 'resize', cols, rows }))
+  terminal.onData((data) => {
+    if (!input.enqueue(data)) terminal?.writeln('\r\n\x1b[33m[待发送输入过多，本次输入未发送，请等待后重试]\x1b[0m')
+  })
+  terminal.onResize(({ cols, rows }) => input.resize(cols, rows))
 
   socket = new WebSocket(dockerWebSocketUrl(
     props.instanceId,
@@ -57,10 +61,12 @@ onMounted(() => {
   }
   socket.onmessage = (event) => handleMessage(event.data)
   socket.onerror = () => {
+    input.stop()
     status.value = '连接错误'
     terminal?.writeln('\r\n\x1b[31m[容器终端连接发生错误]\x1b[0m')
   }
   socket.onclose = () => {
+    input.stop()
     if (!closedByUser && status.value !== '会话已结束' && status.value !== '连接失败') {
       status.value = '连接已断开'
       terminal?.writeln('\r\n\x1b[33m[容器终端连接已断开]\x1b[0m')
@@ -75,6 +81,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   closedByUser = true
+  input.stop()
   resizeObserver?.disconnect()
   window.removeEventListener('resize', fitTerminal)
   socket?.close()
@@ -90,20 +97,25 @@ function handleMessage(raw: unknown) {
     const message = JSON.parse(raw) as DockerTerminalServerMessage
     if (message.type === 'opening') status.value = '正在启动'
     if (message.type === 'ready') {
+      if (terminal) input.resize(terminal.cols, terminal.rows)
+      input.start(message.input_ack === true)
       status.value = '已连接'
       fitTerminal()
       terminal?.focus()
     }
+    if (message.type === 'input_ack') input.acknowledge(message.input_id)
     if (message.type === 'output') {
       terminal?.write(message.encoding === 'utf8' ? message.data : decodeBase64(message.data))
     }
     if (message.type === 'closed') {
+      input.stop()
       status.value = '会话已结束'
       terminal?.writeln(
         `\r\n\x1b[33m[终端已关闭${message.exit_code == null ? '' : `，退出码 ${message.exit_code}`}${message.reason ? `：${message.reason}` : ''}]\x1b[0m`,
       )
     }
     if (message.type === 'error') {
+      input.stop()
       status.value = '连接失败'
       terminal?.writeln(`\r\n\x1b[31m[${message.message}]\x1b[0m`)
     }
@@ -119,19 +131,6 @@ function fitTerminal() {
   } catch {
     // The overlay may be unmounting.
   }
-}
-
-function send(message: DockerTerminalClientMessage) {
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message))
-}
-
-function encodeUtf8(value: string) {
-  const bytes = new TextEncoder().encode(value)
-  let binary = ''
-  for (let index = 0; index < bytes.length; index += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
-  }
-  return btoa(binary)
 }
 
 function decodeBase64(value: string) {

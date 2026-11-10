@@ -1153,6 +1153,8 @@ pub enum AgentOutbound {
     TerminalInput {
         session_id: String,
         data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_id: Option<u32>,
     },
     TerminalResize {
         session_id: String,
@@ -1220,6 +1222,8 @@ pub enum AgentOutbound {
     DockerExecInput {
         session_id: String,
         data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_id: Option<u32>,
     },
     DockerExecResize {
         session_id: String,
@@ -1300,6 +1304,12 @@ pub enum AgentInbound {
     },
     TerminalOpened {
         session_id: String,
+        #[serde(default)]
+        input_ack: bool,
+    },
+    TerminalInputAck {
+        session_id: String,
+        input_id: u32,
     },
     TerminalOutput {
         session_id: String,
@@ -1337,6 +1347,12 @@ pub enum AgentInbound {
     },
     DockerExecOpened {
         session_id: String,
+        #[serde(default)]
+        input_ack: bool,
+    },
+    DockerExecInputAck {
+        session_id: String,
+        input_id: u32,
     },
     DockerExecOutput {
         session_id: String,
@@ -1386,15 +1402,28 @@ pub struct TerminalShellListResponse {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TerminalClientMessage {
-    Input { data: String },
-    Resize { cols: u16, rows: u16 },
+    Input {
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_id: Option<u32>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TerminalServerMessage {
     Opening,
-    Ready,
+    Ready {
+        #[serde(default)]
+        input_ack: bool,
+    },
+    InputAck {
+        input_id: u32,
+    },
     Output {
         data: String,
     },

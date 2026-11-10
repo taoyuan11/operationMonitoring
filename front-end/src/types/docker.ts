@@ -235,12 +235,13 @@ export type DockerLogServerMessage =
   | { type: 'error'; code?: string; retryable?: boolean; message: string }
 
 export type DockerTerminalClientMessage =
-  | { type: 'input'; data: string }
+  | { type: 'input'; data: string; input_id?: number }
   | { type: 'resize'; cols: number; rows: number }
 
 export type DockerTerminalServerMessage =
   | { type: 'opening' }
-  | { type: 'ready' }
+  | { type: 'ready'; input_ack?: boolean }
+  | { type: 'input_ack'; input_id: number }
   | { type: 'output'; data: string; encoding?: 'base64' | 'utf8' }
   | { type: 'closed'; exit_code?: number | null; reason?: string | null }
   | { type: 'error'; message: string }

@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { terminalWebSocketUrl } from '../api/terminal'
+import { createTerminalInput } from '../utils/terminalInput'
 import type { TerminalSessionStatus } from '../types/domain'
 
 const props = defineProps<{
@@ -23,6 +24,7 @@ let fitAddon: FitAddon | null = null
 let resizeObserver: ResizeObserver | null = null
 let closedByUser = false
 let currentStatus: TerminalSessionStatus = 'opening'
+const input = createTerminalInput(() => socket)
 
 onMounted(() => {
   terminal = new Terminal({
@@ -42,8 +44,10 @@ onMounted(() => {
   fitAddon = new FitAddon()
   terminal.loadAddon(fitAddon)
   terminal.open(terminalElement.value!)
-  terminal.onData((data) => sendMessage({ type: 'input', data: encodeUtf8(data) }))
-  terminal.onResize(({ cols, rows }) => sendMessage({ type: 'resize', cols, rows }))
+  terminal.onData((data) => {
+    if (!input.enqueue(data)) terminal?.writeln('\r\n\x1b[33m[待发送输入过多，本次输入未发送，请等待后重试]\x1b[0m')
+  })
+  terminal.onResize(({ cols, rows }) => input.resize(cols, rows))
 
   socket = new WebSocket(terminalWebSocketUrl(props.instanceId, props.shellProgram))
   socket.onopen = () => {
@@ -60,19 +64,26 @@ onMounted(() => {
           break
         case 'ready':
           setStatus('ready')
+          if (terminal) input.resize(terminal.cols, terminal.rows)
+          input.start(message.input_ack === true)
           fitTerminal()
           terminal?.focus()
+          break
+        case 'input_ack':
+          input.acknowledge(message.input_id)
           break
         case 'output':
           terminal?.write(decodeBase64(message.data))
           break
         case 'closed':
+          input.stop()
           setStatus('closed')
           terminal?.writeln(
             `\r\n\x1b[33m[终端已关闭${message.exit_code == null ? '' : `，退出码 ${message.exit_code}`}${message.reason ? `：${message.reason}` : ''}]\x1b[0m`,
           )
           break
         case 'error':
+          input.stop()
           setStatus('error')
           terminal?.writeln(`\r\n\x1b[31m[${message.message}]\x1b[0m`)
           break
@@ -83,11 +94,13 @@ onMounted(() => {
     }
   }
   socket.onerror = () => {
+    input.stop()
     if (currentStatus === 'closed' || currentStatus === 'error') return
     setStatus('error')
     terminal?.writeln('\r\n\x1b[31m[终端连接发生错误]\x1b[0m')
   }
   socket.onclose = () => {
+    input.stop()
     if (closedByUser || currentStatus === 'closed' || currentStatus === 'error') return
     setStatus('disconnected')
     terminal?.writeln('\r\n\x1b[33m[终端连接已断开]\x1b[0m')
@@ -113,6 +126,7 @@ watch(
 
 onBeforeUnmount(() => {
   closedByUser = true
+  input.stop()
   resizeObserver?.disconnect()
   window.removeEventListener('resize', fitTerminal)
   socket?.close()
@@ -136,19 +150,6 @@ function fitTerminal() {
   }
 }
 
-function sendMessage(message: TerminalClientMessage) {
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message))
-}
-
-function encodeUtf8(value: string) {
-  const bytes = new TextEncoder().encode(value)
-  let binary = ''
-  for (let index = 0; index < bytes.length; index += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
-  }
-  return btoa(binary)
-}
-
 function decodeBase64(value: string) {
   const binary = atob(value)
   const bytes = new Uint8Array(binary.length)
@@ -156,13 +157,10 @@ function decodeBase64(value: string) {
   return bytes
 }
 
-type TerminalClientMessage =
-  | { type: 'input'; data: string }
-  | { type: 'resize'; cols: number; rows: number }
-
 type TerminalServerMessage =
   | { type: 'opening' }
-  | { type: 'ready' }
+  | { type: 'ready'; input_ack?: boolean }
+  | { type: 'input_ack'; input_id: number }
   | { type: 'output'; data: string }
   | { type: 'closed'; exit_code: number | null; reason: string | null }
   | { type: 'error'; message: string }

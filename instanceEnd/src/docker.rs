@@ -39,7 +39,7 @@ use crate::{
         DockerRestartPolicy, DockerStatus, DockerStatusState, DockerVolumeCreateSpec,
     },
     outbound::AgentEventSender,
-    pty_io::PtyInputWriter,
+    pty_io::{PtyControl, PtyInput, PtyInputWriter},
     time::now_ts,
     update::docker_protected_update_root,
 };
@@ -353,8 +353,8 @@ impl DockerManager {
         self.exec.open(session_id, container, shell, cols, rows);
     }
 
-    pub fn exec_input(&mut self, session_id: &str, data: &str) {
-        self.exec.input(session_id, data);
+    pub fn exec_input(&mut self, session_id: &str, data: &str, input_id: Option<u32>) {
+        self.exec.input(session_id, data, input_id);
     }
 
     pub fn exec_resize(&mut self, session_id: &str, cols: u16, rows: u16) {
@@ -3147,13 +3147,6 @@ fn parse_log_cursor_bytes(candidate: &[u8]) -> Option<String> {
     .then(|| candidate.to_string())
 }
 
-enum DockerExecControl {
-    Input(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
-    Close,
-    CloseWithReason(String),
-}
-
 struct PtyChildGuard {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     reaped: bool,
@@ -3224,7 +3217,8 @@ impl Drop for PtyChildGuard {
 }
 
 struct ActiveDockerExec {
-    control: std_mpsc::SyncSender<DockerExecControl>,
+    input: std_mpsc::SyncSender<PtyInput>,
+    control: PtyControl,
     active: Arc<AtomicBool>,
 }
 
@@ -3277,12 +3271,14 @@ impl DockerExecManager {
             );
             return;
         };
-        let (control, controls) = std_mpsc::sync_channel(EXEC_CONTROL_QUEUE_CAPACITY);
+        let (input, inputs) = std_mpsc::sync_channel(EXEC_CONTROL_QUEUE_CAPACITY);
+        let control = PtyControl::default();
         let active = Arc::new(AtomicBool::new(true));
         self.sessions.insert(
             session_id.clone(),
             ActiveDockerExec {
-                control,
+                input,
+                control: control.clone(),
                 active: active.clone(),
             },
         );
@@ -3298,7 +3294,8 @@ impl DockerExecManager {
                 &shell,
                 cols.clamp(2, 500),
                 rows.clamp(1, 300),
-                controls,
+                inputs,
+                control,
                 &stream_outbound,
             );
             active.store(false, Ordering::SeqCst);
@@ -3318,7 +3315,7 @@ impl DockerExecManager {
         });
     }
 
-    fn input(&mut self, session_id: &str, encoded_data: &str) {
+    fn input(&mut self, session_id: &str, encoded_data: &str, input_id: Option<u32>) {
         if encoded_data.len() > MAX_EXEC_INPUT_BYTES {
             self.fail_session(session_id, "Docker terminal input exceeded the size limit");
             return;
@@ -3326,11 +3323,7 @@ impl DockerExecManager {
         let decoded = STANDARD.decode(encoded_data);
         match (self.sessions.get(session_id), decoded) {
             (Some(session), Ok(data)) => {
-                if session
-                    .control
-                    .try_send(DockerExecControl::Input(data))
-                    .is_err()
-                {
+                if session.input.try_send(PtyInput { data, input_id }).is_err() {
                     self.fail_session(session_id, "Docker terminal input queue overflowed");
                 }
             }
@@ -3346,36 +3339,25 @@ impl DockerExecManager {
 
     fn resize(&mut self, session_id: &str, cols: u16, rows: u16) {
         if let Some(session) = self.sessions.get(session_id) {
-            if session
-                .control
-                .try_send(DockerExecControl::Resize {
-                    cols: cols.clamp(2, 500),
-                    rows: rows.clamp(1, 300),
-                })
-                .is_err()
-            {
-                self.fail_session(session_id, "Docker terminal control queue overflowed");
-            }
+            session.control.resize(cols, rows);
         }
     }
 
     fn close(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
-            let _ = session.control.try_send(DockerExecControl::Close);
+            session.control.close(None);
         }
     }
 
     fn close_all(&mut self) {
         for (_, session) in self.sessions.drain() {
-            let _ = session.control.try_send(DockerExecControl::Close);
+            session.control.close(None);
         }
     }
 
     fn close_all_with_reason(&mut self, reason: &str) {
         for (_, session) in self.sessions.drain() {
-            let _ = session
-                .control
-                .try_send(DockerExecControl::CloseWithReason(reason.to_string()));
+            session.control.close(Some(reason.to_string()));
         }
     }
 
@@ -3383,9 +3365,7 @@ impl DockerExecManager {
         let Some(session) = self.sessions.remove(session_id) else {
             return;
         };
-        let _ = session
-            .control
-            .try_send(DockerExecControl::CloseWithReason(reason.to_string()));
+        session.control.close(Some(reason.to_string()));
         self.closed(session_id.to_string(), None, Some(reason.to_string()));
     }
 
@@ -3423,7 +3403,8 @@ fn run_docker_exec(
     shell: &str,
     cols: u16,
     rows: u16,
-    controls: std_mpsc::Receiver<DockerExecControl>,
+    inputs: std_mpsc::Receiver<PtyInput>,
+    control: PtyControl,
     stream_outbound: &AgentEventSender,
 ) -> anyhow::Result<(Option<i64>, Option<String>)> {
     let pair = native_pty_system().openpty(PtySize {
@@ -3442,14 +3423,23 @@ fn run_docker_exec(
     let mut child = PtyChildGuard::new(child);
     drop(slave);
     let mut reader = master.try_clone_reader()?;
-    let input_writer = PtyInputWriter::spawn(
+    let ack_session_id = session_id.to_string();
+    let ack_outbound = stream_outbound.clone();
+    let input_writer = PtyInputWriter::spawn_with_ack(
         master.take_writer()?,
         EXEC_WRITE_QUEUE_CAPACITY,
         "om-docker-exec-input",
+        move |input_id| {
+            let _ = ack_outbound.blocking_send(AgentInbound::DockerExecInputAck {
+                session_id: ack_session_id.clone(),
+                input_id,
+            });
+        },
     )?;
 
     stream_outbound.blocking_send(AgentInbound::DockerExecOpened {
         session_id: session_id.to_string(),
+        input_ack: true,
     })?;
     let reader_session_id = session_id.to_string();
     let reader_outbound = stream_outbound.clone();
@@ -3476,39 +3466,35 @@ fn run_docker_exec(
     });
 
     let outcome = loop {
+        if let Some(reason) = control.take_close() {
+            break (child.close_interactive_shell(&input_writer), reason);
+        }
+        if let Some((cols, rows)) = control.take_resize()
+            && let Err(error) = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        {
+            crate::logging::error(format_args!(
+                "Docker terminal session {session_id} resize failed: {error}"
+            ));
+        }
         if let Some(error) = input_writer.take_failure() {
             break (
                 child.terminate(),
                 Some(format!("Failed to write terminal: {error}")),
             );
         }
-        match controls.recv_timeout(Duration::from_millis(100)) {
-            Ok(DockerExecControl::Input(data)) => {
-                if let Err(error) = input_writer.try_write(data) {
+        match inputs.recv_timeout(Duration::from_millis(100)) {
+            Ok(input) => {
+                if let Err(error) = input_writer.try_write_input(input) {
                     break (
                         child.terminate(),
                         Some(format!("Failed to queue terminal input: {error}")),
                     );
                 }
-            }
-            Ok(DockerExecControl::Resize { cols, rows }) => {
-                if let Err(error) = master.resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                }) {
-                    break (
-                        child.terminate(),
-                        Some(format!("Failed to resize terminal: {error}")),
-                    );
-                }
-            }
-            Ok(DockerExecControl::Close) => {
-                break (child.close_interactive_shell(&input_writer), None);
-            }
-            Ok(DockerExecControl::CloseWithReason(reason)) => {
-                break (child.close_interactive_shell(&input_writer), Some(reason));
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => match child.try_wait_code() {
                 Ok(Some(exit_code)) => break (Some(exit_code), None),
@@ -3521,10 +3507,10 @@ fn run_docker_exec(
                 }
             },
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                break (
-                    child.close_interactive_shell(&input_writer),
-                    Some("Docker terminal control channel closed".to_string()),
-                );
+                let reason = control
+                    .take_close()
+                    .unwrap_or_else(|| Some("Docker terminal control channel closed".to_string()));
+                break (child.close_interactive_shell(&input_writer), reason);
             }
         }
     };
@@ -4114,36 +4100,39 @@ esac
     }
 
     #[test]
-    fn docker_exec_closes_a_session_when_its_control_queue_is_full() {
-        let activity = ActivityTracker::default();
+    fn resize_and_close_remain_available_when_docker_input_queue_is_full() {
         let (stream_outbound, mut inbound, _failed) = AgentEventSender::channel(4);
         let mut exec = DockerExecManager::new(
             "docker".into(),
             stream_outbound,
-            activity,
+            ActivityTracker::default(),
             Arc::new(Semaphore::new(2)),
         );
-        let (control, _controls) = std_mpsc::sync_channel(1);
-        control.try_send(DockerExecControl::Close).unwrap();
+        let (input, _inputs) = std_mpsc::sync_channel(1);
+        input
+            .try_send(PtyInput {
+                data: vec![1],
+                input_id: None,
+            })
+            .unwrap();
+        let control = PtyControl::default();
         exec.sessions.insert(
             "congested".to_string(),
             ActiveDockerExec {
-                control,
+                input,
+                control: control.clone(),
                 active: Arc::new(AtomicBool::new(true)),
             },
         );
-
-        exec.resize("congested", 100, 40);
-
+        for cols in 2..500 {
+            exec.resize("congested", cols, 40);
+        }
+        assert!(exec.sessions.contains_key("congested"));
+        assert_eq!(control.take_resize(), Some((499, 40)));
+        assert!(inbound.try_recv().is_err());
+        exec.close("congested");
         assert!(!exec.sessions.contains_key("congested"));
-        assert!(matches!(
-            inbound.try_recv(),
-            Ok(AgentInbound::DockerExecClosed {
-                session_id,
-                exit_code: None,
-                reason: Some(reason),
-            }) if session_id == "congested" && reason.contains("overflowed")
-        ));
+        assert_eq!(control.take_close(), Some(None));
     }
 
     #[test]
@@ -4497,7 +4486,7 @@ esac
 
         let input = STANDARD.encode(vec![b'x'; 32 * 1024]);
         for _ in 0..64 {
-            exec.input("exec-blocked", &input);
+            exec.input("exec-blocked", &input, None);
         }
         exec.close_all();
 

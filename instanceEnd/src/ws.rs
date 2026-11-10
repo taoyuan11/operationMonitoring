@@ -569,8 +569,8 @@ async fn handle_agent_socket(
                             } => {
                                 terminals.open(session_id, shell, cols, rows);
                             }
-                            AgentOutbound::TerminalInput { session_id, data } => {
-                                terminals.input(&session_id, &data);
+                            AgentOutbound::TerminalInput { session_id, data, input_id } => {
+                                terminals.input(&session_id, &data, input_id);
                             }
                             AgentOutbound::TerminalResize { session_id, cols, rows } => {
                                 terminals.resize(&session_id, cols, rows);
@@ -623,8 +623,8 @@ async fn handle_agent_socket(
                             } => {
                                 docker.exec_open(session_id, container, shell, cols, rows);
                             }
-                            AgentOutbound::DockerExecInput { session_id, data } => {
-                                docker.exec_input(&session_id, &data);
+                            AgentOutbound::DockerExecInput { session_id, data, input_id } => {
+                                docker.exec_input(&session_id, &data, input_id);
                             }
                             AgentOutbound::DockerExecResize { session_id, cols, rows } => {
                                 docker.exec_resize(&session_id, cols, rows);
